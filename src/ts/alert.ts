@@ -1,13 +1,13 @@
 import { get, writable } from "svelte/store"
 import { sleep } from "./util"
 import { language } from "../lang"
-import { getDatabase, type MessageGenerationInfo } from "./storage/database.svelte"
+import { getDatabase, nodeOnlyVer, type MessageGenerationInfo } from "./storage/database.svelte"
 import { alertStore as alertStoreImported } from "./stores.svelte"
 
 export interface alertData{
     type: 'error'|'normal'|'none'|'ask'|'wait'|'selectChar'
             |'input'|'toast'|'wait2'|'markdown'|'select'|'login'
-            |'tos'|'cardexport'|'requestdata'|'addchar'|'hypaV2'|'selectModule'
+            |'tos'|'cardexport'|'requestdata'|'addchar'|'selectModule'
             |'chatOptions'|'pukmakkurit'|'branches'|'progress'|'pluginconfirm'|'requestlogs'
             |'togglePresets',
     msg: string,
@@ -32,7 +32,7 @@ export const alertStore = {
 const TOS_ACCEPTANCE_STORAGE_KEY = 'tos2'
 
 export function alertError(msg: string | Error) {
-    console.error(msg)
+    console.error(`[NodeOnly v${nodeOnlyVer}]`, msg)
     const db = getDatabase()
 
     let stackTrace: string | undefined = undefined; 
@@ -291,13 +291,6 @@ export function alertRequestData(info:AlertGenerationInfoStoreData){
     alertStoreImported.set({
         'type': 'requestdata',
         'msg': info.genInfo.generationId ?? 'none'
-    })
-}
-
-export function showHypaV2Alert(){
-    alertStoreImported.set({
-        'type': 'hypaV2',
-        'msg': ""
     })
 }
 

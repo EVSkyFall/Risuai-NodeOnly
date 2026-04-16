@@ -18,6 +18,7 @@
     import { language } from 'src/lang';
     import { getFetchData } from 'src/ts/globalApi.svelte';
     import { alertStore, selectedCharID } from "src/ts/stores.svelte";
+    import { nodeOnlyVer } from "src/ts/storage/database.svelte";
     import { tokenize } from "src/ts/tokenizer";
     import TextAreaInput from "../UI/GUI/TextAreaInput.svelte";
     import ModuleChatMenu from "../Setting/Pages/Module/ModuleChatMenu.svelte";
@@ -161,7 +162,7 @@
     <div class="absolute w-full h-full z-50 bg-black/50 flex justify-center items-center" class:vis={ $alertStore.type === 'wait2'}>
         <div class="bg-darkbg p-4 break-any rounded-md flex flex-col max-w-3xl  max-h-full overflow-y-auto">
             {#if $alertStore.type === 'error'}
-                <h2 class="text-red-700 mt-0 mb-2 w-40 max-w-full">Error</h2>
+                <h2 class="text-red-700 mt-0 mb-2 max-w-full">Error <span class="text-red-900 text-sm">[NodeOnly v{nodeOnlyVer}]</span></h2>
             {:else if $alertStore.type === 'ask'}
                 <h2 class="text-green-700 mt-0 mb-2 w-40 max-w-full">Confirm</h2>
             {:else if $alertStore.type === 'pluginconfirm'}
@@ -203,7 +204,7 @@
                     {/if}
                     <p class="confirm-message">{confirmMessage}</p>
                 </div>
-            {:else if $alertStore.type !== 'select' && $alertStore.type !== 'requestdata' && $alertStore.type !== 'addchar' && $alertStore.type !== 'hypaV2' && $alertStore.type !== 'chatOptions'}
+            {:else if $alertStore.type !== 'select' && $alertStore.type !== 'requestdata' && $alertStore.type !== 'addchar' && $alertStore.type !== 'chatOptions'}
                 <span class="text-gray-300 whitespace-pre-wrap">{$alertStore.msg}</span>
                 {#if $alertStore.submsg && $alertStore.type !== 'progress'}
                     <span class="text-gray-500 text-sm">{$alertStore.submsg}</span>
@@ -504,41 +505,6 @@
                         </div>
                     {/if}
                 {/if}
-            {:else if $alertStore.type === 'hypaV2'}
-                <div class="flex flex-wrap gap-2 mb-4 max-w-full w-124">
-                    <Button selected={generationInfoMenuIndex === 0} size="sm" onclick={() => {generationInfoMenuIndex = 0}}>
-                        Chunks
-                    </Button>
-                    <Button selected={generationInfoMenuIndex === 1} size="sm" onclick={() => {generationInfoMenuIndex = 1}}>
-                        Summarized
-                    </Button>
-                    <button class="ml-auto" onclick={() => {
-                        alertStore.set({
-                            type: 'none',
-                            msg: ''
-                        })
-                    }}>✖</button>
-                </div>
-                {#if generationInfoMenuIndex === 0}
-                    <div class="flex flex-col gap-2 w-full">
-                        {#each DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].hypaV2Data.chunks as chunk, i}
-                            <TextAreaInput bind:value={chunk.text} />
-                        {/each}
-
-                        <!-- Adding non-bound chunk is not okay, change the user flow to edit existing ones. -->
-                    </div>
-                {:else}
-                    {#each DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].hypaV2Data.mainChunks as chunk, i} <!-- Summarized should be mainChunks, afaik. Be aware of that chunks are created with mainChunks, however this editing would not change related chunks. -->
-                        <div class="flex flex-col p-2 rounded-md border-darkborderc border">
-                            {#if i === 0}
-                                <span class="text-green-500">Active</span>
-                            {:else}
-                                <span>Inactive</span>
-                            {/if}
-                            <TextAreaInput bind:value={chunk.text} />
-                        </div>
-                    {/each}
-                {/if}
             {:else if $alertStore.type === 'addchar'}
                 <div class="w-2xl flex flex-col max-w-full">
 
@@ -583,6 +549,21 @@
                     }}>
                         <div class="flex flex-col justify-start items-start">
                             <span>{language.createfromScratch}</span>
+                        </div>
+                        <div class="ml-9 float-right flex-1 flex justify-end">
+                            <ChevronRightIcon />
+                        </div>
+                    </button>
+                    <button class="border-darkborderc border py-2 px-8 flex rounded-md hover:ring-2 items-center mt-2" onclick={(e) => {
+                        e.stopPropagation()
+                        e.preventDefault()
+                        alertStore.set({
+                            type: 'none',
+                            msg: 'importPackage'
+                        })
+                    }}>
+                        <div class="flex flex-col justify-start items-start">
+                            <span>{language.characterPackageImport}</span>
                         </div>
                         <div class="ml-9 float-right flex-1 flex justify-end">
                             <ChevronRightIcon />

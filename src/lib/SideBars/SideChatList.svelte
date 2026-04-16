@@ -2,11 +2,12 @@
     import { onDestroy, onMount } from "svelte";
     import { v4 } from "uuid";
     import Sortable from 'sortablejs/modular/sortable.core.esm.js';
-    import { DownloadIcon, PencilIcon, HardDriveUploadIcon, MenuIcon, TrashIcon, SplitIcon, FolderPlusIcon, BookmarkCheckIcon } from "@lucide/svelte";
+    import { DownloadIcon, PencilIcon, HardDriveUploadIcon, MenuIcon, TrashIcon, SplitIcon, FolderPlusIcon, BookmarkCheckIcon, PackageIcon } from "@lucide/svelte";
 
     import type { Chat, ChatFolder, character, groupChat } from "src/ts/storage/database.svelte";
+    import { ensureChatHydrated } from "src/ts/storage/chatStorage";
     import { DBState, ReloadGUIPointer } from 'src/ts/stores.svelte';
-    import { selectedCharID } from "src/ts/stores.svelte";
+    import { selectedCharID, chatDeselected } from "src/ts/stores.svelte";
 
     import CheckInput from "../UI/GUI/CheckInput.svelte";
     import Button from "../UI/GUI/Button.svelte";
@@ -16,10 +17,11 @@
     import { alertChatOptions, alertConfirm, alertError, alertNormal, alertSelect, alertStore } from "src/ts/alert";
     import { findCharacterbyId, sleep, sortableOptions } from "src/ts/util";
 
-    import { bookmarkListOpen } from "src/ts/stores.svelte";
+    import { bookmarkListOpen, openModuleListStore } from "src/ts/stores.svelte";
     import { language } from "src/lang";
     import Toggles from "./Toggles.svelte";
     import PersonaBind from "./PersonaBind.svelte";
+    import PresetBind from "./PresetBind.svelte";
     import ModelList from "../UI/ModelList.svelte";
     import { changeChatTo, createChatCopyName, requestImmediateSave } from "src/ts/globalApi.svelte";
 
@@ -147,9 +149,7 @@
         chats.unshift(newChat)
         chara.chats = chats
         changeChatTo(0)
-        void requestImmediateSave({
-            skipBackups: true
-        })
+        void requestImmediateSave()
         $ReloadGUIPointer += 1
     }}>{language.newChat}</Button>
 
@@ -243,9 +243,13 @@
                     {@const chatIdx = chara.chats.indexOf(chat)}
                     <button data-risu-chat-idx={chatIdx} onclick={() => {
                         if(!editMode){
-                            changeChatTo(chatIdx)
+                            if(chatIdx === chara.chatPage && !$chatDeselected){
+                                $chatDeselected = true
+                            } else {
+                                changeChatTo(chatIdx)
+                            }
                         }
-                    }} class="risu-chats flex items-center text-textcolor border-solid border-0 border-darkborderc p-2 cursor-pointer rounded-md"class:bg-selected={chatIdx === chara.chatPage}>
+                    }} class="risu-chats flex items-center text-textcolor border-solid border-0 border-darkborderc p-2 cursor-pointer rounded-md"class:bg-selected={chatIdx === chara.chatPage && !$chatDeselected}>
                         {#if editMode}
                             <TextInput bind:value={chat.name} className="grow min-w-0" padding={false}/>
                         {:else}
@@ -260,15 +264,22 @@
                                 const option = await alertChatOptions()
                                 switch(option){
                                     case 0:{
-                                        const newChat = $state.snapshot(chara.chats[chara.chats.indexOf(chat)])
+                                        const chatIdx = chara.chats.indexOf(chat)
+                                        // Hydrate placeholder before copying to ensure full data
+                                        if(chara.chats[chatIdx]?._placeholder){
+                                            await ensureChatHydrated(chara.chats, chatIdx, (chara as character).chaId)
+                                        }
+                                        if(chara.chats[chatIdx]?._placeholder){
+                                            alertError('Failed to load chat data.')
+                                            break
+                                        }
+                                        const newChat = $state.snapshot(chara.chats[chatIdx])
                                         newChat.name = createChatCopyName(newChat.name, 'Copy')
                                         newChat.id = v4()
                                         chara.chats.unshift(newChat)
                                         changeChatTo(0)
                                         chara.chats = chara.chats
-                                        void requestImmediateSave({
-                                            skipBackups: true
-                                        })
+                                        void requestImmediateSave()
                                         break
                                     }
                                     case 1:{
@@ -332,9 +343,7 @@
                                     let chats = chara.chats
                                     chats.splice(chara.chats.indexOf(chat), 1)
                                     chara.chats = chats
-                                    void requestImmediateSave({
-                                        skipBackups: true
-                                    })
+                                    void requestImmediateSave()
                                 }
                             }}>
                                 <TrashIcon size={18}/>
@@ -353,11 +362,15 @@
             {#if chat.folderId == null}
             <button data-risu-chat-idx={i} onclick={() => {
                 if(!editMode){
-                    changeChatTo(i)
+                    if(i === chara.chatPage && !$chatDeselected){
+                        $chatDeselected = true
+                    } else {
+                        changeChatTo(i)
+                    }
                 }
             }}
             class="flex items-center text-textcolor border-solid border-0 border-darkborderc p-2 cursor-pointer rounded-md"
-            class:bg-selected={i === chara.chatPage}>
+            class:bg-selected={i === chara.chatPage && !$chatDeselected}>
                 {#if editMode}
                     <TextInput bind:value={chara.chats[i].name} className="grow min-w-0" padding={false}/>
                 {:else}
@@ -372,15 +385,21 @@
                         const option = await alertChatOptions()
                         switch(option){
                             case 0:{
+                                // Hydrate placeholder before copying to ensure full data
+                                if(chara.chats[i]?._placeholder){
+                                    await ensureChatHydrated(chara.chats, i, (chara as character).chaId)
+                                }
+                                if(chara.chats[i]?._placeholder){
+                                    alertError('Failed to load chat data.')
+                                    break
+                                }
                                 const newChat = $state.snapshot(chara.chats[i])
                                 newChat.name = createChatCopyName(newChat.name, 'Copy')
                                 newChat.id = v4()
                                 chara.chats.unshift(newChat)
                                 changeChatTo(0)
                                 chara.chats = chara.chats
-                                void requestImmediateSave({
-                                    skipBackups: true
-                                })
+                                void requestImmediateSave()
                                 break
                             }
                             case 1:{
@@ -445,9 +464,7 @@
                             let chats = chara.chats
                             chats.splice(i, 1)
                             chara.chats = chats
-                            void requestImmediateSave({
-                                skipBackups: true
-                            })
+                            void requestImmediateSave()
                         }
                     }}>
                         <TrashIcon size={18}/>
@@ -508,7 +525,10 @@
             </button>
         </div>
 
-        {#if DBState.db.characters[$selectedCharID]?.chaId !== '§playground'}
+        {#if DBState.db.characters[$selectedCharID]?.chaId !== '§playground' && !$chatDeselected}
+            {#if DBState.db.showPresetInSidebar}
+                <PresetBind />
+            {/if}
             {#if DBState.db.showModelInSidebar}
                 <div class="flex flex-col gap-1 mt-4">
                     <div class="text-[11px] text-textcolor2 px-1">{language.model} / {language.submodel}</div>
@@ -520,6 +540,16 @@
                 <PersonaBind />
             {/if}
             <Toggles bind:chara={chara} noContainer />
+            <button class="flex w-full items-center justify-center gap-1.5 py-2 px-4 mt-2 rounded-md border border-darkborderc bg-darkbutton hover:bg-selected text-textcolor text-md cursor-pointer transition-colors shadow-xs"
+                onclick={() => {
+                    const char = DBState.db.characters[$selectedCharID]
+                    if (!char) return
+                    char.chats[char.chatPage].modules ??= []
+                    openModuleListStore.set(true)
+                }}>
+                <PackageIcon size={16} class="shrink-0" />
+                <span class="truncate">{language.modules}</span>
+            </button>
         {/if}
     </div>
 </div>

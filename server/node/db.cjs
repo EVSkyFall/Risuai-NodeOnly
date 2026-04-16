@@ -50,10 +50,7 @@ function migrateFromSaveDir() {
     }
 
     const hexFiles = files.filter(f => hexRegex.test(f));
-    if (hexFiles.length === 0) {
-        fs.writeFileSync(migrationMarker, new Date().toISOString(), 'utf-8');
-        return;
-    }
+    if (hexFiles.length === 0) return;
 
     console.log(`[DB] Migrating ${hexFiles.length} file(s) from /save/ to SQLite...`);
 
@@ -63,16 +60,20 @@ function migrateFromSaveDir() {
     const now = Date.now();
 
     const run = db.transaction(() => {
-        for (const hexFile of hexFiles) {
-            const key = Buffer.from(hexFile, 'hex').toString('utf-8');
-            const value = fs.readFileSync(path.join(savePath, hexFile));
+        for (let i = 0; i < hexFiles.length; i++) {
+            if (i % 100 === 0 || i === hexFiles.length - 1) {
+                console.log(`[DB] Migrating... ${i + 1}/${hexFiles.length}`);
+            }
+            const key = Buffer.from(hexFiles[i], 'hex').toString('utf-8');
+            const value = fs.readFileSync(path.join(savePath, hexFiles[i]));
             insert.run(key, value, now);
         }
     });
     run();
 
     fs.writeFileSync(migrationMarker, new Date().toISOString(), 'utf-8');
-    console.log(`[DB] Migration complete. Original files preserved in /save/`);
+    console.log(`[DB] Migration complete. ${hexFiles.length} files preserved in /save/.`);
+    console.log(`[DB] To free disk space, remove migrated files via Settings > Clean Up Save Folder.`);
 }
 
 migrateFromSaveDir();

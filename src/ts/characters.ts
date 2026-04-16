@@ -1,6 +1,8 @@
 import { get, writable } from "svelte/store";
-import { saveImage, setDatabase, type character, type Chat, defaultSdDataFunc, type loreBook, getDatabase, getCharacterByIndex, setCharacterByIndex, getCurrentChat, loadTogglesFromChat } from "./storage/database.svelte";
+import { saveImage, setDatabase, type character, type Chat, defaultSdDataFunc, type loreBook, getDatabase, getCharacterByIndex, setCharacterByIndex, getCurrentChat, loadTogglesFromChat, normalizeChat } from "./storage/database.svelte";
+import { ensureChatHydrated } from "./storage/chatStorage";
 import { alertAddCharacter, alertConfirm, alertError, alertNormal, alertSelect, alertStore, alertWait } from "./alert";
+import { loadingOverlayStore, chatDeselected } from "./stores.svelte";
 import { language } from "../lang";
 import { checkNullish, findCharacterbyId, getUserName, selectMultipleFile, selectSingleFile } from "./util";
 import { v4 as uuidv4, v4 } from 'uuid';
@@ -12,6 +14,7 @@ import { parseMarkdownSafe } from "./parser/parser.svelte";
 import { translateHTML } from "./translator/translator";
 import { doingChat } from "./process/index.svelte";
 import { importCharacter } from "./characterCards";
+import { importCharacterPackage } from "./characterPackage";
 import { PngChunk } from "./pngChunk";
 
 export function createNewCharacter() {
@@ -176,8 +179,16 @@ export async function exportChat(page:number){
         const anonymous = (mode === '2' || mode === '3') ? ((await alertSelect([language.includePersonaName, language.hidePersonaName])) === '1') : false
         const selectedID = get(selectedCharID)
         const db = getDatabase()
-        const chat = db.characters[selectedID].chats[page]
         const char = db.characters[selectedID]
+        // Ensure chat is hydrated before export
+        if(char.chats[page]?._placeholder){
+            await ensureChatHydrated(char.chats, page, char.chaId)
+        }
+        if(char.chats[page]?._placeholder){
+            alertError('Failed to load chat data. Export aborted.')
+            return
+        }
+        const chat = char.chats[page]
         const date = new Date().toJSON();
         const htmlChatParse = async (v:string) => {
             v = parseMarkdownSafe(v)
@@ -425,7 +436,7 @@ export async function importChat(){
                     }
                     chat.id = v4()
                 })
-                db.characters[selectedID].chats.unshift(...chats)
+                db.characters[selectedID].chats.unshift(...chats.map(c => normalizeChat(c)))
                 setDatabase(db)
                 alertNormal(language.successImport)
                 return
@@ -441,7 +452,7 @@ export async function importChat(){
                             v.localLore = []
                         }
                         v.fmIndex ??= -1
-                        return v
+                        return normalizeChat(v)
                     })))
                     setDatabase(db)
                     alertNormal(language.successImport)
@@ -456,7 +467,7 @@ export async function importChat(){
                 if(!(checkNullish(das.message) || checkNullish(das.note) || checkNullish(das.name) || checkNullish(das.localLore))){
                     das.fmIndex ??= -1
                     das.id = v4()
-                    db.characters[selectedID].chats.unshift(das)
+                    db.characters[selectedID].chats.unshift(normalizeChat(das))
                     setDatabase(db)
                     alertNormal(language.successImport)
                     return
@@ -476,7 +487,7 @@ export async function importChat(){
             const chat = doc.querySelector('.idat').textContent
             const json = JSON.parse(chat)
             if(json.message && json.note && json.name && json.localLore){
-                db.characters[selectedID].chats.unshift(json)
+                db.characters[selectedID].chats.unshift(normalizeChat(json))
                 setDatabase(db)
                 alertNormal(language.successImport)
             }
@@ -736,6 +747,9 @@ export async function addCharacter(arg:{
         case 'importCharacter':
             await importCharacter()
             break
+        case 'importPackage':
+            await importCharacterPackage()
+            break
         default:
             MobileGUIStack.set(1)
             return
@@ -762,12 +776,40 @@ export function changeChar(index: number, arg:{
       return
     }
     reseter();
+    chatDeselected.set(false)
     characterFormatUpdate(index, {
       updateInteraction: true,
     });
     selectedCharID.set(index);
     const chat = getCurrentChat()
     if(chat){
-        loadTogglesFromChat(chat)
+        if(chat._placeholder){
+            const db = getDatabase()
+            const char = db.characters[index]
+            const capturedIndex = index
+            const capturedChatId = chat.id
+            if(char){
+                let cancelled = false
+                loadingOverlayStore.set({ active: true, text: language.loading ?? '', onCancel: () => {
+                    cancelled = true
+                    chatDeselected.set(true)
+                    loadingOverlayStore.set({ active: false, text: '', onCancel: null })
+                }})
+                void ensureChatHydrated(char.chats, char.chatPage, char.chaId).then((hydrated) => {
+                    if(cancelled) return
+                    const currentChar = getDatabase().characters[capturedIndex]
+                    const activeChatId = currentChar?.chats?.[currentChar.chatPage]?.id
+                    if(hydrated && get(selectedCharID) === capturedIndex && activeChatId === capturedChatId) {
+                        loadTogglesFromChat(hydrated)
+                    }
+                }).catch((e) => {
+                    console.error('[selectCharacter] hydration failed:', e)
+                }).finally(() => {
+                    if(!cancelled) loadingOverlayStore.set({ active: false, text: '', onCancel: null })
+                })
+            }
+        } else {
+            loadTogglesFromChat(chat)
+        }
     }
 }

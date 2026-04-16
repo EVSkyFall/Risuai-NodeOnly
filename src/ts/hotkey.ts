@@ -159,7 +159,9 @@ export function initHotkey(){
                     break
                 }
                 case 'loadout':{
-                    loadoutModalStore.open = !loadoutModalStore.open
+                    if(!database.hideLoadout){
+                        loadoutModalStore.open = !loadoutModalStore.open
+                    }
                     break
                 }
                 default:{
@@ -308,31 +310,34 @@ export async function quickMenu(){
     const db = getDatabase()
     const showHypaV3 = db.hypaV3 && db.hypaV3Presets?.length > 1
 
+    const showLoadout = !db.hideLoadout
+
     const options = [
         language.presets,
         language.themePresets,
         language.persona,
-        language.hotkeyDesc.loadout,
         ...(showHypaV3 ? [language.longTermMemory + ' ' + language.presets] : []),
+        ...(showLoadout ? [language.hotkeyDesc.loadout] : []),
         language.cancel
     ]
 
     const sel = parseInt(await alertSelect(options))
-    if(sel === 0){
+    let idx = 0
+    if(sel === idx++){
         openPresetList.set(!get(openPresetList))
     }
-    if(sel === 1){
+    else if(sel === idx++){
         openThemePresetList.set(!get(openThemePresetList))
     }
-    if(sel === 2){
+    else if(sel === idx++){
         openPersonaList.set(!get(openPersonaList))
         personaSelectCallback.set(null)
     }
-    if(sel === 3){
-        loadoutModalStore.open = !(loadoutModalStore.open)
-    }
-    if(showHypaV3 && sel === 4){
+    else if(showHypaV3 && sel === idx++){
         openHypaV3PresetList.set(true)
+    }
+    else if(showLoadout && sel === idx++){
+        loadoutModalStore.open = !(loadoutModalStore.open)
     }
 }
 

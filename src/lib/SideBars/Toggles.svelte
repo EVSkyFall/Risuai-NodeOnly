@@ -24,8 +24,9 @@
     let { chara = $bindable(), noContainer }: Props = $props();
 
     let currentChat = $derived(DBState.db.characters[$selectedCharID]?.chats?.[DBState.db.characters[$selectedCharID]?.chatPage])
-    let isPinned = $derived(!!currentChat?.savedToggleValues)
+    let isPinned = $derived(!DBState.db.disableToggleBinding && !!currentChat?.savedToggleValues)
     let dirtyCount = $derived.by(() => {
+        if (DBState.db.disableToggleBinding) return 0
         const saved = currentChat?.savedToggleValues
         if (!saved) return 0
         const current = snapshotToggleValues()
@@ -94,6 +95,7 @@
     })
 
     function isToggleDirty(key: string): boolean {
+        if (DBState.db.disableToggleBinding) return false
         const saved = currentChat?.savedToggleValues
         if (!saved) return false
         const fullKey = `toggle_${key}`
@@ -106,6 +108,13 @@
 
 
     let groupedToggles = $derived.by(() => {
+        // Track chat/module changes so the toggle list re-derives on chat switch
+        const _char = DBState.db.characters[$selectedCharID]
+        void _char?.chats?.[_char?.chatPage]?.modules
+        void _char?.modules
+        void DBState.db.enabledModules
+        void DBState.db.moduleIntergration
+
         const ungrouped = parseToggleSyntax(DBState.db.customPromptTemplateToggle + getModuleToggles())
 
         let groupOpen = false
@@ -178,6 +187,7 @@
     {/each}
 {/snippet}
 
+{#if !DBState.db.disableToggleBinding}
 <div class="text-[11px] text-textcolor2 mt-4 px-1">{language.toggleBindingLabel}</div>
 <div class="flex gap-1 mt-1 items-stretch">
     {#if isPinned}
@@ -216,6 +226,7 @@
         <FolderHeartIcon size={16} />
     </button>
 </div>
+{/if}
 
 {#if !noContainer && groupedToggles.length > 4}
     <div class="h-48 border-darkborderc p-2 border rounded-sm flex flex-col items-start mt-2 overflow-y-auto">
@@ -225,7 +236,7 @@
             </div>
         {/if}
         {@render toggles(groupedToggles, true)}
-        {#if chara && (DBState.db.supaModelType !== 'none' || DBState.db.hanuraiEnable || DBState.db.hypaV3)}
+        {#if chara && DBState.db.hypaV3}
             <div class="flex mt-2 items-center w-full" class:justify-end={$MobileGUI}>
                 <CheckInput
                     check={DBState.db.characters[$selectedCharID]?.chats?.[DBState.db.characters[$selectedCharID]?.chatPage]?.supaMemory ?? chara.supaMemory ?? false}
@@ -235,7 +246,7 @@
                         if (!chat) return
                         chat.supaMemory = !(chat.supaMemory ?? char.supaMemory ?? false)
                     }}
-                    reverse name={DBState.db.hypaV3 ? language.ToggleHypaMemory : DBState.db.hanuraiEnable ? language.hanuraiMemory : DBState.db.hypaMemory ? language.ToggleHypaMemory : language.ToggleSuperMemory}/>
+                    reverse name={language.ToggleHypaMemory}/>
             </div>
         {/if}
     </div>
@@ -246,7 +257,7 @@
         </div>
     {/if}
     {@render toggles(groupedToggles)}
-    {#if DBState.db.supaModelType !== 'none' || DBState.db.hanuraiEnable || DBState.db.hypaV3}
+    {#if DBState.db.hypaV3}
         <div class="flex mt-2 items-center">
             <CheckInput
                 check={DBState.db.characters[$selectedCharID]?.chats?.[DBState.db.characters[$selectedCharID]?.chatPage]?.supaMemory ?? chara.supaMemory ?? false}
@@ -256,7 +267,7 @@
                     if (!chat) return
                     chat.supaMemory = !(chat.supaMemory ?? char.supaMemory ?? false)
                 }}
-                name={DBState.db.hypaV3 ? language.ToggleHypaMemory : DBState.db.hanuraiEnable ? language.hanuraiMemory : DBState.db.hypaMemory ? language.ToggleHypaMemory : language.ToggleSuperMemory}/>
+                name={language.ToggleHypaMemory}/>
         </div>
     {/if}
 {/if}

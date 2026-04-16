@@ -7,6 +7,8 @@
 // /api/login, /api/token/refresh)
 import { language } from "src/lang"
 import { alertError, alertInput, waitAlert } from "../alert"
+import { decodeRisuSave, encodeRisuSaveLegacy } from "./risuSave"
+import { normalizeChat } from "./database.svelte"
 
 // Custom error class for database conflict detection
 export class ConflictError extends Error {
@@ -18,66 +20,12 @@ export class ConflictError extends Error {
     }
 }
 
-// ── database.bin read cache (IndexedDB) ──────────────────────────────────────
-// Caches the database.bin blob + ETag locally so that subsequent page loads can
-// skip the full download when the server responds 304 Not Modified.
-// Only database.bin is cached — this is not a general-purpose cache layer.
-
-const DB_CACHE_DB_NAME = 'risu-db-cache'
-const DB_CACHE_STORE = 'cache'
-const DB_CACHE_KEY = 'database.bin'
-
-async function dbCacheGet(): Promise<{ blob: Uint8Array, etag: string } | null> {
-    try {
-        const db = await new Promise<IDBDatabase>((resolve, reject) => {
-            const req = indexedDB.open(DB_CACHE_DB_NAME, 1)
-            req.onupgradeneeded = () => req.result.createObjectStore(DB_CACHE_STORE)
-            req.onsuccess = () => resolve(req.result)
-            req.onerror = () => reject(req.error)
-        })
-        const tx = db.transaction(DB_CACHE_STORE, 'readonly')
-        const store = tx.objectStore(DB_CACHE_STORE)
-        const result = await new Promise<any>((resolve, reject) => {
-            const req = store.get(DB_CACHE_KEY)
-            req.onsuccess = () => resolve(req.result)
-            req.onerror = () => reject(req.error)
-        })
-        db.close()
-        if (result && result.blob && result.etag) {
-            return { blob: result.blob, etag: result.etag }
-        }
-        return null
-    } catch {
-        return null
-    }
-}
-
-async function dbCacheSet(blob: Uint8Array, etag: string): Promise<void> {
-    try {
-        const db = await new Promise<IDBDatabase>((resolve, reject) => {
-            const req = indexedDB.open(DB_CACHE_DB_NAME, 1)
-            req.onupgradeneeded = () => req.result.createObjectStore(DB_CACHE_STORE)
-            req.onsuccess = () => resolve(req.result)
-            req.onerror = () => reject(req.error)
-        })
-        const tx = db.transaction(DB_CACHE_STORE, 'readwrite')
-        const store = tx.objectStore(DB_CACHE_STORE)
-        // Atomic: blob + etag written in a single transaction
-        store.put({ blob, etag }, DB_CACHE_KEY)
-        await new Promise<void>((resolve, reject) => {
-            tx.oncomplete = () => resolve()
-            tx.onerror = () => reject(tx.error)
-        })
-        db.close()
-    } catch {
-        // Cache write failure is non-fatal
-    }
-}
-
-export { dbCacheSet }
-
 export class NodeStorage{
     private static readonly BULK_WRITE_CLIENT_BATCH = 20
+
+    // Unique per page load — used for cross-device single-writer lock
+    private static sessionId: string =
+        crypto?.randomUUID?.() ?? (Date.now().toString(36) + Math.random().toString(36).slice(2))
 
     _lastDbEtag: string | null = null
     authChecked = false
@@ -108,7 +56,10 @@ export class NodeStorage{
         try {
             const res = await fetch('/api/session', {
                 method: 'POST',
-                headers: { 'risu-auth': await this.createAuth() },
+                headers: {
+                    'risu-auth': await this.createAuth(),
+                    'x-session-id': NodeStorage.sessionId,
+                },
             })
             if (res.ok) {
                 NodeStorage.sessionInitialized = true
@@ -195,11 +146,16 @@ export class NodeStorage{
         await this.checkAuth()
         const headers = new Headers(init.headers)
         headers.set('risu-auth', await this.createAuth())
+        headers.set('x-session-id', NodeStorage.sessionId)
 
         const response = await fetch(input, {
             ...init,
             headers
         })
+
+        if (response.status === 423) {
+            window.dispatchEvent(new CustomEvent('risu-session-deactivated'))
+        }
 
         if(retry && await this.shouldRetryAuth(response)){
             this.authChecked = false
@@ -245,32 +201,6 @@ export class NodeStorage{
             'file-path': Buffer.from(key, 'utf-8').toString('hex')
         }
 
-        // For database.bin, try to use cached version with ETag validation
-        if (key === 'database/database.bin') {
-            const cached = await dbCacheGet()
-            if (cached) {
-                headers['if-none-match'] = cached.etag
-                const da = await this.authFetch('/api/read', { method: "GET", headers })
-                if (da.status === 304) {
-                    this._lastDbEtag = cached.etag
-                    return Buffer.from(cached.blob)
-                }
-                if (da.status < 200 || da.status >= 300) {
-                    throw "getItem Error"
-                }
-                const etag = da.headers.get('x-db-etag')
-                if (etag) {
-                    this._lastDbEtag = etag
-                }
-                const data = Buffer.from(await da.arrayBuffer())
-                if (data.length === 0) return null
-                if (etag) {
-                    void dbCacheSet(new Uint8Array(data), etag)
-                }
-                return data
-            }
-        }
-
         const da = await this.authFetch('/api/read', { method: "GET", headers })
         if(da.status < 200 || da.status >= 300){
             throw "getItem Error"
@@ -285,11 +215,6 @@ export class NodeStorage{
         const data = Buffer.from(await da.arrayBuffer())
         if (data.length === 0){
             return null
-        }
-
-        // Cache database.bin after full download
-        if (key === 'database/database.bin' && etag) {
-            void dbCacheSet(new Uint8Array(data), etag)
         }
 
         return data
@@ -499,6 +424,7 @@ export class NodeStorage{
             xhr.open('POST', '/api/backup/import')
             xhr.setRequestHeader('content-type', 'application/x-risu-backup')
             xhr.setRequestHeader('risu-auth', authHeader)
+            xhr.setRequestHeader('x-session-id', NodeStorage.sessionId)
 
             xhr.upload.onprogress = (event) => {
                 if (event.lengthComputable) {
@@ -521,6 +447,231 @@ export class NodeStorage{
 
             xhr.send(file)
         })
+    }
+
+    // ── Server-side backup ─────────────────────────────────────────────────────
+
+    async saveServerBackup(
+        onProgress?: (current: number, total: number, bytes: number, totalBytes: number) => void
+    ): Promise<{ok: boolean, filename: string, size: number}> {
+        const da = await this.authFetch('/api/backup/server/save', {
+            method: 'POST',
+            headers: {
+                'content-type': 'application/json',
+                'x-session-id': NodeStorage.sessionId,
+            },
+        })
+        if (da.status < 200 || da.status >= 300) {
+            const body = await da.json().catch(() => ({}))
+            throw new Error(body.error || `server backup save error: ${da.status}`)
+        }
+
+        const reader = da.body!.getReader()
+        const decoder = new TextDecoder()
+        let buffer = ''
+        let result: {ok: boolean, filename: string, size: number} | null = null
+
+        while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
+            buffer += decoder.decode(value, { stream: true })
+            const lines = buffer.split('\n')
+            buffer = lines.pop()!
+            for (const line of lines) {
+                if (!line) continue
+                const msg = JSON.parse(line)
+                if (msg.type === 'progress') {
+                    onProgress?.(msg.current, msg.total, msg.bytes, msg.totalBytes)
+                } else if (msg.type === 'done') {
+                    result = msg
+                } else if (msg.type === 'error') {
+                    throw new Error(msg.message)
+                }
+            }
+        }
+        if (!result) throw new Error('Server backup: no result received')
+        return result
+    }
+
+    async listServerBackups(): Promise<{backups: Array<{filename: string, size: number, createdAt: number}>}> {
+        const da = await this.authFetch('/api/backup/server/list')
+        if (da.status < 200 || da.status >= 300) throw new Error(`server backup list error: ${da.status}`)
+        return da.json()
+    }
+
+    async restoreServerBackup(
+        filename: string,
+        onProgress?: (bytes: number, totalBytes: number) => void
+    ): Promise<{ok: boolean, assetsRestored: number}> {
+        const da = await this.authFetch('/api/backup/server/restore', {
+            method: 'POST',
+            headers: {
+                'content-type': 'application/json',
+                'x-session-id': NodeStorage.sessionId,
+            },
+            body: JSON.stringify({ filename }),
+        })
+        if (da.status === 404) throw new Error('Backup file not found')
+        if (da.status === 409) throw new Error('Another import is already in progress')
+        if (da.status < 200 || da.status >= 300) {
+            const body = await da.json().catch(() => ({}))
+            throw new Error(body.error || `server backup restore error: ${da.status}`)
+        }
+
+        const reader = da.body!.getReader()
+        const decoder = new TextDecoder()
+        let buffer = ''
+        let result: {ok: boolean, assetsRestored: number} | null = null
+
+        while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
+            buffer += decoder.decode(value, { stream: true })
+            const lines = buffer.split('\n')
+            buffer = lines.pop()!
+            for (const line of lines) {
+                if (!line) continue
+                const msg = JSON.parse(line)
+                if (msg.type === 'progress') {
+                    onProgress?.(msg.bytes, msg.totalBytes)
+                } else if (msg.type === 'done') {
+                    result = msg
+                } else if (msg.type === 'error') {
+                    throw new Error(msg.message)
+                }
+            }
+        }
+        if (!result) throw new Error('Server backup restore: no result received')
+        return result
+    }
+
+    async deleteServerBackup(filename: string): Promise<void> {
+        const da = await this.authFetch(`/api/backup/server/${encodeURIComponent(filename)}`, {
+            method: 'DELETE',
+        })
+        if (da.status === 404) throw new Error('Backup file not found')
+        if (da.status < 200 || da.status >= 300) throw new Error(`server backup delete error: ${da.status}`)
+    }
+
+    async downloadServerBackup(filename: string): Promise<Response> {
+        const da = await this.authFetch(`/api/backup/server/download/${encodeURIComponent(filename)}`)
+        if (da.status === 404) throw new Error('Backup file not found')
+        if (da.status < 200 || da.status >= 300) throw new Error(`server backup download error: ${da.status}`)
+        return da
+    }
+
+    // ── Chat content (runtime lazy load) ────────────────────────────────────
+
+    async fetchChatContent(chaId: string, chatIndex: number, chatId: string): Promise<any | null> {
+        const da = await this.authFetch(`/api/chat-content/${encodeURIComponent(chaId)}/${chatIndex}`, {
+            headers: { 'x-chat-id': chatId },
+        })
+        if (da.status === 404) return null
+        if (da.status < 200 || da.status >= 300) throw new Error(`fetchChatContent error: ${da.status}`)
+        const buffer = new Uint8Array(await da.arrayBuffer())
+        return normalizeChat(await decodeRisuSave(buffer))
+    }
+
+    async saveChatContent(chaId: string, chatIndex: number, chatId: string, chat: any): Promise<void> {
+        const encoded = encodeRisuSaveLegacy(chat)
+        const da = await this.authFetch(`/api/chat-content/${encodeURIComponent(chaId)}/${chatIndex}`, {
+            method: 'POST',
+            headers: {
+                'content-type': 'application/octet-stream',
+                'x-chat-id': chatId,
+            },
+            body: encoded,
+        })
+        if (da.status < 200 || da.status >= 300) throw new Error(`saveChatContent error: ${da.status}`)
+    }
+
+    // ── Save-folder migration ─────────────────────────────────────────────────
+
+    async scanSaveFolder(folderPath?: string): Promise<{count: number, totalSize: number, hasDatabase: boolean}> {
+        const da = await this.authFetch('/api/migrate/save-folder/scan', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ path: folderPath }),
+        })
+        if (da.status < 200 || da.status >= 300) {
+            const body = await da.json().catch(() => ({}))
+            throw new Error(body.error || `scan error: ${da.status}`)
+        }
+        return da.json()
+    }
+
+    async executeSaveFolderImport(folderPath?: string): Promise<{ok: boolean, imported: number}> {
+        const da = await this.authFetch('/api/migrate/save-folder/execute', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ path: folderPath }),
+        })
+        if (da.status === 409) throw new Error('Another import is already in progress')
+        if (da.status < 200 || da.status >= 300) {
+            const body = await da.json().catch(() => ({}))
+            throw new Error(body.error || `import error: ${da.status}`)
+        }
+        return da.json()
+    }
+
+    async uploadSaveFolderZip(
+        file: Blob,
+        onProgress?: (loaded: number, total: number) => void
+    ): Promise<{ok: boolean, imported: number}> {
+        const authHeader = await this.createAuth()
+
+        return await new Promise((resolve, reject) => {
+            const xhr = new XMLHttpRequest()
+            xhr.open('POST', '/api/migrate/save-folder/upload')
+            xhr.setRequestHeader('content-type', 'application/zip')
+            xhr.setRequestHeader('risu-auth', authHeader)
+            xhr.setRequestHeader('x-session-id', NodeStorage.sessionId)
+
+            xhr.upload.onprogress = (event) => {
+                if (event.lengthComputable) {
+                    onProgress?.(event.loaded, event.total)
+                }
+            }
+
+            xhr.onerror = () => reject(new Error('zip upload failed'))
+            xhr.onload = () => {
+                if (xhr.status < 200 || xhr.status >= 300) {
+                    let msg = `zip import error: ${xhr.status}`
+                    try { msg = JSON.parse(xhr.responseText).error || msg } catch {}
+                    reject(new Error(msg))
+                    return
+                }
+                try {
+                    resolve(JSON.parse(xhr.responseText))
+                } catch (error) {
+                    reject(error)
+                }
+            }
+
+            xhr.send(file)
+        })
+    }
+
+    async scanCleanup(): Promise<{count: number, totalSize: number}> {
+        const da = await this.authFetch('/api/migrate/save-folder/cleanup/scan', {
+            method: 'POST',
+        })
+        if (da.status < 200 || da.status >= 300) {
+            const body = await da.json().catch(() => ({}))
+            throw new Error(body.error || `cleanup scan error: ${da.status}`)
+        }
+        return da.json()
+    }
+
+    async executeCleanup(): Promise<{ok: boolean, removed: number, freedBytes: number}> {
+        const da = await this.authFetch('/api/migrate/save-folder/cleanup/execute', {
+            method: 'POST',
+        })
+        if (da.status < 200 || da.status >= 300) {
+            const body = await da.json().catch(() => ({}))
+            throw new Error(body.error || `cleanup error: ${da.status}`)
+        }
+        return da.json()
     }
 
 }

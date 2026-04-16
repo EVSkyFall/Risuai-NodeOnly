@@ -33,6 +33,7 @@
     import UpdatePopup from './lib/Others/UpdatePopup.svelte';
     import PopupList from './lib/UI/PopupList.svelte';
     import EasyPanel from './lib/Others/ProTools/EasyPanel.svelte';
+    import LoadingOverlay from './lib/Others/LoadingOverlay.svelte';
     import sendSound from './etc/send.mp3'
 
     let gridOpen = $state(false)
@@ -89,7 +90,7 @@
             console.log("Starting silent audio to keep session alive")
             const silentAudio = new Audio(sendSound);
             silentAudio.loop = true;
-            silentAudio.volume = 0.001;
+            silentAudio.volume = 0.000001;
             silentAudio.play();
             keepingSessionAlive = true;
             break
@@ -235,6 +236,7 @@
         <HypaV3Progress />
     {/if}
     <PluginAlertModal />
+    <LoadingOverlay />
     <UpdatePopup />
     {#if popupStore.children}
         <PopupList />
@@ -242,7 +244,7 @@
     {#if easyPanelStore.open}
         <EasyPanel />
     {/if}
-    {#if loadoutModalStore.open}
+    {#if !DBState.db.hideLoadout && loadoutModalStore.open}
         <LoadoutModal />
     {/if}
     {#if popUpEditorStore.open}
