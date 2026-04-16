@@ -20,6 +20,7 @@ import BanCharacterSetSettings from 'src/lib/Setting/Pages/Advanced/BanCharacter
 import CustomModelsSettings from 'src/lib/Setting/Pages/Advanced/CustomModelsSettings.svelte';
 import SettingsExportButtons from 'src/lib/Setting/Pages/Advanced/SettingsExportButtons.svelte';
 import InlayCompressButton from 'src/lib/Setting/Pages/Advanced/InlayCompressButton.svelte';
+import ClaudeTokenizerCalibration from 'src/lib/Setting/Pages/Advanced/ClaudeTokenizerCalibration.svelte';
 
 /**
  * Registry of custom components.
@@ -31,6 +32,7 @@ export const customComponents: Record<string, Component<any>> = {
     'CustomModelsSettings': CustomModelsSettings,
     'SettingsExportButtons': SettingsExportButtons,
     'InlayCompressButton': InlayCompressButton,
+    'ClaudeTokenizerCalibration': ClaudeTokenizerCalibration,
     // Add more as we migrate complex settings
 } as const;
 

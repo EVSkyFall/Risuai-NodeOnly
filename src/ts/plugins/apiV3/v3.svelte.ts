@@ -21,6 +21,7 @@ import { getModelInfo } from "src/ts/model/modellist";
 import type { ModelModeExtended } from "src/ts/process/request/shared";
 import { requestChatDataMain } from "src/ts/process/request/request";
 import type { OpenAIChat } from "src/ts/process/index.svelte";
+import { tokenize as tokenizerTokenize, tokenizeAccurate as tokenizerTokenizeAccurate, encodeWithTokenizer, tokenizerList } from "src/ts/tokenizer";
 
 /*
     V3 API for RisuAI Plugins
@@ -677,6 +678,19 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             }
             return oldApis.nativeFetch(url, options);
         },
+        tokenize: async (text: string, options?: { tokenizer?: string, accurate?: boolean }) => {
+            if(typeof text !== 'string') throw new Error('tokenize: text must be a string');
+            const tok = options?.tokenizer;
+            if(tok){
+                const arr = await encodeWithTokenizer(text, tok);
+                return arr.length;
+            }
+            if(options?.accurate){
+                return await tokenizerTokenizeAccurate(text);
+            }
+            return await tokenizerTokenize(text);
+        },
+        tokenizers: () => tokenizerList.map(([id, label]) => ({ id, label })),
         getChar: oldApis.getChar,
         setChar: oldApis.setChar,
         addProvider: (name: string, func: (arg: PluginV2ProviderArgument, abortSignal?: AbortSignal) => Promise<{ success: boolean, content: string }>, options?: PluginV3ProviderOptions) => {

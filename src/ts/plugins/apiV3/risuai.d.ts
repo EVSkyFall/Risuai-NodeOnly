@@ -1406,6 +1406,34 @@ interface RisuaiPluginAPI {
     nativeFetch(url: string, options?: RequestInit): Promise<Response>;
 
     /**
+     * Count tokens for a text using Risuai's internal tokenizer pipeline.
+     *
+     * Defaults to the tokenizer of the user's currently active model. For Claude
+     * models with API mode enabled, transparently uses the Anthropic count_tokens
+     * API (with persistent cache + per-language fallback). All caching and rate-
+     * limit handling is shared with the host.
+     *
+     * @param text - Text to tokenize
+     * @param options - Optional overrides
+     *   - `tokenizer`: Force a specific tokenizer id ('tik', 'claude', 'mistral',
+     *      'llama', 'llama3', 'novelai', 'novellist', 'gemma', 'cohere', 'deepseek')
+     *   - `accurate`: When true, runs through Risuai's `tokenizeAccurate` path
+     *      which applies parser substitutions before counting.
+     * @returns Promise resolving to the token count
+     *
+     * @example
+     * const n = await risuai.tokenize('hello world');
+     * const claudeN = await risuai.tokenize(longText, { tokenizer: 'claude' });
+     */
+    tokenize(text: string, options?: { tokenizer?: string, accurate?: boolean }): Promise<number>;
+
+    /**
+     * List all tokenizer ids supported by `risuai.tokenize`.
+     * @returns Array of `{ id, label }` pairs
+     */
+    tokenizers(): { id: string, label: string }[];
+
+    /**
      * Saves a secret header for network requests, for protected Headers (like Authorization) that are stripped by Risuai for security.
      * To use saved secret headers, use an object `{ secretHeader: 'Header-Name' }` in the `headers` field of `nativeFetch` options,
      * Like `{ headers: {"Authorization":{ secretHeader: 'Authorization' }} }`

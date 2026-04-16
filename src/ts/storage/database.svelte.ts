@@ -1252,6 +1252,15 @@ export interface Database{
     }[]
     igpPrompt:string
     useTokenizerCaching:boolean
+    claudeTokenizerAPIEnabled:boolean
+    claudeTokenizerAPIKey:string
+    claudeTokenizerAPIModel:string
+    claudeTokenizerFactorKO:number
+    claudeTokenizerFactorEN:number
+    claudeTokenizerFactorJP:number
+    claudeTokenizerFactorSamplesKO:number
+    claudeTokenizerFactorSamplesEN:number
+    claudeTokenizerFactorSamplesJP:number
     showMenuHypaMemoryModal:boolean
     authRefreshes:{
         url:string
