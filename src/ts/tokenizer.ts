@@ -147,7 +147,9 @@ async function callCountTokensAPI(text: string, db: any): Promise<number | null>
     if (inflightCount >= MAX_API_CONCURRENT) return null
     const key = (db.claudeTokenizerAPIKey || '').trim()
     if (!key) return null
-    const model = db.claudeTokenizerAPIModel || 'claude-opus-4-7'
+    // Normalize model id for Anthropic API: Copilot accepts "claude-opus-4.7" but
+    // Anthropic only accepts "claude-opus-4-7" (hyphen). Convert version dots to dashes.
+    const model = (db.claudeTokenizerAPIModel || 'claude-opus-4-7').replace(/(opus|sonnet|haiku)-(\d+)\.(\d+)/g, '$1-$2-$3')
 
     inflightCount++
     try {
