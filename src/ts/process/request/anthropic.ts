@@ -371,22 +371,18 @@ export async function requestClaude(arg:RequestDataArgumentExtended):Promise<req
         delete body.output_config
     }
     else if(adaptiveOnly){
-        // Adaptive-only models (Opus 4.7+): always send adaptive (or omit if explicitly off).
+        // Adaptive-only models (Opus 4.7+): thinking off by default; opt-in via thinkingType.
         // Sampling params return 400 on any non-default value — omit entirely (per Anthropic docs).
         delete body.thinking
         delete body.temperature
         delete body.top_k
         delete body.top_p
-        if(db.thinkingType === 'off'){
-            // Opus 4.7 supports `thinking: {type: "disabled"}` via omitting the field; just don't send adaptive.
-            delete body.output_config
-        } else {
+        if(db.thinkingType !== 'off'){
             const thinkingObj: any = { type: 'adaptive' }
             // Opus 4.7 default is `display: "omitted"` (empty thinking field).
             // Opt back into summarized text when user toggles the setting on.
             if(db.claudeAdaptiveDisplaySummarized) thinkingObj.display = 'summarized'
             body.thinking = thinkingObj
-            body.output_config = { effort: db.adaptiveThinkingEffort ?? 'high' }
         }
     }
     else if(db.thinkingType === 'adaptive' && adaptiveCapable){
@@ -394,10 +390,17 @@ export async function requestClaude(arg:RequestDataArgumentExtended):Promise<req
         const thinkingObj: any = { type: 'adaptive' }
         if(db.claudeAdaptiveDisplaySummarized) thinkingObj.display = 'summarized'
         body.thinking = thinkingObj
-        body.output_config = { effort: db.adaptiveThinkingEffort ?? 'high' }
         body.temperature = 1
         delete body.top_k
         delete body.top_p
+    }
+
+    // Effort is independent from thinking — applies to all output tokens.
+    // Send whenever model supports adaptive (and thus effort) and value is non-default.
+    if(adaptiveCapable && db.adaptiveThinkingEffort && db.adaptiveThinkingEffort !== 'high'){
+        body.output_config = { ...(body.output_config || {}), effort: db.adaptiveThinkingEffort }
+    } else if(!adaptiveCapable){
+        delete body.output_config
     }
     else if(body?.thinking?.budget_tokens === 0){
         delete body.thinking

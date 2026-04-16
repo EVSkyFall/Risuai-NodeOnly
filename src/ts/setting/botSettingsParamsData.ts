@@ -165,12 +165,14 @@ export const modelSpecificParameterItems: SettingItem[] = [
     {
         id: 'params.adaptiveThinkingEffort',
         type: 'segmented',
-        labelKey: 'adaptiveThinkingEffort',
+        fallbackLabel: 'Effort',
         bindKey: 'adaptiveThinkingEffort',
+        // Effort applies to all tokens (text + tool calls + thinking). Independent
+        // from thinking on/off — visible whenever the model supports adaptive
+        // thinking (which implies effort support per Anthropic docs).
         condition: (ctx) =>
-            (ctx.modelInfo.flags.includes(LLMFlags.claudeAdaptiveThinking) ||
-                (ctx.modelInfo.format === LLMFormat.Anthropic && ctx.modelInfo.parameters.includes('thinking_tokens'))) &&
-            ctx.db.thinkingType === 'adaptive',
+            ctx.modelInfo.flags.includes(LLMFlags.claudeAdaptiveThinking) ||
+            (ctx.modelInfo.format === LLMFormat.Anthropic && ctx.modelInfo.parameters.includes('thinking_tokens')),
         options: {
             segmentOptions: [
                 { value: 'low', label: 'Low' },
@@ -180,7 +182,7 @@ export const modelSpecificParameterItems: SettingItem[] = [
                 { value: 'max', label: 'Max' },
             ]
         },
-        keywords: ['adaptive', 'thinking', 'effort'],
+        keywords: ['effort', 'adaptive', 'thinking'],
     },
     {
         id: 'params.claudeAdaptiveDisplaySummarized',
