@@ -22,6 +22,25 @@ import { customV3ProviderMetaStore } from "../plugins/apiV3/v3.svelte"
 export { LLMFlags, LLMProvider, LLMFormat, LLMTokenizer, ProviderNames, OpenAIParameters, ClaudeParameters }
 export type { LLMModel }
 
+/**
+ * Detect Claude models that ONLY support adaptive thinking (no manual budget_tokens).
+ * Currently: Opus 4.7+ and Mythos Preview. Manual `thinking.type: enabled` returns 400 on these.
+ */
+export function isClaudeAdaptiveThinkingOnlyModel(modelId?: string | null): boolean {
+    if(!modelId) return false
+    const id = modelId.toLowerCase()
+    if(id.includes('mythos')) return true
+    // Match opus-4-7, opus-4.7, opus-4-8, opus-5-x, etc. (4.7+ adaptive-only)
+    const m = id.match(/opus-(\d+)[-.](\d+)/)
+    if(m){
+        const major = Number(m[1])
+        const minor = Number(m[2])
+        if(major > 4) return true
+        if(major === 4 && minor >= 7) return true
+    }
+    return false
+}
+
 function makeDeepInfraModels(id:string[]):LLMModel[]{
     return id.map((id) => {
         return {
@@ -629,6 +648,18 @@ export async function registerModelDynamic(){
             for(let model of models){
                 const exists = LLMModels.find(m => m.id === model.id || m.internalID === model.id)
                 if(!exists){
+                    const isAdaptiveOnly = isClaudeAdaptiveThinkingOnlyModel(model.id)
+                    const flags: number[] = [
+                        LLMFlags.hasImageInput,
+                        LLMFlags.hasFirstSystemPrompt,
+                        LLMFlags.hasStreaming,
+                        LLMFlags.claudeAdaptiveThinking
+                    ]
+                    if(isAdaptiveOnly){
+                        flags.push(LLMFlags.claudeAdaptiveThinkingOnly)
+                    } else {
+                        flags.push(LLMFlags.claudeThinking)
+                    }
                     LLMModels.push({
                         name: model.display_name || model.id,
                         id: `dynamic_anthropic_${model.id}`,
@@ -637,14 +668,8 @@ export async function registerModelDynamic(){
                         internalID: model.id,
                         provider: LLMProvider.Anthropic,
                         format: LLMFormat.Anthropic,
-                        flags: [
-                            LLMFlags.hasImageInput,
-                            LLMFlags.hasFirstSystemPrompt,
-                            LLMFlags.hasStreaming,
-                            LLMFlags.claudeThinking,
-                            LLMFlags.claudeAdaptiveThinking
-                        ],
-                        parameters: [...ClaudeParameters, 'thinking_tokens'],
+                        flags,
+                        parameters: isAdaptiveOnly ? ClaudeParameters : [...ClaudeParameters, 'thinking_tokens'],
                         tokenizer: LLMTokenizer.Claude,
                         recommended: true
                     })

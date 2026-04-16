@@ -6,7 +6,7 @@
  */
 
 import type { SettingItem } from './types';
-import { LLMFlags } from '../model/types';
+import { LLMFlags, LLMFormat } from '../model/types';
 
 /**
  * Basic parameter settings that are always visible
@@ -129,12 +129,19 @@ export const modelSpecificParameterItems: SettingItem[] = [
         bindKey: 'thinkingType',
         condition: (ctx) =>
             ctx.modelInfo.flags.includes(LLMFlags.claudeThinking) ||
-            ctx.modelInfo.flags.includes(LLMFlags.claudeAdaptiveThinking),
+            ctx.modelInfo.flags.includes(LLMFlags.claudeAdaptiveThinking) ||
+            (ctx.modelInfo.format === LLMFormat.Anthropic && ctx.modelInfo.parameters.includes('thinking_tokens')),
         options: {
             segmentOptions: [
                 { value: 'off', label: 'Off' },
-                { value: 'budget', label: 'Budget (Manual Tokens)', condition: (ctx) => ctx.modelInfo.flags.includes(LLMFlags.claudeThinking)  },
-                { value: 'adaptive', label: 'Adaptive', condition: (ctx) => ctx.modelInfo.flags.includes(LLMFlags.claudeAdaptiveThinking) },
+                { value: 'budget', label: 'Budget (Manual Tokens)', condition: (ctx) =>
+                    ctx.modelInfo.flags.includes(LLMFlags.claudeThinking) ||
+                    (ctx.modelInfo.format === LLMFormat.Anthropic && ctx.modelInfo.parameters.includes('thinking_tokens') && !ctx.modelInfo.flags.includes(LLMFlags.claudeAdaptiveThinkingOnly))
+                },
+                { value: 'adaptive', label: 'Adaptive', condition: (ctx) =>
+                    ctx.modelInfo.flags.includes(LLMFlags.claudeAdaptiveThinking) ||
+                    (ctx.modelInfo.format === LLMFormat.Anthropic && ctx.modelInfo.parameters.includes('thinking_tokens'))
+                },
             ]
         },
         keywords: ['thinking', 'type', 'mode', 'adaptive', 'budget'],
@@ -161,13 +168,15 @@ export const modelSpecificParameterItems: SettingItem[] = [
         labelKey: 'adaptiveThinkingEffort',
         bindKey: 'adaptiveThinkingEffort',
         condition: (ctx) =>
-            ctx.modelInfo.flags.includes(LLMFlags.claudeAdaptiveThinking) &&
+            (ctx.modelInfo.flags.includes(LLMFlags.claudeAdaptiveThinking) ||
+                (ctx.modelInfo.format === LLMFormat.Anthropic && ctx.modelInfo.parameters.includes('thinking_tokens'))) &&
             ctx.db.thinkingType === 'adaptive',
         options: {
             segmentOptions: [
                 { value: 'low', label: 'Low' },
                 { value: 'medium', label: 'Medium' },
                 { value: 'high', label: 'High' },
+                { value: 'xhigh', label: 'xHigh', condition: (ctx) => ctx.modelInfo.flags.includes(LLMFlags.claudeAdaptiveThinkingOnly) },
                 { value: 'max', label: 'Max' },
             ]
         },

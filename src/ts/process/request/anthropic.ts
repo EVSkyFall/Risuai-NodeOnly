@@ -2,7 +2,7 @@ import { Sha256 } from "@aws-crypto/sha256-js"
 import { HttpRequest } from "@smithy/protocol-http"
 import { SignatureV4 } from "@smithy/signature-v4"
 import { fetchNative, globalFetch, textifyReadableStream } from "src/ts/globalApi.svelte"
-import { LLMFlags, LLMFormat } from "src/ts/model/modellist"
+import { LLMFlags, LLMFormat, isClaudeAdaptiveThinkingOnlyModel } from "src/ts/model/modellist"
 import { registerClaudeObserver } from "src/ts/observer.svelte"
 import { getDatabase } from "src/ts/storage/database.svelte"
 import { replaceAsync, simplifySchema, sleep } from "src/ts/util"
@@ -360,14 +360,37 @@ export async function requestClaude(arg:RequestDataArgumentExtended):Promise<req
     })
 
     // Handle thinking mode: off, adaptive, or budget
-    if(db.thinkingType === 'off'){
+    // Opus 4.7+ and Mythos reject manual `thinking.type: enabled` — force adaptive.
+    const adaptiveOnly = arg.modelInfo.flags.includes(LLMFlags.claudeAdaptiveThinkingOnly)
+        || isClaudeAdaptiveThinkingOnlyModel(arg.modelInfo.internalID)
+        || isClaudeAdaptiveThinkingOnlyModel(arg.modelInfo.id)
+    const adaptiveCapable = adaptiveOnly || arg.modelInfo.flags.includes(LLMFlags.claudeAdaptiveThinking)
+
+    if(db.thinkingType === 'off' && !adaptiveOnly){
         delete body.thinking
+        delete body.output_config
     }
-    else if(db.thinkingType === 'adaptive' && arg.modelInfo.flags.includes(LLMFlags.claudeAdaptiveThinking)){
-        // Adaptive thinking mode
+    else if(adaptiveOnly){
+        // Adaptive-only models: always send adaptive (or omit if explicitly off and disabled support exists).
+        delete body.thinking
+        if(db.thinkingType === 'off'){
+            // Opus 4.7 supports `thinking: {type: "disabled"}` via omitting the field; just don't send adaptive.
+            delete body.output_config
+        } else {
+            body.thinking = { type: 'adaptive' }
+            body.output_config = { effort: db.adaptiveThinkingEffort ?? 'high' }
+            body.temperature = 1
+            delete body.top_k
+            delete body.top_p
+        }
+    }
+    else if(db.thinkingType === 'adaptive' && adaptiveCapable){
         delete body.thinking
         body.thinking = { type: 'adaptive' }
         body.output_config = { effort: db.adaptiveThinkingEffort ?? 'high' }
+        body.temperature = 1
+        delete body.top_k
+        delete body.top_p
     }
     else if(body?.thinking?.budget_tokens === 0){
         delete body.thinking
