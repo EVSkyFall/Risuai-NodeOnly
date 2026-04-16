@@ -31,12 +31,36 @@ import type { RequestDataArgumentExtended, requestDataResponse, StreamResponseCh
 import { applyParameters, setObjectValue } from '../shared'
 
 import type { Contents, OpenAIChatExtra, OpenAIChatFull, ResponseInputItem, ResponseItem, ResponseOutputItem, ToolCall } from './types'
+import { v4 } from "uuid"
+
+function isCopilotURL(url: string): boolean {
+    return url.includes('githubcopilot.com') || url.includes('copilot')
+}
+
+let _copilotInteractionId: string | null = null
+function getCopilotInteractionId(): string {
+    if (!_copilotInteractionId) _copilotInteractionId = v4()
+    return _copilotInteractionId
+}
+
+function applyCopilotTaskHeaders(headers: Record<string, string>, url: string, taskId?: string, isContinuation = false): string | undefined {
+    if (!isCopilotURL(url)) return taskId
+    const id = taskId ?? v4()
+    headers['X-Request-Id'] = id
+    headers['X-Agent-Task-Id'] = id
+    headers['X-Interaction-Id'] = getCopilotInteractionId()
+    headers['X-Initiator'] = isContinuation ? 'agent' : 'user'
+    headers['OpenAI-Intent'] = 'conversation-panel'
+    headers['X-GitHub-Api-Version'] = '2025-05-01'
+    return id
+}
 
 export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<requestDataResponse>{
     let formatedChat:OpenAIChatExtra[] = []
     const formated = arg.formated
     const db = getDatabase()
     const aiModel = arg.aiModel
+    let copilotTaskId: string | undefined = undefined
 
     const processToolCalls = async (text:string, originalMessage:any) => {
         // Split text by tool_call tags and process each segment
@@ -313,9 +337,9 @@ export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<req
                 const msg:OpenAIChatFull = (dat.choices[0].message)
                 return {
                     type: 'success',
-                    result: msg.content
+                    result: msg.content ?? ''
                 }
-            } catch (error) {                    
+            } catch (error) {
                 return {
                     type: 'fail',
                     result: (language.errors.httpError + `${JSON.stringify(dat)}`)
@@ -620,6 +644,7 @@ export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<req
                 })
             }
         }
+        copilotTaskId = applyCopilotTaskHeaders(headers, replacerURL, copilotTaskId, copilotTaskId !== undefined)
         const da = await fetchNative(replacerURL, {
             body: JSON.stringify(body),
             method: "POST",
@@ -681,8 +706,11 @@ export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<req
 
 }
 
-async function requestHTTPOpenAI(replacerURL:string,body:any, headers:Record<string,string>, arg:RequestDataArgumentExtended):Promise<requestDataResponse>{
-    
+async function requestHTTPOpenAI(replacerURL:string,body:any, headers:Record<string,string>, arg:RequestDataArgumentExtended, copilotTaskId?: string):Promise<requestDataResponse>{
+
+    const isContinuation = copilotTaskId !== undefined
+    copilotTaskId = applyCopilotTaskHeaders(headers, replacerURL, copilotTaskId, isContinuation)
+
     const db = getDatabase()
     const res = await globalFetch(replacerURL, {
         body: body,
@@ -712,7 +740,7 @@ async function requestHTTPOpenAI(replacerURL:string,body:any, headers:Record<str
             return extractJSON(dat.choices[0].message.content, arg.extractJson)
         }
         const msg:OpenAIChatFull = (dat.choices[0].message)
-        let result = msg.content
+        let result = msg.content ?? ''
         if(arg.modelInfo.flags.includes(LLMFlags.deepSeekThinkingOutput)){
             console.log("Checking for reasoning content")
             let reasoningContent = ""
@@ -833,7 +861,7 @@ async function requestHTTPOpenAI(replacerURL:string,body:any, headers:Record<str
                 
                 do {
                     attempt++
-                    resRec = await requestHTTPOpenAI(replacerURL, body, headers, arg)
+                    resRec = await requestHTTPOpenAI(replacerURL, body, headers, arg, copilotTaskId)
                     
                     if (resRec.type != 'fail') {
                         break
@@ -865,7 +893,7 @@ async function requestHTTPOpenAI(replacerURL:string,body:any, headers:Record<str
                 if(arg.extractJson && (db.jsonSchemaEnabled || arg.schema)){
                     
                     const c = dat.choices.map((v:{message:{content:string}}) => {
-                        const extracted = extractJSON(v.message.content, arg.extractJson)
+                        const extracted = extractJSON(v.message.content ?? '', arg.extractJson)
                         return ["char", extracted]
                     })
                     
@@ -877,7 +905,7 @@ async function requestHTTPOpenAI(replacerURL:string,body:any, headers:Record<str
                 return {
                     type: 'multiline',
                     result: dat.choices.map((v) => {
-                        return ["char", v.message.content]
+                        return ["char", v.message.content ?? '']
                     })
                 }
             }            
@@ -1408,11 +1436,13 @@ function wrapToolStream(
                         }    
                         
                         body.messages = messages
-                        
+                        // Reapply Copilot task headers for tool continuation (same taskId)
+                        applyCopilotTaskHeaders(headers, replacerURL, copilotTaskId, true)
+
                         let resRec
                         let attempt = 0
                         let errorFlag = true
-                        
+
                         do {
                             attempt++
                             resRec = await fetchNative(replacerURL, {

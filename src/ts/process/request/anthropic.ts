@@ -471,6 +471,7 @@ export async function requestClaude(arg:RequestDataArgumentExtended):Promise<req
             headers: signed.headers,
             plainFetchForce: true,
             chatId: arg.chatId,
+            abortSignal: arg.abortSignal,
             interceptor: 'anthropic_bedrock'
         })
 
@@ -542,15 +543,25 @@ export async function requestClaude(arg:RequestDataArgumentExtended):Promise<req
         "accept": "application/json",
     }
 
-    let betas:string[] = []
+    const isCopilot = isCopilotURL(replacerURL)
 
-    if(body.max_tokens > 8192){
-        betas.push('output-128k-2025-02-19')
+    // Copilot: Bearer auth instead of x-api-key, drop anthropic-version
+    if (isCopilot) {
+        headers["Authorization"] = "Bearer " + apiKey
+        delete headers['anthropic-version']
     }
 
+    let betas:string[] = []
 
-    if(db.claude1HourCaching){
-        betas.push('extended-cache-ttl-2025-04-11')
+    // Skip Anthropic-specific beta headers for Copilot
+    if (!isCopilot) {
+        if(body.max_tokens > 8192){
+            betas.push('output-128k-2025-02-19')
+        }
+
+        if(db.claude1HourCaching){
+            betas.push('extended-cache-ttl-2025-04-11')
+        }
     }
 
     if(betas.length > 0){
@@ -771,30 +782,110 @@ export async function requestClaude(arg:RequestDataArgumentExtended):Promise<req
         })
     }
 
+    // Copilot: strip trailing assistant messages (prefill not supported)
+    if (isCopilot) {
+        while (body.messages?.length > 0 && body.messages[body.messages.length - 1]?.role === 'assistant') {
+            body.messages.pop()
+        }
+    }
+
     return requestClaudeHTTP(replacerURL, headers, body, arg)
 }
 
-async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:string}, body:any, arg:RequestDataArgumentExtended):Promise<requestDataResponse> {
+function isCopilotURL(url: string): boolean {
+    return url.includes('githubcopilot.com') || url.includes('copilot')
+}
+
+let _copilotInteractionId: string | null = null
+function getCopilotInteractionId(): string {
+    if (!_copilotInteractionId) _copilotInteractionId = v4()
+    return _copilotInteractionId
+}
+
+function applyCopilotTaskHeaders(headers: { [key: string]: string }, url: string, taskId?: string, isContinuation = false): string | undefined {
+    if (!isCopilotURL(url)) return taskId
+    const id = taskId ?? v4()
+    headers['X-Request-Id'] = id
+    headers['X-Agent-Task-Id'] = id
+    headers['X-Interaction-Id'] = getCopilotInteractionId()
+    headers['X-Initiator'] = isContinuation ? 'agent' : 'user'
+    headers['OpenAI-Intent'] = 'conversation-panel'
+    headers['X-GitHub-Api-Version'] = '2025-05-01'
+    if (url.includes('/v1/messages')) {
+        headers['anthropic-beta'] = 'interleaved-thinking-2025-05-14,context-management-2025-06-27,advanced-tool-use-2025-11-20'
+    }
+    return id
+}
+
+async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:string}, body:any, arg:RequestDataArgumentExtended, copilotTaskId?: string):Promise<requestDataResponse> {
+
+    const isContinuation = copilotTaskId !== undefined
+    copilotTaskId = applyCopilotTaskHeaders(headers, replacerURL, copilotTaskId, isContinuation)
     
     if(arg.useStreaming){
-        
-        const res = await fetchNative(replacerURL, {
-            body: JSON.stringify(body),
-            headers: headers,
-            method: "POST",
-            chatId: arg.chatId,
-            signal: arg.abortSignal,
-            interceptor: 'anthropic_streaming'
-        })
+
+        let res: Response
+        let lastErrText = ''
+        const STREAM_MAX_RETRIES = 5
+        // Exponential-ish backoff: 3s, 6s, 12s, 20s, 30s
+        const RETRY_DELAYS_MS = [3000, 6000, 12000, 20000, 30000]
+        for(let attempt = 0; attempt < STREAM_MAX_RETRIES; attempt++){
+            try {
+                res = await fetchNative(replacerURL, {
+                    body: JSON.stringify(body),
+                    headers: headers,
+                    method: "POST",
+                    chatId: arg.chatId,
+                    signal: arg.abortSignal,
+                    interceptor: 'anthropic_streaming'
+                })
+            } catch(fetchErr: any) {
+                // Network error (ERR_INCOMPLETE_CHUNKED_ENCODING, TypeError: network error, etc.)
+                console.warn(`[Anthropic Stream] Fetch error on attempt ${attempt + 1}/${STREAM_MAX_RETRIES}: ${fetchErr?.message || fetchErr}`)
+                lastErrText = fetchErr?.message || 'network error'
+                if(attempt < STREAM_MAX_RETRIES - 1){
+                    const waitMs = RETRY_DELAYS_MS[attempt] ?? 30000
+                    await sleep(waitMs)
+                    continue
+                }
+                return { type: 'fail' as const, result: `Network error after ${STREAM_MAX_RETRIES} retries: ${lastErrText}` }
+            }
+            if(res.status === 200){
+                lastErrText = ''
+                break
+            }
+            // Non-200: drain body once into lastErrText for diagnostics / retry decision
+            lastErrText = await textifyReadableStream(res.body)
+            // Retry on transient errors
+            if(attempt < STREAM_MAX_RETRIES - 1 && (res.status === 429 || res.status >= 500 || res.status === 400)){
+                const isRetryable = res.status === 429 || res.status >= 500
+                    || lastErrText?.includes('model_not_supported')
+                    || lastErrText?.includes('overload')
+                    || lastErrText?.includes('unavailable')
+                if(isRetryable){
+                    const waitMs = RETRY_DELAYS_MS[attempt] ?? 30000
+                    console.warn(`[Anthropic Stream] Retry ${attempt + 1}/${STREAM_MAX_RETRIES} after ${waitMs}ms: ${lastErrText.substring(0, 100)}`)
+                    await sleep(waitMs)
+                    continue
+                }
+            }
+            break
+        }
 
         if(res.status !== 200){
             return {
                 type: 'fail',
-                result: await textifyReadableStream(res.body)
+                result: lastErrText || `HTTP ${res.status}`
             }
         }
         let breakError = ''
         let thinking = false
+
+        // Track tool_use blocks during streaming for MCP tool call handling
+        let streamToolUseBlocks: any[] = []
+        let currentToolBlock: any = null
+        let streamStopReason: string | null = null
+        let streamContentBlocks: any[] = []
 
         const stream = new ReadableStream<StreamResponseChunk>({
             async start(controller){
@@ -803,27 +894,71 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
                 let parserData = ''
                 const decoder = new TextDecoder()
                 const parseEvent = ((e:string) => {
-                    try {               
+                    try {
                         const parsedData = JSON.parse(e)
 
-                        if(parsedData?.type === 'content_block_delta'){
-                            if(parsedData?.delta?.type === 'text' || parsedData.delta?.type === 'text_delta'){
-                                if(thinking){
-                                    text += "</Thoughts>\n\n"
-                                    thinking = false
+                        if(parsedData?.type === 'content_block_start'){
+                            const cb = parsedData?.content_block
+                            if(cb?.type === 'tool_use'){
+                                currentToolBlock = {
+                                    type: 'tool_use',
+                                    id: cb.id,
+                                    name: cb.name,
+                                    input: {},
+                                    _inputJson: ''
                                 }
-                                text += parsedData.delta?.text ?? ''
-                            }
-    
-                            if(parsedData?.delta?.type === 'thinking' || parsedData.delta?.type === 'thinking_delta'){
+                                streamContentBlocks.push(currentToolBlock)
+                                console.warn(`%c[Tool Call] ${cb.name}`, 'color: #4fc3f7; font-weight: bold', { id: cb.id })
+                            } else if(cb?.type === 'text'){
+                                currentToolBlock = { type: 'text', text: '' }
+                                streamContentBlocks.push(currentToolBlock)
+                            } else if(cb?.type === 'thinking'){
+                                currentToolBlock = { type: 'thinking', thinking: '', signature: '' }
+                                streamContentBlocks.push(currentToolBlock)
+                            } else if(cb?.type === 'redacted_thinking'){
+                                currentToolBlock = { type: 'redacted_thinking', data: cb.data || '' }
+                                streamContentBlocks.push(currentToolBlock)
                                 if(!thinking){
                                     text += "<Thoughts>\n"
                                     thinking = true
                                 }
-                                text += parsedData.delta?.thinking ?? ''
+                                text += '\n{{redacted_thinking}}\n'
+                            } else {
+                                currentToolBlock = null
                             }
-    
-                            if(parsedData?.delta?.type === 'redacted_thinking'){
+                        }
+
+                        if(parsedData?.type === 'content_block_delta'){
+                            const dt = parsedData?.delta
+                            if(dt?.type === 'input_json_delta' && currentToolBlock?.type === 'tool_use'){
+                                currentToolBlock._inputJson += (dt.partial_json || '')
+                            }
+                            else if(dt?.type === 'text' || dt?.type === 'text_delta'){
+                                if(currentToolBlock?.type === 'text'){
+                                    currentToolBlock.text += dt?.text ?? ''
+                                }
+                                if(thinking){
+                                    text += "</Thoughts>\n\n"
+                                    thinking = false
+                                }
+                                text += dt?.text ?? ''
+                            }
+                            else if(dt?.type === 'thinking' || dt?.type === 'thinking_delta'){
+                                if(currentToolBlock?.type === 'thinking'){
+                                    currentToolBlock.thinking += dt?.thinking ?? ''
+                                }
+                                if(!thinking){
+                                    text += "<Thoughts>\n"
+                                    thinking = true
+                                }
+                                text += dt?.thinking ?? ''
+                            }
+                            else if(dt?.type === 'signature_delta'){
+                                if(currentToolBlock?.type === 'thinking'){
+                                    currentToolBlock.signature = dt?.signature ?? ''
+                                }
+                            }
+                            else if(dt?.type === 'redacted_thinking'){
                                 if(!thinking){
                                     text += "<Thoughts>\n"
                                     thinking = true
@@ -832,10 +967,24 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
                             }
                         }
 
+                        if(parsedData?.type === 'content_block_stop'){
+                            if(currentToolBlock?.type === 'tool_use'){
+                                const rawJson = currentToolBlock._inputJson || '{}'
+                                try { currentToolBlock.input = JSON.parse(rawJson) } catch { currentToolBlock.input = {} }
+                                delete currentToolBlock._inputJson
+                                streamToolUseBlocks.push(currentToolBlock)
+                                console.warn(`%c[Tool Input] ${currentToolBlock.name}`, 'color: #81c784; font-weight: bold', currentToolBlock.input)
+                            }
+                            currentToolBlock = null
+                        }
+
+                        if(parsedData?.type === 'message_delta'){
+                            streamStopReason = parsedData?.delta?.stop_reason || null
+                        }
+
                         if(parsedData?.type === 'error'){
                             const errormsg:string = parsedData?.error?.message
                             if(errormsg && errormsg.toLocaleLowerCase().includes('overload') && db.antiServerOverloads){
-                                // console.log('Overload detected, retrying...')
                                 controller.enqueue({
                                     "0": "Overload detected, retrying..."
                                 })
@@ -845,26 +994,38 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
                             text += "Error:" + parsedData?.error?.message
 
                         }
-                        
+
                     }
                     catch (error) {
                     }
 
-                        
-                        
+
+
                 })
                 let breakWhile = false
                 let i = 0;
                 let prevText = ''
+                let streamRetryCount = 0
+                const STREAM_MID_RETRY_MAX = 2
                 while(true){
                     try {
                         if(arg?.abortSignal?.aborted || breakWhile){
                             break
                         }
-                        const {done, value} = await reader.read() 
+                        const {done, value} = await reader.read()
                         if(done){
+                            // Check if stream ended prematurely (no stop_reason received)
+                            if(!streamStopReason && !text){
+                                // Empty response with no stop_reason = broken stream, treat as error
+                                throw new Error('Stream ended prematurely (no data received)')
+                            }
+                            if(!streamStopReason && text && !breakWhile){
+                                // Had text but no stop_reason = truncated response, treat as error for retry
+                                throw new Error('Stream truncated (no stop_reason)')
+                            }
                             break
                         }
+                        streamRetryCount = 0 // reset on successful read
                         parserData += (decoder.decode(value))
                         let parts = parserData.split('\n')
                         for(;i<parts.length-1;i++){
@@ -906,9 +1067,241 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
                         })
 
                     } catch (error) {
-                        await sleep(1)
+                        if(arg?.abortSignal?.aborted) break
+
+                        // Preserve completed tool_use blocks — execute them and let Claude continue
+                        if(streamToolUseBlocks.length > 0){
+                            console.warn(`[Anthropic Stream] Connection lost (${error?.message || ''}), but ${streamToolUseBlocks.length} tool(s) completed — proceeding with tool execution as if stop_reason=tool_use`)
+                            streamStopReason = 'tool_use'
+                            try { reader.cancel() } catch {}
+                            break
+                        }
+
+                        // Preserve completed text/thinking via prefix continuation
+                        // Push partial assistant response as message and ask to continue
+                        const completedBlocks = streamContentBlocks.filter(b =>
+                            b.type === 'text' ||
+                            b.type === 'redacted_thinking' ||
+                            (b.type === 'thinking' && b.thinking && b.thinking.length > 0)
+                        )
+                        const hasContent = completedBlocks.length > 0 || text.length > 0
+
+                        streamRetryCount++
+                        if(streamRetryCount > STREAM_MID_RETRY_MAX){
+                            breakError = `Stream failed after ${STREAM_MID_RETRY_MAX} retries`
+                            break
+                        }
+                        const waitMs = Math.min(streamRetryCount * 5000, 30000)
+
+                        if(hasContent){
+                            console.warn(`[Anthropic Stream] Connection lost (${error?.message || ''}), attempting continuation-style retry: ${text.length} chars + ${completedBlocks.length} blocks preserved, ${streamRetryCount}/${STREAM_MID_RETRY_MAX} in ${waitMs}ms`)
+                            try { reader.cancel() } catch {}
+                            await sleep(waitMs)
+                            // Build proper multi-turn: assistant with partial content + user "continue" instruction
+                            // This avoids prefill (which Copilot rejects) and uses valid Anthropic multi-turn structure
+                            const contBody = JSON.parse(JSON.stringify(body))
+                            const blocksForContinuation = [...completedBlocks]
+                            const hasCompletedText = completedBlocks.some(b => b.type === 'text')
+                            if(!hasCompletedText && text){
+                                blocksForContinuation.push({ type: 'text', text })
+                            }
+                            // Partial text not captured in content_block_stop yet — include it
+                            if(hasCompletedText && text){
+                                const lastTextBlock = [...blocksForContinuation].reverse().find(b => b.type === 'text')
+                                if(lastTextBlock && text.length > (lastTextBlock.text?.length || 0)){
+                                    lastTextBlock.text = text
+                                }
+                            }
+                            contBody.messages = [
+                                ...(contBody.messages || []),
+                                { role: 'assistant', content: blocksForContinuation },
+                                { role: 'user', content: '[SYSTEM: The previous response was cut off mid-generation due to a network error. Your partial output above was captured. Do NOT repeat any of it — continue seamlessly from the exact point it was cut, as if resuming mid-sentence if necessary. Preserve tone, style, and formatting from your partial response.]' }
+                            ]
+                            try {
+                                const retryRes = await fetchNative(replacerURL, {
+                                    body: JSON.stringify(contBody),
+                                    headers: headers,
+                                    method: "POST",
+                                    chatId: arg.chatId,
+                                    signal: arg.abortSignal,
+                                    interceptor: 'anthropic_streaming_prefix_retry'
+                                })
+                                if(retryRes.status === 200){
+                                    reader = retryRes.body.getReader()
+                                    parserData = ''
+                                    // Reset per-stream state but KEEP accumulated text/blocks (will append)
+                                    streamStopReason = null
+                                    currentToolBlock = null
+                                    i = 0
+                                    continue
+                                }
+                                console.warn(`[Anthropic Stream] Continuation retry got ${retryRes.status} — falling back to full retry`)
+                                try { await textifyReadableStream(retryRes.body) } catch {}
+                            } catch(contErr) {
+                                console.warn(`[Anthropic Stream] Continuation retry error: ${contErr?.message || contErr} — falling back to full retry`)
+                            }
+                        }
+
+                        // Full retry fallback
+                        console.warn(`[Anthropic Stream] Full retry ${streamRetryCount}/${STREAM_MID_RETRY_MAX} in ${waitMs}ms (had ${text.length} chars, 0 completed tools)`)
+                        try { reader.cancel() } catch {}
+                        text = ''
+                        parserData = ''
+                        prevText = ''
+                        thinking = false
+                        streamToolUseBlocks = []
+                        currentToolBlock = null
+                        streamStopReason = null
+                        streamContentBlocks = []
+                        i = 0
+                        await sleep(waitMs)
+                        try {
+                            const retryRes = await fetchNative(replacerURL, {
+                                body: JSON.stringify(body),
+                                headers: headers,
+                                method: "POST",
+                                chatId: arg.chatId,
+                                signal: arg.abortSignal,
+                                interceptor: 'anthropic_streaming_retry'
+                            })
+                            if(retryRes.status === 200){
+                                reader = retryRes.body.getReader()
+                                parserData = ''
+                                continue
+                            }
+                            console.warn(`[Anthropic Stream] Retry got ${retryRes.status}`)
+                            try { await textifyReadableStream(retryRes.body) } catch {}
+                        } catch(retryErr) {
+                            console.warn(`[Anthropic Stream] Retry fetch error: ${retryErr?.message || retryErr}`)
+                        }
                     }
                 }
+
+                // If stream broke with an error, emit it as text and close normally
+                // (controller.error() causes unhandled alert popups)
+                if(breakError){
+                    controller.enqueue({ "0": text + `\n\n---\n**[${breakError}. Please retry (reroll).]**` })
+                    controller.close()
+                    return
+                }
+
+                // Rescue incomplete tool_use block that didn't get content_block_stop
+                if(currentToolBlock?.type === 'tool_use'){
+                    const rawJson = currentToolBlock._inputJson || '{}'
+                    try { currentToolBlock.input = JSON.parse(rawJson) } catch { currentToolBlock.input = {} }
+                    delete currentToolBlock._inputJson
+                    streamToolUseBlocks.push(currentToolBlock)
+                    console.warn(`[Anthropic Stream] Rescued incomplete tool_use: ${currentToolBlock.name}`, currentToolBlock.input)
+                    currentToolBlock = null
+                    if(!streamStopReason) streamStopReason = 'tool_use'
+                }
+
+                // Handle tool_use in streaming: execute tools and send results back
+                if(streamStopReason === 'tool_use' && streamToolUseBlocks.length > 0){
+                    const messages: Claude3ExtendedChat[] = body.messages
+                    const filteredBlocks = streamContentBlocks.filter(b =>
+                        b.type === 'text' || b.type === 'tool_use' ||
+                        b.type === 'redacted_thinking' ||
+                        (b.type === 'thinking' && b.thinking && b.thinking.length > 0)
+                    )
+                    messages.push({
+                        role: 'assistant',
+                        content: filteredBlocks
+                    })
+                    const toolResponse: Claude3Chat = { role: 'user', content: [] }
+                    for(const toolBlock of streamToolUseBlocks){
+                        console.warn(`%c[Tool Exec] ${toolBlock.name}`, 'color: #ffb74d; font-weight: bold', 'Starting...')
+                        const execStart = performance.now()
+                        const used = await callTool(toolBlock.name, toolBlock.input)
+                        const r: Claude3ToolResponseBlock = {
+                            type: 'tool_result',
+                            tool_use_id: toolBlock.id,
+                            content: used.map((v) => {
+                                switch(v.type){
+                                    case 'text': return { type: 'text', text: v.text }
+                                    case 'image': return { type: 'image', source: { type: 'base64', media_type: v.mimeType, data: v.data } }
+                                    default: return { type: 'text', text: `Unsupported: ${v.type}` }
+                                }
+                            })
+                        }
+                        console.warn(`%c[Tool Result] ${toolBlock.name}`, 'color: #a5d6a7; font-weight: bold',
+                            `${Math.round(performance.now() - execStart)}ms`,
+                            used.map(v => v.type === 'text' ? v.text?.substring(0, 200) : `[${v.type}]`))
+                        toolResponse.content.push(r)
+                        if(arg.rememberToolUsage){
+                            arg.additionalOutput ??= ''
+                            arg.additionalOutput += await encodeToolCall({
+                                call: { id: toolBlock.id, name: toolBlock.name, arg: toolBlock.input },
+                                response: used
+                            })
+                        }
+                    }
+                    messages.push(toolResponse)
+                    body.messages = messages
+                    if(thinking){
+                        text += "</Thoughts>\n\n"
+                        thinking = false
+                        controller.enqueue({ "0": text })
+                    }
+                    // Streaming continuation — retries handled by requestClaudeHTTP's fetch retry logic
+                    body.stream = true
+                    console.warn(`%c[Tool Continuation]`, 'color: #ce93d8; font-weight: bold', `Resuming with ${streamToolUseBlocks.length} tool result(s)...`)
+                    const TOOL_CONT_MAX_RETRIES = 5
+                    let toolContSuccess = false
+                    for(let toolContAttempt = 0; toolContAttempt < TOOL_CONT_MAX_RETRIES; toolContAttempt++){
+                        try {
+                            const continuationResult = await requestClaudeHTTP(replacerURL, headers, body, arg, copilotTaskId)
+                            if(continuationResult.type === 'streaming'){
+                                const contReader = (continuationResult.result as ReadableStream).getReader()
+                                let contText = ''
+                                let contBroken = false
+                                let contChunks = 0
+                                try {
+                                    while(true){
+                                        const {done: cDone, value: cValue} = await contReader.read()
+                                        if(cDone) break
+                                        contChunks++
+                                        contText = (cValue as any)?.["0"] ?? ''
+                                        controller.enqueue({ "0": text + contText })
+                                    }
+                                } catch(readErr) {
+                                    console.warn(`[Tool Continuation] Stream read error on attempt ${toolContAttempt + 1}: ${readErr?.message || readErr}`)
+                                    contBroken = true
+                                }
+                                // Check if continuation actually produced meaningful output
+                                if(!contBroken && contChunks > 0 && contText && !contText.includes('[Tool continuation failed') && !contText.includes('[Stream failed')){
+                                    toolContSuccess = true
+                                    break
+                                }
+                                if(!contBroken && contChunks === 0){
+                                    console.warn(`[Tool Continuation] Empty response on attempt ${toolContAttempt + 1}`)
+                                    contBroken = true
+                                }
+                                // Fall through to retry
+                            } else if(continuationResult.type === 'success'){
+                                controller.enqueue({ "0": text + continuationResult.result })
+                                toolContSuccess = true
+                                break
+                            } else {
+                                const errMsg = continuationResult.result || 'unknown error'
+                                console.warn(`[Tool Continuation] Attempt ${toolContAttempt + 1}/${TOOL_CONT_MAX_RETRIES} failed: ${String(errMsg).substring(0, 100)}`)
+                            }
+                        } catch(e: any) {
+                            console.warn(`[Tool Continuation] Attempt ${toolContAttempt + 1}/${TOOL_CONT_MAX_RETRIES} error: ${e?.message || e}`)
+                        }
+                        // Retry with backoff
+                        if(toolContAttempt < TOOL_CONT_MAX_RETRIES - 1){
+                            const waitMs = Math.min((toolContAttempt + 1) * 5000, 30000)
+                            console.warn(`[Tool Continuation] Retrying in ${waitMs}ms...`)
+                            await sleep(waitMs)
+                            continue
+                        }
+                    }
+                    if(!toolContSuccess){
+                        controller.enqueue({ "0": '\n\n---\n**[Tool continuation failed after all retries. Please retry (reroll).]**' })
+                    }
+                }
+
                 controller.close()
             },
             cancel(){
@@ -923,13 +1316,34 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
     }
 
     const db = getDatabase()
-    const res = await globalFetch(replacerURL, {
-        body: body,
-        headers: headers,
-        method: "POST",
-        chatId: arg.chatId,
-        interceptor: 'anthropic_http'
-    })
+    let res: any
+    const MAX_RETRIES = 5
+    const RETRY_DELAYS_MS = [3000, 6000, 12000, 20000, 30000]
+    for(let attempt = 0; attempt < MAX_RETRIES; attempt++){
+        res = await globalFetch(replacerURL, {
+            body: body,
+            headers: headers,
+            method: "POST",
+            chatId: arg.chatId,
+            abortSignal: arg.abortSignal,
+            interceptor: 'anthropic_http'
+        })
+
+        if(res.ok && !res.data?.error) break
+
+        // Retry on transient errors (model_not_supported, overload, 429, 500+, unavailable)
+        const errStr = JSON.stringify(res.data)
+        const isRetryable = res.status === 429
+            || res.status >= 500
+            || errStr?.includes('model_not_supported')
+            || errStr?.includes('overload')
+            || errStr?.includes('unavailable')
+        if(!isRetryable || attempt >= MAX_RETRIES - 1) break
+
+        const waitMs = RETRY_DELAYS_MS[attempt] ?? 30000
+        console.log(`[Anthropic] Retry ${attempt + 1}/${MAX_RETRIES} after ${waitMs}ms: ${errStr.substring(0, 100)}`)
+        await sleep(waitMs)
+    }
 
     if(!res.ok){
         const stringlified = JSON.stringify(res.data)
@@ -1035,7 +1449,7 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
         body.messages = messages
         body.stream = false
 
-        return requestClaudeHTTP(replacerURL, headers, body, arg)
+        return requestClaudeHTTP(replacerURL, headers, body, arg, copilotTaskId)
     }
     for(const content of contents){
         if(content.type === 'text'){

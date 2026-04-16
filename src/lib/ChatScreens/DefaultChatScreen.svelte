@@ -281,8 +281,10 @@
                 return
             }
         }
+        // Reuse the previous message's Copilot turnId so the reroll is bundled as the same quota turn
+        const prevTurnId = rerolls[0]?.[0]?.generationInfo?.copilotTurnId
         DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message = cha
-        await sendChatMain()
+        await sendChatMain(false, prevTurnId)
     }
 
     async function unReroll() {
@@ -317,7 +319,7 @@
 
     let abortController:null|AbortController = null
 
-    async function sendChatMain(continued:boolean = false) {
+    async function sendChatMain(continued:boolean = false, copilotTurnId?:string) {
 
         let previousLength = DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message.length
         messageInput = ''
@@ -325,7 +327,8 @@
         try {
             await sendChat(-1, {
                 signal:abortController.signal,
-                continue:continued
+                continue:continued,
+                ...(copilotTurnId ? { copilotTurnId } : {})
             })
             if(previousLength < DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message.length){
                 rerolls.push(safeStructuredClone(DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message).slice(previousLength))

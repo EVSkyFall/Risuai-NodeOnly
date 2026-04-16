@@ -134,6 +134,8 @@ export function setDatabase(data:Database){
     if(checkNullish(data.subModel)){
         data.subModel = 'gemini-3-flash-preview'
     }
+    data.subMaxContext ??= 0
+    data.subMaxResponse ??= 0
     if(checkNullish(data.waifuWidth)){
         data.waifuWidth = 100
     }
@@ -905,6 +907,8 @@ export interface Database{
     iconsize:number
     theme: string
     subModel:string
+    subMaxContext:number
+    subMaxResponse:number
     emotionPrompt: string,
     formatversion:number
     waifuWidth:number
@@ -1602,6 +1606,8 @@ export interface botPreset{
     formatingOrder: FormatingOrderItem[]
     aiModel?: string
     subModel?:string
+    subMaxContext?:number
+    subMaxResponse?:number
     currentPluginProvider?:string
     textgenWebUIStreamURL?:string
     textgenWebUIBlockingURL?:string
@@ -1961,6 +1967,7 @@ export interface Message{
 export interface MessageGenerationInfo{
     model?: string
     generationId?: string
+    copilotTurnId?: string
     inputTokens?: number
     outputTokens?: number
     maxContext?: number
@@ -2100,6 +2107,8 @@ export const presetTemplate:botPreset = {
     formatingOrder: ['main', 'description', 'personaPrompt','chats','lastChat', 'jailbreak', 'lorebook', 'globalNote', 'authorNote'],
     aiModel: "gemini-3-flash-preview",
     subModel: "gemini-3-flash-preview",
+    subMaxContext: 0,
+    subMaxResponse: 0,
     currentPluginProvider: "",
     textgenWebUIStreamURL: '',
     textgenWebUIBlockingURL: '',
@@ -2216,6 +2225,8 @@ export function saveCurrentPreset(){
         formatingOrder: db.formatingOrder,
         aiModel: db.aiModel,
         subModel: db.subModel,
+        subMaxContext: db.subMaxContext,
+        subMaxResponse: db.subMaxResponse,
         currentPluginProvider: db.currentPluginProvider,
         textgenWebUIStreamURL: db.textgenWebUIStreamURL,
         textgenWebUIBlockingURL: db.textgenWebUIBlockingURL,
@@ -2333,6 +2344,8 @@ export function setPreset(db:Database, newPres: botPreset){
     db.formatingOrder = newPres.formatingOrder ?? db.formatingOrder
     db.aiModel = newPres.aiModel ?? db.aiModel
     db.subModel = newPres.subModel ?? db.subModel
+    db.subMaxContext = newPres.subMaxContext ?? db.subMaxContext
+    db.subMaxResponse = newPres.subMaxResponse ?? db.subMaxResponse
     db.currentPluginProvider = newPres.currentPluginProvider ?? db.currentPluginProvider
     db.textgenWebUIStreamURL = newPres.textgenWebUIStreamURL ?? db.textgenWebUIStreamURL
     db.textgenWebUIBlockingURL = newPres.textgenWebUIBlockingURL ?? db.textgenWebUIBlockingURL

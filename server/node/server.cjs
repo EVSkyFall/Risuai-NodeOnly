@@ -19,6 +19,18 @@ const { kvGet, kvSet, kvDel, kvList,
 const { applyPatch } = require('fast-json-patch');
 const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON } = require('./utils.cjs');
 
+// Increase undici headersTimeout for proxy fetch — Copilot API can be slow during tool execution
+try {
+    const { Agent, setGlobalDispatcher } = require('undici')
+    setGlobalDispatcher(new Agent({
+        headersTimeout: 600_000,   // 10 minutes (default 300s)
+        bodyTimeout: 1_800_000,    // 30 minutes (long streaming responses)
+        connectTimeout: 30_000,    // 30 seconds connect
+    }))
+} catch {
+    // Node.js without separate undici — fallback to defaults
+}
+
 // Node.js version check
 const [nodeMajor] = process.version.slice(1).split('.').map(Number);
 if (nodeMajor < 24) {
@@ -27,6 +39,107 @@ if (nodeMajor < 24) {
 
 // Configuration flags for patch-based sync
 const enablePatchSync = true;
+
+// ─── Copilot Turn Session Manager ────────────────────────────────────────────
+// Deterministic ID derivation from turnId+model. Same inputs → same taskId.
+// Same turnId + same model within 30min: first request = user, all subsequent = agent.
+const copilotTurnSessions = new Map()
+const COPILOT_SESSION_TTL_MS = 30 * 60_000
+
+function isCopilotURL(url) {
+    return typeof url === 'string' && (url.includes('githubcopilot.com') || url.includes('api.individual.githubcopilot.com'))
+}
+
+function deterministicUUID(seed) {
+    const hash = nodeCrypto.createHash('sha256').update(seed).digest('hex')
+    return `${hash.slice(0,8)}-${hash.slice(8,12)}-${hash.slice(12,16)}-${hash.slice(16,20)}-${hash.slice(20,32)}`
+}
+
+// Track the most recent active session per model for auto-bundling
+const recentModelSessions = new Map() // model → { key, turnId, lastUsed }
+
+function applyCopilotTurnHeaders(header, targetUrl, turnId, requestBody) {
+    if (!isCopilotURL(targetUrl)) return false
+    let model = null
+    try {
+        let bodyStr = requestBody
+        if (Buffer.isBuffer(requestBody)) bodyStr = requestBody.toString('utf-8')
+        const body = typeof bodyStr === 'string' ? JSON.parse(bodyStr) : bodyStr
+        model = body?.model || null
+    } catch {}
+
+    // Auto-bundle: if no turnId or unknown turnId, try to attach to the most recent session for this model
+    const now = Date.now()
+    let effectiveTurnId = turnId
+    let autoBundled = false
+    if (model) {
+        const recent = recentModelSessions.get(model)
+        if (recent && (now - recent.lastUsed < COPILOT_SESSION_TTL_MS)) {
+            const recentSession = copilotTurnSessions.get(recent.key)
+            if (recentSession && recentSession.userSent && (now - recentSession.createdAt < COPILOT_SESSION_TTL_MS)) {
+                // Recent session exists and already had a USER call — bundle as AGENT
+                if (!turnId || !copilotTurnSessions.has(model ? `${turnId}::${model}` : turnId)) {
+                    effectiveTurnId = recent.turnId
+                    autoBundled = true
+                }
+            }
+        }
+    }
+
+    if (!effectiveTurnId) {
+        // No turnId and no recent session to attach to — generate one
+        effectiveTurnId = nodeCrypto.randomUUID()
+        autoBundled = false
+    }
+
+    const key = model ? `${effectiveTurnId}::${model}` : effectiveTurnId
+    const taskId = deterministicUUID(key + '-task')
+    const interactionId = deterministicUUID(key + '-interaction')
+
+    let session = copilotTurnSessions.get(key)
+
+    if (!session || (now - session.createdAt > COPILOT_SESSION_TTL_MS)) {
+        session = { userSent: false, requestCount: 0, createdAt: now }
+        copilotTurnSessions.set(key, session)
+    }
+
+    session.requestCount++
+    const isUser = !session.userSent
+    if (isUser) session.userSent = true
+
+    // Update recent model session tracker
+    if (model) {
+        recentModelSessions.set(model, { key, turnId: effectiveTurnId, lastUsed: now })
+    }
+
+    header['X-Agent-Task-Id'] = taskId
+    header['X-Request-Id'] = nodeCrypto.randomUUID()
+    header['X-Interaction-Id'] = interactionId
+    header['X-Initiator'] = isUser ? 'user' : 'agent'
+    header['OpenAI-Intent'] = 'conversation-panel'
+    if (!header['X-GitHub-Api-Version'] && !header['X-Github-Api-Version'] && !header['x-github-api-version']) {
+        header['X-GitHub-Api-Version'] = '2025-05-01'
+    }
+
+    if (targetUrl.includes('/v1/messages')) {
+        if (!header['anthropic-beta']) {
+            header['anthropic-beta'] = 'interleaved-thinking-2025-05-14,context-management-2025-06-27,advanced-tool-use-2025-11-20'
+        }
+    }
+
+    const bundleTag = autoBundled ? ' [auto-bundled]' : ''
+    console.warn(`[${new Date().toISOString()}] [Copilot Turn] ${isUser ? 'USER' : 'AGENT'} | turnId=${effectiveTurnId.substring(0,8)} model=${model || '?'} req#${session.requestCount} taskId=${taskId.substring(0,8)}${bundleTag}`)
+    return true
+}
+
+function markCopilotTurnSuccess(_turnId) {}
+
+setInterval(() => {
+    const now = Date.now()
+    for (const [key, session] of copilotTurnSessions) {
+        if (now - session.createdAt > COPILOT_SESSION_TTL_MS) copilotTurnSessions.delete(key)
+    }
+}, 60_000)
 
 // In-memory database cache for patch-based sync
 // dbCache stores the STRIPPED (stubs-only) version matching what the client sees.
@@ -1675,7 +1788,7 @@ async function checkAuth(req, res, returnOnlyStatus = false, {allowExpired = fal
 }
 
 const reverseProxyFunc = async (req, res, next) => {
-    if(!await checkAuth(req, res)){
+    if(!await checkAuth(req, res, false, {allowExpired: true})){
         return;
     }
     
@@ -1722,6 +1835,16 @@ const reverseProxyFunc = async (req, res, next) => {
                 requestBody = JSON.stringify(req.body);
             }
         }
+        // Copilot turn bundling: inject task headers if this is a Copilot URL with a turn ID
+        const turnId = req.headers['x-risu-turn-id']
+        applyCopilotTurnHeaders(header, urlParam, turnId, requestBody)
+
+        // Debug: log Copilot requests
+        if (isCopilotURL(urlParam)) {
+            let bodyModel = '?'
+            try { const b = JSON.parse(Buffer.isBuffer(requestBody) ? requestBody.toString('utf-8') : requestBody); bodyModel = b?.model || '?' } catch {}
+            console.log(`[Proxy] POST ${urlParam.substring(0,80)} | model=${bodyModel} | turnId=${turnId || 'none'} | hasAnthropicBeta=${!!header['anthropic-beta']}`)
+        }
         // make request to original server
         originalResponse = await fetch(urlParam, {
             method: req.method,
@@ -1746,6 +1869,15 @@ const reverseProxyFunc = async (req, res, next) => {
         res.header(headObj);
         // send response status to client
         res.status(originalResponse.status);
+        // Debug: log non-OK Copilot responses with body
+        if (isCopilotURL(urlParam) && !originalResponse.ok) {
+            let errBody = ''
+            try { errBody = await originalResponse.clone().text().catch(() => '') } catch {}
+            console.log(`[Proxy] Copilot ${originalResponse.status} for ${urlParam.substring(0,80)} | ${errBody.substring(0,300)}`)
+        }
+        if (turnId && originalResponse.ok && isCopilotURL(urlParam)) {
+            markCopilotTurnSuccess(turnId)
+        }
         // send response body to client
         await pipeline(originalResponse.body, res);
 
@@ -1773,7 +1905,7 @@ const reverseProxyFunc = async (req, res, next) => {
 }
 
 const reverseProxyFunc_get = async (req, res, next) => {
-    if(!await checkAuth(req, res)){
+    if(!await checkAuth(req, res, false, {allowExpired: true})){
         return;
     }
     
@@ -3559,6 +3691,728 @@ app.post('/api/migrate/save-folder/cleanup/execute', async (req, res, next) => {
 });
 
 // ── Inlay bulk compression endpoint ──────────────────────────────────────────
+// ─── MCP LLM Call Endpoint ──────────────────────────────────────────────────
+// MCP servers call LLMs through RisuAI's active preset config.
+// No separate API key needed — uses Main/Aux model settings from the database.
+
+let _copilotBearerCaches = new Map() // key → { token, expiry }
+
+async function exchangeCopilotToken(githubToken) {
+    const cacheKey = githubToken.substring(0, 10)
+    const cached = _copilotBearerCaches.get(cacheKey)
+    if (cached?.token && Date.now() < cached.expiry - 60000) return cached.token
+    const res = await fetch('https://api.github.com/copilot_internal/v2/token', {
+        method: 'GET',
+        headers: {
+            'Accept': 'application/json',
+            'Authorization': `Bearer ${githubToken}`,
+            'Editor-Version': 'vscode/1.85.0',
+            'Editor-Plugin-Version': 'copilot-chat/0.22.0',
+            'Copilot-Integration-Id': 'vscode-chat',
+            'User-Agent': 'GitHubCopilotChat/0.22.0'
+        }
+    })
+    if (!res.ok) throw new Error(`Copilot token exchange failed: ${res.status}`)
+    const data = await res.json()
+    const token = data?.token || ''
+    if (!token) throw new Error('Empty Copilot bearer token')
+    _copilotBearerCaches.set(cacheKey, { token, expiry: (data?.expires_at || 0) * 1000 || (Date.now() + 30 * 60000) })
+    return token
+}
+
+async function resolveModelConfig(profile) {
+    // Read DB directly from storage (dbCache may be empty/stubbed in 1.1.1 lazy loading)
+    let db
+    try {
+        const raw = kvGet('database/database.bin')
+        if (!raw) return null
+        db = normalizeJSON(await decodeRisuSave(raw))
+    } catch (e) {
+        console.warn(`[MCP LLM] Failed to decode DB: ${e?.message}`)
+        return null
+    }
+    if (!db) return null
+    const modelId = profile === 'aux' ? db.subModel : db.aiModel
+    if (!modelId) return null
+
+    // xcustom::: models
+    if (modelId.startsWith('xcustom:::')) {
+        const custom = (db.customModels || []).find(m => m.id === modelId)
+        if (!custom) return null
+        return {
+            model: custom.name || modelId,
+            url: custom.url || '',
+            key: custom.key || '',
+            format: custom.format, // 0=OpenAI, 2=Anthropic
+            isCopilot: (custom.url || '').includes('githubcopilot.com'),
+            isClaude: custom.format === 2,
+        }
+    }
+
+    // Standard models — determine from model ID
+    const isClaude = /claude/i.test(modelId)
+    const key = isClaude ? db.claudeAPIKey : db.openAIKey
+    return {
+        model: modelId,
+        url: '',
+        key: key || '',
+        format: isClaude ? 2 : 0,
+        isCopilot: false,
+        isClaude,
+    }
+}
+
+app.post('/api/mcp/llm/call', mcpAuthMiddleware, async (req, res) => {
+    try {
+        const { profile, messages, system, max_tokens, temperature, stream, thinking, output_config, model: modelOverride } = req.body
+        if (!messages) {
+            res.status(400).json({ error: 'messages is required' })
+            return
+        }
+
+        const config = await resolveModelConfig(profile || 'main')
+        if (!config) {
+            res.status(500).json({ error: `No model configured for profile "${profile || 'main'}"` })
+            return
+        }
+
+        const model = modelOverride || config.model
+        const turnId = req.headers['x-risu-turn-id']
+
+        // Determine endpoint URL
+        let targetUrl
+        if (config.isCopilot) {
+            targetUrl = config.isClaude
+                ? 'https://api.githubcopilot.com/v1/messages'
+                : 'https://api.githubcopilot.com/chat/completions'
+        } else if (config.url) {
+            targetUrl = config.isClaude
+                ? config.url.replace(/\/$/, '') + '/v1/messages'
+                : config.url.replace(/\/$/, '') + '/v1/chat/completions'
+        } else {
+            res.status(500).json({ error: 'No URL configured for model' })
+            return
+        }
+
+        // Auth
+        let authToken = config.key
+        if (config.isCopilot && authToken) {
+            authToken = await exchangeCopilotToken(authToken)
+        }
+
+        const headers = {
+            'Content-Type': 'application/json',
+            'Authorization': config.isClaude && !config.isCopilot
+                ? undefined  // Anthropic direct uses x-api-key
+                : `Bearer ${authToken}`,
+        }
+        if (config.isClaude && !config.isCopilot) {
+            headers['x-api-key'] = config.key
+            headers['anthropic-version'] = '2023-06-01'
+        }
+        if (config.isCopilot) {
+            headers['Editor-Version'] = 'vscode/1.85.0'
+            headers['Editor-Plugin-Version'] = 'copilot-chat/0.22.0'
+            headers['Copilot-Integration-Id'] = 'vscode-chat'
+            headers['User-Agent'] = 'GitHubCopilotChat/0.22.0'
+        }
+
+        // Turn bundling
+        if (turnId) {
+            applyCopilotTurnHeaders(headers, targetUrl, turnId, JSON.stringify({ model }))
+        }
+
+        // Build body
+        let body
+        if (config.isClaude) {
+            body = {
+                model,
+                system: system || undefined,
+                messages,
+                max_tokens: max_tokens || 4096,
+                temperature: temperature ?? 1,
+                stream: stream ?? true,
+            }
+            if (thinking) body.thinking = thinking
+            if (output_config) body.output_config = output_config
+            if (config.isCopilot) {
+                headers['anthropic-beta'] = 'interleaved-thinking-2025-05-14,context-management-2025-06-27,advanced-tool-use-2025-11-20'
+            }
+        } else {
+            body = {
+                model,
+                messages: system ? [{ role: 'system', content: system }, ...messages] : messages,
+                max_tokens: max_tokens || 4096,
+                temperature: temperature ?? 0.7,
+                stream: stream ?? true,
+            }
+        }
+
+        // Clean undefined headers
+        for (const k of Object.keys(headers)) { if (headers[k] === undefined) delete headers[k] }
+
+        console.warn(`[MCP LLM] ${profile || 'main'} → ${model} | ${config.isCopilot ? 'Copilot' : 'Direct'} | turnId=${turnId?.substring(0,8) || 'none'}`)
+
+        const llmRes = await fetch(targetUrl, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(body),
+        })
+
+        res.status(llmRes.status)
+        for (const [k, v] of llmRes.headers) {
+            if (!['content-encoding', 'transfer-encoding', 'content-length'].includes(k.toLowerCase())) {
+                res.setHeader(k, v)
+            }
+        }
+        await pipeline(llmRes.body, res)
+    } catch (err) {
+        console.warn(`[MCP LLM] Error: ${err?.message || err}`)
+        if (!res.headersSent) {
+            res.status(502).json({ error: err?.message || 'LLM call failed' })
+        }
+    }
+})
+
+// ─── RisuAI Access MCP API ──────────────────────────────────────────────────
+// Server-side reimplementation of internal:risuai MCP for external access
+// (Claude Code, etc.). Operates on dbCache / kvGet + decodeRisuSave.
+
+/** MCP auth: accepts session cookie OR static API key (for CLI tools like Claude Code) */
+const MCP_API_KEY = process.env.RISU_MCP_API_KEY || null
+function mcpAuthMiddleware(req, res, next) {
+    // 1. Session cookie (browser login)
+    const token = parseSessionCookie(req)
+    if (token && (sessions.get(token) ?? 0) > Date.now()) return next()
+    // 2. Static API key (x-mcp-key header or query param)
+    if (MCP_API_KEY) {
+        const key = req.headers['x-mcp-key'] || req.query?.mcpKey
+        if (key === MCP_API_KEY) return next()
+    }
+    res.status(401).json({ error: 'Unauthorized' })
+}
+
+/** Load decoded database object (uses dbCache if available) */
+async function loadDatabase() {
+    if (dbCache[DB_HEX_KEY]) return dbCache[DB_HEX_KEY]
+    const raw = kvGet('database/database.bin')
+    if (!raw) throw new Error('database/database.bin not found')
+    const decoded = normalizeJSON(await decodeRisuSave(raw))
+    dbCache[DB_HEX_KEY] = decoded
+    return decoded
+}
+
+/** Persist database changes with debounce (same pattern as /api/patch) */
+function scheduleDatabaseSave() {
+    if (saveTimers[DB_HEX_KEY]) clearTimeout(saveTimers[DB_HEX_KEY])
+    saveTimers[DB_HEX_KEY] = setTimeout(() => {
+        try {
+            if (dbCache[DB_HEX_KEY]) {
+                const data = Buffer.from(encodeRisuSaveLegacy(dbCache[DB_HEX_KEY]))
+                kvSet('database/database.bin', data)
+                dbEtag = computeBufferEtag(data)
+                createBackupAndRotate()
+            }
+        } catch (e) {
+            console.error('[MCP-Access] Save error:', e)
+        } finally {
+            delete saveTimers[DB_HEX_KEY]
+        }
+    }, SAVE_INTERVAL)
+}
+
+/** Find character by chaId or name */
+function findCharacter(characters, id) {
+    if (!id) return null
+    return characters.find(c => c.chaId === id || c.name === id) || null
+}
+
+/** Find module by id or name (non-MCP only) */
+function findModule(modules, id) {
+    if (!id) return null
+    return modules.find(m => m.id === id || m.name === id) || null
+}
+
+// --- Character endpoints ---
+
+app.post('/api/mcp/characters/list', mcpAuthMiddleware, async (req, res) => {
+    try {
+        const db = await loadDatabase()
+        const chars = db.characters || []
+        const { count = 50, offset = 0 } = req.body || {}
+        const slice = chars.slice(offset, offset + count).map(c => ({
+            chaId: c.chaId, name: c.name, type: c.type || 'character'
+        }))
+        res.json({ characters: slice, total: chars.length })
+    } catch (e) {
+        res.status(500).json({ error: e.message })
+    }
+})
+
+app.post('/api/mcp/characters/get', mcpAuthMiddleware, async (req, res) => {
+    try {
+        const db = await loadDatabase()
+        const { id, fields } = req.body || {}
+        const char = findCharacter(db.characters || [], id)
+        if (!char) return res.status(404).json({ error: 'Character not found' })
+        if (fields && Array.isArray(fields)) {
+            const filtered = {}
+            for (const f of fields) { if (f in char) filtered[f] = char[f] }
+            filtered.chaId = char.chaId
+            filtered.name = char.name
+            return res.json(filtered)
+        }
+        // Return all fields except heavy ones (chats, image)
+        const { chats, image, ...rest } = char
+        res.json(rest)
+    } catch (e) {
+        res.status(500).json({ error: e.message })
+    }
+})
+
+app.post('/api/mcp/characters/set', mcpAuthMiddleware, async (req, res) => {
+    try {
+        await queueStorageOperation(async () => {
+            const db = await loadDatabase()
+            const { id, data } = req.body || {}
+            const char = findCharacter(db.characters || [], id)
+            if (!char) return res.status(404).json({ error: 'Character not found' })
+            // Whitelist of editable fields (matching internal MCP)
+            const editable = [
+                'name', 'firstMessage', 'desc', 'notes', 'personality', 'scenario',
+                'alternateGreetings', 'tags', 'creator', 'systemPrompt',
+                'postHistoryInstructions', 'replaceGlobalNote', 'backgroundHTML',
+                'bias', 'modules'
+            ]
+            let changed = 0
+            for (const key of editable) {
+                if (key in (data || {})) { char[key] = data[key]; changed++ }
+            }
+            if (changed === 0) return res.status(400).json({ error: 'No valid fields to update' })
+            scheduleDatabaseSave()
+            res.json({ success: true, changed })
+        })
+    } catch (e) {
+        res.status(500).json({ error: e.message })
+    }
+})
+
+// --- Lorebook endpoints ---
+
+app.post('/api/mcp/characters/lorebooks/list', mcpAuthMiddleware, async (req, res) => {
+    try {
+        const db = await loadDatabase()
+        const { id, count = 50, offset = 0 } = req.body || {}
+        const char = findCharacter(db.characters || [], id)
+        if (!char) return res.status(404).json({ error: 'Character not found' })
+        const lore = char.globalLore || []
+        const slice = lore.slice(offset, offset + count).map(l => ({
+            comment: l.comment, key: l.key, alwaysActive: l.alwaysActive, mode: l.mode
+        }))
+        res.json({ lorebooks: slice, total: lore.length })
+    } catch (e) {
+        res.status(500).json({ error: e.message })
+    }
+})
+
+app.post('/api/mcp/characters/lorebooks/get', mcpAuthMiddleware, async (req, res) => {
+    try {
+        const db = await loadDatabase()
+        const { id, names } = req.body || {}
+        const char = findCharacter(db.characters || [], id)
+        if (!char) return res.status(404).json({ error: 'Character not found' })
+        const lore = char.globalLore || []
+        const matched = lore.filter(l => (names || []).includes(l.comment))
+        res.json({ lorebooks: matched })
+    } catch (e) {
+        res.status(500).json({ error: e.message })
+    }
+})
+
+app.post('/api/mcp/characters/lorebooks/set', mcpAuthMiddleware, async (req, res) => {
+    try {
+        await queueStorageOperation(async () => {
+            const db = await loadDatabase()
+            const { id, name, content, keys, newName, alwaysActive } = req.body || {}
+            const char = findCharacter(db.characters || [], id)
+            if (!char) return res.status(404).json({ error: 'Character not found' })
+            if (!char.globalLore) char.globalLore = []
+            let entry = char.globalLore.find(l => l.comment === name)
+            if (!entry) {
+                entry = { key: '', secondkey: '', insertorder: 100, comment: name || '', content: '', mode: 'normal', alwaysActive: false, selective: false }
+                char.globalLore.push(entry)
+            }
+            if (content !== undefined) entry.content = content
+            if (keys !== undefined) entry.key = keys
+            if (newName !== undefined) entry.comment = newName
+            if (alwaysActive !== undefined) entry.alwaysActive = alwaysActive
+            scheduleDatabaseSave()
+            res.json({ success: true })
+        })
+    } catch (e) {
+        res.status(500).json({ error: e.message })
+    }
+})
+
+app.post('/api/mcp/characters/lorebooks/delete', mcpAuthMiddleware, async (req, res) => {
+    try {
+        await queueStorageOperation(async () => {
+            const db = await loadDatabase()
+            const { id, name } = req.body || {}
+            const char = findCharacter(db.characters || [], id)
+            if (!char) return res.status(404).json({ error: 'Character not found' })
+            const lore = char.globalLore || []
+            const idx = lore.findIndex(l => l.comment === name)
+            if (idx === -1) return res.status(404).json({ error: 'Lorebook entry not found' })
+            lore.splice(idx, 1)
+            scheduleDatabaseSave()
+            res.json({ success: true })
+        })
+    } catch (e) {
+        res.status(500).json({ error: e.message })
+    }
+})
+
+// --- Regex scripts endpoints ---
+
+app.post('/api/mcp/characters/regex/list', mcpAuthMiddleware, async (req, res) => {
+    try {
+        const db = await loadDatabase()
+        const { id } = req.body || {}
+        const char = findCharacter(db.characters || [], id)
+        if (!char) return res.status(404).json({ error: 'Character not found' })
+        res.json({ scripts: char.customscript || [] })
+    } catch (e) {
+        res.status(500).json({ error: e.message })
+    }
+})
+
+app.post('/api/mcp/characters/regex/set', mcpAuthMiddleware, async (req, res) => {
+    try {
+        await queueStorageOperation(async () => {
+            const db = await loadDatabase()
+            const { id, name, newName, in: inRegex, out, type, flag, ableFlag } = req.body || {}
+            const char = findCharacter(db.characters || [], id)
+            if (!char) return res.status(404).json({ error: 'Character not found' })
+            if (!char.customscript) char.customscript = []
+            let entry = char.customscript.find(s => s.comment === name)
+            if (!entry) {
+                entry = { comment: name || '', in: '', out: '', type: 'editdisplay', flag: '', ableFlag: true }
+                char.customscript.push(entry)
+            }
+            if (newName !== undefined) entry.comment = newName
+            if (inRegex !== undefined) entry.in = inRegex
+            if (out !== undefined) entry.out = out
+            if (type !== undefined) entry.type = type
+            if (flag !== undefined) entry.flag = flag
+            if (ableFlag !== undefined) entry.ableFlag = ableFlag
+            scheduleDatabaseSave()
+            res.json({ success: true })
+        })
+    } catch (e) {
+        res.status(500).json({ error: e.message })
+    }
+})
+
+app.post('/api/mcp/characters/regex/delete', mcpAuthMiddleware, async (req, res) => {
+    try {
+        await queueStorageOperation(async () => {
+            const db = await loadDatabase()
+            const { id, name } = req.body || {}
+            const char = findCharacter(db.characters || [], id)
+            if (!char) return res.status(404).json({ error: 'Character not found' })
+            const scripts = char.customscript || []
+            const idx = scripts.findIndex(s => s.comment === name)
+            if (idx === -1) return res.status(404).json({ error: 'Regex script not found' })
+            scripts.splice(idx, 1)
+            scheduleDatabaseSave()
+            res.json({ success: true })
+        })
+    } catch (e) {
+        res.status(500).json({ error: e.message })
+    }
+})
+
+// --- Chat history endpoint ---
+
+app.post('/api/mcp/chats/get', mcpAuthMiddleware, async (req, res) => {
+    try {
+        const db = await loadDatabase()
+        const { id, count = 20, offset = 0 } = req.body || {}
+        const char = findCharacter(db.characters || [], id)
+        if (!char) return res.status(404).json({ error: 'Character not found' })
+        const chats = char.chats || []
+        const currentChat = chats[char.chatPage || 0]
+        if (!currentChat) return res.json({ messages: [], total: 0 })
+        const msgs = (currentChat.message || []).slice().reverse()
+        const slice = msgs.slice(offset, offset + Math.min(count, 20))
+        res.json({ messages: slice, total: msgs.length, chatPage: char.chatPage || 0 })
+    } catch (e) {
+        res.status(500).json({ error: e.message })
+    }
+})
+
+// --- Module endpoints ---
+
+app.post('/api/mcp/modules/list', mcpAuthMiddleware, async (req, res) => {
+    try {
+        const db = await loadDatabase()
+        const modules = (db.modules || []).filter(m => !m.mcp)
+        const { count = 50, offset = 0 } = req.body || {}
+        const slice = modules.slice(offset, offset + count).map(m => ({
+            id: m.id, name: m.name, description: m.description, enabled: (db.enabledModules || []).includes(m.id)
+        }))
+        res.json({ modules: slice, total: modules.length })
+    } catch (e) {
+        res.status(500).json({ error: e.message })
+    }
+})
+
+app.post('/api/mcp/modules/get', mcpAuthMiddleware, async (req, res) => {
+    try {
+        const db = await loadDatabase()
+        const { id, fields } = req.body || {}
+        const mod = findModule((db.modules || []).filter(m => !m.mcp), id)
+        if (!mod) return res.status(404).json({ error: 'Module not found' })
+        const result = { ...mod, enabled: (db.enabledModules || []).includes(mod.id) }
+        if (fields && Array.isArray(fields)) {
+            const filtered = {}
+            for (const f of fields) { if (f in result) filtered[f] = result[f] }
+            filtered.id = result.id
+            filtered.name = result.name
+            return res.json(filtered)
+        }
+        res.json(result)
+    } catch (e) {
+        res.status(500).json({ error: e.message })
+    }
+})
+
+app.post('/api/mcp/modules/set', mcpAuthMiddleware, async (req, res) => {
+    try {
+        await queueStorageOperation(async () => {
+            const db = await loadDatabase()
+            const { id, data } = req.body || {}
+            const mod = findModule((db.modules || []).filter(m => !m.mcp), id)
+            if (!mod) return res.status(404).json({ error: 'Module not found' })
+            const editable = ['name', 'description', 'lowLevelAccess', 'backgroundEmbedding', 'customModuleToggle']
+            let changed = 0
+            for (const key of editable) {
+                if (key in (data || {})) { mod[key] = data[key]; changed++ }
+            }
+            if (changed === 0) return res.status(400).json({ error: 'No valid fields to update' })
+            scheduleDatabaseSave()
+            res.json({ success: true, changed })
+        })
+    } catch (e) {
+        res.status(500).json({ error: e.message })
+    }
+})
+
+// --- Module lorebook endpoints ---
+
+app.post('/api/mcp/modules/lorebooks/list', mcpAuthMiddleware, async (req, res) => {
+    try {
+        const db = await loadDatabase()
+        const { id, count = 50, offset = 0 } = req.body || {}
+        const mod = findModule((db.modules || []).filter(m => !m.mcp), id)
+        if (!mod) return res.status(404).json({ error: 'Module not found' })
+        const lore = mod.lorebook || []
+        const slice = lore.slice(offset, offset + count).map(l => ({
+            comment: l.comment, key: l.key, alwaysActive: l.alwaysActive, mode: l.mode
+        }))
+        res.json({ lorebooks: slice, total: lore.length })
+    } catch (e) {
+        res.status(500).json({ error: e.message })
+    }
+})
+
+app.post('/api/mcp/modules/lorebooks/get', mcpAuthMiddleware, async (req, res) => {
+    try {
+        const db = await loadDatabase()
+        const { id, names } = req.body || {}
+        const mod = findModule((db.modules || []).filter(m => !m.mcp), id)
+        if (!mod) return res.status(404).json({ error: 'Module not found' })
+        const matched = (mod.lorebook || []).filter(l => (names || []).includes(l.comment))
+        res.json({ lorebooks: matched })
+    } catch (e) {
+        res.status(500).json({ error: e.message })
+    }
+})
+
+app.post('/api/mcp/modules/lorebooks/set', mcpAuthMiddleware, async (req, res) => {
+    try {
+        await queueStorageOperation(async () => {
+            const db = await loadDatabase()
+            const { id, name, content, keys, newName, alwaysActive } = req.body || {}
+            const mod = findModule((db.modules || []).filter(m => !m.mcp), id)
+            if (!mod) return res.status(404).json({ error: 'Module not found' })
+            if (!mod.lorebook) mod.lorebook = []
+            let entry = mod.lorebook.find(l => l.comment === name)
+            if (!entry) {
+                entry = { key: '', secondkey: '', insertorder: 100, comment: name || '', content: '', mode: 'normal', alwaysActive: false, selective: false }
+                mod.lorebook.push(entry)
+            }
+            if (content !== undefined) entry.content = content
+            if (keys !== undefined) entry.key = keys
+            if (newName !== undefined) entry.comment = newName
+            if (alwaysActive !== undefined) entry.alwaysActive = alwaysActive
+            scheduleDatabaseSave()
+            res.json({ success: true })
+        })
+    } catch (e) {
+        res.status(500).json({ error: e.message })
+    }
+})
+
+app.post('/api/mcp/modules/lorebooks/delete', mcpAuthMiddleware, async (req, res) => {
+    try {
+        await queueStorageOperation(async () => {
+            const db = await loadDatabase()
+            const { id, name } = req.body || {}
+            const mod = findModule((db.modules || []).filter(m => !m.mcp), id)
+            if (!mod) return res.status(404).json({ error: 'Module not found' })
+            const lore = mod.lorebook || []
+            const idx = lore.findIndex(l => l.comment === name)
+            if (idx === -1) return res.status(404).json({ error: 'Lorebook entry not found' })
+            lore.splice(idx, 1)
+            scheduleDatabaseSave()
+            res.json({ success: true })
+        })
+    } catch (e) {
+        res.status(500).json({ error: e.message })
+    }
+})
+
+// --- Module regex endpoints ---
+
+app.post('/api/mcp/modules/regex/list', mcpAuthMiddleware, async (req, res) => {
+    try {
+        const db = await loadDatabase()
+        const { id } = req.body || {}
+        const mod = findModule((db.modules || []).filter(m => !m.mcp), id)
+        if (!mod) return res.status(404).json({ error: 'Module not found' })
+        res.json({ scripts: mod.regex || [] })
+    } catch (e) {
+        res.status(500).json({ error: e.message })
+    }
+})
+
+app.post('/api/mcp/modules/regex/set', mcpAuthMiddleware, async (req, res) => {
+    try {
+        await queueStorageOperation(async () => {
+            const db = await loadDatabase()
+            const { id, name, newName, in: inRegex, out, type, flag, ableFlag } = req.body || {}
+            const mod = findModule((db.modules || []).filter(m => !m.mcp), id)
+            if (!mod) return res.status(404).json({ error: 'Module not found' })
+            if (!mod.regex) mod.regex = []
+            let entry = mod.regex.find(s => s.comment === name)
+            if (!entry) {
+                entry = { comment: name || '', in: '', out: '', type: 'editdisplay', flag: '', ableFlag: true }
+                mod.regex.push(entry)
+            }
+            if (newName !== undefined) entry.comment = newName
+            if (inRegex !== undefined) entry.in = inRegex
+            if (out !== undefined) entry.out = out
+            if (type !== undefined) entry.type = type
+            if (flag !== undefined) entry.flag = flag
+            if (ableFlag !== undefined) entry.ableFlag = ableFlag
+            scheduleDatabaseSave()
+            res.json({ success: true })
+        })
+    } catch (e) {
+        res.status(500).json({ error: e.message })
+    }
+})
+
+app.post('/api/mcp/modules/regex/delete', mcpAuthMiddleware, async (req, res) => {
+    try {
+        await queueStorageOperation(async () => {
+            const db = await loadDatabase()
+            const { id, name } = req.body || {}
+            const mod = findModule((db.modules || []).filter(m => !m.mcp), id)
+            if (!mod) return res.status(404).json({ error: 'Module not found' })
+            const scripts = mod.regex || []
+            const idx = scripts.findIndex(s => s.comment === name)
+            if (idx === -1) return res.status(404).json({ error: 'Regex script not found' })
+            scripts.splice(idx, 1)
+            scheduleDatabaseSave()
+            res.json({ success: true })
+        })
+    } catch (e) {
+        res.status(500).json({ error: e.message })
+    }
+})
+
+// --- Lua script endpoints ---
+
+app.post('/api/mcp/characters/lua/get', mcpAuthMiddleware, async (req, res) => {
+    try {
+        const db = await loadDatabase()
+        const { id } = req.body || {}
+        const char = findCharacter(db.characters || [], id)
+        if (!char) return res.status(404).json({ error: 'Character not found' })
+        const code = char.triggerscript?.[0]?.effect?.[0]?.code || ''
+        res.json({ code })
+    } catch (e) {
+        res.status(500).json({ error: e.message })
+    }
+})
+
+app.post('/api/mcp/characters/lua/set', mcpAuthMiddleware, async (req, res) => {
+    try {
+        await queueStorageOperation(async () => {
+            const db = await loadDatabase()
+            const { id, code } = req.body || {}
+            const char = findCharacter(db.characters || [], id)
+            if (!char) return res.status(404).json({ error: 'Character not found' })
+            if (!char.triggerscript) char.triggerscript = [{ type: 'start', effect: [{ type: 'triggercode', code: '' }] }]
+            if (!char.triggerscript[0]) char.triggerscript[0] = { type: 'start', effect: [{ type: 'triggercode', code: '' }] }
+            if (!char.triggerscript[0].effect) char.triggerscript[0].effect = [{ type: 'triggercode', code: '' }]
+            if (!char.triggerscript[0].effect[0]) char.triggerscript[0].effect[0] = { type: 'triggercode', code: '' }
+            char.triggerscript[0].effect[0].code = code || ''
+            scheduleDatabaseSave()
+            res.json({ success: true })
+        })
+    } catch (e) {
+        res.status(500).json({ error: e.message })
+    }
+})
+
+app.post('/api/mcp/modules/lua/get', mcpAuthMiddleware, async (req, res) => {
+    try {
+        const db = await loadDatabase()
+        const { id } = req.body || {}
+        const mod = findModule((db.modules || []).filter(m => !m.mcp), id)
+        if (!mod) return res.status(404).json({ error: 'Module not found' })
+        const code = mod.trigger?.[0]?.effect?.[0]?.code || ''
+        res.json({ code })
+    } catch (e) {
+        res.status(500).json({ error: e.message })
+    }
+})
+
+app.post('/api/mcp/modules/lua/set', mcpAuthMiddleware, async (req, res) => {
+    try {
+        await queueStorageOperation(async () => {
+            const db = await loadDatabase()
+            const { id, code } = req.body || {}
+            const mod = findModule((db.modules || []).filter(m => !m.mcp), id)
+            if (!mod) return res.status(404).json({ error: 'Module not found' })
+            if (!mod.trigger) mod.trigger = [{ type: 'start', effect: [{ type: 'triggercode', code: '' }] }]
+            if (!mod.trigger[0]) mod.trigger[0] = { type: 'start', effect: [{ type: 'triggercode', code: '' }] }
+            if (!mod.trigger[0].effect) mod.trigger[0].effect = [{ type: 'triggercode', code: '' }]
+            if (!mod.trigger[0].effect[0]) mod.trigger[0].effect[0] = { type: 'triggercode', code: '' }
+            mod.trigger[0].effect[0].code = code || ''
+            scheduleDatabaseSave()
+            res.json({ success: true })
+        })
+    } catch (e) {
+        res.status(500).json({ error: e.message })
+    }
+})
+
+// ─── End RisuAI Access MCP API ──────────────────────────────────────────────
 const COMPRESS_IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'bmp']);
 
 app.post('/api/inlays/compress', sessionAuthMiddleware, async (req, res) => {

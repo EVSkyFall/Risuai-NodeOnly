@@ -342,7 +342,10 @@ export async function requestChatDataMain(arg:requestDataArgument, model:ModelMo
     }
 
     targ.formated = safeStructuredClone(arg.formated)
-    targ.maxTokens = arg.maxTokens ??db.maxResponse
+    const isSubModel = model !== 'model'
+    const resolvedMaxTokens = arg.maxTokens ?? (isSubModel && db.subMaxResponse > 0 ? db.subMaxResponse : db.maxResponse)
+    targ.maxTokens = resolvedMaxTokens
+    console.warn(`[requestChatData] mode=${model} isSub=${isSubModel} argMax=${arg.maxTokens} subMax=${db.subMaxResponse} mainMax=${db.maxResponse} → resolved=${resolvedMaxTokens}`)
     targ.temperature = arg.temperature ?? (db.temperature / 100)
     targ.bias = arg.bias
     targ.currentChar = arg.currentChar
@@ -368,6 +371,22 @@ export async function requestChatDataMain(arg:requestDataArgument, model:ModelMo
     const format = targ.modelInfo.format
 
     targ.formated = reformater(targ.formated, targ.modelInfo)
+
+    // Sub-model context truncation: trim oldest messages if subMaxContext is set
+    if (isSubModel && db.subMaxContext > 0) {
+        let totalTokens = 0
+        // Estimate tokens from formated messages (rough: chars / 3 for mixed content)
+        for (const msg of targ.formated) {
+            totalTokens += Math.ceil((typeof msg.content === 'string' ? msg.content.length : JSON.stringify(msg.content).length) / 3)
+        }
+        // Remove oldest non-system messages until within budget
+        while (totalTokens > db.subMaxContext && targ.formated.length > 1) {
+            const idx = targ.formated.findIndex(m => m.role !== 'system')
+            if (idx === -1) break
+            const removed = targ.formated.splice(idx, 1)[0]
+            totalTokens -= Math.ceil((typeof removed.content === 'string' ? removed.content.length : JSON.stringify(removed.content).length) / 3)
+        }
+    }
 
     switch(format){
         case LLMFormat.OpenAICompatible:

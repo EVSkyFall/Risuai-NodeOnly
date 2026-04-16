@@ -28,6 +28,37 @@ import { decodeProxyJobWsChunk, formatProxyStreamErrorMessage, parseProxyJobWsEv
 
 export const forageStorage = new AutoStorage()
 
+// ─── Copilot Turn ID ─────────────────────────────────────────────────────────
+// Set by sendChat() at the start of each user turn.
+// All fetchNative calls within the same turn will include this in X-Risu-Turn-Id.
+let _currentTurnId: string | null = null
+export function setCurrentTurnId(id: string | null) { _currentTurnId = id }
+export function getCurrentTurnId(): string | null { return _currentTurnId }
+
+// ─── Plugin Turn ID (auto-generated for out-of-sendChat LLM calls) ──────────
+// When plugins (e.g. Libra) call nativeFetch outside sendChat(), getCurrentTurnId()
+// is null. This provides an auto-generated turnId so those calls still get bundled.
+// Expires after 15 minutes of inactivity.
+let _pluginTurnId: string | null = null
+let _pluginTurnTimer: ReturnType<typeof setTimeout> | null = null
+const PLUGIN_TURN_TTL_MS = 15 * 60_000
+
+function getOrCreatePluginTurnId(): string {
+    if (!_pluginTurnId) {
+        _pluginTurnId = crypto.randomUUID()
+    }
+    if (_pluginTurnTimer) clearTimeout(_pluginTurnTimer)
+    _pluginTurnTimer = setTimeout(() => {
+        _pluginTurnId = null
+        _pluginTurnTimer = null
+    }, PLUGIN_TURN_TTL_MS)
+    return _pluginTurnId
+}
+
+export function getEffectiveTurnId(): string | null {
+    return _currentTurnId || getOrCreatePluginTurnId()
+}
+
 interface fetchLog {
     body: string
     header: string
@@ -1129,12 +1160,14 @@ async function fetchWithProxy(url: string, arg: GlobalFetchArgs): Promise<Global
     try {
         const furl = `/proxy2`;
         arg.headers["Content-Type"] ??= arg.body instanceof URLSearchParams ? "application/x-www-form-urlencoded" : "application/json";
+        const turnId = getEffectiveTurnId()
         const headers = {
             "risu-header": encodeURIComponent(JSON.stringify(arg.headers)),
             "risu-url": encodeURIComponent(url),
             "Content-Type": arg.body instanceof URLSearchParams ? "application/x-www-form-urlencoded" : "application/json",
             ...(arg.useRisuToken && { "x-risu-tk": "use" }),
             ...(DBState?.db?.requestLocation && { "risu-location": DBState.db.requestLocation }),
+            ...(turnId ? { "x-risu-turn-id": turnId } : {}),
         };
 
         // Add risu-auth header for Node.js server
@@ -1811,6 +1844,14 @@ export async function fetchNative(url: string, arg: {
             })
         }
 
+        // Copilot URLs: skip direct fetch (CORS will fail + wastes quota), go straight to proxy2
+        if (url.includes('githubcopilot.com')) {
+            return await fetchViaProxy2(url, headers, realBody, {
+                ...arg,
+                signal: requestSignal
+            })
+        }
+
         // Try direct fetch first (upstream behavior), fall back to proxy on CORS/network error
         try {
             return await fetch(url, {
@@ -1839,6 +1880,7 @@ async function fetchViaProxy2(
     realBody: Uint8Array | undefined,
     arg: { method?: string, signal?: AbortSignal, useRisuTk?: boolean, requestTimeoutMs?: number }
 ): Promise<Response> {
+    const turnId = getEffectiveTurnId()
     const proxyHeaders: Record<string, string> = {
         "risu-header": encodeURIComponent(JSON.stringify(headers)),
         "risu-url": encodeURIComponent(url),
@@ -1846,6 +1888,7 @@ async function fetchViaProxy2(
         ...(arg.useRisuTk ? { "x-risu-tk": "use" } : {}),
         ...(arg.requestTimeoutMs && { "risu-timeout-ms": Math.max(1, Math.floor(arg.requestTimeoutMs)).toString() }),
         ...(DBState?.db?.requestLocation ? { "risu-location": DBState.db.requestLocation } : {}),
+        ...(turnId ? { "x-risu-turn-id": turnId } : {}),
     }
 
     if (realBody) {

@@ -417,6 +417,13 @@ export class HypaProcessorV2<TMetadata> {
         throw new Error('Voyage Context 3 requires a Voyage API Key');
       }
 
+      // voyage-context-3 hard limit: 32k tokens per example, no server-side truncation.
+      // Truncate client-side with conservative ~1.5 chars/token assumption (Korean/mixed).
+      const VOYAGE_MAX_CHARS = 42000;
+      const truncatedContents = contents.map(s =>
+        s.length > VOYAGE_MAX_CHARS ? s.slice(0, VOYAGE_MAX_CHARS) : s
+      );
+
       const voyageResponse = await globalFetch(
         "https://api.voyageai.com/v1/contextualizedembeddings",
         {
@@ -425,7 +432,7 @@ export class HypaProcessorV2<TMetadata> {
             "Content-Type": "application/json"
           },
           body: {
-            "inputs": contents.map(s => [s]),
+            "inputs": truncatedContents.map(s => [s]),
             "model": "voyage-context-3",
             "input_type": inputType
           }

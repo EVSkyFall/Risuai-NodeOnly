@@ -1,5 +1,5 @@
 import { v4 } from "uuid"
-import { fetchNative, openURL } from "../../globalApi.svelte"
+import { fetchNative, getEffectiveTurnId, openURL } from "../../globalApi.svelte"
 import { alertInput } from "../../alert";
 
 export type MCPPrompt = {
@@ -297,6 +297,13 @@ export class MCPClient{
                 headers['Authorization'] = `Bearer ${this.accessToken}`
             }
 
+            // Propagate current turn ID so MCP servers can bundle their Copilot sub-calls
+            // into the same quota turn as the main model call.
+            const turnId = getEffectiveTurnId()
+            if(turnId){
+                headers['X-Risu-Turn-Id'] = turnId
+            }
+
             const abortController = new AbortController()
             const requestParams = {
                 body: JSON.stringify(body),
@@ -517,6 +524,11 @@ export class MCPClient{
 
             if(this.accessToken){
                 headers['Authorization'] = `Bearer ${this.accessToken}`
+            }
+
+            const sseTurnId = getEffectiveTurnId()
+            if(sseTurnId){
+                headers['X-Risu-Turn-Id'] = sseTurnId
             }
 
             const connection = await fetchNative(this.url, {

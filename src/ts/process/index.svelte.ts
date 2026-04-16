@@ -26,7 +26,7 @@ import { runLuaEditTrigger } from "./scriptings";
 import { getModelInfo, LLMFlags } from "../model/modellist";
 import { hypaMemoryV3 } from "./memory/hypav3";
 import { getModuleAssets, getModuleToggles } from "./modules";
-import { readImage } from "../globalApi.svelte";
+import { readImage, setCurrentTurnId } from "../globalApi.svelte";
 
 export interface OpenAIChat{
     role: 'system'|'user'|'assistant'|'function'
@@ -66,9 +66,13 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     usedContinueTokens?:number,
     preview?:boolean
     previewPrompt?:boolean
+    copilotTurnId?:string
 } = {}):Promise<boolean> {
 
     chatProcessStage.set(0)
+    // Set turn ID for Copilot quota bundling — all API calls within this sendChat share the same turn
+    const turnId = arg.copilotTurnId || v4()
+    setCurrentTurnId(turnId)
     const abortSignal = arg.signal ?? (new AbortController()).signal
     
     // NOTE: `throwError()` can be called before these are populated (e.g. HypaV3 early validation errors).
@@ -1332,6 +1336,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     generationInfo = {
         model: generationModel,
         generationId: generationId,
+        copilotTurnId: turnId,
         inputTokens: inputTokens,
         outputTokens: outputTokens,
         maxContext: maxContextTokens,
@@ -1410,6 +1415,9 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         DBState.db.characters[selectedChar].reloadKeys += 1
         let lastResponseChunk:{[key:string]:string} = {}
         let streamAborted:boolean = abortSignal.aborted
+        const SCRIPT_THROTTLE_MS = 150
+        let lastScriptProcessTime = 0
+        let pendingFinalProcess = false
         const abortReader = () => {
             streamAborted = true
             void reader.cancel().catch(() => {})
@@ -1438,10 +1446,18 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     if(DBState.db.removeIncompleteResponse){
                         result = trimUntilPunctuation(result)
                     }
-                    let result2 = await processScriptFull(nowChatroom, reformatContent(prefix + result), 'editoutput', msgIndex)
-                    DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = result2.data
-                    emoChanged = result2.emoChanged
-                    DBState.db.characters[selectedChar].reloadKeys += 1
+                    // Throttle editdisplay processing to reduce flickering (especially for Claude full-text streaming)
+                    const now = performance.now()
+                    if (now - lastScriptProcessTime >= SCRIPT_THROTTLE_MS) {
+                        let result2 = await processScriptFull(nowChatroom, reformatContent(prefix + result), 'editoutput', msgIndex)
+                        DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = result2.data
+                        emoChanged = result2.emoChanged
+                        DBState.db.characters[selectedChar].reloadKeys += 1
+                        lastScriptProcessTime = now
+                        pendingFinalProcess = true
+                    } else {
+                        pendingFinalProcess = true
+                    }
                 }
                 if(readed.done){
                     break
@@ -1450,6 +1466,12 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
         finally {
             abortSignal.removeEventListener('abort', abortReader)
+            // Process final pending chunk that was throttled
+            if (pendingFinalProcess && result) {
+                let result2 = await processScriptFull(nowChatroom, reformatContent(prefix + result), 'editoutput', msgIndex)
+                DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = result2.data
+                emoChanged = result2.emoChanged
+            }
             DBState.db.characters[selectedChar].chats[selectedChat].isStreaming = false
             DBState.db.characters[selectedChar].reloadKeys += 1
             void reader.cancel().catch(() => {})
@@ -1578,7 +1600,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             chatAdditonalTokens: arg.chatAdditonalTokens,
             continue: true,
             signal: abortSignal,
-            usedContinueTokens: resultTokens
+            usedContinueTokens: resultTokens,
+            copilotTurnId: turnId
         })
     }
 
@@ -1619,7 +1642,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         
         doingChat.set(false)
         return await sendChat(chatProcessIndex, {
-            signal: abortSignal
+            signal: abortSignal,
+            copilotTurnId: turnId
         })
     }
 
@@ -1877,6 +1901,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         DBState.db.characters[selectedChar].chats[selectedChat].message[lastMessageIndex].generationInfo = generationInfo
     }
 
+    setCurrentTurnId(null)
     return true
 }
 

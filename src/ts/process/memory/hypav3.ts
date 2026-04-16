@@ -1965,9 +1965,16 @@ class HypaProcesserEx extends HypaProcesser {
         if (groupsToEmbed.length > 0) {
             const batches = this.batchVoyageGroups(groupsToEmbed);
 
+            // voyage-context-3 has no server-side truncation; enforce char limit per chunk.
+            // 42000 chars ≈ 28k tokens at ~1.5 chars/token (Korean/mixed).
+            const VOYAGE_MAX_CHARS_PER_CHUNK = 42000;
             for (const batch of batches) {
                 const input = batch.map(group =>
-                    group.map(chunk => chunk.text)
+                    group.map(chunk =>
+                        chunk.text.length > VOYAGE_MAX_CHARS_PER_CHUNK
+                            ? chunk.text.slice(0, VOYAGE_MAX_CHARS_PER_CHUNK)
+                            : chunk.text
+                    )
                 );
 
                 const response = await globalFetch(
@@ -2025,11 +2032,59 @@ class HypaProcesserEx extends HypaProcesser {
     private batchVoyageGroups(groups: SummaryChunk[][]): SummaryChunk[][][] {
         const MAX_CHUNKS_PER_REQUEST = 16000;
         const MAX_INPUTS_PER_REQUEST = 1000;
+        // voyage-context-3 hard limit: 32k tokens per example.
+        // Conservative ~1.5 chars/token (Korean/mixed) with safety margin:
+        // 28k tokens * 1.5 chars = 42000 chars per group.
+        const MAX_CHARS_PER_GROUP = 42000;
+
+        // Step 1: split any oversized group into sub-groups by character budget.
+        // Each sub-group preserves chunk order and stays within the token limit.
+        const splitOversizedGroup = (group: SummaryChunk[]): SummaryChunk[][] => {
+            const subGroups: SummaryChunk[][] = [];
+            let current: SummaryChunk[] = [];
+            let currentChars = 0;
+
+            for (const chunk of group) {
+                const chunkLen = chunk.text.length;
+                // Single chunk already exceeds limit — emit alone (will still fail,
+                // but at least other groups in the batch won't be affected).
+                if (chunkLen > MAX_CHARS_PER_GROUP) {
+                    if (current.length > 0) {
+                        subGroups.push(current);
+                        current = [];
+                        currentChars = 0;
+                    }
+                    subGroups.push([chunk]);
+                    continue;
+                }
+                if (currentChars + chunkLen > MAX_CHARS_PER_GROUP && current.length > 0) {
+                    subGroups.push(current);
+                    current = [];
+                    currentChars = 0;
+                }
+                current.push(chunk);
+                currentChars += chunkLen;
+            }
+            if (current.length > 0) subGroups.push(current);
+            return subGroups;
+        };
+
+        const normalizedGroups: SummaryChunk[][] = [];
+        for (const group of groups) {
+            const totalChars = group.reduce((sum, c) => sum + c.text.length, 0);
+            if (totalChars > MAX_CHARS_PER_GROUP) {
+                normalizedGroups.push(...splitOversizedGroup(group));
+            } else {
+                normalizedGroups.push(group);
+            }
+        }
+
+        // Step 2: pack normalized groups into batches.
         const batches: SummaryChunk[][][] = [];
         let currentBatch: SummaryChunk[][] = [];
         let currentChunkCount = 0;
 
-        for (const group of groups) {
+        for (const group of normalizedGroups) {
             if (
                 currentBatch.length > 0 &&
                 (currentBatch.length + 1 > MAX_INPUTS_PER_REQUEST ||
