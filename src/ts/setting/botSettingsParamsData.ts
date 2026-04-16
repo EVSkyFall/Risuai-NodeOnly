@@ -297,6 +297,7 @@ export const allBasicParameterItems: SettingItem[] = [
     modelSpecificParameterItems.find(i => i.id === 'params.thinkingType')!,
     modelSpecificParameterItems.find(i => i.id === 'params.thinkingTokens')!,
     modelSpecificParameterItems.find(i => i.id === 'params.adaptiveThinkingEffort')!,
+    modelSpecificParameterItems.find(i => i.id === 'params.claudeAdaptiveDisplaySummarized')!,
     ...samplingParameterItems, // temperature
     modelSpecificParameterItems.find(i => i.id === 'params.topK')!,
     modelSpecificParameterItems.find(i => i.id === 'params.minP')!,
