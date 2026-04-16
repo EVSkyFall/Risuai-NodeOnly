@@ -516,6 +516,18 @@ export const LLMModels: LLMModel[] = [
         'google/gemma-2-27b-it',
         'google/gemma-2-9b-it'
     ]),
+    // NanoGPT — single provider entry; model list fetched on demand via getNanoGPTModels()
+    {
+        id: 'nanogpt',
+        name: 'NanoGPT',
+        fullName: 'NanoGPT',
+        provider: LLMProvider.NanoGPT,
+        format: LLMFormat.NanoGPT,
+        flags: [LLMFlags.hasFullSystemPrompt, LLMFlags.hasImageInput, LLMFlags.hasStreaming, LLMFlags.OAICompletionTokens],
+        parameters: OpenAIParameters,
+        tokenizer: LLMTokenizer.Unknown,
+        recommended: true,
+    },
     // Plugin and Custom API
     {
         id: 'custom',
@@ -680,7 +692,6 @@ export async function registerModelDynamic(){
         console.error('Error fetching Anthropic models', error)
     }
 
-
 }
 
 //testing purpose only, not used in production
@@ -804,7 +815,7 @@ export function getModelList<T extends boolean>(arg:{
     if(arg.groupedByProvider){
         let group: GetModelListGroup[] = []
         for(let model of models){
-            if(model.provider === LLMProvider.AsIs){
+            if(model.provider === LLMProvider.AsIs || model.provider === LLMProvider.NanoGPT){
                 group.push({
                     providerName: '@as-is',
                     models: [model]

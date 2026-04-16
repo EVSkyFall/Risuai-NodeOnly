@@ -1,5 +1,5 @@
 import { type memoryVector, HypaProcesser, similarity, contextHash, getPersistedHypaVector, setPersistedHypaVector } from "./hypamemory";
-import { globalFetch } from "src/ts/globalApi.svelte";
+import { isContextModel, getContextProvider } from "./contextualEmbedding";
 import { TaskRateLimiter } from "./taskRateLimiter";
 import {
     type EmbeddingText,
@@ -1720,11 +1720,22 @@ export async function summarize(oaiMessages: OpenAIChat[], isResummarize: boolea
 
         // Remove thoughts content for API
         const thoughtsRegex = /<Thoughts>[\s\S]*?<\/Thoughts>/g;
+        const result = response.result.replace(thoughtsRegex, "").trim();
 
-        return response.result.replace(thoughtsRegex, "").trim();
+        if (result.length === 0) {
+            throw new Error("Empty summary after removing thoughts content");
+        }
+
+        return result;
     }
 
-    // Local
+    // Local — ensure system message comes first for WebLLM models
+    const firstSystemIndex = formated.findIndex(m => m.role === 'system');
+    if (firstSystemIndex > 0) {
+        const [system] = formated.splice(firstSystemIndex, 1);
+        formated.unshift(system);
+    }
+
     const content = await chatCompletion(formated, settings.summarizationModel, {
         max_tokens: 8192,
         temperature: 0,
@@ -1739,8 +1750,13 @@ export async function summarize(oaiMessages: OpenAIChat[], isResummarize: boolea
 
     // Remove think content
     const thinkRegex = /<think>[\s\S]*?<\/think>/g;
+    const result = content.replace(thinkRegex, "").trim();
 
-    return content.replace(thinkRegex, "").trim();
+    if (result.length === 0) {
+        throw new Error("Empty summary after removing think content");
+    }
+
+    return result;
 }
 
 export function getCurrentHypaV3Preset(): HypaV3Preset {
@@ -1895,8 +1911,8 @@ class HypaProcesserEx extends HypaProcesser {
     summaryChunkVectors: SummaryChunkVector[] = [];
 
     async addSummaryChunks(chunks: SummaryChunk[]): Promise<void> {
-        if (this.model === 'voyageContext3') {
-            await this.addSummaryChunksVoyage(chunks);
+        if (isContextModel(this.model)) {
+            await this.addSummaryChunksContextual(chunks);
             return;
         }
 
@@ -1917,16 +1933,11 @@ class HypaProcesserEx extends HypaProcesser {
         this.summaryChunkVectors.push(...newSummaryChunkVectors);
     }
 
-    private async addSummaryChunksVoyage(chunks: SummaryChunk[]): Promise<void> {
-        const db = getDatabase();
-        const apiKey = db.voyageApiKey?.trim();
-        if (!apiKey) {
-            throw new Error('Voyage Context 3 requires a Voyage API Key');
-        }
+    private async addSummaryChunksContextual(chunks: SummaryChunk[]): Promise<void> {
+        const provider = getContextProvider(this.model);
 
         const cacheKeyFor = (text: string, groupTexts: string[]) => {
-            const ctx = groupTexts.length > 1 ? `|ctx:${contextHash(groupTexts)}` : '';
-            return `${text}|voyageContext3${ctx}`;
+            return `${text}${provider.getCacheKeySuffix(groupTexts)}`;
         };
 
         const summaryGroups = new Map<Summary, SummaryChunk[]>();
@@ -1963,55 +1974,27 @@ class HypaProcesserEx extends HypaProcesser {
         }
 
         if (groupsToEmbed.length > 0) {
-            const batches = this.batchVoyageGroups(groupsToEmbed);
+            const groups = groupsToEmbed.map(group =>
+                group.map(chunk => chunk.text)
+            );
 
-            // voyage-context-3 has no server-side truncation; enforce char limit per chunk.
-            // 42000 chars ≈ 28k tokens at ~1.5 chars/token (Korean/mixed).
-            const VOYAGE_MAX_CHARS_PER_CHUNK = 42000;
-            for (const batch of batches) {
-                const input = batch.map(group =>
-                    group.map(chunk =>
-                        chunk.text.length > VOYAGE_MAX_CHARS_PER_CHUNK
-                            ? chunk.text.slice(0, VOYAGE_MAX_CHARS_PER_CHUNK)
-                            : chunk.text
-                    )
-                );
+            const results = await provider.embedDocumentGroups(groups);
 
-                const response = await globalFetch(
-                    "https://api.voyageai.com/v1/contextualizedembeddings",
-                    {
-                        headers: {
-                            "Authorization": "Bearer " + apiKey,
-                            "Content-Type": "application/json"
-                        },
-                        body: {
-                            "model": "voyage-context-3",
-                            "inputs": input,
-                            "input_type": "document"
-                        }
-                    }
-                );
+            for (let i = 0; i < groupsToEmbed.length; i++) {
+                const group = groupsToEmbed[i];
+                const groupTexts = group.map(c => c.text);
+                const embeddings = results[i];
 
-                if (!response.ok || !response.data.data) {
-                    throw new Error(JSON.stringify(response.data));
-                }
+                for (let j = 0; j < group.length; j++) {
+                    const chunk = group[j];
+                    const embedding = embeddings[j];
+                    const vector: memoryVector = {
+                        content: chunk.text,
+                        embedding
+                    };
 
-                for (let i = 0; i < batch.length; i++) {
-                    const group = batch[i];
-                    const groupTexts = group.map(c => c.text);
-                    const groupEmbeddings = response.data.data[i].data;
-
-                    for (let j = 0; j < group.length; j++) {
-                        const chunk = group[j];
-                        const embedding = groupEmbeddings[j].embedding;
-                        const vector: memoryVector = {
-                            content: chunk.text,
-                            embedding
-                        };
-
-                        await setPersistedHypaVector(cacheKeyFor(chunk.text, groupTexts), vector);
-                        cachedVectors.set(chunk.text, vector);
-                    }
+                    await setPersistedHypaVector(cacheKeyFor(chunk.text, groupTexts), vector);
+                    cachedVectors.set(chunk.text, vector);
                 }
             }
         }
@@ -2027,82 +2010,6 @@ class HypaProcesserEx extends HypaProcesser {
             this.vectors.push(vector);
             this.summaryChunkVectors.push({ chunk, vector });
         }
-    }
-
-    private batchVoyageGroups(groups: SummaryChunk[][]): SummaryChunk[][][] {
-        const MAX_CHUNKS_PER_REQUEST = 16000;
-        const MAX_INPUTS_PER_REQUEST = 1000;
-        // voyage-context-3 hard limit: 32k tokens per example.
-        // Conservative ~1.5 chars/token (Korean/mixed) with safety margin:
-        // 28k tokens * 1.5 chars = 42000 chars per group.
-        const MAX_CHARS_PER_GROUP = 42000;
-
-        // Step 1: split any oversized group into sub-groups by character budget.
-        // Each sub-group preserves chunk order and stays within the token limit.
-        const splitOversizedGroup = (group: SummaryChunk[]): SummaryChunk[][] => {
-            const subGroups: SummaryChunk[][] = [];
-            let current: SummaryChunk[] = [];
-            let currentChars = 0;
-
-            for (const chunk of group) {
-                const chunkLen = chunk.text.length;
-                // Single chunk already exceeds limit — emit alone (will still fail,
-                // but at least other groups in the batch won't be affected).
-                if (chunkLen > MAX_CHARS_PER_GROUP) {
-                    if (current.length > 0) {
-                        subGroups.push(current);
-                        current = [];
-                        currentChars = 0;
-                    }
-                    subGroups.push([chunk]);
-                    continue;
-                }
-                if (currentChars + chunkLen > MAX_CHARS_PER_GROUP && current.length > 0) {
-                    subGroups.push(current);
-                    current = [];
-                    currentChars = 0;
-                }
-                current.push(chunk);
-                currentChars += chunkLen;
-            }
-            if (current.length > 0) subGroups.push(current);
-            return subGroups;
-        };
-
-        const normalizedGroups: SummaryChunk[][] = [];
-        for (const group of groups) {
-            const totalChars = group.reduce((sum, c) => sum + c.text.length, 0);
-            if (totalChars > MAX_CHARS_PER_GROUP) {
-                normalizedGroups.push(...splitOversizedGroup(group));
-            } else {
-                normalizedGroups.push(group);
-            }
-        }
-
-        // Step 2: pack normalized groups into batches.
-        const batches: SummaryChunk[][][] = [];
-        let currentBatch: SummaryChunk[][] = [];
-        let currentChunkCount = 0;
-
-        for (const group of normalizedGroups) {
-            if (
-                currentBatch.length > 0 &&
-                (currentBatch.length + 1 > MAX_INPUTS_PER_REQUEST ||
-                 currentChunkCount + group.length > MAX_CHUNKS_PER_REQUEST)
-            ) {
-                batches.push(currentBatch);
-                currentBatch = [];
-                currentChunkCount = 0;
-            }
-            currentBatch.push(group);
-            currentChunkCount += group.length;
-        }
-
-        if (currentBatch.length > 0) {
-            batches.push(currentBatch);
-        }
-
-        return batches;
     }
 
     async similaritySearchScoredEx(
