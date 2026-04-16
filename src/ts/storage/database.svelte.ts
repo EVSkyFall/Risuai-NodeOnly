@@ -1270,6 +1270,7 @@ export interface Database{
     }[]
     igpPrompt:string
     useTokenizerCaching:boolean
+    claudeAdaptiveDisplaySummarized:boolean
     claudeTokenizerAPIEnabled:boolean
     claudeTokenizerAPIKey:string
     claudeTokenizerAPIModel:string

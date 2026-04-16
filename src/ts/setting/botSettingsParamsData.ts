@@ -183,6 +183,17 @@ export const modelSpecificParameterItems: SettingItem[] = [
         keywords: ['adaptive', 'thinking', 'effort'],
     },
     {
+        id: 'params.claudeAdaptiveDisplaySummarized',
+        type: 'check',
+        fallbackLabel: 'Show thinking content (summarized)',
+        bindKey: 'claudeAdaptiveDisplaySummarized',
+        condition: (ctx) =>
+            (ctx.modelInfo.flags.includes(LLMFlags.claudeAdaptiveThinking) ||
+                (ctx.modelInfo.format === LLMFormat.Anthropic && ctx.modelInfo.parameters.includes('thinking_tokens'))) &&
+            ctx.db.thinkingType === 'adaptive',
+        keywords: ['adaptive', 'thinking', 'display', 'summarized', 'show', 'reasoning'],
+    },
+    {
         id: 'params.topK',
         type: 'slider',
         fallbackLabel: 'Top K',

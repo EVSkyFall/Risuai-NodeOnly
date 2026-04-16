@@ -371,22 +371,29 @@ export async function requestClaude(arg:RequestDataArgumentExtended):Promise<req
         delete body.output_config
     }
     else if(adaptiveOnly){
-        // Adaptive-only models: always send adaptive (or omit if explicitly off and disabled support exists).
+        // Adaptive-only models (Opus 4.7+): always send adaptive (or omit if explicitly off).
+        // Sampling params return 400 on any non-default value — omit entirely (per Anthropic docs).
         delete body.thinking
+        delete body.temperature
+        delete body.top_k
+        delete body.top_p
         if(db.thinkingType === 'off'){
             // Opus 4.7 supports `thinking: {type: "disabled"}` via omitting the field; just don't send adaptive.
             delete body.output_config
         } else {
-            body.thinking = { type: 'adaptive' }
+            const thinkingObj: any = { type: 'adaptive' }
+            // Opus 4.7 default is `display: "omitted"` (empty thinking field).
+            // Opt back into summarized text when user toggles the setting on.
+            if(db.claudeAdaptiveDisplaySummarized) thinkingObj.display = 'summarized'
+            body.thinking = thinkingObj
             body.output_config = { effort: db.adaptiveThinkingEffort ?? 'high' }
-            body.temperature = 1
-            delete body.top_k
-            delete body.top_p
         }
     }
     else if(db.thinkingType === 'adaptive' && adaptiveCapable){
         delete body.thinking
-        body.thinking = { type: 'adaptive' }
+        const thinkingObj: any = { type: 'adaptive' }
+        if(db.claudeAdaptiveDisplaySummarized) thinkingObj.display = 'summarized'
+        body.thinking = thinkingObj
         body.output_config = { effort: db.adaptiveThinkingEffort ?? 'high' }
         body.temperature = 1
         delete body.top_k
