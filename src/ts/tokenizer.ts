@@ -5,7 +5,7 @@ import type { MultiModal, OpenAIChat } from "./process/index.svelte";
 import { supportsInlayImage } from "./process/files/inlays";
 import { risuChatParser } from "./parser/parser.svelte";
 import { tokenizeGGUFModel } from "./process/models/local";
-import { globalFetch } from "./globalApi.svelte";
+import { globalFetch, fetchViaProxy2 } from "./globalApi.svelte";
 import { getModelInfo, LLMTokenizer, type LLMModel } from "./model/modellist";
 import { pluginV2 } from "./plugins/plugins.svelte";
 import type { GemmaTokenizer } from "@huggingface/transformers";
@@ -151,18 +151,21 @@ async function callCountTokensAPI(text: string, db: any): Promise<number | null>
 
     inflightCount++
     try {
-        const resp = await fetch('https://api.anthropic.com/v1/messages/count_tokens', {
-            method: 'POST',
-            headers: {
+        // Route through proxy2 — browser-direct fetch to api.anthropic.com fails CORS preflight.
+        const bodyBytes = new TextEncoder().encode(JSON.stringify({
+            model,
+            messages: [{ role: 'user', content: text }],
+        }))
+        const resp = await fetchViaProxy2(
+            'https://api.anthropic.com/v1/messages/count_tokens',
+            {
                 'x-api-key': key,
                 'anthropic-version': '2023-06-01',
                 'content-type': 'application/json',
             },
-            body: JSON.stringify({
-                model,
-                messages: [{ role: 'user', content: text }],
-            }),
-        })
+            bodyBytes,
+            { method: 'POST' }
+        )
         if (resp.status === 429) {
             const retryAfter = parseInt(resp.headers.get('retry-after') || '60', 10) || 60
             rateLimitedUntil = Date.now() + retryAfter * 1000

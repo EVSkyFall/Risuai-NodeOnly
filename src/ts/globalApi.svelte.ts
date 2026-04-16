@@ -1874,7 +1874,7 @@ export async function fetchNative(url: string, arg: {
 
 const defaultProxyJobHeartbeatSec = 15
 
-async function fetchViaProxy2(
+export async function fetchViaProxy2(
     url: string,
     headers: Record<string, string>,
     realBody: Uint8Array | undefined,
