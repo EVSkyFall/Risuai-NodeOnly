@@ -1230,9 +1230,11 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
                 }
 
                 // Handle tool_use in streaming: execute tools and send results back
-                // Treat both 'tool_use' (legacy) and 'pause_turn' (advanced-tool-use beta) as
-                // tool execution signals — Opus 4.7+ via Vertex/Copilot returns pause_turn.
-                if((streamStopReason === 'tool_use' || streamStopReason === 'pause_turn') && streamToolUseBlocks.length > 0){
+                console.warn(`%c[Stream End]`, 'color: #aaa', `stop_reason=${streamStopReason} | toolUseBlocks=${streamToolUseBlocks.length} | textLen=${text.length}`)
+                // Whenever the model produced tool_use blocks, run them and continue —
+                // regardless of stop_reason. Anthropic's signal varies (tool_use, pause_turn,
+                // sometimes end_turn via Vertex/Copilot proxies), so trust the content.
+                if(streamToolUseBlocks.length > 0){
                     const messages: Claude3ExtendedChat[] = body.messages
                     const filteredBlocks = streamContentBlocks.filter(b =>
                         b.type === 'text' || b.type === 'tool_use' ||
