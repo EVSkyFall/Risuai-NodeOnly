@@ -1230,7 +1230,9 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
                 }
 
                 // Handle tool_use in streaming: execute tools and send results back
-                if(streamStopReason === 'tool_use' && streamToolUseBlocks.length > 0){
+                // Treat both 'tool_use' (legacy) and 'pause_turn' (advanced-tool-use beta) as
+                // tool execution signals — Opus 4.7+ via Vertex/Copilot returns pause_turn.
+                if((streamStopReason === 'tool_use' || streamStopReason === 'pause_turn') && streamToolUseBlocks.length > 0){
                     const messages: Claude3ExtendedChat[] = body.messages
                     const filteredBlocks = streamContentBlocks.filter(b =>
                         b.type === 'text' || b.type === 'tool_use' ||
