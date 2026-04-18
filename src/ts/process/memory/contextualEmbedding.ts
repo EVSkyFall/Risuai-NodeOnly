@@ -29,10 +29,11 @@ const MAX_INPUTS_PER_REQUEST = 1000;
 // Per-chunk: Voyage allows ~32k tokens. 42000 chars stays safely under that.
 const VOYAGE_MAX_CHARS = 42000;
 // Per-batch (sum across all chunks in one request): Voyage hard cap is 120k tokens.
-// Use a conservative estimate of 3 chars/token (Korean/CJK heavy content can be denser)
-// and a 100k token budget to leave headroom for wrapper overhead.
-const VOYAGE_MAX_BATCH_TOKENS_EST = 100_000;
-const CHARS_PER_TOKEN_EST = 3;
+// Empirically observed: chars/3 estimate undercounted Korean content by ~1.4x
+// (100k estimated → 141k actual). Use chars/2 (CJK-realistic) and an 80k budget
+// for safety margin against tokenizer variance.
+const VOYAGE_MAX_BATCH_TOKENS_EST = 80_000;
+const CHARS_PER_TOKEN_EST = 2;
 
 function truncateForVoyage(text: string): string {
     return text.length > VOYAGE_MAX_CHARS ? text.slice(0, VOYAGE_MAX_CHARS) : text;
@@ -96,25 +97,38 @@ class VoyageContext3Provider implements ContextualEmbeddingProvider {
 
   async embedQueries(queries: string[]): Promise<VectorArray[]> {
     const apiKey = this.getApiKey();
-    const response = await globalFetch(VOYAGE_API_URL, {
-      headers: {
-        "Authorization": "Bearer " + apiKey,
-        "Content-Type": "application/json"
-      },
-      body: {
-        "inputs": queries.map(s => [truncateForVoyage(s)]),
-        "model": VOYAGE_MODEL,
-        "input_type": "query"
-      }
-    });
+    const truncated = queries.map(truncateForVoyage);
+    // Each query is its own one-element group for the API; reuse the
+    // document-batching helper to enforce the 120k token-per-batch cap.
+    const queryGroups = truncated.map(t => [t]);
+    const batches = this.batchGroups(queryGroups);
+    const out: VectorArray[] = new Array(truncated.length);
 
-    if (!response.ok || !response.data.data) {
-      throw new Error(JSON.stringify(response.data));
+    let offset = 0;
+    for (const batch of batches) {
+      const response = await globalFetch(VOYAGE_API_URL, {
+        headers: {
+          "Authorization": "Bearer " + apiKey,
+          "Content-Type": "application/json"
+        },
+        body: {
+          "inputs": batch,
+          "model": VOYAGE_MODEL,
+          "input_type": "query"
+        }
+      });
+
+      if (!response.ok || !response.data.data) {
+        throw new Error(JSON.stringify(response.data));
+      }
+
+      for (let i = 0; i < batch.length; i++) {
+        out[offset + i] = response.data.data[i].data[0].embedding;
+      }
+      offset += batch.length;
     }
 
-    return response.data.data.map(
-      (group: { data: { embedding: VectorArray }[] }) => group.data[0].embedding
-    );
+    return out;
   }
 
   getCacheKeySuffix(contextTexts?: string[]): string {
