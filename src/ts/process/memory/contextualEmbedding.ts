@@ -26,12 +26,22 @@ const VOYAGE_API_URL = "https://api.voyageai.com/v1/contextualizedembeddings";
 const VOYAGE_MODEL = "voyage-context-3";
 const MAX_CHUNKS_PER_REQUEST = 16000;
 const MAX_INPUTS_PER_REQUEST = 1000;
-// Voyage accepts up to ~32k tokens per chunk; 42000 chars is a safe truncation cap
-// that keeps most single-chunk entries under the limit without fragmenting them further.
+// Per-chunk: Voyage allows ~32k tokens. 42000 chars stays safely under that.
 const VOYAGE_MAX_CHARS = 42000;
+// Per-batch (sum across all chunks in one request): Voyage hard cap is 120k tokens.
+// Use a conservative estimate of 3 chars/token (Korean/CJK heavy content can be denser)
+// and a 100k token budget to leave headroom for wrapper overhead.
+const VOYAGE_MAX_BATCH_TOKENS_EST = 100_000;
+const CHARS_PER_TOKEN_EST = 3;
 
 function truncateForVoyage(text: string): string {
     return text.length > VOYAGE_MAX_CHARS ? text.slice(0, VOYAGE_MAX_CHARS) : text;
+}
+
+function estimateTokens(group: string[]): number {
+    let chars = 0;
+    for (const c of group) chars += c.length;
+    return Math.ceil(chars / CHARS_PER_TOKEN_EST);
 }
 
 class VoyageContext3Provider implements ContextualEmbeddingProvider {
@@ -118,19 +128,24 @@ class VoyageContext3Provider implements ContextualEmbeddingProvider {
     const batches: string[][][] = [];
     let currentBatch: string[][] = [];
     let currentChunkCount = 0;
+    let currentTokenEst = 0;
 
     for (const group of groups) {
+      const groupTokens = estimateTokens(group);
       if (
         currentBatch.length > 0 &&
         (currentBatch.length + 1 > MAX_INPUTS_PER_REQUEST ||
-         currentChunkCount + group.length > MAX_CHUNKS_PER_REQUEST)
+         currentChunkCount + group.length > MAX_CHUNKS_PER_REQUEST ||
+         currentTokenEst + groupTokens > VOYAGE_MAX_BATCH_TOKENS_EST)
       ) {
         batches.push(currentBatch);
         currentBatch = [];
         currentChunkCount = 0;
+        currentTokenEst = 0;
       }
       currentBatch.push(group);
       currentChunkCount += group.length;
+      currentTokenEst += groupTokens;
     }
 
     if (currentBatch.length > 0) {
