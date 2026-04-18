@@ -161,6 +161,9 @@ function formatBatchResult(result: any): string {
 /**
  * Walk all chats across all characters to find the message tagged with this
  * batchId, then replace its content with the result text and clear the tag.
+ * After replacement, runs the `output` trigger so on-output modules
+ * (Lightboard, regex post-processing, etc.) see the real response text
+ * instead of the placeholder they would have run against earlier.
  */
 async function applyResultToMessage(batchId: string, text: string): Promise<void> {
     const db = getDatabase()
@@ -177,6 +180,17 @@ async function applyResultToMessage(batchId: string, text: string): Promise<void
                 if (msg?.generationInfo?.batchId === batchId) {
                     msg.data = text
                     delete msg.generationInfo.batchId
+                    // Best-effort: run the on-output trigger pipeline against
+                    // the freshly-arrived content. Modules expecting current
+                    // active char/chat may behave unexpectedly if the user
+                    // switched away, but Lightboard / regex post-processing
+                    // generally works against the passed chat reference.
+                    try {
+                        const triggers = await import("src/ts/process/triggers")
+                        await triggers.runTrigger(char, 'output', { chat })
+                    } catch (e: any) {
+                        console.warn(`[ClaudeBatch] post-batch trigger failed for ${batchId}:`, e?.message || e)
+                    }
                     return
                 }
             }
