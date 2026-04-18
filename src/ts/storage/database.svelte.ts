@@ -1956,6 +1956,7 @@ export interface MessageGenerationInfo{
     model?: string
     generationId?: string
     copilotTurnId?: string
+    batchId?: string
     inputTokens?: number
     outputTokens?: number
     maxContext?: number

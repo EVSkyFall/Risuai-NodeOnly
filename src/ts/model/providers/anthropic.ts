@@ -2,7 +2,9 @@ import { LLMFlags, LLMFormat, LLMProvider, LLMTokenizer, ClaudeParameters, type 
 
 export const AnthropicModels: LLMModel[] = [
 
-    // Claude 4.7 Opus (adaptive-thinking only)
+    // Claude 4.7 Opus — UI mirrors 4.6 (same flags/params); the
+    // claudeAdaptiveThinkingOnly flag tells the request builder to coerce
+    // any "budget" thinkingType into adaptive at send time.
     {
         name: "Claude 4.7 Opus",
         id: 'claude-opus-4-7',
@@ -13,10 +15,11 @@ export const AnthropicModels: LLMModel[] = [
             LLMFlags.hasImageInput,
             LLMFlags.hasFirstSystemPrompt,
             LLMFlags.hasStreaming,
+            LLMFlags.claudeThinking,
             LLMFlags.claudeAdaptiveThinking,
             LLMFlags.claudeAdaptiveThinkingOnly
         ],
-        parameters: ClaudeParameters,
+        parameters: [...ClaudeParameters, 'thinking_tokens'],
         tokenizer: LLMTokenizer.Claude,
         recommended: true
     },

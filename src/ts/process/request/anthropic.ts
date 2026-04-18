@@ -12,6 +12,7 @@ import { extractJSON } from "../templates/jsonSchema"
 import { callTool, decodeToolCall, encodeToolCall } from "../mcp/mcp"
 import type { RequestDataArgumentExtended, requestDataResponse, StreamResponseChunk } from './request'
 import { applyParameters } from './shared'
+import { submitClaudeBatch } from './claudeBatchTracker'
 
 interface Claude3TextBlock {
     type: 'text',
@@ -631,182 +632,37 @@ export async function requestClaude(arg:RequestDataArgumentExtended):Promise<req
         if(body.stream !== undefined){
             delete body.stream
         }
-        const id = v4()
-        const resp = await fetchNative(replacerURL + '/batches', {
-            "body": JSON.stringify({
-                "requests": [{
-                    "custom_id": id,
-                    "params": body,
-                }]
-            }),
-            "method": "POST",
-            signal: arg.abortSignal,
-            headers: headers,
-            interceptor: 'anthropic_batching'
-        })
-
-        if(resp.status !== 200){
+        // Persistent batch flow: submit + tag the message via generationInfo.batchId,
+        // then return a placeholder. The global tracker (claudeBatchTracker) polls
+        // every 30s, survives tab closes, and applies the final result via direct
+        // DB mutation when the batch ends.
+        try {
+            const { batchId } = await submitClaudeBatch(replacerURL, body, headers, arg.abortSignal)
+            arg.additionalOutput ??= ''
+            const placeholder = `[배치 처리 중 — ID ${batchId.substring(0, 18)}\u2026 ⏳]\n` +
+                `[Anthropic Batches API 사용 중. 1시간 이내에 응답이 자동으로 갱신됩니다. 탭을 닫아도 결과는 저장됩니다.]`
+            // sendChat reads this after the response and writes it into the
+            // assistant message's generationInfo, so the tracker can locate the
+            // slot when the batch finally ends (could be hours later).
+            arg.additionalBatchId = batchId
             return {
-                type: 'fail',
-                result: await textifyReadableStream(resp.body)
-            }
-        }
-
-        const r = (await resp.json())
-
-        if(!r.id){
-            return {
-                type: 'fail',
-                result: 'No results URL returned from Claude batch request'
-            }
-        }
-
-        const statusUrl = replacerURL + `/batches/${r.id}`
-        const resultsUrl = replacerURL + `/batches/${r.id}/results`
-        const cancelUrl = replacerURL + `/batches/${r.id}/cancel`
-        const abortSignal = arg.abortSignal
-
-        // Streaming is used in batch API to apply successful response even after abortSignal is fired
-        // In order to do otherwise, `request.ts` and `index.svelte.ts` should be edited to bypass abort signal check
-        const stream = new ReadableStream<StreamResponseChunk>({
-            async start(controller){
-                const batchStartTime = Date.now()
-                const BATCH_TIMEOUT = 24 * 60 * 60 * 1000 + 600 * 1000 // 24 hours + 10 minutes
-                let cancelRequested = false
-
-                while(true){
-                    try {
-                        await sleep(3000)
-                        if(abortSignal?.aborted && !cancelRequested){
-                            cancelRequested = true
-                            try {
-                                await fetchNative(cancelUrl, {
-                                    "body": "{}",
-                                    "method": "POST",
-                                    "headers": headers,
-                                    "interceptor": 'anthropic_batching_cancel'
-                                })
-                            } catch(e) {
-                                // ignore cancel request errors
-                            }
-                        }
-                        if(Date.now() - batchStartTime > BATCH_TIMEOUT){
-                            controller.error(new Error('Claude batch request timed out after 24 hours'))
-                            return
-                        }
-
-                        const statusRes = await fetchNative(statusUrl, {
-                            "method": "GET",
-                            "headers": headers,
-                            "signal": cancelRequested ? undefined : abortSignal,
-                            "interceptor": 'anthropic_batching_status'
-                        })
-
-                        if(statusRes.status !== 200){
-                            controller.error(new Error(await textifyReadableStream(statusRes.body)))
-                            return
-                        }
-
-                        const statusData = await statusRes.json()
-
-                        if(statusData.processing_status !== 'ended'){
-                            continue
-                        }
-
-                        const batchRes = await fetchNative(resultsUrl, {
-                            "method": "GET",
-                            "headers": headers,
-                            "signal": cancelRequested ? undefined : abortSignal,
-                            "interceptor": 'anthropic_batching_results'
-                        })
-
-                        if(batchRes.status !== 200){
-                            controller.error(new Error(await textifyReadableStream(batchRes.body)))
-                            return
-                        }
-
-                        //since jsonl
-                        const batchTextData = (await batchRes.text()).split('\n').filter((v) => v.trim() !== ''). map((v) => {
-                            try {
-                                return JSON.parse(v)
-                            } catch (error) {
-                                return null
-                            }
-                        }).filter((v) => v !== null)
-                        
-                        for(const batchData of batchTextData){
-                            const type = batchData?.result?.type
-                            console.log('Claude batch result type:', type)
-                            if(batchData?.result?.type === 'succeeded'){
-                                const contents = batchData.result.message.content ?? []
-                                let resText = ''
-                                let thinking = false
-                                for(const content of contents){
-                                    if(content.type === 'text'){
-                                        if(thinking){
-                                            resText += "</Thoughts>\n\n"
-                                            thinking = false
-                                        }
-                                        resText += content.text
-                                    }
-                                    if(content.type === 'thinking'){
-                                        if(!thinking){
-                                            resText += "<Thoughts>\n"
-                                            thinking = true
-                                        }
-                                        resText += content.thinking ?? ''
-                                    }
-                                    if(content.type === 'redacted_thinking'){
-                                        if(!thinking){
-                                            resText += "<Thoughts>\n"
-                                            thinking = true
-                                        }
-                                        resText += '\n{{redacted_thinking}}\n'
-                                    }
-                                }
-
-                                if(thinking){
-                                    resText += "</Thoughts>\n\n"
-                                    thinking = false
-                                }
-
-                                controller.enqueue({ "0": resText })
-                                controller.close()
-                                return
-                            }
-                            if(batchData?.result?.type === 'errored'){
-                                const batchError = batchData.result.error
-
-                                const message = batchError?.error?.message ? 
-                                `${batchError.error.type}: ${batchError.error.message}` : 
-                                JSON.stringify(batchError)
-
-                                controller.error(new Error(message))
-                                return
-                            }
-                            if(batchData?.result?.type === 'canceled'){
-                                controller.close()
-                                return
-                            }
-                            if(batchData?.result?.type === 'expired'){
-                                controller.error(new Error('Claude batch request expired'))
-                                return
-                            }
-                        }
-                    } catch (error) {
-                        console.error('Error while waiting for Claude batch results:', error)
+                type: 'streaming',
+                result: new ReadableStream<StreamResponseChunk>({
+                    start(controller){
+                        controller.enqueue({ "0": placeholder })
+                        controller.close()
                     }
-                }
+                }),
             }
-        })
-
-        return {
-            type: 'streaming',
-            result: stream
+        } catch (e: any) {
+            return {
+                type: 'fail',
+                result: e?.message || 'Batch submission failed',
+            }
         }
     }
-    
-    
+
+
     if(db.claudeRetrivalCaching){
         registerClaudeObserver({
             url: replacerURL,

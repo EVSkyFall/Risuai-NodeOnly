@@ -665,12 +665,12 @@ export async function registerModelDynamic(){
                         LLMFlags.hasImageInput,
                         LLMFlags.hasFirstSystemPrompt,
                         LLMFlags.hasStreaming,
+                        LLMFlags.claudeThinking,
                         LLMFlags.claudeAdaptiveThinking
                     ]
                     if(isAdaptiveOnly){
+                        // UI mirrors 4.6 (same flags/params); request builder coerces budget→adaptive at send time
                         flags.push(LLMFlags.claudeAdaptiveThinkingOnly)
-                    } else {
-                        flags.push(LLMFlags.claudeThinking)
                     }
                     LLMModels.push({
                         name: model.display_name || model.id,
@@ -681,7 +681,7 @@ export async function registerModelDynamic(){
                         provider: LLMProvider.Anthropic,
                         format: LLMFormat.Anthropic,
                         flags,
-                        parameters: isAdaptiveOnly ? ClaudeParameters : [...ClaudeParameters, 'thinking_tokens'],
+                        parameters: [...ClaudeParameters, 'thinking_tokens'],
                         tokenizer: LLMTokenizer.Claude,
                         recommended: true
                     })

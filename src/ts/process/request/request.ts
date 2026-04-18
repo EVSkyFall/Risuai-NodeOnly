@@ -63,6 +63,9 @@ export interface RequestDataArgumentExtended extends requestDataArgument{
     key?:string
     additionalOutput?:string
     saveSignatures?:boolean
+    /** Set by anthropic.ts batch path; sendChat copies into generationInfo so the
+     *  background tracker can find this message slot when the batch completes. */
+    additionalBatchId?:string
 }
 
 export type requestDataResponse = {
@@ -81,6 +84,7 @@ export type requestDataResponse = {
         emotion?: string
     }
     model?: string
+    batchId?: string
 }|{
     type: "multiline",
     result: ['user'|'char',string][],
@@ -416,7 +420,15 @@ export async function requestChatDataMain(arg:requestDataArgument, model:ModelMo
         case LLMFormat.Anthropic:
         case LLMFormat.AnthropicLegacy:
         case LLMFormat.AWSBedrockClaude:
-            return requestClaude(targ)
+            {
+                const r = await requestClaude(targ)
+                // Surface batch metadata set by the Anthropic batch path so
+                // sendChat can tag the placeholder message with batchId.
+                if (r.type === 'streaming' && targ.additionalBatchId) {
+                    (r as any).batchId = targ.additionalBatchId
+                }
+                return r
+            }
         case LLMFormat.Horde:
             return requestHorde(targ)
         case LLMFormat.WebLLM:

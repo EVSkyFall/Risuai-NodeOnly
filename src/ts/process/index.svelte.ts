@@ -1374,6 +1374,11 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         generationInfo.model = getGenerationModelString(req.model)
         console.log(generationInfo.model, req.model)
     }
+    // Carry Claude batch id forward so the placeholder message can be tagged
+    // and the background tracker can update it when the batch finishes.
+    if(req.type === 'streaming' && (req as any).batchId){
+        generationInfo.batchId = (req as any).batchId
+    }
 
     if(arg.previewPrompt && req.type === 'success'){
         previewBody = req.result

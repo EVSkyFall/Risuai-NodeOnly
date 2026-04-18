@@ -58,6 +58,40 @@ function deterministicUUID(seed) {
 // Track the most recent active session per model for auto-bundling
 const recentModelSessions = new Map() // model → { key, turnId, lastUsed }
 
+// Persistent Copilot client identity. Copilot's /v1/messages quota bucket is
+// keyed partly by user-agent + machine-id; rotating per launch flags us as a
+// new unstable client and pushes us into the tighter Chat bucket. Persist so
+// the messages-proxy (Claude Code SDK) bucket stays sticky across restarts.
+const _copilotIdPath = path.join(process.cwd(), 'save', '__copilot_ids.json')
+let _copilotIds = null
+function getCopilotIds() {
+    if (_copilotIds) return _copilotIds
+    try {
+        if (existsSync(_copilotIdPath)) {
+            const parsed = JSON.parse(readFileSync(_copilotIdPath, 'utf-8'))
+            if (parsed?.machineId && parsed?.deviceId) {
+                _copilotIds = parsed
+                return _copilotIds
+            }
+        }
+    } catch {}
+    _copilotIds = {
+        machineId: nodeCrypto.randomUUID(),
+        deviceId: nodeCrypto.randomUUID(),
+    }
+    try { writeFileSync(_copilotIdPath, JSON.stringify(_copilotIds)) } catch {}
+    return _copilotIds
+}
+// Session id rotates per server boot (matches VSCode: new window = new session).
+const _copilotSessionId = nodeCrypto.randomUUID()
+
+// Header values identifying us to Copilot. These track recent VSCode + Copilot
+// Chat releases — rotate periodically as GitHub may tighten version checks.
+const COPILOT_EDITOR_VERSION = 'vscode/1.104.3'
+const COPILOT_PLUGIN_VERSION = 'copilot-chat/0.44.1'
+const COPILOT_CLAUDE_CODE_UA = 'vscode_claude_code/2.1.98 (external, sdk-ts, agent-sdk/0.2.98)'
+const COPILOT_API_VERSION = '2025-10-01'
+
 function applyCopilotTurnHeaders(header, targetUrl, turnId, requestBody) {
     if (!isCopilotURL(targetUrl)) return false
     let model = null
@@ -113,22 +147,44 @@ function applyCopilotTurnHeaders(header, targetUrl, turnId, requestBody) {
     }
 
     header['X-Agent-Task-Id'] = taskId
-    header['X-Request-Id'] = nodeCrypto.randomUUID()
     header['X-Interaction-Id'] = interactionId
     header['X-Initiator'] = isUser ? 'user' : 'agent'
-    header['OpenAI-Intent'] = 'conversation-panel'
-    if (!header['X-GitHub-Api-Version'] && !header['X-Github-Api-Version'] && !header['x-github-api-version']) {
-        header['X-GitHub-Api-Version'] = '2025-05-01'
+
+    const isMessagesEndpoint = targetUrl.includes('/v1/messages')
+    if (isMessagesEndpoint) {
+        // Route into Copilot's "Claude Code SDK" quota pool instead of the
+        // tighter Chat bucket. Distinct headers identify the caller shape.
+        const ids = getCopilotIds()
+        // Strip Chat-bucket markers that would override us downstream
+        delete header['Copilot-Integration-Id']
+        delete header['copilot-integration-id']
+        header['OpenAI-Intent'] = 'messages-proxy'
+        header['X-Interaction-Type'] = 'messages-proxy'
+        header['User-Agent'] = COPILOT_CLAUDE_CODE_UA
+        header['Editor-Version'] = COPILOT_EDITOR_VERSION
+        header['Editor-Plugin-Version'] = COPILOT_PLUGIN_VERSION
+        header['X-Request-Id'] = taskId // same as X-Agent-Task-Id — bundles tool round-trips as one task
+        header['Editor-Device-Id'] = ids.deviceId
+        header['VSCode-MachineId'] = ids.machineId
+        header['VSCode-SessionId'] = _copilotSessionId
+        if (!header['anthropic-beta']) {
+            // Drop context-management-2025-06-27 — some Copilot paths interpret it
+            // as unsupported and fall back to a degraded / Chat-bucket path.
+            header['anthropic-beta'] = 'interleaved-thinking-2025-05-14,advanced-tool-use-2025-11-20'
+        }
+    } else {
+        // Chat-completions / other Copilot endpoints keep the older header shape
+        header['X-Request-Id'] = nodeCrypto.randomUUID()
+        header['OpenAI-Intent'] = 'conversation-panel'
     }
 
-    if (targetUrl.includes('/v1/messages')) {
-        if (!header['anthropic-beta']) {
-            header['anthropic-beta'] = 'interleaved-thinking-2025-05-14,context-management-2025-06-27,advanced-tool-use-2025-11-20'
-        }
+    if (!header['X-GitHub-Api-Version'] && !header['X-Github-Api-Version'] && !header['x-github-api-version']) {
+        header['X-GitHub-Api-Version'] = isMessagesEndpoint ? COPILOT_API_VERSION : '2025-05-01'
     }
 
     const bundleTag = autoBundled ? ' [auto-bundled]' : ''
-    console.warn(`[${new Date().toISOString()}] [Copilot Turn] ${isUser ? 'USER' : 'AGENT'} | turnId=${effectiveTurnId.substring(0,8)} model=${model || '?'} req#${session.requestCount} taskId=${taskId.substring(0,8)}${bundleTag}`)
+    const bucketTag = isMessagesEndpoint ? ' bucket=messages-proxy' : ' bucket=chat'
+    console.warn(`[${new Date().toISOString()}] [Copilot Turn] ${isUser ? 'USER' : 'AGENT'} | turnId=${effectiveTurnId.substring(0,8)} model=${model || '?'} req#${session.requestCount} taskId=${taskId.substring(0,8)}${bundleTag}${bucketTag} ua=${(header['User-Agent']||'').split(' ')[0]}`)
     return true
 }
 
@@ -3811,16 +3867,19 @@ app.post('/api/mcp/llm/call', mcpAuthMiddleware, async (req, res) => {
             headers['anthropic-version'] = '2023-06-01'
         }
         if (config.isCopilot) {
-            headers['Editor-Version'] = 'vscode/1.85.0'
-            headers['Editor-Plugin-Version'] = 'copilot-chat/0.22.0'
-            headers['Copilot-Integration-Id'] = 'vscode-chat'
+            // Apply Chat-bucket defaults. applyCopilotTurnHeaders below will
+            // override to messages-proxy mode (Claude Code SDK bucket) when
+            // the target URL is /v1/messages.
+            headers['Editor-Version'] = COPILOT_EDITOR_VERSION
+            headers['Editor-Plugin-Version'] = COPILOT_PLUGIN_VERSION
             headers['User-Agent'] = 'GitHubCopilotChat/0.22.0'
+            if (!targetUrl.includes('/v1/messages')) {
+                headers['Copilot-Integration-Id'] = 'vscode-chat'
+            }
         }
 
-        // Turn bundling
-        if (turnId) {
-            applyCopilotTurnHeaders(headers, targetUrl, turnId, JSON.stringify({ model }))
-        }
+        // Turn bundling (also finalizes messages-proxy / Chat bucket headers)
+        applyCopilotTurnHeaders(headers, targetUrl, turnId, JSON.stringify({ model }))
 
         // Build body
         let body
