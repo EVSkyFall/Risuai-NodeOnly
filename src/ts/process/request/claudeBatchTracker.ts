@@ -173,21 +173,32 @@ async function applyResultToMessage(batchId: string, text: string): Promise<void
         const char = chars[charId]
         const chats = char?.chats
         if (!Array.isArray(chats)) continue
-        for (const chat of chats) {
+        for (let chatPage = 0; chatPage < chats.length; chatPage++) {
+            const chat = chats[chatPage]
             const msgs = chat?.message
             if (!Array.isArray(msgs)) continue
             for (const msg of msgs) {
                 if (msg?.generationInfo?.batchId === batchId) {
                     msg.data = text
                     delete msg.generationInfo.batchId
-                    // Best-effort: run the on-output trigger pipeline against
-                    // the freshly-arrived content. Modules expecting current
-                    // active char/chat may behave unexpectedly if the user
-                    // switched away, but Lightboard / regex post-processing
-                    // generally works against the passed chat reference.
+
+                    // Run on-output triggers against the freshly arrived content.
+                    // runTrigger clones the chat internally and returns the modified
+                    // version; we must write that back to DB or Lightboard / regex
+                    // post-processing changes are silently lost.
                     try {
-                        const triggers = await import("src/ts/process/triggers")
-                        await triggers.runTrigger(char, 'output', { chat })
+                        const [triggers, dbMod] = await Promise.all([
+                            import("src/ts/process/triggers"),
+                            import("src/ts/storage/database.svelte"),
+                        ])
+                        const result = await triggers.runTrigger(char, 'output', { chat })
+                        if (result?.chat) {
+                            const normalized = (dbMod as any).normalizeChat
+                                ? (dbMod as any).normalizeChat(result.chat)
+                                : result.chat
+                            chars[charId].chats[chatPage] = normalized
+                            console.warn(`[ClaudeBatch] post-batch trigger applied for ${batchId} (charId=${charId}, chatPage=${chatPage})`)
+                        }
                     } catch (e: any) {
                         console.warn(`[ClaudeBatch] post-batch trigger failed for ${batchId}:`, e?.message || e)
                     }
