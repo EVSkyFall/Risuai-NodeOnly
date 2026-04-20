@@ -3970,7 +3970,7 @@ app.post('/api/mcp/llm/call', mcpAuthMiddleware, async (req, res) => {
  */
 app.post('/api/proxy/copilot-chat', mcpAuthMiddleware, async (req, res) => {
     try {
-        const { model, messages: oaiMessages, temperature, max_tokens, stream, response_format, system: oaiSystem, extra_body } = req.body || {}
+        const { model, messages: oaiMessages, temperature, max_tokens, stream, response_format, system: oaiSystem, extra_body, output_config, thinking, top_p, top_k } = req.body || {}
         if (!Array.isArray(oaiMessages)) {
             res.status(400).json({ error: 'messages array required' })
             return
@@ -4033,6 +4033,10 @@ app.post('/api/proxy/copilot-chat', mcpAuthMiddleware, async (req, res) => {
             max_tokens: max_tokens || 4096,
             temperature: temperature ?? 1,
             stream: stream ?? false,
+            ...(top_p !== undefined ? { top_p } : {}),
+            ...(top_k !== undefined ? { top_k } : {}),
+            ...(thinking ? { thinking } : {}),
+            ...(output_config ? { output_config } : {}),
             ...(extra_body && typeof extra_body === 'object' ? extra_body : {}),
         }
 
