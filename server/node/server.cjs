@@ -3952,23 +3952,47 @@ app.post('/api/mcp/llm/call', mcpAuthMiddleware, async (req, res) => {
 /**
  * OpenAI chat/completions-shape adapter for plugins (e.g. Omninode) that only
  * speak OpenAI format but need the Anthropic /v1/messages path (1M context,
- * messages-proxy bucket, turn bundling). Omninode parses Anthropic-shape
- * responses natively so the forwarded reply stays in Anthropic format.
+ * messages-proxy bucket, adaptive thinking).
  *
- * Usage (Omninode config):
+ * Independent from RisuAI's main/aux model config — caller supplies its own
+ * GitHub Copilot token and model. Server handles shape conversion, bearer
+ * exchange, and Copilot's messages-proxy headers.
+ *
+ * Omninode settings:
  *   API URL: https://<server>:6001/api/proxy/copilot-chat
- *              (optional: ?profile=aux for the sub-model slot)
- *   API Key: (ignored — server uses RisuAI's configured Copilot/Claude key)
- *   Model:   override the profile's default model, or leave as configured
+ *   API Key: your GitHub token (ghu_... or gho_...; server exchanges it
+ *            to a short-lived Copilot Bearer each call, cached ~30min)
+ *   Model:   claude-opus-4.7 / claude-opus-4.6 / etc.
+ *   (no Custom Headers / Custom Body needed)
  *
- * Auth: session cookie (same-origin from the RisuAI UI) or x-mcp-key header.
+ * Omninode parses Anthropic responses natively (`data.content[].text`), so
+ * the reply passes through unchanged.
  */
 app.post('/api/proxy/copilot-chat', mcpAuthMiddleware, async (req, res) => {
     try {
-        const profile = (req.query.profile || 'main').toString()
-        const { model: modelOverride, messages: oaiMessages, temperature, max_tokens, stream, response_format, system: oaiSystem } = req.body || {}
+        const { model, messages: oaiMessages, temperature, max_tokens, stream, response_format, system: oaiSystem, extra_body } = req.body || {}
         if (!Array.isArray(oaiMessages)) {
             res.status(400).json({ error: 'messages array required' })
+            return
+        }
+        if (!model) {
+            res.status(400).json({ error: 'model required (e.g. claude-opus-4.7)' })
+            return
+        }
+
+        // Caller's token (GitHub personal token; exchanged server-side)
+        const authHeader = req.headers['authorization'] || ''
+        const ghToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : ''
+        if (!ghToken) {
+            res.status(401).json({ error: 'Authorization: Bearer <github-token> required' })
+            return
+        }
+
+        let copilotBearer
+        try {
+            copilotBearer = await exchangeCopilotToken(ghToken)
+        } catch (e) {
+            res.status(401).json({ error: `Copilot token exchange failed: ${e?.message || e}` })
             return
         }
 
@@ -3983,25 +4007,50 @@ app.post('/api/proxy/copilot-chat', mcpAuthMiddleware, async (req, res) => {
             } else if (m.role === 'user' || m.role === 'assistant') {
                 anthMessages.push({ role: m.role, content: m.content })
             }
-            // silently drop tool/function roles — Omninode doesn't use them on this path
+            // tool/function roles dropped silently
         }
-        // Emulate OpenAI JSON mode via system instruction
         if (response_format?.type === 'json_object') {
             const instr = 'Respond with a single valid JSON object only. Do not wrap in code fences or add prose.'
             systemText = systemText ? systemText + '\n\n' + instr : instr
         }
 
-        await proxyLLMCall(res, {
-            profile,
-            messages: anthMessages,
+        const targetUrl = 'https://api.githubcopilot.com/v1/messages'
+        const headers = {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${copilotBearer}`,
+            'Editor-Version': COPILOT_EDITOR_VERSION,
+            'Editor-Plugin-Version': COPILOT_PLUGIN_VERSION,
+            'User-Agent': 'GitHubCopilotChat/0.22.0',
+            'anthropic-beta': 'interleaved-thinking-2025-05-14,advanced-tool-use-2025-11-20',
+        }
+        // applyCopilotTurnHeaders finalizes messages-proxy / chat bucket headers
+        applyCopilotTurnHeaders(headers, targetUrl, req.headers['x-risu-turn-id'], JSON.stringify({ model }))
+
+        const body = {
+            model,
             system: systemText || undefined,
+            messages: anthMessages,
             max_tokens: max_tokens || 4096,
-            temperature,
+            temperature: temperature ?? 1,
             stream: stream ?? false,
-            model: modelOverride,
-            turnId: req.headers['x-risu-turn-id'],
-            anthropic_beta: 'interleaved-thinking-2025-05-14,advanced-tool-use-2025-11-20',
+            ...(extra_body && typeof extra_body === 'object' ? extra_body : {}),
+        }
+
+        console.warn(`[CopilotChatProxy] ${model} | msgs=${anthMessages.length} | max_tokens=${body.max_tokens}`)
+
+        const llmRes = await fetch(targetUrl, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(body),
         })
+
+        res.status(llmRes.status)
+        for (const [k, v] of llmRes.headers) {
+            if (!['content-encoding', 'transfer-encoding', 'content-length'].includes(k.toLowerCase())) {
+                res.setHeader(k, v)
+            }
+        }
+        await pipeline(llmRes.body, res)
     } catch (err) {
         console.warn(`[CopilotChatProxy] Error: ${err?.message || err}`)
         if (!res.headersSent) {
