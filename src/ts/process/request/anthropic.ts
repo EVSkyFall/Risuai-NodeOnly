@@ -12,7 +12,7 @@ import { extractJSON } from "../templates/jsonSchema"
 import { callTool, decodeToolCall, encodeToolCall } from "../mcp/mcp"
 import type { RequestDataArgumentExtended, requestDataResponse, StreamResponseChunk } from './request'
 import { applyParameters } from './shared'
-import { submitClaudeBatch } from './claudeBatchTracker'
+import { submitClaudeBatch, registerBatchStream, unregisterBatchStream, cancelClaudeBatch } from './claudeBatchTracker'
 
 interface Claude3TextBlock {
     type: 'text',
@@ -638,19 +638,40 @@ export async function requestClaude(arg:RequestDataArgumentExtended):Promise<req
         // DB mutation when the batch ends.
         try {
             const { batchId } = await submitClaudeBatch(replacerURL, body, headers, arg.abortSignal)
-            arg.additionalOutput ??= ''
-            const placeholder = `[배치 처리 중 — ID ${batchId.substring(0, 18)}\u2026 ⏳]\n` +
-                `[Anthropic Batches API 사용 중. 1시간 이내에 응답이 자동으로 갱신됩니다. 탭을 닫아도 결과는 저장됩니다.]`
-            // sendChat reads this after the response and writes it into the
-            // assistant message's generationInfo, so the tracker can locate the
-            // slot when the batch finally ends (could be hours later).
+            // sendChat tags the assistant message with this so the tracker can
+            // find the slot if the tab closes mid-batch (DB-mutation fallback).
             arg.additionalBatchId = batchId
+            const abortSignal = arg.abortSignal
             return {
                 type: 'streaming',
                 result: new ReadableStream<StreamResponseChunk>({
                     start(controller){
-                        controller.enqueue({ "0": placeholder })
-                        controller.close()
+                        // Stream stays OPEN until the tracker delivers the result.
+                        // sendChat shows the message as "generating" the whole time;
+                        // when complete the tracker enqueues+closes through us, so
+                        // the on-output trigger pipeline runs natively in-place.
+                        registerBatchStream(batchId, controller)
+                        // Show a notice while waiting (ReadableStream chunks are
+                        // treated as full text replacement by sendChat — the final
+                        // result will overwrite this placeholder).
+                        const placeholder = `[배치 처리 중 — ID ${batchId.substring(0, 18)}\u2026 ⏳]\n` +
+                            `[Anthropic Batches API. 응답 도착 시 자동 갱신됩니다. 탭을 닫아도 결과는 저장됩니다.]`
+                        try { controller.enqueue({ "0": placeholder }) } catch {}
+                        if (abortSignal) {
+                            const onAbort = () => {
+                                unregisterBatchStream(batchId)
+                                cancelClaudeBatch(batchId).catch(() => {})
+                                try { controller.close() } catch {}
+                            }
+                            if (abortSignal.aborted) onAbort()
+                            else abortSignal.addEventListener('abort', onAbort, { once: true })
+                        }
+                    },
+                    cancel(){
+                        // Reader was cancelled (eg navigation); leave the batch
+                        // in the persistent tracker so it can be applied via DB
+                        // mutation when results arrive.
+                        unregisterBatchStream(batchId)
                     }
                 }),
             }

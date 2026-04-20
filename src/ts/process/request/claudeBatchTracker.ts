@@ -42,6 +42,21 @@ let pollerTimer: ReturnType<typeof setTimeout> | null = null
 let loaded = false
 let loadPromise: Promise<void> | null = null
 
+// Live stream subscribers: when sendChat is currently reading the placeholder
+// stream, the controller is registered here. On batch completion, tracker
+// routes the result through the controller (sendChat finishes naturally and
+// runs the on-output trigger pipeline). When the tab is closed mid-batch the
+// subscriber is gone and we fall through to direct DB mutation.
+const activeStreams = new Map<string, { controller: any, cleanup?: () => void }>()
+
+export function registerBatchStream(batchId: string, controller: any, cleanup?: () => void): void {
+    activeStreams.set(batchId, { controller, cleanup })
+}
+
+export function unregisterBatchStream(batchId: string): void {
+    activeStreams.delete(batchId)
+}
+
 async function loadPending(): Promise<void> {
     if (loaded) return
     if (!loadPromise) {
@@ -166,6 +181,24 @@ function formatBatchResult(result: any): string {
  * instead of the placeholder they would have run against earlier.
  */
 async function applyResultToMessage(batchId: string, text: string): Promise<void> {
+    // Fast path: an active sendChat is still listening on the placeholder
+    // stream. Route the result through the controller so the consumer
+    // finishes naturally (which fires onOutput, inlay, etc. in-place).
+    const subscriber = activeStreams.get(batchId)
+    if (subscriber) {
+        try {
+            subscriber.controller.enqueue({ "0": text })
+            subscriber.controller.close()
+            activeStreams.delete(batchId)
+            try { subscriber.cleanup?.() } catch {}
+            return
+        } catch (_e) {
+            activeStreams.delete(batchId)
+            // Controller closed/errored on its own (eg navigation); fall
+            // through to DB-mutation path below.
+        }
+    }
+
     const db = getDatabase()
     const chars = (db as any).characters
     if (!chars) return
