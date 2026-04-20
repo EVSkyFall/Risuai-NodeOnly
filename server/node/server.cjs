@@ -4026,13 +4026,17 @@ app.post('/api/proxy/copilot-chat', mcpAuthMiddleware, async (req, res) => {
         // applyCopilotTurnHeaders finalizes messages-proxy / chat bucket headers
         applyCopilotTurnHeaders(headers, targetUrl, req.headers['x-risu-turn-id'], JSON.stringify({ model }))
 
+        // Always stream from Copilot to avoid undici headersTimeout
+        // (non-streaming Opus calls can exceed 10 minutes to first byte).
+        // Then accumulate the SSE events into a single Anthropic-shape JSON
+        // so Omninode's existing non-stream parser sees a normal response.
         const body = {
             model,
             system: systemText || undefined,
             messages: anthMessages,
             max_tokens: max_tokens || 4096,
             temperature: temperature ?? 1,
-            stream: stream ?? false,
+            stream: true,
             ...(top_p !== undefined ? { top_p } : {}),
             ...(top_k !== undefined ? { top_k } : {}),
             ...(thinking ? { thinking } : {}),
@@ -4040,7 +4044,7 @@ app.post('/api/proxy/copilot-chat', mcpAuthMiddleware, async (req, res) => {
             ...(extra_body && typeof extra_body === 'object' ? extra_body : {}),
         }
 
-        console.warn(`[CopilotChatProxy] ${model} | msgs=${anthMessages.length} | max_tokens=${body.max_tokens}`)
+        console.warn(`[CopilotChatProxy] ${model} | msgs=${anthMessages.length} | max_tokens=${body.max_tokens} | stream-collect`)
 
         const llmRes = await fetch(targetUrl, {
             method: 'POST',
@@ -4048,17 +4052,100 @@ app.post('/api/proxy/copilot-chat', mcpAuthMiddleware, async (req, res) => {
             body: JSON.stringify(body),
         })
 
-        res.status(llmRes.status)
-        for (const [k, v] of llmRes.headers) {
-            if (!['content-encoding', 'transfer-encoding', 'content-length'].includes(k.toLowerCase())) {
-                res.setHeader(k, v)
+        if (!llmRes.ok) {
+            const errText = await llmRes.text().catch(() => '')
+            res.status(llmRes.status).json({ error: errText.substring(0, 500) || llmRes.statusText })
+            return
+        }
+
+        // Collect SSE → build Anthropic Message object
+        const assembled = {
+            id: null,
+            type: 'message',
+            role: 'assistant',
+            content: [],
+            model,
+            stop_reason: null,
+            stop_sequence: null,
+            usage: { input_tokens: 0, output_tokens: 0 },
+        }
+        const blocks = new Map() // index -> { type, text, thinking, signature, id, name, inputJson }
+
+        const dec = new TextDecoder()
+        let buf = ''
+        const reader = llmRes.body.getReader()
+        while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
+            buf += dec.decode(value, { stream: true })
+            let nl
+            while ((nl = buf.indexOf('\n')) >= 0) {
+                const line = buf.slice(0, nl).trim()
+                buf = buf.slice(nl + 1)
+                if (!line.startsWith('data:')) continue
+                const payload = line.slice(5).trim()
+                if (!payload || payload === '[DONE]') continue
+                let ev
+                try { ev = JSON.parse(payload) } catch { continue }
+                if (ev.type === 'message_start' && ev.message) {
+                    assembled.id = ev.message.id || assembled.id
+                    assembled.model = ev.message.model || assembled.model
+                    if (ev.message.usage) assembled.usage.input_tokens = ev.message.usage.input_tokens || 0
+                }
+                else if (ev.type === 'content_block_start') {
+                    const cb = ev.content_block || {}
+                    blocks.set(ev.index, {
+                        type: cb.type,
+                        text: cb.type === 'text' ? (cb.text || '') : '',
+                        thinking: cb.type === 'thinking' ? (cb.thinking || '') : '',
+                        signature: cb.signature || '',
+                        id: cb.id || null,
+                        name: cb.name || null,
+                        inputJson: '',
+                        data: cb.data || null,
+                    })
+                }
+                else if (ev.type === 'content_block_delta') {
+                    const b = blocks.get(ev.index)
+                    if (!b) continue
+                    const d = ev.delta || {}
+                    if (d.type === 'text_delta' || d.type === 'text') b.text += (d.text || '')
+                    else if (d.type === 'thinking_delta' || d.type === 'thinking') b.thinking += (d.thinking || '')
+                    else if (d.type === 'signature_delta') b.signature = d.signature || ''
+                    else if (d.type === 'input_json_delta') b.inputJson += (d.partial_json || '')
+                }
+                else if (ev.type === 'message_delta') {
+                    if (ev.delta?.stop_reason) assembled.stop_reason = ev.delta.stop_reason
+                    if (ev.delta?.stop_sequence) assembled.stop_sequence = ev.delta.stop_sequence
+                    if (ev.usage?.output_tokens !== undefined) assembled.usage.output_tokens = ev.usage.output_tokens
+                }
+                // message_stop / content_block_stop: nothing to accumulate
             }
         }
-        await pipeline(llmRes.body, res)
+
+        // Convert collected blocks (in index order) to content array
+        const sortedIndices = [...blocks.keys()].sort((a, b) => a - b)
+        for (const idx of sortedIndices) {
+            const b = blocks.get(idx)
+            if (b.type === 'text') {
+                assembled.content.push({ type: 'text', text: b.text })
+            } else if (b.type === 'thinking') {
+                assembled.content.push({ type: 'thinking', thinking: b.thinking, signature: b.signature })
+            } else if (b.type === 'redacted_thinking') {
+                assembled.content.push({ type: 'redacted_thinking', data: b.data })
+            } else if (b.type === 'tool_use') {
+                let input = {}
+                try { input = JSON.parse(b.inputJson || '{}') } catch {}
+                assembled.content.push({ type: 'tool_use', id: b.id, name: b.name, input })
+            }
+        }
+
+        res.status(200).json(assembled)
     } catch (err) {
-        console.warn(`[CopilotChatProxy] Error: ${err?.message || err}`)
+        const cause = err?.cause ? (err.cause.code || err.cause.message || String(err.cause)) : ''
+        console.warn(`[CopilotChatProxy] Error: ${err?.message || err}${cause ? ' | cause=' + cause : ''}`)
         if (!res.headersSent) {
-            res.status(502).json({ error: err?.message || 'proxy call failed' })
+            res.status(502).json({ error: (err?.message || 'proxy call failed') + (cause ? ` (${cause})` : '') })
         }
     }
 })
