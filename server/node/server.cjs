@@ -3818,6 +3818,109 @@ async function resolveModelConfig(profile) {
     }
 }
 
+/**
+ * Shared core for /api/mcp/llm/call and /api/proxy/copilot-chat.
+ * Resolves model config by profile, builds request to Copilot/Anthropic/OpenAI
+ * with all required auth + headers, pipes the response back to `res`.
+ */
+async function proxyLLMCall(res, params) {
+    const { profile, messages, system, max_tokens, temperature, stream, thinking, output_config, model: modelOverride, turnId, anthropic_beta } = params
+
+    const config = await resolveModelConfig(profile || 'main')
+    if (!config) {
+        res.status(500).json({ error: `No model configured for profile "${profile || 'main'}"` })
+        return
+    }
+
+    const model = modelOverride || config.model
+
+    // Determine endpoint URL
+    let targetUrl
+    if (config.isCopilot) {
+        targetUrl = config.isClaude
+            ? 'https://api.githubcopilot.com/v1/messages'
+            : 'https://api.githubcopilot.com/chat/completions'
+    } else if (config.url) {
+        targetUrl = config.isClaude
+            ? config.url.replace(/\/$/, '') + '/v1/messages'
+            : config.url.replace(/\/$/, '') + '/v1/chat/completions'
+    } else {
+        res.status(500).json({ error: 'No URL configured for model' })
+        return
+    }
+
+    // Auth
+    let authToken = config.key
+    if (config.isCopilot && authToken) {
+        authToken = await exchangeCopilotToken(authToken)
+    }
+
+    const headers = {
+        'Content-Type': 'application/json',
+        'Authorization': config.isClaude && !config.isCopilot
+            ? undefined
+            : `Bearer ${authToken}`,
+    }
+    if (config.isClaude && !config.isCopilot) {
+        headers['x-api-key'] = config.key
+        headers['anthropic-version'] = '2023-06-01'
+    }
+    if (config.isCopilot) {
+        headers['Editor-Version'] = COPILOT_EDITOR_VERSION
+        headers['Editor-Plugin-Version'] = COPILOT_PLUGIN_VERSION
+        headers['User-Agent'] = 'GitHubCopilotChat/0.22.0'
+        if (!targetUrl.includes('/v1/messages')) {
+            headers['Copilot-Integration-Id'] = 'vscode-chat'
+        }
+    }
+
+    applyCopilotTurnHeaders(headers, targetUrl, turnId, JSON.stringify({ model }))
+
+    // Build body
+    let body
+    if (config.isClaude) {
+        body = {
+            model,
+            system: system || undefined,
+            messages,
+            max_tokens: max_tokens || 4096,
+            temperature: temperature ?? 1,
+            stream: stream ?? true,
+        }
+        if (thinking) body.thinking = thinking
+        if (output_config) body.output_config = output_config
+        if (config.isCopilot) {
+            headers['anthropic-beta'] = anthropic_beta || 'interleaved-thinking-2025-05-14,advanced-tool-use-2025-11-20'
+        }
+    } else {
+        body = {
+            model,
+            messages: system ? [{ role: 'system', content: system }, ...messages] : messages,
+            max_tokens: max_tokens || 4096,
+            temperature: temperature ?? 0.7,
+            stream: stream ?? true,
+        }
+    }
+
+    for (const k of Object.keys(headers)) { if (headers[k] === undefined) delete headers[k] }
+
+    console.warn(`[ProxyLLM] ${profile || 'main'} → ${model} | ${config.isCopilot ? 'Copilot' : 'Direct'} | turnId=${turnId?.substring(0, 8) || 'none'}`)
+
+    const llmRes = await fetch(targetUrl, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+    })
+
+    res.status(llmRes.status)
+    for (const [k, v] of llmRes.headers) {
+        if (!['content-encoding', 'transfer-encoding', 'content-length'].includes(k.toLowerCase())) {
+            res.setHeader(k, v)
+        }
+    }
+    await pipeline(llmRes.body, res)
+}
+
 app.post('/api/mcp/llm/call', mcpAuthMiddleware, async (req, res) => {
     try {
         const { profile, messages, system, max_tokens, temperature, stream, thinking, output_config, model: modelOverride } = req.body
@@ -3825,110 +3928,84 @@ app.post('/api/mcp/llm/call', mcpAuthMiddleware, async (req, res) => {
             res.status(400).json({ error: 'messages is required' })
             return
         }
-
-        const config = await resolveModelConfig(profile || 'main')
-        if (!config) {
-            res.status(500).json({ error: `No model configured for profile "${profile || 'main'}"` })
-            return
-        }
-
-        const model = modelOverride || config.model
-        const turnId = req.headers['x-risu-turn-id']
-
-        // Determine endpoint URL
-        let targetUrl
-        if (config.isCopilot) {
-            targetUrl = config.isClaude
-                ? 'https://api.githubcopilot.com/v1/messages'
-                : 'https://api.githubcopilot.com/chat/completions'
-        } else if (config.url) {
-            targetUrl = config.isClaude
-                ? config.url.replace(/\/$/, '') + '/v1/messages'
-                : config.url.replace(/\/$/, '') + '/v1/chat/completions'
-        } else {
-            res.status(500).json({ error: 'No URL configured for model' })
-            return
-        }
-
-        // Auth
-        let authToken = config.key
-        if (config.isCopilot && authToken) {
-            authToken = await exchangeCopilotToken(authToken)
-        }
-
-        const headers = {
-            'Content-Type': 'application/json',
-            'Authorization': config.isClaude && !config.isCopilot
-                ? undefined  // Anthropic direct uses x-api-key
-                : `Bearer ${authToken}`,
-        }
-        if (config.isClaude && !config.isCopilot) {
-            headers['x-api-key'] = config.key
-            headers['anthropic-version'] = '2023-06-01'
-        }
-        if (config.isCopilot) {
-            // Apply Chat-bucket defaults. applyCopilotTurnHeaders below will
-            // override to messages-proxy mode (Claude Code SDK bucket) when
-            // the target URL is /v1/messages.
-            headers['Editor-Version'] = COPILOT_EDITOR_VERSION
-            headers['Editor-Plugin-Version'] = COPILOT_PLUGIN_VERSION
-            headers['User-Agent'] = 'GitHubCopilotChat/0.22.0'
-            if (!targetUrl.includes('/v1/messages')) {
-                headers['Copilot-Integration-Id'] = 'vscode-chat'
-            }
-        }
-
-        // Turn bundling (also finalizes messages-proxy / Chat bucket headers)
-        applyCopilotTurnHeaders(headers, targetUrl, turnId, JSON.stringify({ model }))
-
-        // Build body
-        let body
-        if (config.isClaude) {
-            body = {
-                model,
-                system: system || undefined,
-                messages,
-                max_tokens: max_tokens || 4096,
-                temperature: temperature ?? 1,
-                stream: stream ?? true,
-            }
-            if (thinking) body.thinking = thinking
-            if (output_config) body.output_config = output_config
-            if (config.isCopilot) {
-                headers['anthropic-beta'] = 'interleaved-thinking-2025-05-14,context-management-2025-06-27,advanced-tool-use-2025-11-20'
-            }
-        } else {
-            body = {
-                model,
-                messages: system ? [{ role: 'system', content: system }, ...messages] : messages,
-                max_tokens: max_tokens || 4096,
-                temperature: temperature ?? 0.7,
-                stream: stream ?? true,
-            }
-        }
-
-        // Clean undefined headers
-        for (const k of Object.keys(headers)) { if (headers[k] === undefined) delete headers[k] }
-
-        console.warn(`[MCP LLM] ${profile || 'main'} → ${model} | ${config.isCopilot ? 'Copilot' : 'Direct'} | turnId=${turnId?.substring(0,8) || 'none'}`)
-
-        const llmRes = await fetch(targetUrl, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify(body),
+        await proxyLLMCall(res, {
+            profile: profile || 'main',
+            messages,
+            system,
+            max_tokens,
+            temperature,
+            stream,
+            thinking,
+            output_config,
+            model: modelOverride,
+            turnId: req.headers['x-risu-turn-id'],
+            anthropic_beta: 'interleaved-thinking-2025-05-14,context-management-2025-06-27,advanced-tool-use-2025-11-20',
         })
-
-        res.status(llmRes.status)
-        for (const [k, v] of llmRes.headers) {
-            if (!['content-encoding', 'transfer-encoding', 'content-length'].includes(k.toLowerCase())) {
-                res.setHeader(k, v)
-            }
-        }
-        await pipeline(llmRes.body, res)
     } catch (err) {
         console.warn(`[MCP LLM] Error: ${err?.message || err}`)
         if (!res.headersSent) {
             res.status(502).json({ error: err?.message || 'LLM call failed' })
+        }
+    }
+})
+
+/**
+ * OpenAI chat/completions-shape adapter for plugins (e.g. Omninode) that only
+ * speak OpenAI format but need the Anthropic /v1/messages path (1M context,
+ * messages-proxy bucket, turn bundling). Omninode parses Anthropic-shape
+ * responses natively so the forwarded reply stays in Anthropic format.
+ *
+ * Usage (Omninode config):
+ *   API URL: https://<server>:6001/api/proxy/copilot-chat
+ *              (optional: ?profile=aux for the sub-model slot)
+ *   API Key: (ignored — server uses RisuAI's configured Copilot/Claude key)
+ *   Model:   override the profile's default model, or leave as configured
+ *
+ * Auth: session cookie (same-origin from the RisuAI UI) or x-mcp-key header.
+ */
+app.post('/api/proxy/copilot-chat', mcpAuthMiddleware, async (req, res) => {
+    try {
+        const profile = (req.query.profile || 'main').toString()
+        const { model: modelOverride, messages: oaiMessages, temperature, max_tokens, stream, response_format, system: oaiSystem } = req.body || {}
+        if (!Array.isArray(oaiMessages)) {
+            res.status(400).json({ error: 'messages array required' })
+            return
+        }
+
+        // OpenAI -> Anthropic shape
+        let systemText = typeof oaiSystem === 'string' ? oaiSystem : ''
+        const anthMessages = []
+        for (const m of oaiMessages) {
+            if (!m || typeof m !== 'object') continue
+            if (m.role === 'system') {
+                const text = typeof m.content === 'string' ? m.content : JSON.stringify(m.content)
+                systemText = systemText ? systemText + '\n\n' + text : text
+            } else if (m.role === 'user' || m.role === 'assistant') {
+                anthMessages.push({ role: m.role, content: m.content })
+            }
+            // silently drop tool/function roles — Omninode doesn't use them on this path
+        }
+        // Emulate OpenAI JSON mode via system instruction
+        if (response_format?.type === 'json_object') {
+            const instr = 'Respond with a single valid JSON object only. Do not wrap in code fences or add prose.'
+            systemText = systemText ? systemText + '\n\n' + instr : instr
+        }
+
+        await proxyLLMCall(res, {
+            profile,
+            messages: anthMessages,
+            system: systemText || undefined,
+            max_tokens: max_tokens || 4096,
+            temperature,
+            stream: stream ?? false,
+            model: modelOverride,
+            turnId: req.headers['x-risu-turn-id'],
+            anthropic_beta: 'interleaved-thinking-2025-05-14,advanced-tool-use-2025-11-20',
+        })
+    } catch (err) {
+        console.warn(`[CopilotChatProxy] Error: ${err?.message || err}`)
+        if (!res.headersSent) {
+            res.status(502).json({ error: err?.message || 'proxy call failed' })
         }
     }
 })
