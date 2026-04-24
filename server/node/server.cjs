@@ -1461,8 +1461,10 @@ function setupProxyStreamWebSocket(server) {
     server.on('upgrade', async (req, socket, head) => {
         try {
             const reqUrl = new URL(req.url, `http://${req.headers.host}`);
+            // Only handle proxy-stream-jobs paths. Let other upgrade listeners
+            // (eg setupLLMWorkerWebSocket) handle their own paths — destroying
+            // the socket here would kill them before they could respond.
             if (!reqUrl.pathname.startsWith('/proxy-stream-jobs/') || !reqUrl.pathname.endsWith('/ws')) {
-                socket.destroy();
                 return;
             }
 
