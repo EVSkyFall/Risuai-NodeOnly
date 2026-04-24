@@ -3753,6 +3753,67 @@ app.post('/api/migrate/save-folder/cleanup/execute', async (req, res, next) => {
 
 let _copilotBearerCaches = new Map() // key → { token, expiry }
 
+// In-process Vertex AI access-token cache. Browser side mints these with
+// `db.vertexAccessTokenExpires` set to ~58 min from now; we honor that cache
+// first, then mint our own JWT-signed token if it's expired or absent (so
+// MCP-driven calls work even when the browser is closed).
+let _vertexServerToken = { token: '', expiresAt: 0 }
+
+async function ensureVertexAccessToken(db) {
+    const now = Date.now()
+    // Prefer browser-cached token if still fresh (60s grace).
+    if (db.vertexAccessToken && (db.vertexAccessTokenExpires || 0) > now + 60_000) {
+        return db.vertexAccessToken
+    }
+    // Then in-memory server-minted token.
+    if (_vertexServerToken.token && _vertexServerToken.expiresAt > now + 60_000) {
+        return _vertexServerToken.token
+    }
+    if (!db.vertexClientEmail || !db.vertexPrivateKey) {
+        return null
+    }
+    try {
+        const issuedAt = Math.floor(now / 1000)
+        const header = { alg: 'RS256', typ: 'JWT' }
+        const claims = {
+            iss: db.vertexClientEmail,
+            iat: issuedAt,
+            exp: issuedAt + 3600,
+            scope: 'https://www.googleapis.com/auth/cloud-platform',
+            aud: 'https://oauth2.googleapis.com/token',
+        }
+        const b64u = (obj) => Buffer.from(JSON.stringify(obj)).toString('base64url')
+        const signingInput = `${b64u(header)}.${b64u(claims)}`
+        const signature = nodeCrypto.createSign('RSA-SHA256')
+            .update(signingInput)
+            .sign(db.vertexPrivateKey)
+            .toString('base64url')
+        const jwt = `${signingInput}.${signature}`
+        const tokRes = await fetch('https://oauth2.googleapis.com/token', {
+            method: 'POST',
+            headers: { 'content-type': 'application/x-www-form-urlencoded' },
+            body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`,
+        })
+        if (!tokRes.ok) {
+            console.warn(`[ProxyLLM] Vertex token mint failed: ${tokRes.status}`)
+            return null
+        }
+        const data = await tokRes.json()
+        if (!data?.access_token) return null
+        _vertexServerToken = { token: data.access_token, expiresAt: now + 3500 * 1000 }
+        return data.access_token
+    } catch (e) {
+        console.warn(`[ProxyLLM] Vertex token mint error: ${e?.message}`)
+        return null
+    }
+}
+
+function isVertexGlobalOnlyModel(modelId) {
+    // Mirrors src/ts/process/request/google.ts — Gemini 3 preview models are
+    // global-endpoint only as of 2025-12.
+    return /^gemini-3-.*-preview$/.test(modelId)
+}
+
 async function exchangeCopilotToken(githubToken) {
     const cacheKey = githubToken.substring(0, 10)
     const cached = _copilotBearerCaches.get(cacheKey)
@@ -3819,8 +3880,40 @@ async function resolveModelConfig(profile) {
         }
     }
     if (/^gemini-/i.test(modelId)) {
-        // Use Google's OpenAI-compatibility endpoint so we can reuse the
-        // OpenAI body shape that proxyLLMCall already constructs.
+        // RisuAI internal model IDs append `-vertex` to Gemini ids when the
+        // user picks the Vertex variant. Detect, strip, and route to Vertex's
+        // OpenAI-compat endpoint instead of AI Studio (which uses a regular
+        // API key — the user typically doesn't set one when configured for
+        // Vertex via service account).
+        if (modelId.endsWith('-vertex')) {
+            const cleanModel = modelId.replace(/-vertex$/, '')
+            const region = db.vertexRegion || 'us-central1'
+            const projectId = db.google?.projectId || db.vertexProjectId
+            if (!projectId) {
+                console.warn('[ProxyLLM] Vertex model selected but db.google.projectId is missing')
+                return null
+            }
+            const effRegion = isVertexGlobalOnlyModel(cleanModel) ? 'global' : region
+            const baseHost = effRegion === 'global'
+                ? 'https://aiplatform.googleapis.com'
+                : `https://${effRegion}-aiplatform.googleapis.com`
+            const accessToken = await ensureVertexAccessToken(db)
+            if (!accessToken) {
+                console.warn('[ProxyLLM] Vertex token unavailable (need vertexAccessToken or vertexClientEmail+vertexPrivateKey)')
+                return null
+            }
+            return {
+                model: cleanModel,
+                url: `${baseHost}/v1beta1/projects/${projectId}/locations/${effRegion}/endpoints/openapi/chat/completions`,
+                urlIsFinal: true,
+                key: accessToken, // already a Bearer token
+                format: 0,
+                isCopilot: false,
+                isClaude: false,
+                isVertex: true,
+            }
+        }
+        // Plain Gemini → Google AI Studio's OpenAI-compatibility endpoint
         return {
             model: modelId,
             url: 'https://generativelanguage.googleapis.com/v1beta/openai',
@@ -3874,9 +3967,13 @@ async function proxyLLMCall(res, params) {
             ? 'https://api.githubcopilot.com/v1/messages'
             : 'https://api.githubcopilot.com/chat/completions'
     } else if (config.url) {
-        targetUrl = config.isClaude
-            ? config.url.replace(/\/$/, '') + '/v1/messages'
-            : config.url.replace(/\/$/, '') + '/v1/chat/completions'
+        if (config.urlIsFinal) {
+            targetUrl = config.url
+        } else {
+            targetUrl = config.isClaude
+                ? config.url.replace(/\/$/, '') + '/v1/messages'
+                : config.url.replace(/\/$/, '') + '/v1/chat/completions'
+        }
     } else {
         res.status(500).json({ error: 'No URL configured for model' })
         return
