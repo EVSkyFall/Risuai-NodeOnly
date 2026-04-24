@@ -32,7 +32,12 @@ type ClaudeLang = 'ko' | 'en' | 'jp'
 const MIN_API_LEN = 50
 const PERSISTENT_KEY = 'claude_token_cache.json'
 const PERSISTENT_FLUSH_DELAY_MS = 5000
-const MAX_API_CONCURRENT = 5
+// Tier-2 Anthropic limit is 2000 RPM (~33 RPS). With ~0.5–1.5s per call this
+// supports 30 concurrent without saturating. If you upgrade tiers, raise this.
+const MAX_API_CONCURRENT = 30
+// How long an over-the-limit call should wait for a free slot before giving
+// up and falling back to the local tokenizer estimate.
+const SLOT_WAIT_TIMEOUT_MS = 30_000
 const MESSAGE_OVERHEAD = 12 // tokens contributed by `[{role:user, content:""}]` wrapping
 
 function detectLang(text: string): ClaudeLang {
@@ -142,16 +147,58 @@ export function getClaudeTokenizerPersistentCacheSize(): number {
 let rateLimitedUntil = 0
 let inflightCount = 0
 
+// FIFO slot queue: when we exceed MAX_API_CONCURRENT, callers wait for a
+// running call to release. This lets large cold-start bursts (re-tokenizing
+// 1000+ messages after a cache invalidation) saturate the API instead of
+// falling through to the local estimate after the first 30 calls.
+type SlotWaiter = (granted: boolean) => void
+const slotWaiters: SlotWaiter[] = []
+
+async function acquireSlot(timeoutMs: number): Promise<boolean> {
+    if (inflightCount < MAX_API_CONCURRENT) {
+        inflightCount++
+        return true
+    }
+    return new Promise<boolean>((resolve) => {
+        let done = false
+        const w: SlotWaiter = (granted) => {
+            if (done) return
+            done = true
+            clearTimeout(timer)
+            if (granted) inflightCount++
+            resolve(granted)
+        }
+        const timer = setTimeout(() => {
+            if (done) return
+            done = true
+            const idx = slotWaiters.indexOf(w)
+            if (idx >= 0) slotWaiters.splice(idx, 1)
+            resolve(false)
+        }, timeoutMs)
+        slotWaiters.push(w)
+    })
+}
+
+function releaseSlot(): void {
+    if (slotWaiters.length > 0) {
+        const w = slotWaiters.shift()!
+        // Transfer the slot directly to the next waiter — w() will increment
+        // inflightCount itself, so we skip the decrement on this release.
+        w(true)
+    } else {
+        inflightCount--
+    }
+}
+
 async function callCountTokensAPI(text: string, db: any): Promise<number | null> {
     if (Date.now() < rateLimitedUntil) return null
-    if (inflightCount >= MAX_API_CONCURRENT) return null
     const key = (db.claudeTokenizerAPIKey || '').trim()
     if (!key) return null
     // Normalize model id for Anthropic API: Copilot accepts "claude-opus-4.7" but
     // Anthropic only accepts "claude-opus-4-7" (hyphen). Convert version dots to dashes.
     const model = (db.claudeTokenizerAPIModel || 'claude-opus-4-7').replace(/(opus|sonnet|haiku)-(\d+)\.(\d+)/g, '$1-$2-$3')
 
-    inflightCount++
+    if (!(await acquireSlot(SLOT_WAIT_TIMEOUT_MS))) return null
     try {
         // Route through proxy2 — browser-direct fetch to api.anthropic.com fails CORS preflight.
         const bodyBytes = new TextEncoder().encode(JSON.stringify({
@@ -181,7 +228,7 @@ async function callCountTokensAPI(text: string, db: any): Promise<number | null>
     } catch (_e) {
         return null
     } finally {
-        inflightCount--
+        releaseSlot()
     }
 }
 
