@@ -3805,16 +3805,49 @@ async function resolveModelConfig(profile) {
         }
     }
 
-    // Standard models — determine from model ID
-    const isClaude = /claude/i.test(modelId)
-    const key = isClaude ? db.claudeAPIKey : db.openAIKey
+    // Standard models — determine endpoint from model ID prefix.
+    // Note: returned `url` is the API base; proxyLLMCall appends the right
+    // suffix (/v1/messages for Anthropic, /v1/chat/completions for OpenAI-shape).
+    if (/^claude-/i.test(modelId) || /^anthropic\./i.test(modelId)) {
+        return {
+            model: modelId,
+            url: 'https://api.anthropic.com',
+            key: db.claudeAPIKey || '',
+            format: 2,
+            isCopilot: false,
+            isClaude: true,
+        }
+    }
+    if (/^gemini-/i.test(modelId)) {
+        // Use Google's OpenAI-compatibility endpoint so we can reuse the
+        // OpenAI body shape that proxyLLMCall already constructs.
+        return {
+            model: modelId,
+            url: 'https://generativelanguage.googleapis.com/v1beta/openai',
+            key: db.google?.accessToken || db.geminiAPIKey || '',
+            format: 0,
+            isCopilot: false,
+            isClaude: false,
+        }
+    }
+    if (/^(gpt-|o1|o3|chatgpt|text-)/i.test(modelId)) {
+        return {
+            model: modelId,
+            url: 'https://api.openai.com',
+            key: db.openAIKey || '',
+            format: 0,
+            isCopilot: false,
+            isClaude: false,
+        }
+    }
+    // Unknown standard model — best guess: try OpenAI key + reverse_proxy URL
     return {
         model: modelId,
-        url: '',
-        key: key || '',
-        format: isClaude ? 2 : 0,
+        url: db.forceReplaceUrl || '',
+        key: db.openAIKey || db.proxyKey || '',
+        format: 0,
         isCopilot: false,
-        isClaude,
+        isClaude: false,
     }
 }
 
