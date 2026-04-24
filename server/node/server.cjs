@@ -3902,8 +3902,14 @@ async function resolveModelConfig(profile) {
                 console.warn('[ProxyLLM] Vertex token unavailable (need vertexAccessToken or vertexClientEmail+vertexPrivateKey)')
                 return null
             }
+            // Vertex's OpenAI-compat endpoint requires the model field to be
+            // `<publisher>/<model>` (publisher embedded in body, not URL path
+            // like the native /publishers/{p}/models/{m} endpoint).
+            const publisher = /^claude-/i.test(cleanModel) ? 'anthropic'
+                : /^llama/i.test(cleanModel) ? 'meta'
+                : 'google'
             return {
-                model: cleanModel,
+                model: `${publisher}/${cleanModel}`,
                 url: `${baseHost}/v1beta1/projects/${projectId}/locations/${effRegion}/endpoints/openapi/chat/completions`,
                 urlIsFinal: true,
                 key: accessToken, // already a Bearer token
