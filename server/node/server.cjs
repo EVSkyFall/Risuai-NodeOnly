@@ -1347,6 +1347,113 @@ async function runProxyStreamJob(job, arg) {
     }
 }
 
+// --- LLM Worker: Browser-as-worker bridge for /api/mcp/llm/call ---
+//
+// Instead of re-implementing routing/auth/format conversion for every model
+// provider in server.cjs, we forward MCP LLM requests to an active browser
+// session over WebSocket. The browser uses RisuAI's existing requestChatData
+// pipeline (with all its routing, retry, Vertex auth, etc.) and streams the
+// result back. New provider added to browser code automatically works for MCP.
+
+const llmWorkers = new Set() // active WebSocket connections
+const llmInflight = new Map() // reqId → { res, streaming, worker, closed, timer }
+
+function pickLLMWorker() {
+    for (const ws of llmWorkers) {
+        if (ws.readyState === ws.OPEN) return ws
+    }
+    return null
+}
+
+function setupLLMWorkerWebSocket(server) {
+    const wss = new WebSocketServer({ noServer: true })
+
+    server.on('upgrade', async (req, socket, head) => {
+        try {
+            const url = new URL(req.url, `http://${req.headers.host}`)
+            if (url.pathname !== '/ws/llm-worker') return
+
+            const auth = url.searchParams.get('risu-auth') || normalizeAuthHeader(req.headers['risu-auth'])
+            if (!await isAuthorizedProxyRequest({ headers: { 'risu-auth': auth } })) {
+                socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n')
+                socket.destroy()
+                return
+            }
+
+            wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req))
+        } catch (e) {
+            try { socket.write('HTTP/1.1 400 Bad Request\r\n\r\n'); socket.destroy() } catch {}
+        }
+    })
+
+    wss.on('connection', (ws) => {
+        llmWorkers.add(ws)
+        console.warn(`[LLMWorker] browser connected (${llmWorkers.size} total)`)
+
+        const pingTimer = setInterval(() => {
+            if (ws.readyState !== ws.OPEN) return
+            try { ws.ping() } catch {}
+        }, 30000)
+
+        ws.on('message', (raw) => {
+            let msg
+            try { msg = JSON.parse(raw.toString('utf-8')) } catch { return }
+            if (!msg?.reqId) return
+            const ctx = llmInflight.get(msg.reqId)
+            if (!ctx || ctx.closed) return
+
+            if (msg.type === 'chunk') {
+                if (ctx.streaming) {
+                    try { ctx.res.write(`data: ${JSON.stringify(msg.data || {})}\n\n`) } catch {}
+                }
+            } else if (msg.type === 'done') {
+                ctx.closed = true
+                clearTimeout(ctx.timer)
+                if (ctx.streaming) {
+                    try {
+                        ctx.res.write(`event: done\ndata: ${JSON.stringify(msg.response || {})}\n\n`)
+                        ctx.res.end()
+                    } catch {}
+                } else {
+                    try { ctx.res.status(200).json(msg.response || { content: [{ type: 'text', text: '' }] }) } catch {}
+                }
+                llmInflight.delete(msg.reqId)
+            } else if (msg.type === 'error') {
+                ctx.closed = true
+                clearTimeout(ctx.timer)
+                try {
+                    if (ctx.res.headersSent) {
+                        ctx.res.write(`event: error\ndata: ${JSON.stringify({ error: msg.error || 'Worker error' })}\n\n`)
+                        ctx.res.end()
+                    } else {
+                        ctx.res.status(500).json({ error: msg.error || 'Worker error' })
+                    }
+                } catch {}
+                llmInflight.delete(msg.reqId)
+            }
+        })
+
+        const cleanup = () => {
+            clearInterval(pingTimer)
+            llmWorkers.delete(ws)
+            console.warn(`[LLMWorker] browser disconnected (${llmWorkers.size} total)`)
+            // Fail any inflight tied to this worker
+            for (const [reqId, ctx] of llmInflight) {
+                if (ctx.worker !== ws || ctx.closed) continue
+                ctx.closed = true
+                clearTimeout(ctx.timer)
+                try {
+                    if (ctx.res.headersSent) ctx.res.end()
+                    else ctx.res.status(503).json({ error: 'Browser worker disconnected mid-request' })
+                } catch {}
+                llmInflight.delete(reqId)
+            }
+        }
+        ws.on('close', cleanup)
+        ws.on('error', cleanup)
+    })
+}
+
 // --- Proxy Stream: WebSocket setup ---
 
 function setupProxyStreamWebSocket(server) {
@@ -4059,24 +4166,65 @@ async function proxyLLMCall(res, params) {
 
 app.post('/api/mcp/llm/call', mcpAuthMiddleware, async (req, res) => {
     try {
-        const { profile, messages, system, max_tokens, temperature, stream, thinking, output_config, model: modelOverride } = req.body
+        const { messages } = req.body || {}
         if (!messages) {
             res.status(400).json({ error: 'messages is required' })
             return
         }
-        await proxyLLMCall(res, {
-            profile: profile || 'main',
-            messages,
-            system,
-            max_tokens,
-            temperature,
-            stream,
-            thinking,
-            output_config,
-            model: modelOverride,
-            turnId: req.headers['x-risu-turn-id'],
-            anthropic_beta: 'interleaved-thinking-2025-05-14,context-management-2025-06-27,advanced-tool-use-2025-11-20',
-        })
+
+        const worker = pickLLMWorker()
+        if (!worker) {
+            res.status(503).json({
+                error: 'No active RisuAI browser session. Open RisuAI in a browser tab to enable MCP LLM calls.',
+            })
+            return
+        }
+
+        const reqId = nodeCrypto.randomUUID()
+        const streaming = req.body?.stream === true
+
+        if (streaming) {
+            res.status(200)
+            res.setHeader('Content-Type', 'text/event-stream')
+            res.setHeader('Cache-Control', 'no-cache')
+            res.setHeader('Connection', 'keep-alive')
+            try { res.flushHeaders() } catch {}
+        }
+
+        const ctx = { res, streaming, worker, closed: false, timer: null }
+
+        // 10-minute hard timeout (longer than typical LLM call but bounded)
+        ctx.timer = setTimeout(() => {
+            if (ctx.closed) return
+            ctx.closed = true
+            try { worker.send(JSON.stringify({ type: 'abort', reqId })) } catch {}
+            try {
+                if (res.headersSent) res.end()
+                else res.status(504).json({ error: 'Worker timed out after 10m' })
+            } catch {}
+            llmInflight.delete(reqId)
+        }, 10 * 60 * 1000)
+
+        // Detect client disconnect — abort the worker call to avoid wasted quota
+        const onClose = () => {
+            if (ctx.closed) return
+            ctx.closed = true
+            clearTimeout(ctx.timer)
+            try { worker.send(JSON.stringify({ type: 'abort', reqId })) } catch {}
+            llmInflight.delete(reqId)
+        }
+        res.on('close', onClose)
+
+        llmInflight.set(reqId, ctx)
+
+        worker.send(JSON.stringify({
+            type: 'llm-request',
+            reqId,
+            params: {
+                ...req.body,
+                turnId: req.headers['x-risu-turn-id'] || null,
+            },
+        }))
     } catch (err) {
         console.warn(`[MCP LLM] Error: ${err?.message || err}`)
         if (!res.headersSent) {
@@ -4948,6 +5096,7 @@ async function startServer() {
             // HTTPS
             server = https.createServer(httpsOptions, app);
             setupProxyStreamWebSocket(server);
+            setupLLMWorkerWebSocket(server);
             server.listen(port, () => {
                 console.log("[Server] HTTPS server is running.");
                 console.log(`[Server] https://localhost:${port}/`);
@@ -4956,6 +5105,7 @@ async function startServer() {
             // HTTP
             server = http.createServer(app);
             setupProxyStreamWebSocket(server);
+            setupLLMWorkerWebSocket(server);
             server.listen(port, () => {
                 console.log("[Server] HTTP server is running.");
                 console.log(`[Server] http://localhost:${port}/`);

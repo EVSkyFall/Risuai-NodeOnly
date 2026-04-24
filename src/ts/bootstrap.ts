@@ -152,6 +152,10 @@ export async function loadData() {
             // polls them in the background and writes the result into the
             // matching message slot when the batch ends.
             import('./process/request/claudeBatchTracker').then(m => m.resumeClaudeBatches()).catch(() => {})
+            // Connect to /ws/llm-worker so /api/mcp/llm/call can route through
+            // RisuAI's full requestChatData pipeline (provider routing, auth,
+            // model translation) instead of server.cjs re-implementing it.
+            import('./llmWorker').then(m => m.startLLMWorker()).catch(() => {})
             saveDb()
             moduleUpdate()
             // cleanChunks는 화면 진입 후 유휴 시간에 실행 (부트 블로킹 제거)
