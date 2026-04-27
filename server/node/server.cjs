@@ -2034,7 +2034,14 @@ const reverseProxyFunc = async (req, res, next) => {
         res.header(headObj);
         // send response status to client
         res.status(originalResponse.status);
-        // Debug: log non-OK Copilot responses with body
+        // Debug: log non-OK upstream responses with body (helpful when upstream
+        // 5xx surfaces to the client — e.g. transient OpenAI/Copilot/Anthropic
+        // server errors that come back as `Internal Server Error (ref: ...)`.
+        if (!originalResponse.ok && !isCopilotURL(urlParam)) {
+            let errBody = ''
+            try { errBody = await originalResponse.clone().text().catch(() => '') } catch {}
+            console.log(`[Proxy] ${originalResponse.status} for ${urlParam.substring(0,80)} | ${errBody.substring(0,300)}`)
+        }
         if (isCopilotURL(urlParam) && !originalResponse.ok) {
             let errBody = ''
             try { errBody = await originalResponse.clone().text().catch(() => '') } catch {}
