@@ -6316,10 +6316,8 @@ function setupLLMWorkerWebSocket(server) {
         ws.on('close', cleanup)
         ws.on('error', cleanup)
     })
-    }
-});
+}
 
-// ── Inlay bulk compression endpoint ──────────────────────────────────────────
 // ─── MCP LLM Call Endpoint ──────────────────────────────────────────────────
 // MCP servers call LLMs through RisuAI's active preset config.
 // No separate API key needed — uses Main/Aux model settings from the database.
@@ -7410,6 +7408,34 @@ app.post('/api/mcp/modules/lua/get', mcpAuthMiddleware, async (req, res) => {
         const db = await loadDatabase()
         const { id } = req.body || {}
         const mod = findModule((db.modules || []).filter(m => !m.mcp), id)
+        if (!mod) return res.status(404).json({ error: 'Module not found' })
+        const code = mod.trigger?.[0]?.effect?.[0]?.code || ''
+        res.json({ code })
+    } catch (e) {
+        res.status(500).json({ error: e.message })
+    }
+})
+
+app.post('/api/mcp/modules/lua/set', mcpAuthMiddleware, async (req, res) => {
+    try {
+        await queueStorageOperation(async () => {
+            const db = await loadDatabase()
+            const { id, code } = req.body || {}
+            const mod = findModule((db.modules || []).filter(m => !m.mcp), id)
+            if (!mod) return res.status(404).json({ error: 'Module not found' })
+            if (!mod.trigger) mod.trigger = [{ type: 'start', effect: [{ type: 'triggercode', code: '' }] }]
+            if (!mod.trigger[0]) mod.trigger[0] = { type: 'start', effect: [{ type: 'triggercode', code: '' }] }
+            if (!mod.trigger[0].effect) mod.trigger[0].effect = [{ type: 'triggercode', code: '' }]
+            if (!mod.trigger[0].effect[0]) mod.trigger[0].effect[0] = { type: 'triggercode', code: '' }
+            mod.trigger[0].effect[0].code = code || ''
+            scheduleDatabaseSave()
+            res.json({ success: true })
+        })
+    } catch (e) {
+        res.status(500).json({ error: e.message })
+    }
+})
+
 async function startServer() {
     try {
         await migrateInlaysToFilesystem();
