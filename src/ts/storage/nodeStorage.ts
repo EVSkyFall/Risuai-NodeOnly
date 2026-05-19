@@ -6,7 +6,7 @@
 // Server counterpart: server/node/server.cjs (createServerJwt, checkAuth,
 // /api/login, /api/token/refresh)
 import { language } from "src/lang"
-import { alertError, alertInput, waitAlert } from "../alert"
+import { alertInput, waitAlert, notifyError } from "../alert"
 import { decodeRisuSave, encodeRisuSaveLegacy } from "./risuSave"
 import { normalizeChat } from "./database.svelte"
 
@@ -18,6 +18,23 @@ export class ConflictError extends Error {
         this.name = 'ConflictError'
         this.currentEtag = currentEtag
     }
+}
+
+// Warning the server attaches to /api/patch responses when the most recent
+// debounced persist failed (Stage 1 visibility — see issues.md).
+export interface PersistWarning {
+    timestamp: number
+    message: string
+    attemptedSize: number | null
+    source: string
+}
+
+export interface PatchItemResult {
+    success: boolean
+    etag?: string
+    persistWarning?: PersistWarning
+    /** Set when the server's chat-internal-field guard rejected the patch. */
+    chatGuardRejected?: boolean
 }
 
 export class NodeStorage{
@@ -102,7 +119,7 @@ export class NodeStorage{
         })
 
         if(response.status === 429){
-            alertError(`Too many attempts. Please wait and try again later.`)
+            notifyError(`Too many attempts. Please wait and try again later.`)
             await waitAlert()
             throw new Error('Too many login attempts')
         }
@@ -306,7 +323,7 @@ export class NodeStorage{
         this._lastDbEtag = etag
     }
 
-    async patchItem(key: string, patchData: { patch: any[], expectedHash: string }): Promise<{success: boolean, etag?: string}> {
+    async patchItem(key: string, patchData: { patch: any[], expectedHash: string }): Promise<PatchItemResult> {
         const da = await this.authFetch('/api/patch', {
             method: "POST",
             body: JSON.stringify(patchData),
@@ -322,7 +339,13 @@ export class NodeStorage{
             if (key === 'database/database.bin' && currentEtag) {
                 this._lastDbEtag = currentEtag
             }
-            return { success: false, etag: currentEtag }
+            // Server signals chat-guard rejection via explicit fields. The
+            // error string fallback is kept for forward-compat with deployed
+            // servers that haven't shipped the explicit fields yet.
+            const rejectedByChatGuard = data.chatGuardRejected === true
+                || data.code === 'CHAT_GUARD_REJECTED'
+                || (typeof data.error === 'string' && data.error.includes('chat-internal field ops'))
+            return { success: false, etag: currentEtag, chatGuardRejected: rejectedByChatGuard }
         }
         if (da.status < 200 || da.status >= 300) {
             return { success: false }
@@ -335,7 +358,8 @@ export class NodeStorage{
         if (key === 'database/database.bin' && nextEtag) {
             this._lastDbEtag = nextEtag
         }
-        return { success: true, etag: nextEtag }
+        const persistWarning = data.persistWarning as PersistWarning | undefined
+        return { success: true, etag: nextEtag, persistWarning }
     }
 
     // ── Bulk asset operations (3-2-B) ──────────────────────────────────────────
@@ -390,8 +414,11 @@ export class NodeStorage{
         }
     }
 
-    async exportBackup(): Promise<Response> {
-        const da = await this.authFetch('/api/backup/export')
+    async exportBackup(opts?: { target?: 'upstream' }): Promise<Response> {
+        const url = opts?.target === 'upstream'
+            ? '/api/backup/export?target=upstream'
+            : '/api/backup/export'
+        const da = await this.authFetch(url)
         if (da.status < 200 || da.status >= 300) throw `backup export error: ${da.status}`
         return da
     }
@@ -425,24 +452,63 @@ export class NodeStorage{
             xhr.setRequestHeader('content-type', 'application/x-risu-backup')
             xhr.setRequestHeader('risu-auth', authHeader)
             xhr.setRequestHeader('x-session-id', NodeStorage.sessionId)
+            // Opt into NDJSON streaming so the server keeps the response socket
+            // alive during long post-upload work — prevents reverse-proxy 502s.
+            xhr.setRequestHeader('accept', 'application/x-ndjson')
 
+            let uploadComplete = false
             xhr.upload.onprogress = (event) => {
                 if (event.lengthComputable) {
                     onProgress?.(event.loaded, event.total)
                 }
             }
+            xhr.upload.onload = () => { uploadComplete = true }
 
+            let parsedIndex = 0
+            let leftover = ''
+            let result: {ok: boolean, assetsRestored: number, coldStorageFailed?: number} | null = null
+            let serverErrorMsg: string | null = null
+
+            const drainNdjson = () => {
+                const text = xhr.responseText
+                if (text.length <= parsedIndex) return
+                leftover += text.slice(parsedIndex)
+                parsedIndex = text.length
+                const lines = leftover.split('\n')
+                leftover = lines.pop() ?? ''
+                for (const line of lines) {
+                    if (!line) continue
+                    let msg: any
+                    try { msg = JSON.parse(line) } catch { continue }
+                    if (msg.type === 'progress' && uploadComplete) {
+                        // After upload finishes, surface server-side processing
+                        // progress through the same callback for UI continuity.
+                        onProgress?.(msg.bytes, msg.totalBytes)
+                    } else if (msg.type === 'done') {
+                        result = msg
+                    } else if (msg.type === 'error') {
+                        serverErrorMsg = typeof msg.message === 'string' ? msg.message : 'backup import failed'
+                    }
+                    // Ignore 'heartbeat' and unknown event types.
+                }
+            }
+
+            xhr.onprogress = drainNdjson
             xhr.onerror = () => reject(new Error('backup import request failed'))
             xhr.onload = () => {
                 if (xhr.status < 200 || xhr.status >= 300) {
-                    reject(new Error(`backup import error: ${xhr.status}`))
+                    let msg = `backup import error: ${xhr.status}`
+                    try {
+                        const body = JSON.parse(xhr.responseText)
+                        if (body?.error) msg = String(body.error)
+                    } catch {}
+                    reject(new Error(msg))
                     return
                 }
-                try {
-                    resolve(JSON.parse(xhr.responseText))
-                } catch (error) {
-                    reject(error)
-                }
+                drainNdjson()
+                if (serverErrorMsg) reject(new Error(serverErrorMsg))
+                else if (result) resolve(result)
+                else reject(new Error('backup import: no result received'))
             }
 
             xhr.send(file)

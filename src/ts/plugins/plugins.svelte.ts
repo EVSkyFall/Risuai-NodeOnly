@@ -510,7 +510,6 @@ export const allowedDbKeys = [
     'plugins',
     'pluginCustomStorage',
     'temperature',
-    'askRemoval',
     'maxContext',
     'maxResponse',
     'frequencyPenalty',

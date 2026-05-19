@@ -1,5 +1,5 @@
 import { language } from "src/lang"
-import { alertError } from "src/ts/alert";
+import { notifyError } from "src/ts/alert";
 import { getDatabase } from "src/ts/storage/database.svelte"
 import { LLMFlags, LLMFormat, LLMProvider } from "src/ts/model/modellist"
 import { strongBan, tokenizeNum } from "src/ts/tokenizer"
@@ -13,9 +13,9 @@ interface LocalNetworkRequestOptions {
     requestTimeoutMs?: number
 }
 
-function getLocalNetworkRequestOptions(url: string): LocalNetworkRequestOptions {
+function getLocalNetworkRequestOptions(url: string, force: boolean = false): LocalNetworkRequestOptions {
     const db = getDatabase()
-    if (!db.localNetworkMode) return {}
+    if (!force && !db.localNetworkMode) return {}
     if (!isLocalNetworkUrl(url)) return {}
     return {
         networkRoute: 'local_network' as const,
@@ -28,7 +28,7 @@ import { applyChatTemplate } from "../../templates/chatTemplate"
 import { supportsInlayImage } from "../../files/inlays"
 import { callTool, decodeToolCall, encodeToolCall } from "../../mcp/mcp"
 import type { RequestDataArgumentExtended, requestDataResponse, StreamResponseChunk } from '../request'
-import { applyParameters, setObjectValue } from '../shared'
+import { applyAdditionalParameters, applyParameters, getAdditionalParameters } from '../shared'
 
 import type { Contents, OpenAIChatExtra, OpenAIChatFull, ResponseInputItem, ResponseItem, ResponseOutputItem, ToolCall } from './types'
 import { v4 } from "uuid"
@@ -232,6 +232,9 @@ export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<req
     if(aiModel === 'reverse_proxy'){
         requestModel = db.customProxyRequestModel
     }
+    if(aiModel === 'nanogpt'){
+        requestModel = db.nanogptRequestModel
+    }
 
     if(aiModel === 'openrouter' && db.openrouterRequestModel === 'risu/free'){
         openrouterRequestModel = await getFreeOpenRouterModels()
@@ -366,7 +369,8 @@ export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<req
     let body:{
         [key:string]:any
     } = ({
-        model: aiModel === 'openrouter' ? openrouterRequestModel :
+        model: aiModel === 'nanogpt' ? db.nanogptRequestModel :
+            aiModel === 'openrouter' ? openrouterRequestModel :
             aiModel === 'vercel' ? db.vercelRequestModel :
             aiModel === 'openai-dynamic' ? db.openAIRequestModel :
             requestModel ===  'gpt35' ? 'gpt-3.5-turbo'
@@ -539,7 +543,8 @@ export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<req
         }
     }
 
-    let replacerURL = aiModel === 'openrouter' ? "https://openrouter.ai/api/v1/chat/completions" :
+    let replacerURL = aiModel === 'nanogpt' ? (db.nanogptUseSubscriptionEndpoint ? 'https://nano-gpt.com/api/subscription/v1/chat/completions' : 'https://nano-gpt.com/api/v1/chat/completions') :
+        aiModel === 'openrouter' ? "https://openrouter.ai/api/v1/chat/completions" :
         aiModel === 'vercel' ? "https://ai-gateway.vercel.sh/v1/chat/completions" :
         (arg.customURL) ?? ('https://api.openai.com/v1/chat/completions')
 
@@ -571,7 +576,7 @@ export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<req
     }
 
     let headers = {
-        "Authorization": "Bearer " + (arg.key ?? (aiModel === 'reverse_proxy' ?  db.proxyKey : (aiModel === 'openrouter' ? db.openrouterKey : (aiModel === 'vercel' ? db.vercelKey : db.openAIKey)))),
+        "Authorization": "Bearer " + (arg.key ?? (aiModel === 'nanogpt' ? db.nanogptKey : aiModel === 'reverse_proxy' ?  db.proxyKey : (aiModel === 'openrouter' ? db.openrouterKey : (aiModel === 'vercel' ? db.vercelKey : db.openAIKey)))),
         "Content-Type": "application/json"
     }
 
@@ -581,6 +586,9 @@ export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<req
     if(aiModel === 'openrouter'){
         headers["X-Title"] = 'RisuAI'
         headers["HTTP-Referer"] = 'https://risuai.xyz'
+    }
+    if(aiModel === 'nanogpt' && db.nanogptProvider){
+        headers["X-Provider"] = db.nanogptProvider
     }
     if(risuIdentify){
         headers["X-Proxy-Risu"] = 'RisuAI'
@@ -596,70 +604,7 @@ export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<req
         body.n = db.genTime
     }
     if(aiModel === 'reverse_proxy' || aiModel.startsWith('xcustom:::')){
-        let additionalParams = aiModel === 'reverse_proxy' ? db.additionalParams : []
-
-        if(aiModel.startsWith('xcustom:::')){
-            const found = db.customModels.find(m => m.id === aiModel)
-            const params = found?.params
-            if(params){
-                const lines = params.split('\n')
-                for(const line of lines){
-                    const split = line.split('=')
-                    if(split.length >= 2){
-                        additionalParams.push([split[0], split.slice(1).join('=')])
-                    }
-                }
-            }
-        }
-
-        for(let i=0;i<additionalParams.length;i++){
-            let key = additionalParams[i][0]
-            let value = additionalParams[i][1]
-
-            if(!key || !value){
-                continue
-            }
-
-            if(value === '{{none}}'){
-                if(key.startsWith('header::')){
-                    key = key.replace('header::', '')
-                    delete headers[key]
-                }
-                else{
-                    delete body[key]
-                }
-                continue
-            }
-
-            if(key.startsWith('header::')){
-                key = key.replace('header::', '')
-                headers[key] = value
-            }
-            else if(value.startsWith('json::')){
-                value = value.replace('json::', '')
-                try {
-                    body[key] = JSON.parse(value)
-                } catch (error) {}
-            }
-            else if((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))){
-                body = setObjectValue(body, key, value.slice(1, -1))
-            }
-            else if(value === 'true' || value === 'false'){
-                body = setObjectValue(body, key, value === 'true')
-            }
-            else if(value === 'null'){
-                body = setObjectValue(body, key, null)
-            }
-            else{
-                const num = Number(value)
-                if(isNaN(num)){
-                    body = setObjectValue(body, key, value)
-                }
-                else{
-                    body = setObjectValue(body, key, num)
-                }
-            }
-        }
+        body = applyAdditionalParameters(body, headers, getAdditionalParameters(aiModel))
     }
 
     // OpenAI Batch API: submit as async batch (50% discount, 24h)
@@ -697,7 +642,7 @@ export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<req
             signal: arg.abortSignal,
             chatId: arg.chatId,
             interceptor: 'openai_streaming',
-            ...getLocalNetworkRequestOptions(replacerURL),
+            ...getLocalNetworkRequestOptions(replacerURL, arg.forceLocalNetwork),
         })
 
         if(da.status !== 200){
@@ -763,7 +708,7 @@ async function requestHTTPOpenAI(replacerURL:string,body:any, headers:Record<str
         abortSignal: arg.abortSignal,
         chatId: arg.chatId,
         interceptor: 'openai_basic',
-        ...getLocalNetworkRequestOptions(replacerURL),
+        ...getLocalNetworkRequestOptions(replacerURL, arg.forceLocalNetwork),
     })
 
     function processTextResponse(dat: any):string{
@@ -919,7 +864,7 @@ async function requestHTTPOpenAI(replacerURL:string,body:any, headers:Record<str
                 const result = (db.simplifiedToolUse ? '' : (processTextResponse(dat) ?? '') + '\n\n') + callCode
                         
                 if(resRec.type === 'fail') {
-                    alertError(`Failed to fetch model response after tool execution`)
+                    notifyError(`Failed to fetch model response after tool execution`)
                     return {
                         type: 'success',
                         result: result
@@ -1259,8 +1204,6 @@ function getTranStream(arg:RequestDataArgumentExtended):TransformStream<Uint8Arr
             }
             control.enqueue(JSONreaded)
         } else if(reasoningContent){
-            // Stream reasoning live so the UI doesn't sit blank while a long
-            // chain-of-thought streams before the answer body starts.
             control.enqueue({
                 ...readed,
                 "0": `<Thoughts>\n${reasoningContent}\n</Thoughts>\n${readed["0"] ?? ''}`
@@ -1294,9 +1237,6 @@ function getTranStream(arg:RequestDataArgumentExtended):TransformStream<Uint8Arr
                 if(chunkText){
                     const key = arg.multiGen ? choice.index.toString() : "0"
                     const prev = readed[key] ?? ""
-                    // DeepSeek API ships cumulative chunks despite the spec.
-                    // Detect by prefix match and replace, otherwise quadratic
-                    // text bloat (every chunk re-emits all prior text).
                     if(prev.length > 0 && chunkText.length > prev.length && chunkText.startsWith(prev)){
                         readed[key] = chunkText
                     } else {
@@ -1323,8 +1263,9 @@ function getTranStream(arg:RequestDataArgumentExtended):TransformStream<Uint8Arr
                     }
                     readed["__tool_calls"] = JSON.stringify(toolCallsData)
                 }
-                if(choice?.delta?.reasoning_content){
-                    const rc: string = choice.delta.reasoning_content
+                const reasoningDelta = choice?.delta?.reasoning_content ?? choice?.delta?.reasoning
+                if(reasoningDelta){
+                    const rc: string = reasoningDelta
                     if(reasoningContent.length > 0 && rc.length > reasoningContent.length && rc.startsWith(reasoningContent)){
                         reasoningContent = rc
                     } else {
@@ -1340,7 +1281,7 @@ function getTranStream(arg:RequestDataArgumentExtended):TransformStream<Uint8Arr
         transform(chunk, control) {
             buffer += decoder.decode(chunk, { stream: true })
             const lines = buffer.split('\n')
-            buffer = lines.pop() ?? ''  // keep incomplete tail for next call
+            buffer = lines.pop() ?? ''
 
             let terminated = false
             for(const line of lines){
@@ -1496,7 +1437,7 @@ function wrapToolStream(
                         } while (attempt <= db.requestRetrys) // Retry up to db.requestRetrys times
                         
                         if(errorFlag){
-                            alertError(`Failed to fetch model response after tool execution`)
+                            notifyError(`Failed to fetch model response after tool execution`)
                             return controller.close()
                         }
                         

@@ -458,9 +458,10 @@ let googleCloudTokenizedCache = new Map<string, number>()
 async function tokenizeGoogleCloud(text:string) {
     const db = getDatabase()
     const model = getModelInfo(db.aiModel)
+    const cacheKey = text + model.internalID
 
-    if(googleCloudTokenizedCache.has(text + model.internalID)){
-        const count = googleCloudTokenizedCache.get(text + model.internalID)
+    if(googleCloudTokenizedCache.has(cacheKey)){
+        const count = googleCloudTokenizedCache.get(cacheKey) ?? 0
         return new Uint32Array(count)
     }
 
@@ -483,7 +484,7 @@ async function tokenizeGoogleCloud(text:string) {
     }
 
     const json = await res.json()
-    googleCloudTokenizedCache.set(text + model.internalID, json.totalTokens as number)
+    googleCloudTokenizedCache.set(cacheKey, json.totalTokens as number)
     const count = json.totalTokens as number
 
     return new Uint32Array(count)
@@ -799,6 +800,7 @@ export async function getCharToken(char?:character|null){
     if((char as any).type === 'group'){
         return {persistant:0, dynamic:0}
     }
+
 
     const basicTokenize = async (data:string) => {
         data = data.replace(/{{char}}/g, char.name).replace(/<char>/g, char.name)

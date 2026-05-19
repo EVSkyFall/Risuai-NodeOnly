@@ -16,6 +16,7 @@ export const basicParameterItems: SettingItem[] = [
         id: 'params.maxContext',
         type: 'number',
         labelKey: 'maxContextSize',
+        helpKey: 'maxContextSize',
         bindKey: 'maxContext',
         options: { min: 0 },
         keywords: ['context', 'size', 'token', 'limit'],
@@ -24,6 +25,7 @@ export const basicParameterItems: SettingItem[] = [
         id: 'params.maxResponse',
         type: 'number',
         labelKey: 'maxResponseSize',
+        helpKey: 'maxResponseSize',
         bindKey: 'maxResponse',
         options: { min: 0, max: 2048 },
         keywords: ['response', 'size', 'output', 'length'],
@@ -37,10 +39,11 @@ export const seedSetting: SettingItem = {
     id: 'params.seed',
     type: 'number',
     labelKey: 'seed',
+    helpKey: 'seed',
     bindKey: 'generationSeed',
-    condition: (ctx) => 
-        ctx.db.aiModel.startsWith('gpt') || 
-        ctx.db.aiModel === 'reverse_proxy' || 
+    condition: (ctx) =>
+        ctx.db.aiModel.startsWith('gpt') ||
+        ctx.db.aiModel === 'reverse_proxy' ||
         ctx.db.aiModel === 'openrouter',
     keywords: ['seed', 'random', 'deterministic'],
 };
@@ -75,6 +78,7 @@ export const penaltyParameterItems: SettingItem[] = [
         id: 'params.frequencyPenalty',
         type: 'slider',
         labelKey: 'frequencyPenalty',
+        helpKey: 'frequencyPenalty',
         bindKey: 'frequencyPenalty',
         condition: (ctx) => ctx.modelInfo.parameters.includes('frequency_penalty'),
         options: {
@@ -90,6 +94,7 @@ export const penaltyParameterItems: SettingItem[] = [
         id: 'params.presencePenalty',
         type: 'slider',
         labelKey: 'presensePenalty',
+        helpKey: 'presensePenalty',
         bindKey: 'PresensePenalty',
         condition: (ctx) => ctx.modelInfo.parameters.includes('presence_penalty'),
         options: {
@@ -105,6 +110,7 @@ export const penaltyParameterItems: SettingItem[] = [
         id: 'params.topP',
         type: 'slider',
         fallbackLabel: 'Top P',
+        helpKey: 'topP',
         bindKey: 'top_p',
         condition: (ctx) => ctx.modelInfo.parameters.includes('top_p'),
         options: {
@@ -126,6 +132,7 @@ export const modelSpecificParameterItems: SettingItem[] = [
         id: 'params.thinkingType',
         type: 'segmented',
         labelKey: 'thinkingType',
+        helpKey: 'thinkingType',
         bindKey: 'thinkingType',
         condition: (ctx) =>
             ctx.modelInfo.flags.includes(LLMFlags.claudeThinking) ||
@@ -150,6 +157,7 @@ export const modelSpecificParameterItems: SettingItem[] = [
         id: 'params.thinkingTokens',
         type: 'slider',
         labelKey: 'thinkingTokens',
+        helpKey: 'thinkingTokens',
         bindKey: 'thinkingTokens',
         condition: (ctx) =>
             ctx.modelInfo.parameters.includes('thinking_tokens') &&
@@ -182,7 +190,8 @@ export const modelSpecificParameterItems: SettingItem[] = [
     {
         id: 'params.adaptiveThinkingEffort',
         type: 'segmented',
-        fallbackLabel: 'Effort',
+        labelKey: 'adaptiveThinkingEffort',
+        helpKey: 'adaptiveThinkingEffort',
         bindKey: 'adaptiveThinkingEffort',
         // Effort applies to all tokens (text + tool calls + thinking). Independent
         // from thinking on/off — visible whenever the model supports adaptive
@@ -216,6 +225,7 @@ export const modelSpecificParameterItems: SettingItem[] = [
         id: 'params.topK',
         type: 'slider',
         fallbackLabel: 'Top K',
+        helpKey: 'topK',
         bindKey: 'top_k',
         condition: (ctx) => ctx.modelInfo.parameters.includes('top_k'),
         options: {
@@ -230,6 +240,7 @@ export const modelSpecificParameterItems: SettingItem[] = [
         id: 'params.minP',
         type: 'slider',
         fallbackLabel: 'Min P',
+        helpKey: 'minP',
         bindKey: 'min_p',
         condition: (ctx) => ctx.modelInfo.parameters.includes('min_p'),
         options: {
@@ -245,6 +256,7 @@ export const modelSpecificParameterItems: SettingItem[] = [
         id: 'params.topA',
         type: 'slider',
         fallbackLabel: 'Top A',
+        helpKey: 'topA',
         bindKey: 'top_a',
         condition: (ctx) => ctx.modelInfo.parameters.includes('top_a'),
         options: {
@@ -260,6 +272,7 @@ export const modelSpecificParameterItems: SettingItem[] = [
         id: 'params.repetitionPenalty',
         type: 'slider',
         fallbackLabel: 'Repetition penalty',
+        helpKey: 'repetitionPenalty',
         bindKey: 'repetition_penalty',
         condition: (ctx) => ctx.modelInfo.parameters.includes('repetition_penalty'),
         options: {
@@ -275,6 +288,7 @@ export const modelSpecificParameterItems: SettingItem[] = [
         id: 'params.reasoningEffort',
         type: 'segmented',
         fallbackLabel: 'Reasoning Effort',
+        helpKey: 'reasoningEffort',
         bindKey: 'reasoningEffort',
         condition: (ctx) => ctx.modelInfo.parameters.includes('reasoning_effort'),
         options: {
@@ -295,6 +309,7 @@ export const modelSpecificParameterItems: SettingItem[] = [
         id: 'params.verbosity',
         type: 'slider',
         fallbackLabel: 'Verbosity',
+        helpKey: 'verbosity',
         bindKey: 'verbosity',
         condition: (ctx) => ctx.modelInfo.parameters.includes('verbosity'),
         options: {

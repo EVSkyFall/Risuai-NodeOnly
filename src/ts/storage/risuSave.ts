@@ -792,6 +792,53 @@ export function normalizeJSON(value: any, seen?: WeakSet<object>): any {
     return result;
 }
 
+// Compare two arrays element-wise, but emit a single `replace` op covering the
+// whole array when structure changes (add, remove, reorder). Element-wise diff
+// via fast-json-patch is dangerous on arrays of deep objects: deleting one
+// entry shifts every following index, each shifted slot deep-diffs "old item N
+// vs new item N+1", and the resulting op list can balloon past V8's function
+// argument limit (~125k) — `patch.push(...ops)` then throws
+// `RangeError: Maximum call stack size exceeded`. Callers MUST iterate the
+// returned ops with `for (const op of ops) patch.push(op)` rather than spread,
+// to stay safe even when a single item's internal diff is large.
+//
+// `idKey != null` (modules): structural detection by id equality at each index,
+// with a safety belt that forces `replace` when ids are falsy or duplicated
+// (defensive against corrupted backups). `idKey == null` (botPresets, which
+// have no stable id): length-only detection.
+export function diffArrayWithIdGuard(
+    compare: (a: any, b: any) => any[],
+    path: string,
+    lastArr: any[] | undefined,
+    curArr: any[],
+    idKey: string | null,
+): any[] {
+    const last = lastArr ?? []
+    let structural = last.length !== curArr.length
+
+    if (!structural && idKey != null) {
+        const lastIds = last.map((m: any) => m?.[idKey])
+        const curIds = curArr.map((m: any) => m?.[idKey])
+        const hasInvalidIds = curIds.some(id => !id) || lastIds.some(id => !id)
+        const hasDuplicates = new Set(curIds).size !== curIds.length
+        structural = hasInvalidIds || hasDuplicates ||
+            lastIds.some((id, i) => id !== curIds[i])
+    }
+
+    if (structural) {
+        return [{ op: 'replace', path, value: curArr }]
+    }
+
+    const ops: any[] = []
+    for (let i = 0; i < curArr.length; i++) {
+        const subPatch = compare(last[i], curArr[i])
+        for (const p of subPatch) {
+            ops.push({ ...p, path: `${path}/${i}${p.path}` })
+        }
+    }
+    return ops
+}
+
 export class RisuSavePatcher {
     private lastSyncedDb: any;
     private hashBlocks: { [key: string]: number } = {};
@@ -861,15 +908,17 @@ export class RisuSavePatcher {
         }
 
         if (toSave.botPreset) {
-            const normBotPresets = normalizeJSON(curBotPresets)
-            patch.push(...compare({ botPresets: lastBotPresets }, { botPresets: normBotPresets }))
+            const normBotPresets = normalizeJSON(curBotPresets) ?? []
+            const ops = diffArrayWithIdGuard(compare, '/botPresets', lastBotPresets, normBotPresets, null)
+            for (const op of ops) patch.push(op)
             this.hashBlocks['botPresets'] = calculateHash(normBotPresets);
             this.lastSyncedDb.botPresets = normBotPresets;
         }
 
         if (toSave.modules) {
-            const normModules = normalizeJSON(curModules)
-            patch.push(...compare({ modules: lastModules }, { modules: normModules }))
+            const normModules = normalizeJSON(curModules) ?? []
+            const ops = diffArrayWithIdGuard(compare, '/modules', lastModules, normModules, 'id')
+            for (const op of ops) patch.push(op)
             this.hashBlocks['modules'] = calculateHash(normModules);
             this.lastSyncedDb.modules = normModules;
         }
@@ -935,4 +984,75 @@ export class RisuSavePatcher {
             expectedHash
         }
     }
+}
+
+// Stub metadata fields a patch may legitimately touch on `chats[i]`. Anything
+// else is chat-internal data that lives server-side via /api/chat-content;
+// emitting such ops over /api/patch silently strips the `_stub` flag in the
+// server's dbCache and corrupts the on-disk DB. Keep in sync with chatToStub.
+const STUB_METADATA_FIELDS = new Set(['id', 'name', '_stub', 'lastDate', 'folderId', 'modules']);
+
+// Only these op types are legitimate on chat-internal paths. The patcher's
+// fast-json-patch.compare only emits add/replace/remove; move/copy/test would
+// only come from external/legacy clients and could bypass the field-name
+// allowlist by aliasing _stub through `from`. Reject them outright.
+const ALLOWED_CHAT_OP_TYPES = new Set(['add', 'replace', 'remove'])
+
+const CHAT_FIELD_PATH_RE = /^\/characters\/\d+\/chats\/\d+\/([^/]+)/
+
+/**
+ * Detect patch ops that mutate chat-internal fields. The patcher should never
+ * produce these — chats are always run through chatToStub before diffing — so
+ * any hit indicates a baseline-vs-current mismatch that would cause server-side
+ * data loss (see findChatInternalFieldOps in server.cjs). Used by the save
+ * pipeline to refuse the patch and fall through to a safe full write.
+ *
+ * The `_stub` field gets stricter treatment than other allowed fields: only
+ * `add`/`replace` with literal value `true` is permitted. Removing `_stub`
+ * or setting it to a falsy value is itself the loss vector — the server's
+ * reassembleFullDb skips fullChat merge when `_stub` is falsy.
+ *
+ * `move`/`copy` ops on chat-internal paths are rejected wholesale because
+ * the field-name allowlist on `path` alone can't catch a `from` that points
+ * at `_stub` or another chat-internal field. Both `path` and `from` are
+ * checked when present.
+ */
+export function findDangerousChatOps(patch: any[]): { op: string; path: string; field: string; reason?: string }[] {
+    if (!Array.isArray(patch)) return []
+    const violations: { op: string; path: string; field: string; reason?: string }[] = []
+    for (const op of patch) {
+        if (!op || typeof op !== 'object' || typeof op.path !== 'string') continue
+
+        const pathMatch = op.path.match(CHAT_FIELD_PATH_RE)
+        const fromMatch = typeof op.from === 'string' ? op.from.match(CHAT_FIELD_PATH_RE) : null
+        if (!pathMatch && !fromMatch) continue
+
+        // Any move/copy/test that touches a chat-internal field — on either
+        // path or from — is a bypass attempt. Block at the op-type layer.
+        if (!ALLOWED_CHAT_OP_TYPES.has(op.op)) {
+            violations.push({
+                op: op.op,
+                path: op.path,
+                field: pathMatch?.[1] ?? fromMatch?.[1] ?? '',
+                reason: `disallowed op type on chat field`,
+            })
+            continue
+        }
+
+        if (pathMatch) {
+            const field = pathMatch[1]
+            if (!STUB_METADATA_FIELDS.has(field)) {
+                violations.push({ op: op.op, path: op.path, field })
+                continue
+            }
+            if (field === '_stub') {
+                if (op.op === 'remove') {
+                    violations.push({ op: op.op, path: op.path, field, reason: 'remove _stub' })
+                } else if ((op.op === 'add' || op.op === 'replace') && op.value !== true) {
+                    violations.push({ op: op.op, path: op.path, field, reason: 'non-true _stub value' })
+                }
+            }
+        }
+    }
+    return violations
 }

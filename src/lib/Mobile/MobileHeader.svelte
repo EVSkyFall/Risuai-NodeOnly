@@ -4,6 +4,7 @@
     
     import { DBState } from 'src/ts/stores.svelte';
     import { MobileGUIStack, MobileSearch, selectedCharID, SettingsMenuIndex, MobileSideBar } from "src/ts/stores.svelte";
+    import { SettingsRoute } from "src/ts/routing";
 
 </script>
 <div class="w-full px-4 h-16 border-b border-b-darkborderc bg-darkbg flex justify-start items-center gap-2">
@@ -30,17 +31,17 @@
         </div>
     {:else if $MobileGUIStack === 2 && $SettingsMenuIndex > -1}
         <button onclick={() => {
-            SettingsMenuIndex.set(-1)
+            SettingsMenuIndex.set(SettingsRoute.None)
         }}>
             <ArrowLeft />
         </button>
-        <span class="font-bold text-lg">Risuai</span>
+        <span class="font-bold text-lg">PocketRisu</span>
     {:else if $MobileGUIStack === 1}
         <div class="flex items-stretch w-2xl max-w-full">
             <input placeholder={language.search + '...'} bind:value={$MobileSearch} class="peer focus:border-textcolor transition-colors outline-hidden text-textcolor p-2 min-w-0 border bg-transparent rounded-md input-text text-xl grow mx-4 border-darkborderc resize-none overflow-y-hidden overflow-x-hidden max-w-full">
         </div>
     {:else}
-        <span class="font-bold text-lg">Risuai</span>
+        <span class="font-bold text-lg">PocketRisu</span>
 
     {/if}
 </div>

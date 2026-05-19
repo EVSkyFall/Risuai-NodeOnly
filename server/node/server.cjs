@@ -12,37 +12,52 @@ const nodeCrypto = require('crypto')
 const zlib = require('zlib')
 const rateLimit = require('express-rate-limit')
 const { WebSocketServer } = require('ws')
-const sharp = require('sharp')
+const Vips = require('wasm-vips')
+let _vipsPromise = null
+const getVips = () => {
+    if (!_vipsPromise) {
+        _vipsPromise = Vips().catch(err => {
+            _vipsPromise = null
+            throw err
+        })
+    }
+    return _vipsPromise
+}
 const { kvGet, kvSet, kvDel, kvList,
         kvDelPrefix, kvListWithSizes, kvSize, kvGetUpdatedAt, kvCopyValue, clearEntities, checkpointWal,
         db: sqliteDb } = require('./db.cjs');
+const {
+    addLogBatch, queryLogs, clearLogs, countLogs,
+    logger, installProcessHandlers, expressErrorMiddleware,
+} = require('./logs.cjs');
 const { applyPatch } = require('fast-json-patch');
-const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON } = require('./utils.cjs');
+const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, hasRemoteBlocks } = require('./utils.cjs');
+const { spawn, execSync } = require('child_process');
+const os = require('os');
+const { Readable, Transform } = require('stream');
 
-// Increase undici headersTimeout for proxy fetch — Copilot API can be slow during tool execution
+// Install process-level error handlers before any other init so early crashes get logged.
+installProcessHandlers();
+
 try {
     const { Agent, setGlobalDispatcher } = require('undici')
     setGlobalDispatcher(new Agent({
-        headersTimeout: 600_000,   // 10 minutes (default 300s)
-        bodyTimeout: 1_800_000,    // 30 minutes (long streaming responses)
-        connectTimeout: 30_000,    // 30 seconds connect
+        headersTimeout: 600_000,
+        bodyTimeout: 1_800_000,
+        connectTimeout: 30_000,
     }))
-} catch {
-    // Node.js without separate undici — fallback to defaults
-}
+} catch {}
 
 // Node.js version check
 const [nodeMajor] = process.version.slice(1).split('.').map(Number);
 if (nodeMajor < 24) {
-    console.warn(`[Server] Node.js ${process.version} is below the recommended version (v24.x). Consider upgrading for best compatibility.`);
+    logger.warn(`[Server] Node.js ${process.version} is below the recommended version (v24.x). Consider upgrading for best compatibility.`);
 }
 
 // Configuration flags for patch-based sync
 const enablePatchSync = true;
 
 // ─── Copilot Turn Session Manager ────────────────────────────────────────────
-// Deterministic ID derivation from turnId+model. Same inputs → same taskId.
-// Same turnId + same model within 30min: first request = user, all subsequent = agent.
 const copilotTurnSessions = new Map()
 const COPILOT_SESSION_TTL_MS = 30 * 60_000
 
@@ -55,13 +70,8 @@ function deterministicUUID(seed) {
     return `${hash.slice(0,8)}-${hash.slice(8,12)}-${hash.slice(12,16)}-${hash.slice(16,20)}-${hash.slice(20,32)}`
 }
 
-// Track the most recent active session per model for auto-bundling
-const recentModelSessions = new Map() // model → { key, turnId, lastUsed }
+const recentModelSessions = new Map()
 
-// Persistent Copilot client identity. Copilot's /v1/messages quota bucket is
-// keyed partly by user-agent + machine-id; rotating per launch flags us as a
-// new unstable client and pushes us into the tighter Chat bucket. Persist so
-// the messages-proxy (Claude Code SDK) bucket stays sticky across restarts.
 const _copilotIdPath = path.join(process.cwd(), 'save', '__copilot_ids.json')
 let _copilotIds = null
 function getCopilotIds() {
@@ -82,11 +92,8 @@ function getCopilotIds() {
     try { writeFileSync(_copilotIdPath, JSON.stringify(_copilotIds)) } catch {}
     return _copilotIds
 }
-// Session id rotates per server boot (matches VSCode: new window = new session).
 const _copilotSessionId = nodeCrypto.randomUUID()
 
-// Header values identifying us to Copilot. These track recent VSCode + Copilot
-// Chat releases — rotate periodically as GitHub may tighten version checks.
 const COPILOT_EDITOR_VERSION = 'vscode/1.104.3'
 const COPILOT_PLUGIN_VERSION = 'copilot-chat/0.44.1'
 const COPILOT_CLAUDE_CODE_UA = 'vscode_claude_code/2.1.98 (external, sdk-ts, agent-sdk/0.2.98)'
@@ -102,22 +109,14 @@ function applyCopilotTurnHeaders(header, targetUrl, turnId, requestBody) {
         model = body?.model || null
     } catch {}
 
-    // Auto-bundle: if no turnId or unknown turnId, try to attach to the most recent session for this model
-    // gpt-5.5 via /responses rejects agent-mode bundling ("extensions do not support agent mode")
-    // For these models, force a fresh turnId every request so X-Initiator: user is always sent.
     const now = Date.now()
     let effectiveTurnId = turnId
     let autoBundled = false
-    // Auto-bundling disabled — every request gets a fresh turnId (user-initiated).
-    // Copilot increasingly rejects agent mode for extensions ("extensions do not support agent mode").
-    if (true) {
-        effectiveTurnId = nodeCrypto.randomUUID()
-    } else if (model) {
+    if (model) {
         const recent = recentModelSessions.get(model)
         if (recent && (now - recent.lastUsed < COPILOT_SESSION_TTL_MS)) {
             const recentSession = copilotTurnSessions.get(recent.key)
             if (recentSession && recentSession.userSent && (now - recentSession.createdAt < COPILOT_SESSION_TTL_MS)) {
-                // Recent session exists and already had a USER call — bundle as AGENT
                 if (!turnId || !copilotTurnSessions.has(model ? `${turnId}::${model}` : turnId)) {
                     effectiveTurnId = recent.turnId
                     autoBundled = true
@@ -127,7 +126,6 @@ function applyCopilotTurnHeaders(header, targetUrl, turnId, requestBody) {
     }
 
     if (!effectiveTurnId) {
-        // No turnId and no recent session to attach to — generate one
         effectiveTurnId = nodeCrypto.randomUUID()
         autoBundled = false
     }
@@ -147,7 +145,6 @@ function applyCopilotTurnHeaders(header, targetUrl, turnId, requestBody) {
     const isUser = !session.userSent
     if (isUser) session.userSent = true
 
-    // Update recent model session tracker
     if (model) {
         recentModelSessions.set(model, { key, turnId: effectiveTurnId, lastUsed: now })
     }
@@ -158,10 +155,7 @@ function applyCopilotTurnHeaders(header, targetUrl, turnId, requestBody) {
 
     const isMessagesEndpoint = targetUrl.includes('/v1/messages')
     if (isMessagesEndpoint) {
-        // Route into Copilot's "Claude Code SDK" quota pool instead of the
-        // tighter Chat bucket. Distinct headers identify the caller shape.
         const ids = getCopilotIds()
-        // Strip Chat-bucket markers that would override us downstream
         delete header['Copilot-Integration-Id']
         delete header['copilot-integration-id']
         header['OpenAI-Intent'] = 'messages-proxy'
@@ -169,17 +163,14 @@ function applyCopilotTurnHeaders(header, targetUrl, turnId, requestBody) {
         header['User-Agent'] = COPILOT_CLAUDE_CODE_UA
         header['Editor-Version'] = COPILOT_EDITOR_VERSION
         header['Editor-Plugin-Version'] = COPILOT_PLUGIN_VERSION
-        header['X-Request-Id'] = taskId // same as X-Agent-Task-Id — bundles tool round-trips as one task
+        header['X-Request-Id'] = taskId
         header['Editor-Device-Id'] = ids.deviceId
         header['VSCode-MachineId'] = ids.machineId
         header['VSCode-SessionId'] = _copilotSessionId
         if (!header['anthropic-beta']) {
-            // Drop context-management-2025-06-27 — some Copilot paths interpret it
-            // as unsupported and fall back to a degraded / Chat-bucket path.
             header['anthropic-beta'] = 'interleaved-thinking-2025-05-14,advanced-tool-use-2025-11-20'
         }
     } else {
-        // Chat-completions / other Copilot endpoints keep the older header shape
         header['X-Request-Id'] = nodeCrypto.randomUUID()
         header['OpenAI-Intent'] = 'conversation-panel'
     }
@@ -190,7 +181,7 @@ function applyCopilotTurnHeaders(header, targetUrl, turnId, requestBody) {
 
     const bundleTag = autoBundled ? ' [auto-bundled]' : ''
     const bucketTag = isMessagesEndpoint ? ' bucket=messages-proxy' : ' bucket=chat'
-    console.warn(`[${new Date().toISOString()}] [Copilot Turn] ${isUser ? 'USER' : 'AGENT'} | turnId=${effectiveTurnId.substring(0,8)} model=${model || '?'} req#${session.requestCount} taskId=${taskId.substring(0,8)}${bundleTag}${bucketTag} ua=${(header['User-Agent']||'').split(' ')[0]}`)
+    logger.info(`[Copilot Turn] ${isUser ? 'USER' : 'AGENT'} | turnId=${effectiveTurnId.substring(0,8)} model=${model || '?'} req#${session.requestCount} taskId=${taskId.substring(0,8)}${bundleTag}${bucketTag}`)
     return true
 }
 
@@ -231,10 +222,108 @@ function queueStorageOperation(operation) {
 
 const DB_HEX_KEY = Buffer.from('database/database.bin', 'utf-8').toString('hex');
 
-// ─── Server-side database backup ─────────────────────────────────────────────
-const BACKUP_BUDGET_BYTES = 500 * 1024 * 1024; // 500 MB
+// ─── Persist failure tracking (Stage 1 visibility) ───────────────────────────
+// Debounced persist runs in setTimeout, so failures cannot be returned in the
+// triggering response. Record the latest failure here and surface it on the
+// next /api/patch response. Cleared on next successful persist.
+let lastPersistFailure = null;
+
+function recordPersistFailure(error, source) {
+    const message = String(error?.message || error || 'unknown error');
+    const attemptedSize = typeof error?.attemptedSize === 'number' ? error.attemptedSize : null;
+    // Preserve timestamp when the failure is identical to the last one — every
+    // debounce cycle re-records the same failure, and clients dedupe by ts.
+    // Without this guard a fresh ts every 5s would re-fire the toast.
+    if (lastPersistFailure
+        && lastPersistFailure.source === source
+        && lastPersistFailure.message === message
+        && lastPersistFailure.attemptedSize === attemptedSize) {
+        return;
+    }
+    lastPersistFailure = {
+        timestamp: Date.now(),
+        message,
+        attemptedSize,
+        source,
+    };
+}
+
+function clearPersistFailure() {
+    lastPersistFailure = null;
+}
+
+function currentPersistWarning() {
+    return lastPersistFailure;
+}
+
+// ─── Server-side database backup (DB-only snapshots) ────────────────────────
+//
+// Snapshots live as `database/dbbackup-{ts}.bin` keys inside the kv table.
+// They're created on every successful persist (with a cooldown) and rotated
+// to fit user-configured count/size limits — see SNAPSHOT_LIMIT_* below.
+const SNAPSHOT_LIMIT_COUNT_KEY = 'config/snapshot-max-count';
+const SNAPSHOT_LIMIT_BYTES_KEY = 'config/snapshot-max-bytes';
+const SNAPSHOT_LIMIT_DEFAULT_COUNT = 20;
+const SNAPSHOT_LIMIT_DEFAULT_BYTES = 500 * 1024 * 1024; // 500 MB
+// Safety bounds to keep a stray PUT from making the system unusable.
+const SNAPSHOT_LIMIT_MIN_COUNT = 1;
+const SNAPSHOT_LIMIT_MAX_COUNT = 100;
+const SNAPSHOT_LIMIT_MIN_BYTES = 10 * 1024 * 1024;        // 10 MB
+const SNAPSHOT_LIMIT_MAX_BYTES = 50 * 1024 * 1024 * 1024; // 50 GB
 const BACKUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 let lastBackupTime = null;
+
+function readSnapshotConfigInt(key, fallback, min, max) {
+    try {
+        const raw = kvGet(key);
+        if (!raw) return fallback;
+        const n = parseInt(Buffer.from(raw).toString('utf-8').trim(), 10);
+        if (!Number.isFinite(n)) return fallback;
+        return Math.min(max, Math.max(min, n));
+    } catch { return fallback; }
+}
+
+function getSnapshotLimits() {
+    return {
+        maxCount: readSnapshotConfigInt(
+            SNAPSHOT_LIMIT_COUNT_KEY, SNAPSHOT_LIMIT_DEFAULT_COUNT,
+            SNAPSHOT_LIMIT_MIN_COUNT, SNAPSHOT_LIMIT_MAX_COUNT,
+        ),
+        maxBytes: readSnapshotConfigInt(
+            SNAPSHOT_LIMIT_BYTES_KEY, SNAPSHOT_LIMIT_DEFAULT_BYTES,
+            SNAPSHOT_LIMIT_MIN_BYTES, SNAPSHOT_LIMIT_MAX_BYTES,
+        ),
+    };
+}
+
+// Walk newest → oldest; keep within both limits, delete the rest. The most
+// recent snapshot is always kept (even if it alone exceeds the byte limit) so
+// we never end up with zero backups after a config change.
+function trimSnapshotsToLimits() {
+    const { maxCount, maxBytes } = getSnapshotLimits();
+    const entries = kvListWithSizes(DB_BACKUP_PREFIX)
+        .map((it) => {
+            const tsRaw = parseInt(it.key.slice(DB_BACKUP_PREFIX.length, -4), 10);
+            return { key: it.key, size: it.size, ts: Number.isFinite(tsRaw) ? tsRaw : 0 };
+        })
+        .sort((a, b) => b.ts - a.ts);
+
+    let runningBytes = 0;
+    const toDelete = [];
+    for (let i = 0; i < entries.length; i++) {
+        const e = entries[i];
+        const isFirst = i === 0;
+        const fitsByCount = i < maxCount;
+        const fitsByBytes = runningBytes + e.size <= maxBytes;
+        if (isFirst || (fitsByCount && fitsByBytes)) {
+            runningBytes += e.size;
+        } else {
+            toDelete.push(e.key);
+        }
+    }
+    for (const key of toDelete) kvDel(key);
+    return { kept: entries.length - toDelete.length, removed: toDelete.length };
+}
 
 function createBackupAndRotate() {
     const now = Date.now();
@@ -243,22 +332,9 @@ function createBackupAndRotate() {
     }
     lastBackupTime = now;
 
-    const backupKey = `database/dbbackup-${(now / 100).toFixed()}.bin`;
+    const backupKey = `${DB_BACKUP_PREFIX}${(now / 100).toFixed()}.bin`;
     kvCopyValue('database/database.bin', backupKey);
-
-    const backupKeys = kvList('database/dbbackup-')
-        .sort((a, b) => {
-            const aTs = parseInt(a.slice(18, -4));
-            const bTs = parseInt(b.slice(18, -4));
-            return bTs - aTs;
-        });
-
-    const dbSize = kvSize('database/database.bin') || 1;
-    const maxBackups = Math.min(20, Math.max(3, Math.floor(BACKUP_BUDGET_BYTES / dbSize)));
-
-    while (backupKeys.length > maxBackups) {
-        kvDel(backupKeys.pop());
-    }
+    trimSnapshotsToLimits();
 }
 
 async function flushPendingDb() {
@@ -306,38 +382,107 @@ function assignMissingChatIds(dbObj) {
     return changed;
 }
 
+// Recovers chats whose folderId points to a deleted folder. The previous merge
+// layer silently kept stale folderId on disk when a user moved a chat out of a
+// folder, then later deleting that folder produced orphans invisible in the
+// sidebar (rendered into neither the no-folder section nor any folder section).
+// Boot-time normalize so historical corruption self-heals; new corruption is
+// blocked by the merge fix in mergeChatStubWithFullChat.
+function normalizeOrphanFolderIds(dbObj) {
+    let changed = false;
+    if (!dbObj?.characters) return changed;
+    for (const char of dbObj.characters) {
+        if (!char?.chats) continue;
+        const validIds = new Set((char.chatFolders ?? []).map(f => f?.id).filter(Boolean));
+        for (const chat of char.chats) {
+            if (!chat) continue;
+            if (chat.folderId && !validIds.has(chat.folderId)) {
+                chat.folderId = null;
+                changed = true;
+            }
+        }
+    }
+    return changed;
+}
+
 async function decodeDatabaseWithPersistentChatIds(raw, options = {}) {
-    const { createBackup = false } = options;
+    const { createBackup = false, migrationResult = null } = options;
+    // Convert legacy REMOTE-block layouts to inline format before decoding.
+    // If migration ran it overwrote database.bin, so the caller's `raw` is
+    // stale and we re-read from KV. Idempotent on the no-op path.
+    const migration = await migrateRemoteBlocksIfNeeded();
+    if (migration.ran) {
+        const fresh = kvGet('database/database.bin');
+        if (fresh) raw = fresh;
+    }
     const dbObj = normalizeJSON(await decodeRisuSave(raw));
+    let needsPersist = false;
+
     const hadMissingIds = assignMissingChatIds(dbObj);
-    if (hadMissingIds) {
+    if (hadMissingIds) needsPersist = true;
+
+    const hadOrphanFolderIds = normalizeOrphanFolderIds(dbObj);
+    if (hadOrphanFolderIds) needsPersist = true;
+
+    // One-time migration: restore upstream cold storage characters to full characters.
+    // This runs when upstream data first enters NodeOnly (backup import or save folder copy).
+    // After restore, the coldstorage field is removed and the clean DB is persisted.
+    // Failed characters are promoted to safe blank characters — their KV data is preserved for manual recovery.
+    const coldRestoreResult = restoreColdStorageCharactersInDb(dbObj);
+    if (coldRestoreResult.restored > 0 || coldRestoreResult.failed > 0) needsPersist = true;
+    if (coldRestoreResult.failed > 0) {
+        logger.error(`[ColdStorage] ${coldRestoreResult.failed} character(s) could not be restored and were converted to safe blank characters. Cold storage KV data is preserved.`);
+        for (const name of coldRestoreResult.failedNames) {
+            logger.error(`[ColdStorage]   - "${name}"`);
+        }
+    }
+
+    if (needsPersist) {
         kvSet('database/database.bin', Buffer.from(encodeRisuSaveLegacy(dbObj)));
         if (createBackup) {
             createBackupAndRotate();
         }
+    }
+    if (migrationResult) {
+        migrationResult.coldStorageFailed = coldRestoreResult.failed;
     }
     return dbObj;
 }
 
 /**
  * Convert a full chat to a stub (metadata only).
+ *
+ * Hybrid corruption guard: a chat carrying `_stub: true` AND a real `message`
+ * array is the v1.4.x legacy hybrid pattern. The fast-path "if _stub return"
+ * would propagate the corruption (server reassemble skips merge for _stub
+ * chats with no fullChat lookup match). Treat hybrids as real chats and
+ * collapse them to a real stub here.
  */
 function chatToStub(chat) {
-    if (!chat || chat._stub) return chat;
+    if (!chat) return chat;
+    if (chat._stub && !Array.isArray(chat.message)) return chat;
     const stub = {
         id: chat.id || '',
         name: chat.name ?? '',
         _stub: true,
     };
-    if (chat.lastDate != null) stub.lastDate = chat.lastDate;
-    if (chat.folderId != null) stub.folderId = chat.folderId;
-    if (chat.modules != null) stub.modules = chat.modules;
+    // Preserve key presence even when the value is null/undefined so the
+    // round-trip distinguishes "user cleared" from "field absent". See
+    // mergeChatStubWithFullChat — it relies on `in` semantics.
+    if ('lastDate' in chat) stub.lastDate = chat.lastDate;
+    if ('folderId' in chat) stub.folderId = chat.folderId;
+    if ('modules' in chat) stub.modules = chat.modules;
     return stub;
 }
 
 /**
  * Initialize fullChatStore from a decoded full database object.
  * Extracts all chat payloads into the store keyed by chaId → chatId.
+ *
+ * Hybrid corruption recovery: a chat with both `_stub: true` and a real
+ * message array is treated as a real chat (its fullChat data is intact).
+ * Strip the `_stub` flag in place so subsequent reassemble passes don't
+ * reproduce the hybrid on disk.
  */
 function initChatStore(dbObj) {
     fullChatStore = new Map();
@@ -346,12 +491,19 @@ function initChatStore(dbObj) {
         if (!char?.chaId || !char.chats) continue;
         const charChats = new Map();
         for (const chat of char.chats) {
-            if (chat && !chat._stub) {
-                if (!chat.id) {
-                    chat.id = nodeCrypto.randomUUID();
-                }
-                charChats.set(chat.id, chat);
+            if (!chat) continue;
+            const isStub = chat._stub === true;
+            const hasMessage = Array.isArray(chat.message);
+            // Real stub (no payload) — fullChatStore tracks payloads only.
+            if (isStub && !hasMessage) continue;
+            // Hybrid: strip the corrupt _stub flag, keep the real chat.
+            if (isStub && hasMessage) {
+                delete chat._stub;
             }
+            if (!chat.id) {
+                chat.id = nodeCrypto.randomUUID();
+            }
+            charChats.set(chat.id, chat);
         }
         if (charChats.size > 0) {
             fullChatStore.set(char.chaId, charChats);
@@ -389,9 +541,18 @@ function mergeChatStubWithFullChat(stub, fullChat) {
         id: stub.id || fullChat.id || '',
         name: stub.name,
     };
-    if (stub.lastDate != null) merged.lastDate = stub.lastDate;
-    if (stub.folderId != null) merged.folderId = stub.folderId;
-    if (stub.modules != null) merged.modules = stub.modules;
+    // Defensive: never let `_stub: true` ride along on a merged chat. If
+    // fullChat carries a stale flag (legacy disk corruption), the spread
+    // would propagate the hybrid pattern back to disk and re-trigger the
+    // chat-data loss path on next round-trip.
+    if ('_stub' in merged) delete merged._stub;
+    // Use key presence (`in`) so an explicit null/undefined from the client —
+    // meaning "user cleared this field" — overwrites fullChat. The previous
+    // `!= null` check conflated "cleared" with "absent" and silently kept
+    // stale folderId / modules on disk, producing orphan-folder chats.
+    if ('lastDate' in stub) merged.lastDate = stub.lastDate;
+    if ('folderId' in stub) merged.folderId = stub.folderId;
+    if ('modules' in stub) merged.modules = stub.modules;
     return merged;
 }
 
@@ -415,11 +576,107 @@ function reassembleFullDb(strippedDb) {
     return full;
 }
 
+// ─── Remote-block migration ─────────────────────────────────────────────────
+//
+// Background: upstream RisuAI (and very early NodeOnly versions) split each
+// character's data out of database.bin into a separate `remotes/<chaId>.local.bin`
+// file. The main database.bin then carries a REMOTE pointer block instead of the
+// character payload. The server-side RisuSaveDecoder used to skip those blocks
+// outright, so any decode pass — /api/read, /api/chat-content fallback, chat
+// store init — saw the character as missing and lost its chats.
+//
+// NodeOnly never wanted this split (`disableRemoteSaving` is hardcoded to
+// true), so we one-shot convert any leftover REMOTE blocks to inline raw blocks
+// the first time a server with such data boots. The reencoded database.bin is
+// stored in legacy msgpack format, which has no block structure at all — so
+// the REMOTE code path becomes unreachable for future decodes.
+//
+// Idempotent via a KV marker. The marker lives in KV (not on disk) so a backup
+// import — which wipes most KV prefixes and INSERTs a new database.bin — naturally
+// clears it, letting the new contents be re-evaluated.
+
+const REMOTE_MIGRATION_MARKER_KEY = 'migration/disable-remote-saving';
+const REMOTE_MIGRATION_MARKER_VALUE = Buffer.from('done', 'utf-8');
+
+function isRemoteMigrationDone() {
+    const value = kvGet(REMOTE_MIGRATION_MARKER_KEY);
+    return value !== null && value.length > 0;
+}
+
+function markRemoteMigrationDone() {
+    kvSet(REMOTE_MIGRATION_MARKER_KEY, REMOTE_MIGRATION_MARKER_VALUE);
+}
+
+/**
+ * Convert any leftover REMOTE blocks in database.bin into inline raw blocks.
+ * Safe to call repeatedly: idempotent via KV marker.
+ */
+async function migrateRemoteBlocksIfNeeded() {
+    if (isRemoteMigrationDone()) return { ran: false, reason: 'already-done' };
+
+    const raw = kvGet('database/database.bin');
+    if (!raw) {
+        markRemoteMigrationDone();
+        return { ran: false, reason: 'no-database' };
+    }
+
+    if (!hasRemoteBlocks(raw)) {
+        markRemoteMigrationDone();
+        return { ran: false, reason: 'no-remote-blocks' };
+    }
+
+    logger.info('[Migration] REMOTE blocks detected in database.bin; converting to inline format');
+
+    // Pre-migration backup so a botched migration can be rolled back manually.
+    // Use a dedicated prefix — `database/dbbackup-` is on a 20-snapshot rotation
+    // whose timestamp parser would assign this entry ts=0 (because of the
+    // non-numeric suffix), making it the first to evict. The migration safety
+    // net must outlive ordinary backup churn.
+    const backupKey = `migration-backup/pre-remote-fix-${Date.now()}.bin`;
+    kvCopyValue('database/database.bin', backupKey);
+
+    const dbObj = await decodeRisuSave(raw, {
+        resolveRemote: async (name) => {
+            const value = kvGet(`remotes/${name}.local.bin`);
+            return value || null;
+        },
+    });
+
+    const reEncoded = encodeRisuSaveLegacy(dbObj, 'compression');
+
+    // Single transaction so swap + marker move together.
+    // remotes/ files are intentionally NOT deleted here: pre-migration
+    // dbbackup-* snapshots and the migration-backup we just wrote both
+    // only carry database.bin (kvCopyValue is single-key). If a user later
+    // restores one of those snapshots — which holds REMOTE pointers —
+    // resolveRemote needs the remotes/<id>.local.bin payloads to still
+    // exist, otherwise every REMOTE-pointed character drops on the next
+    // decode and the backup is effectively dead. The orphans don't grow
+    // (NodeOnly's disableRemoteSaving = true on writes), so leaving them
+    // costs a few MB of disk for full backup recoverability.
+    sqliteDb.transaction(() => {
+        kvSet('database/database.bin', Buffer.from(reEncoded));
+        markRemoteMigrationDone();
+    })();
+
+    // Reset in-memory caches whose contents were derived from the pre-migration
+    // bytes — next reader recomputes from the migrated database.bin.
+    invalidateDbCache();
+    dbEtag = null;
+
+    const characterCount = Array.isArray(dbObj.characters) ? dbObj.characters.length : 0;
+    logger.info(`[Migration] Remote-block migration complete. Inlined ${characterCount} character(s); pre-migration backup at ${backupKey}`);
+    return { ran: true, characterCount, backupKey };
+}
+
 /**
  * Ensure fullChatStore is initialized. Loads from disk if needed.
  */
 async function ensureChatStore() {
     if (fullChatStore) return;
+    // Run remote-block migration first so the decode below sees an inline DB.
+    // Idempotent — skipped on every subsequent call.
+    await migrateRemoteBlocksIfNeeded();
     const raw = kvGet('database/database.bin');
     if (!raw) {
         fullChatStore = new Map();
@@ -431,6 +688,112 @@ async function ensureChatStore() {
     initChatStore(dbObj);
 }
 
+// Stub metadata fields a JSON Patch may legitimately touch on a `chats[i]`
+// entry. Anything else is a chat-internal field — those live in fullChatStore,
+// not in dbCache, and should never appear in a /api/patch payload. Keep in
+// sync with chatToStub on both server and client.
+const STUB_METADATA_FIELDS = new Set(['id', 'name', '_stub', 'lastDate', 'folderId', 'modules']);
+
+// Only add/replace/remove are produced by the legitimate patcher. move/copy
+// could alias _stub or other chat-internal fields through `from`, bypassing
+// the path-based field allowlist. Reject those op types outright on chat
+// paths. test ops can also reveal/manipulate state; deny for symmetry.
+const ALLOWED_CHAT_OP_TYPES = new Set(['add', 'replace', 'remove']);
+
+const CHAT_FIELD_PATH_RE = /^\/characters\/\d+\/chats\/\d+\/([^/]+)/;
+
+/**
+ * Detect JSON Patch ops that mutate chat-internal fields (anything beyond
+ * STUB_METADATA_FIELDS). Such ops are the loss vector: applying them to
+ * dbCache leaves a metadata-only chat without `_stub`, which then bypasses
+ * fullChat merge in reassembleFullDb and gets persisted as-is.
+ *
+ * Whole-chat ops (path = `/characters/N/chats/M` or `/characters/N/chats`)
+ * are allowed — those replace/add/remove chat slots wholesale and the
+ * reassemble guard takes care of validating the resulting state.
+ *
+ * The `_stub` field gets stricter treatment than other allowed fields: only
+ * `add`/`replace` with literal value `true` is permitted. Any op that could
+ * remove the flag or set it to a falsy value is itself the loss mechanism
+ * (reassembleFullDb skips merge when `_stub` is falsy), so it must be
+ * blocked at the patch boundary, not just at the persist boundary.
+ *
+ * `move`/`copy` ops are rejected wholesale on chat-internal paths because
+ * the field-name allowlist on `path` alone can't catch a `from` that points
+ * at `_stub` or another chat-internal field. Both `path` and `from` are
+ * checked when present.
+ */
+function findChatInternalFieldOps(patch) {
+    if (!Array.isArray(patch)) return [];
+    const violations = [];
+    for (const op of patch) {
+        if (!op || typeof op !== 'object' || typeof op.path !== 'string') continue;
+
+        const pathMatch = op.path.match(CHAT_FIELD_PATH_RE);
+        const fromMatch = typeof op.from === 'string' ? op.from.match(CHAT_FIELD_PATH_RE) : null;
+        if (!pathMatch && !fromMatch) continue;
+
+        if (!ALLOWED_CHAT_OP_TYPES.has(op.op)) {
+            violations.push({
+                op: op.op,
+                path: op.path,
+                field: (pathMatch && pathMatch[1]) || (fromMatch && fromMatch[1]) || '',
+                reason: 'disallowed op type on chat field',
+            });
+            continue;
+        }
+
+        if (pathMatch) {
+            const field = pathMatch[1];
+            if (!STUB_METADATA_FIELDS.has(field)) {
+                violations.push({ op: op.op, path: op.path, field });
+                continue;
+            }
+            if (field === '_stub') {
+                if (op.op === 'remove') {
+                    violations.push({ op: op.op, path: op.path, field, reason: 'remove _stub' });
+                } else if ((op.op === 'add' || op.op === 'replace') && op.value !== true) {
+                    violations.push({ op: op.op, path: op.path, field, reason: 'non-true _stub value' });
+                }
+            }
+        }
+    }
+    return violations;
+}
+
+/**
+ * Detect chats that lost their `_stub` flag without being upgraded to a real
+ * Chat. reassembleFullDb skips merge when `_stub` is falsy, so persisting such
+ * a chat would write metadata-only to disk and silently strip messages — the
+ * exact data-loss path reported with PATCH `remove /chats/N/{message,...}` ops.
+ *
+ * A real Chat has `message` (Array). A real stub has `_stub === true`. Anything
+ * with neither is a malformed in-between state; treat as a corruption signal.
+ */
+function findStubFlagLossChats(fullDb) {
+    if (!fullDb?.characters) return [];
+    const losses = [];
+    for (let ci = 0; ci < fullDb.characters.length; ci++) {
+        const char = fullDb.characters[ci];
+        if (!char?.chats) continue;
+        for (let chi = 0; chi < char.chats.length; chi++) {
+            const chat = char.chats[chi];
+            if (!chat || typeof chat !== 'object') continue;
+            const isStub = chat._stub === true;
+            const hasMessage = Array.isArray(chat.message);
+            if (!isStub && !hasMessage) {
+                losses.push({
+                    chaId: char.chaId,
+                    charIndex: ci,
+                    chatIndex: chi,
+                    chatId: chat.id || null,
+                });
+            }
+        }
+    }
+    return losses;
+}
+
 /**
  * Persist dbCache to disk with full chats merged back in.
  */
@@ -439,8 +802,45 @@ async function persistDbCacheWithChats(filePath, decodedKey) {
     if (!strippedDb) return;
     await ensureChatStore();
     const fullDb = reassembleFullDb(strippedDb);
+
+    // Disk protection guard: abort persist when reassemble produced metadata-only
+    // chats. Writing them would lock the loss in (next /api/read returns the
+    // stripped chat with no `_stub`, so hydration never re-merges fullChatStore).
+    // Invalidate dbCache so the next request re-reads from disk and rebuilds a
+    // consistent stub view; client receives 409 on next /api/patch via hash mismatch.
+    if (decodedKey === 'database/database.bin') {
+        const losses = findStubFlagLossChats(fullDb);
+        if (losses.length > 0) {
+            const sample = losses.slice(0, 3).map(l => `${l.chaId}/${l.chatId ?? l.chatIndex}`).join(', ');
+            const err = new Error(
+                `persist aborted: ${losses.length} chat(s) lost _stub flag without upgrade — `
+                + `would silently strip messages on disk. sample=[${sample}]`
+            );
+            recordPersistFailure(err, 'persistDbCacheWithChats:stub-flag-loss');
+            delete dbCache[filePath];
+            throw err;
+        }
+    }
+
     const data = Buffer.from(encodeRisuSaveLegacy(fullDb));
-    kvSet(decodedKey, data);
+    try {
+        kvSet(decodedKey, data);
+    } catch (err) {
+        // Tag with BLOB size so the visibility layer can surface it to the user.
+        // The dominant failure mode (better-sqlite3 INT_MAX) is size-driven.
+        if (err && typeof err === 'object') {
+            try { err.attemptedSize = data.length; } catch {}
+        }
+        throw err;
+    }
+    // Refresh fullChatStore from the persisted snapshot so subsequent
+    // /api/chat-content GETs return the same metadata (folderId, modules)
+    // that just hit disk. Without this, PATCH-only clears of stub fields
+    // leave fullChatStore holding stale fullChat objects, and hydration
+    // would resurrect the cleared values until the next /api/read.
+    if (decodedKey === 'database/database.bin') {
+        initChatStore(fullDb);
+    }
 }
 
 function shouldCompress(req, res) {
@@ -454,6 +854,17 @@ function shouldCompress(req, res) {
 
     const contentType = String(res.getHeader('Content-Type') || '').toLowerCase();
     if (contentType.includes('text/event-stream')) {
+        return false;
+    }
+    // NDJSON endpoints (backup import/restore, inlay bulk compression) emit
+    // small per-line events and rely on real-time flushes — keepalive
+    // heartbeats in particular must reach reverse proxies before their
+    // response timeout fires. gzip would buffer those lines until enough
+    // bytes accumulated for an efficient compression block, defeating the
+    // 502-avoidance the streaming endpoints were built for. compressible's
+    // mime-db happens not to list application/x-ndjson today (so this is
+    // a no-op in practice) but a future dep upgrade could flip it on.
+    if (contentType.includes('application/x-ndjson')) {
         return false;
     }
     // Already-compressed media formats: gzip adds CPU cost with ~0% size gain
@@ -476,7 +887,11 @@ app.use('/assets', express.static(path.join(process.cwd(), 'dist/assets'), {
 }));
 app.use(express.static(path.join(process.cwd(), 'dist'), {index: false, maxAge: 0}));
 app.use(express.json({ limit: '100mb' }));
-app.use(express.raw({ type: 'application/octet-stream', limit: '2gb' }));
+app.use((req, res, next) => {
+    // Skip express.raw() for backup import — it must stream, not buffer into memory
+    if (req.path === '/api/backup/import') return next();
+    return express.raw({ type: 'application/octet-stream', limit: '2gb' })(req, res, next);
+});
 app.use(express.text({ limit: '100mb' }));
 const {pipeline} = require('stream/promises')
 const sslPath = path.join(process.cwd(), 'server/node/ssl/certificate');
@@ -490,10 +905,26 @@ if(!existsSync(savePath)){
     mkdirSync(savePath)
 }
 
-// Server-side backup directory (outside save/ to avoid bloating updater copies)
-const backupsDir = path.join(process.cwd(), "backups")
+// Server-side backup directory (outside save/ to avoid bloating updater copies).
+// Configurable at runtime via the kv key `config/server-backup-path`. When the
+// user changes the path the old directory is left in place (existing backups
+// stay where they were); only future backups land at the new path.
+const DEFAULT_BACKUPS_DIR = path.join(process.cwd(), "backups");
+const BACKUP_PATH_CONFIG_KEY = 'config/server-backup-path';
+
+function readBackupsDirConfig() {
+    try {
+        const raw = kvGet(BACKUP_PATH_CONFIG_KEY);
+        if (!raw) return DEFAULT_BACKUPS_DIR;
+        const text = Buffer.from(raw).toString('utf-8').trim();
+        return text || DEFAULT_BACKUPS_DIR;
+    } catch { return DEFAULT_BACKUPS_DIR; }
+}
+
+let backupsDir = readBackupsDirConfig();
 if(!existsSync(backupsDir)){
-    mkdirSync(backupsDir)
+    try { mkdirSync(backupsDir, { recursive: true }); }
+    catch { backupsDir = DEFAULT_BACKUPS_DIR; mkdirSync(backupsDir, { recursive: true }); }
 }
 const BACKUP_FILENAME_REGEX = /^risu-backup-\d+\.bin$/;
 
@@ -517,6 +948,16 @@ if (existsSync(jwtSecretPath)) {
     writeFileSync(jwtSecretPath, jwtSecret, 'utf-8')
 }
 
+// ── Instance ID for anonymous usage analytics ────────────────────────────────
+const instanceIdPath = path.join(savePath, '__instance_id')
+let instanceId
+if (existsSync(instanceIdPath)) {
+    instanceId = readFileSync(instanceIdPath, 'utf-8').trim()
+} else {
+    instanceId = nodeCrypto.randomUUID()
+    writeFileSync(instanceIdPath, instanceId, 'utf-8')
+}
+
 const authCodePath = path.join(process.cwd(), 'save', '__authcode')
 const inlayDir = path.join(savePath, 'inlays')
 const inlayMigrationMarker = path.join(inlayDir, '.migrated_to_fs')
@@ -525,21 +966,156 @@ const BACKUP_IMPORT_MAX_BYTES = Number(process.env.RISU_BACKUP_IMPORT_MAX_BYTES 
 const BACKUP_ENTRY_NAME_MAX_BYTES = 1024;
 // Minimum free disk space headroom multiplier: require 2× the backup size to be free
 const BACKUP_DISK_HEADROOM = 2;
+// Heartbeat interval for NDJSON import progress stream. 5 s by default —
+// shorter than every common reverse-proxy response timeout (nginx 60 s, Cloudflare
+// 100 s). Operators behind more aggressive proxies can tighten this. Clamped to
+// 100 ms so a misconfiguration can't spam the socket.
+const BACKUP_NDJSON_HEARTBEAT_MS = Math.max(
+    100,
+    Number(process.env.BACKUP_NDJSON_HEARTBEAT_MS ?? '5000') || 5000,
+);
 
 let importInProgress = false;
+
+// ── Cloudflare Quick Tunnel ─────────────────────────────────────────────────
+const TUNNEL_DISABLED = process.env.RISU_TUNNEL_DISABLED === 'true';
+let tunnelProcess = null;
+let tunnelUrl = null;
+let tunnelStatus = 'off';   // 'off' | 'downloading' | 'starting' | 'running' | 'error'
+let tunnelError = null;
+let tunnelStartTimeout = null;
+
+const CLOUDFLARED_ASSETS = {
+    'darwin-arm64':  { url: 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz', type: 'tgz' },
+    'darwin-x64':    { url: 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64.tgz', type: 'tgz' },
+    'linux-x64':     { url: 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64', type: 'bin' },
+    'linux-arm64':   { url: 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64', type: 'bin' },
+    // Termux reports process.platform === 'android' but the linux-arm64
+    // cloudflared binary (statically linked Go) runs cleanly on Bionic.
+    'android-arm64': { url: 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64', type: 'bin' },
+    'win32-x64':     { url: 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe', type: 'bin' },
+};
+
+function findCloudflaredBinary() {
+    const ext = process.platform === 'win32' ? '.exe' : '';
+    const bundled = path.join(process.cwd(), 'bin', 'cloudflared' + ext);
+    if (existsSync(bundled)) return bundled;
+    try {
+        execSync(process.platform === 'win32' ? 'where cloudflared' : 'which cloudflared', { stdio: 'pipe' });
+        return 'cloudflared';
+    } catch {
+        return null;
+    }
+}
+
+function followRedirects(url) {
+    return new Promise((resolve, reject) => {
+        const mod = url.startsWith('https') ? require('https') : require('http');
+        mod.get(url, { headers: { 'User-Agent': 'pocketrisu' } }, (res) => {
+            if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                followRedirects(res.headers.location).then(resolve, reject);
+            } else if (res.statusCode === 200) {
+                resolve(res);
+            } else {
+                reject(new Error(`HTTP ${res.statusCode}`));
+            }
+        }).on('error', reject);
+    });
+}
+
+async function downloadCloudflared() {
+    const key = `${process.platform}-${process.arch}`;
+    const asset = CLOUDFLARED_ASSETS[key];
+    if (!asset) throw new Error(`Unsupported platform: ${key}`);
+
+    const ext = process.platform === 'win32' ? '.exe' : '';
+    const binDir = path.join(process.cwd(), 'bin');
+    const dest = path.join(binDir, 'cloudflared' + ext);
+
+    if (!existsSync(binDir)) require('fs').mkdirSync(binDir, { recursive: true });
+
+    console.log(`[Tunnel] Downloading cloudflared for ${key}...`);
+    const res = await followRedirects(asset.url);
+
+    if (asset.type === 'tgz') {
+        const tmpPath = path.join(binDir, '_cloudflared.tgz');
+        await new Promise((resolve, reject) => {
+            const ws = require('fs').createWriteStream(tmpPath);
+            res.pipe(ws);
+            ws.on('finish', () => { ws.close(); resolve(); });
+            ws.on('error', reject);
+        });
+        execSync(`tar -xzf "${tmpPath}" -C "${binDir}"`, { stdio: 'pipe' });
+        require('fs').unlinkSync(tmpPath);
+    } else {
+        await new Promise((resolve, reject) => {
+            const ws = require('fs').createWriteStream(dest);
+            res.pipe(ws);
+            ws.on('finish', () => { ws.close(); resolve(); });
+            ws.on('error', reject);
+        });
+    }
+
+    if (process.platform !== 'win32') require('fs').chmodSync(dest, 0o755);
+    console.log('[Tunnel] cloudflared downloaded successfully.');
+    return dest;
+}
+
+function stopTunnel() {
+    if (tunnelStartTimeout) { clearTimeout(tunnelStartTimeout); tunnelStartTimeout = null; }
+    if (tunnelProcess) {
+        try { tunnelProcess.kill('SIGTERM'); } catch {}
+        tunnelProcess = null;
+    }
+    tunnelUrl = null;
+    tunnelStatus = 'off';
+    tunnelError = null;
+}
 
 // ── Update check ─────────────────────────────────────────────────────────────
 const UPDATE_CHECK_DISABLED = process.env.RISU_UPDATE_CHECK === 'false';
 const UPDATE_CHECK_URL = process.env.RISU_UPDATE_URL || 'https://risu-update-worker.nodridan.workers.dev/check';
 const PUBLIC_STATS_URL = (process.env.RISU_UPDATE_URL || 'https://risu-update-worker.nodridan.workers.dev/check').replace(/\/check$/, '/api/public-stats');
 
-const currentVersion = (() => {
+// Re-read on each call so non-portable updates (docker/git pull) without a
+// process restart don't keep reporting the old version to the update worker.
+function getCurrentVersion() {
     try {
         const pkg = JSON.parse(readFileSync(path.join(process.cwd(), 'package.json'), 'utf-8'));
         return pkg.version || '0.0.0';
     } catch { return '0.0.0'; }
+}
+
+// ── Deployment type & self-update helpers ─────────────────────────────────────
+const GITHUB_REPO = 'PocketRisu/PocketRisu';
+
+const deploymentType = (() => {
+    // Only portable builds have the .portable marker (created by CI release workflow).
+    // Self-update is gated on this — all other types are inferred for analytics only.
+    // Wrapped in try/catch so unexpected filesystem errors can't crash server boot.
+    try {
+        if (existsSync(path.join(process.cwd(), '.portable'))) return 'portable';
+        if (existsSync(path.join(process.cwd(), '.git'))) return 'git';
+        if (existsSync('/.dockerenv')) return 'docker';
+        try {
+            const cgroup = readFileSync('/proc/1/cgroup', 'utf-8');
+            if (cgroup.includes('docker') || cgroup.includes('containerd')) return 'docker';
+        } catch {}
+        if (process.platform === 'android') return 'termux';
+    } catch {}
+    return 'unknown';
 })();
 
+function getSelfUpdateAssetInfo(version) {
+    const platformMap = { win32: 'win', linux: 'linux', darwin: 'macos' };
+    const platformName = platformMap[process.platform];
+    if (!platformName) return null;
+    const arch = process.arch; // x64, arm64
+    const ext = process.platform === 'win32' ? 'zip' : 'tar.gz';
+    const filename = `PocketRisu-v${version}-${platformName}-${arch}.${ext}`;
+    const url = `https://github.com/${GITHUB_REPO}/releases/download/v${version}/${filename}`;
+    return { platformName, arch, ext, filename, url };
+}
 
 function isSafeInlayId(id) {
     return typeof id === 'string' &&
@@ -864,17 +1440,25 @@ async function migrateInlaysToFilesystem() {
             kvDel(`inlay_thumb/${id}`);
             kvDel(`inlay_info/${id}`);
         } catch (error) {
-            console.warn(`[InlayFS] Failed to migrate ${key}:`, error?.message || error);
+            logger.warn(`[InlayFS] Failed to migrate ${key}:`, error?.message || error);
         }
     }
 
     await fs.writeFile(inlayMigrationMarker, new Date().toISOString(), 'utf-8');
 }
 
-async function fetchLatestRelease() {
+async function fetchLatestRelease(lang) {
     if (UPDATE_CHECK_DISABLED) return null;
     try {
-        const url = `${UPDATE_CHECK_URL}?v=${encodeURIComponent(currentVersion)}`;
+        const currentVersion = getCurrentVersion();
+        const params = new URLSearchParams({
+            v: currentVersion,
+            d: deploymentType,
+            os: `${process.platform}-${process.arch}`,
+            id: instanceId,
+        });
+        if (lang) params.set('l', String(lang).slice(0, 16));
+        const url = `${UPDATE_CHECK_URL}?${params}`;
         const res = await fetch(url);
         if (!res.ok) return null;
         const data = await res.json();
@@ -883,7 +1467,7 @@ async function fetchLatestRelease() {
         }
         return data;
     } catch (e) {
-        console.error('[Update] Failed to check for updates:', e.message);
+        logger.error('[Update] Failed to check for updates:', e.message);
         return null;
     }
 }
@@ -891,7 +1475,26 @@ async function fetchLatestRelease() {
 // ── Session store for direct asset URL auth (F-0) ──────────────────────────
 // <img src="/api/asset/..."> cannot send custom headers, so we use a session
 // cookie issued after initial JWT auth. Single-user environment: Map is fine.
+// Sessions are persisted to disk so they survive server restarts.
+const SESSION_FILE = path.join(process.cwd(), 'save', '__sessions')
 const sessions = new Map() // token → expiresAt (ms)
+
+function loadSessions() {
+    try {
+        const raw = readFileSync(SESSION_FILE, 'utf-8')
+        const now = Date.now()
+        for (const [token, exp] of JSON.parse(raw)) {
+            if (exp > now) sessions.set(token, exp)
+        }
+    } catch { /* file missing or corrupt – start fresh */ }
+}
+
+function saveSessions() {
+    try { writeFileSync(SESSION_FILE, JSON.stringify([...sessions])) }
+    catch { /* non-critical */ }
+}
+
+loadSessions()
 
 function parseSessionCookie(req) {
     const cookieHeader = req.headers.cookie || ''
@@ -1353,113 +1956,6 @@ async function runProxyStreamJob(job, arg) {
     }
 }
 
-// --- LLM Worker: Browser-as-worker bridge for /api/mcp/llm/call ---
-//
-// Instead of re-implementing routing/auth/format conversion for every model
-// provider in server.cjs, we forward MCP LLM requests to an active browser
-// session over WebSocket. The browser uses RisuAI's existing requestChatData
-// pipeline (with all its routing, retry, Vertex auth, etc.) and streams the
-// result back. New provider added to browser code automatically works for MCP.
-
-const llmWorkers = new Set() // active WebSocket connections
-const llmInflight = new Map() // reqId → { res, streaming, worker, closed, timer }
-
-function pickLLMWorker() {
-    for (const ws of llmWorkers) {
-        if (ws.readyState === ws.OPEN) return ws
-    }
-    return null
-}
-
-function setupLLMWorkerWebSocket(server) {
-    const wss = new WebSocketServer({ noServer: true })
-
-    server.on('upgrade', async (req, socket, head) => {
-        try {
-            const url = new URL(req.url, `http://${req.headers.host}`)
-            if (url.pathname !== '/ws/llm-worker') return
-
-            const auth = url.searchParams.get('risu-auth') || normalizeAuthHeader(req.headers['risu-auth'])
-            if (!await isAuthorizedProxyRequest({ headers: { 'risu-auth': auth } })) {
-                socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n')
-                socket.destroy()
-                return
-            }
-
-            wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req))
-        } catch (e) {
-            try { socket.write('HTTP/1.1 400 Bad Request\r\n\r\n'); socket.destroy() } catch {}
-        }
-    })
-
-    wss.on('connection', (ws) => {
-        llmWorkers.add(ws)
-        console.warn(`[LLMWorker] browser connected (${llmWorkers.size} total)`)
-
-        const pingTimer = setInterval(() => {
-            if (ws.readyState !== ws.OPEN) return
-            try { ws.ping() } catch {}
-        }, 30000)
-
-        ws.on('message', (raw) => {
-            let msg
-            try { msg = JSON.parse(raw.toString('utf-8')) } catch { return }
-            if (!msg?.reqId) return
-            const ctx = llmInflight.get(msg.reqId)
-            if (!ctx || ctx.closed) return
-
-            if (msg.type === 'chunk') {
-                if (ctx.streaming) {
-                    try { ctx.res.write(`data: ${JSON.stringify(msg.data || {})}\n\n`) } catch {}
-                }
-            } else if (msg.type === 'done') {
-                ctx.closed = true
-                clearTimeout(ctx.timer)
-                if (ctx.streaming) {
-                    try {
-                        ctx.res.write(`event: done\ndata: ${JSON.stringify(msg.response || {})}\n\n`)
-                        ctx.res.end()
-                    } catch {}
-                } else {
-                    try { ctx.res.status(200).json(msg.response || { content: [{ type: 'text', text: '' }] }) } catch {}
-                }
-                llmInflight.delete(msg.reqId)
-            } else if (msg.type === 'error') {
-                ctx.closed = true
-                clearTimeout(ctx.timer)
-                try {
-                    if (ctx.res.headersSent) {
-                        ctx.res.write(`event: error\ndata: ${JSON.stringify({ error: msg.error || 'Worker error' })}\n\n`)
-                        ctx.res.end()
-                    } else {
-                        ctx.res.status(500).json({ error: msg.error || 'Worker error' })
-                    }
-                } catch {}
-                llmInflight.delete(msg.reqId)
-            }
-        })
-
-        const cleanup = () => {
-            clearInterval(pingTimer)
-            llmWorkers.delete(ws)
-            console.warn(`[LLMWorker] browser disconnected (${llmWorkers.size} total)`)
-            // Fail any inflight tied to this worker
-            for (const [reqId, ctx] of llmInflight) {
-                if (ctx.worker !== ws || ctx.closed) continue
-                ctx.closed = true
-                clearTimeout(ctx.timer)
-                try {
-                    if (ctx.res.headersSent) ctx.res.end()
-                    else ctx.res.status(503).json({ error: 'Browser worker disconnected mid-request' })
-                } catch {}
-                llmInflight.delete(reqId)
-            }
-        }
-        ws.on('close', cleanup)
-        ws.on('error', cleanup)
-    })
-}
-
 // --- Proxy Stream: WebSocket setup ---
 
 function setupProxyStreamWebSocket(server) {
@@ -1467,9 +1963,6 @@ function setupProxyStreamWebSocket(server) {
     server.on('upgrade', async (req, socket, head) => {
         try {
             const reqUrl = new URL(req.url, `http://${req.headers.host}`);
-            // Only handle proxy-stream-jobs paths. Let other upgrade listeners
-            // (eg setupLLMWorkerWebSocket) handle their own paths — destroying
-            // the socket here would kill them before they could respond.
             if (!reqUrl.pathname.startsWith('/proxy-stream-jobs/') || !reqUrl.pathname.endsWith('/ws')) {
                 return;
             }
@@ -1578,6 +2071,109 @@ function parseInlaySidecarBackupName(name) {
     return { id };
 }
 
+function normalizeColdStorageStorageKey(nameOrKey) {
+    let key = nameOrKey;
+    if (key.startsWith('coldstorage/')) {
+        key = key.slice('coldstorage/'.length);
+    }
+    if (key.endsWith('.json')) {
+        key = key.slice(0, -'.json'.length);
+    }
+    if (!key || key.includes('/') || isInvalidBackupPathSegment(key)) {
+        throw new Error(`Invalid cold storage entry name: ${nameOrKey}`);
+    }
+    return `coldstorage/${key}`;
+}
+
+function toColdStorageBackupName(storageKey) {
+    return `${normalizeColdStorageStorageKey(storageKey)}.json`;
+}
+
+function parseColdStorageJsonBuffer(buffer, sourceLabel, options = {}) {
+    const { allowPlainJson = false } = options;
+    try {
+        const decompressed = zlib.gunzipSync(buffer);
+        return {
+            coldData: JSON.parse(decompressed.toString('utf-8')),
+            format: 'gzip',
+        };
+    } catch (gzipError) {
+        if (!allowPlainJson) {
+            throw gzipError;
+        }
+        try {
+            return {
+                coldData: JSON.parse(buffer.toString('utf-8')),
+                format: 'plain-json',
+            };
+        } catch (jsonError) {
+            throw new Error(`[ColdStorage] failed to parse ${sourceLabel}: gzip=${gzipError.message}; json=${jsonError.message}`);
+        }
+    }
+}
+
+function encodeColdStorageCanonicalBuffer(coldData) {
+    return Buffer.from(zlib.gzipSync(Buffer.from(JSON.stringify(coldData), 'utf-8')));
+}
+
+function readColdStorageJsonEntry(nameOrKey, options = {}) {
+    const { migrateLegacy = false, allowPlainJsonFallback = false } = options;
+    const canonicalKey = normalizeColdStorageStorageKey(nameOrKey);
+    const legacyBackupKey = `${canonicalKey}.json`;
+
+    let storageKey = canonicalKey;
+    let value = kvGet(canonicalKey);
+    if (!value) {
+        storageKey = legacyBackupKey;
+        value = kvGet(legacyBackupKey);
+    }
+    if (!value) {
+        return null;
+    }
+
+    const parsed = parseColdStorageJsonBuffer(value, storageKey, {
+        allowPlainJson: allowPlainJsonFallback || storageKey !== canonicalKey,
+    });
+
+    if (migrateLegacy && (storageKey !== canonicalKey || parsed.format !== 'gzip')) {
+        kvSet(canonicalKey, encodeColdStorageCanonicalBuffer(parsed.coldData));
+        if (storageKey !== canonicalKey) {
+            kvDel(storageKey);
+        }
+    }
+
+    return {
+        coldData: parsed.coldData,
+        storageKey,
+        canonicalKey,
+        format: parsed.format,
+    };
+}
+
+function listColdStorageBackupEntries() {
+    const canonicalKeys = Array.from(new Set(
+        kvList('coldstorage/').map((key) => normalizeColdStorageStorageKey(key))
+    )).sort((a, b) => a.localeCompare(b));
+
+    return canonicalKeys.map((storageKey) => {
+        const entry = readColdStorageJsonEntry(storageKey, {
+            migrateLegacy: true,
+            allowPlainJsonFallback: true,
+        });
+        if (!entry) {
+            throw new Error(`[ColdStorage] missing cold storage entry while exporting: ${storageKey}`);
+        }
+        const plainJson = Buffer.from(JSON.stringify(entry.coldData), 'utf-8');
+        return {
+            kind: 'buffer',
+            buffer: plainJson,
+            backupName: toColdStorageBackupName(storageKey),
+            sortKey: toColdStorageBackupName(storageKey),
+            size: plainJson.length,
+        };
+    });
+}
+
 function resolveBackupStorageKey(name) {
     if (Buffer.byteLength(name, 'utf-8') > BACKUP_ENTRY_NAME_MAX_BYTES) {
         throw new Error(`Backup entry name too long: ${name.slice(0, 64)}`);
@@ -1611,6 +2207,12 @@ function resolveBackupStorageKey(name) {
             throw new Error(`Invalid inlay sidecar backup entry name: ${name}`);
         }
         return name;
+    }
+
+    // Upstream backups transport cold storage as coldstorage/<uuid>.json.
+    // Normalize back to the runtime KV key: coldstorage/<uuid>.
+    if (name.startsWith('coldstorage/')) {
+        return normalizeColdStorageStorageKey(name);
     }
 
     if (isInvalidBackupPathSegment(name) || name !== path.basename(name)) {
@@ -1649,7 +2251,12 @@ function parseBackupChunk(buffer, onEntry) {
 // Accepts any async iterable of Buffer chunks (HTTP request body, file stream, etc.)
 async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0, onProgress = null } = {}) {
     const BATCH_SIZE = 5000;
-    let remainingBuffer = Buffer.alloc(0);
+    // Defer Buffer.concat until enough bytes for the next entry are buffered.
+    // Concatenating on every chunk arrival is O(n²) when a single entry (e.g.
+    // database.risudat) far exceeds chunk size.
+    let pendingChunks = [];
+    let pendingTotal = 0;
+    let nextEntryThreshold = 8;
     let hasDatabase = false;
     let assetsRestored = 0;
     let bytesReceived = 0;
@@ -1706,6 +2313,18 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
     kvDelPrefix('inlay_thumb/');
     kvDelPrefix('inlay_meta/');
     kvDelPrefix('inlay_info/');
+    kvDelPrefix('coldstorage/');
+    // Same reasoning as clearExistingData (save-folder import path): wipe stale
+    // remote payloads from the prior user before this backup's contents land.
+    // .bin backups never carry REMOTE blocks today, so the migration won't
+    // resolveRemote on them — but keeping the two import paths consistent
+    // avoids a contamination regression if that ever changes (upstream sync,
+    // plugin-generated buffers, etc.).
+    kvDelPrefix('remotes/');
+    // Allow remote-block migration to re-evaluate against the new database.bin.
+    // (.bin backups themselves never carry REMOTE blocks — legacy msgpack
+    // format only — but a fresh import is a clear "data changed" signal.)
+    kvDel(REMOTE_MIGRATION_MARKER_KEY);
     clearEntities();
 
     try {
@@ -1716,10 +2335,17 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
             }
             if (onProgress) onProgress(bytesReceived, totalBytes);
 
-            remainingBuffer = remainingBuffer.length === 0
-                ? Buffer.from(chunk)
-                : Buffer.concat([remainingBuffer, Buffer.from(chunk)]);
-            remainingBuffer = parseBackupChunk(remainingBuffer, (name, data) => {
+            pendingChunks.push(Buffer.from(chunk));
+            pendingTotal += chunk.length;
+            if (pendingTotal < nextEntryThreshold) continue;
+
+            const buffer = pendingChunks.length === 1
+                ? pendingChunks[0]
+                : Buffer.concat(pendingChunks, pendingTotal);
+            pendingChunks = [];
+            pendingTotal = 0;
+
+            const remaining = parseBackupChunk(buffer, (name, data) => {
                 if (seenEntryNames.has(name)) {
                     throw new Error(`Duplicate backup entry: ${name}`);
                 }
@@ -1787,7 +2413,12 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
                     // Skip deprecated thumbnail entries from legacy backups
                 } else {
                     const storageKey = resolveBackupStorageKey(name);
-                    kvSet(storageKey, data);
+                    const storageValue = storageKey.startsWith('coldstorage/')
+                        ? encodeColdStorageCanonicalBuffer(
+                            parseColdStorageJsonBuffer(data, name, { allowPlainJson: true }).coldData
+                        )
+                        : data;
+                    kvSet(storageKey, storageValue);
                     if (storageKey === 'database/database.bin') {
                         hasDatabase = true;
                     } else {
@@ -1802,9 +2433,28 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
                     batchCount = 0;
                 }
             });
+
+            if (remaining.length === 0) {
+                nextEntryThreshold = 8;
+            } else {
+                pendingChunks.push(remaining);
+                pendingTotal = remaining.length;
+                if (remaining.length < 4) {
+                    nextEntryThreshold = 8;
+                } else {
+                    const nameLen = remaining.readUInt32LE(0);
+                    const headerEnd = 4 + nameLen + 4;
+                    if (remaining.length < headerEnd) {
+                        nextEntryThreshold = headerEnd;
+                    } else {
+                        const dataLen = remaining.readUInt32LE(4 + nameLen);
+                        nextEntryThreshold = headerEnd + dataLen;
+                    }
+                }
+            }
         }
 
-        if (remainingBuffer.length > 0) {
+        if (pendingTotal > 0) {
             throw new Error('Backup stream ended with incomplete entry');
         }
         if (!hasDatabase) {
@@ -1844,14 +2494,30 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
 
     invalidateDbCache();
 
+    // Trigger cold storage migration now so import result includes failure count.
+    const dbRaw = kvGet('database/database.bin');
+    let coldStorageFailed = 0;
+    if (dbRaw) {
+        const migration = {};
+        const dbObj = await decodeDatabaseWithPersistentChatIds(dbRaw, {
+            createBackup: false,
+            migrationResult: migration,
+        });
+        coldStorageFailed = migration.coldStorageFailed || 0;
+        initChatStore(dbObj);
+    }
+
     try {
         checkpointWal('TRUNCATE');
     } catch (checkpointError) {
-        console.warn('[Backup Import] WAL checkpoint after import failed:', checkpointError);
+        logger.warn('[Backup Import] WAL checkpoint after import failed:', checkpointError);
     }
 
     console.log(`[Backup Import] Complete: ${assetsRestored} assets restored, ${(bytesReceived / 1024 / 1024).toFixed(1)}MB processed`);
-    return { assetsRestored, bytesReceived };
+    if (coldStorageFailed > 0) {
+        logger.error(`[Backup Import] ${coldStorageFailed} cold storage character(s) could not be restored`);
+    }
+    return { assetsRestored, bytesReceived, coldStorageFailed };
 }
 
 app.get('/', async (req, res, next) => {
@@ -1959,7 +2625,7 @@ async function checkAuth(req, res, returnOnlyStatus = false, {allowExpired = fal
 }
 
 const reverseProxyFunc = async (req, res, next) => {
-    if(!await checkAuth(req, res, false, {allowExpired: true})){
+    if(!await checkAuth(req, res)){
         return;
     }
     
@@ -2006,26 +2672,30 @@ const reverseProxyFunc = async (req, res, next) => {
                 requestBody = JSON.stringify(req.body);
             }
         }
-        // Copilot turn bundling: inject task headers if this is a Copilot URL with a turn ID
+
         const turnId = req.headers['x-risu-turn-id']
         applyCopilotTurnHeaders(header, urlParam, turnId, requestBody)
 
-        // Debug: log Copilot requests
-        if (isCopilotURL(urlParam)) {
-            let bodyModel = '?'
-            try { const b = JSON.parse(Buffer.isBuffer(requestBody) ? requestBody.toString('utf-8') : requestBody); bodyModel = b?.model || '?' } catch {}
-            console.log(`[Proxy] POST ${urlParam.substring(0,80)} | model=${bodyModel} | turnId=${turnId || 'none'} | hasAnthropicBeta=${!!header['anthropic-beta']}`)
-        }
-        // make request to original server
         originalResponse = await fetch(urlParam, {
             method: req.method,
             headers: header,
             body: requestBody,
             signal: timeout.signal
         });
-        // get response body as stream
-        const originalBody = originalResponse.body;
-        // get response headers
+
+        if (!originalResponse.ok && isCopilotURL(urlParam)) {
+            let errBody = ''
+            try { errBody = await originalResponse.clone().text().catch(() => '') } catch {}
+            logger.warn(`[Proxy] Copilot ${originalResponse.status} for ${urlParam.substring(0,80)} | ${errBody.substring(0,300)}`)
+        } else if (!originalResponse.ok) {
+            let errBody = ''
+            try { errBody = await originalResponse.clone().text().catch(() => '') } catch {}
+            logger.warn(`[Proxy] ${originalResponse.status} for ${urlParam.substring(0,80)} | ${errBody.substring(0,300)}`)
+        }
+        if (turnId && originalResponse.ok && isCopilotURL(urlParam)) {
+            markCopilotTurnSuccess(turnId)
+        }
+
         const head = new Headers(originalResponse.headers);
         head.delete('content-security-policy');
         head.delete('content-security-policy-report-only');
@@ -2036,27 +2706,8 @@ const reverseProxyFunc = async (req, res, next) => {
         for (let [k, v] of head) {
             headObj[k] = v;
         }
-        // send response headers to client
         res.header(headObj);
-        // send response status to client
         res.status(originalResponse.status);
-        // Debug: log non-OK upstream responses with body (helpful when upstream
-        // 5xx surfaces to the client — e.g. transient OpenAI/Copilot/Anthropic
-        // server errors that come back as `Internal Server Error (ref: ...)`.
-        if (!originalResponse.ok && !isCopilotURL(urlParam)) {
-            let errBody = ''
-            try { errBody = await originalResponse.clone().text().catch(() => '') } catch {}
-            console.log(`[Proxy] ${originalResponse.status} for ${urlParam.substring(0,80)} | ${errBody.substring(0,300)}`)
-        }
-        if (isCopilotURL(urlParam) && !originalResponse.ok) {
-            let errBody = ''
-            try { errBody = await originalResponse.clone().text().catch(() => '') } catch {}
-            console.log(`[Proxy] Copilot ${originalResponse.status} for ${urlParam.substring(0,80)} | ${errBody.substring(0,300)}`)
-        }
-        if (turnId && originalResponse.ok && isCopilotURL(urlParam)) {
-            markCopilotTurnSuccess(turnId)
-        }
-        // send response body to client
         await pipeline(originalResponse.body, res);
 
 
@@ -2074,7 +2725,7 @@ const reverseProxyFunc = async (req, res, next) => {
             }
             return;
         }
-        console.error('[Proxy]', req.method, urlParam, err?.cause || err);
+        logger.error(`[Proxy] ${req.method} ${urlParam}`, err);
         next(err);
         return;
     } finally {
@@ -2083,7 +2734,7 @@ const reverseProxyFunc = async (req, res, next) => {
 }
 
 const reverseProxyFunc_get = async (req, res, next) => {
-    if(!await checkAuth(req, res, false, {allowExpired: true})){
+    if(!await checkAuth(req, res)){
         return;
     }
     
@@ -2306,7 +2957,7 @@ async function hubProxyFunc(req, res) {
         }
         
     } catch (error) {
-        console.error("[Hub Proxy] Error:", error);
+        logger.error("[Hub Proxy] Error:", error);
         if (!res.headersSent) {
             res.status(502).send({ error: 'Proxy request failed: ' + error.message });
         } else {
@@ -2459,6 +3110,7 @@ app.post('/api/session', async (req, res) => {
     for (const [t, exp] of sessions) {
         if (exp < Date.now()) sessions.delete(t)
     }
+    saveSessions()
     const maxAge = 7 * 24 * 60 * 60 // seconds
     res.setHeader('Set-Cookie', `risu-session=${token}; HttpOnly; SameSite=Strict; Max-Age=${maxAge}; Path=/`)
     res.json({ ok: true })
@@ -2511,10 +3163,17 @@ const THUMB_QUALITY = 75;
 const THUMB_IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp']);
 
 async function generateThumbnail(buffer) {
-    return sharp(buffer)
-        .resize(THUMB_MAX_SIDE, THUMB_MAX_SIDE, { fit: 'inside', withoutEnlargement: true })
-        .webp({ quality: THUMB_QUALITY })
-        .toBuffer();
+    const vips = await getVips()
+    const img = vips.Image.thumbnailBuffer(buffer, THUMB_MAX_SIDE, {
+        height: THUMB_MAX_SIDE,
+        size: 'down',
+    })
+    try {
+        const out = img.writeToBuffer('.webp', { Q: THUMB_QUALITY })
+        return Buffer.from(out);
+    } finally {
+        img.delete()
+    }
 }
 
 app.get('/api/asset/:hexKey', sessionAuthMiddleware, async (req, res) => {
@@ -2580,7 +3239,7 @@ app.get('/api/asset/:hexKey', sessionAuthMiddleware, async (req, res) => {
         })
         res.send(binary)
     } catch (error) {
-        console.error('[Asset] Failed to serve asset:', error);
+        logger.error('[Asset] Failed to serve asset:', error);
         res.status(500).end()
     }
 })
@@ -2651,8 +3310,10 @@ app.get('/api/read', async (req, res, next) => {
                     dbCache[filePath] = stripped;
                     value = Buffer.from(encodeRisuSaveLegacy(stripped));
                 } catch (e) {
-                    console.error('[Read] Failed to strip chats from database.bin:', e.message);
-                    // Fall through with original value
+                    // Log the Error itself (not just e.message) so logger.*
+                    // tags it and the Express middleware won't re-log after next().
+                    logger.error('[Read] Failed to strip chats from database.bin', e);
+                    return next(e);
                 }
                 dbEtag = computeBufferEtag(value);
                 if (req.headers['if-none-match'] === dbEtag) {
@@ -2723,6 +3384,75 @@ app.get('/api/list', async (req, res, next) => {
     }
 });
 
+// ─── /api/logs — client-side error/warning/info log persistence ───────────────
+const LOGS_POST_MAX_ENTRIES = 1000;
+app.post('/api/logs', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    try {
+        const body = req.body;
+        const entries = Array.isArray(body) ? body : [body];
+        if (entries.length === 0) {
+            return res.send({ success: true, written: 0 });
+        }
+        if (entries.length > LOGS_POST_MAX_ENTRIES) {
+            return res.status(413).send({ error: `too many entries (max ${LOGS_POST_MAX_ENTRIES})` });
+        }
+        const prepared = entries
+            .filter(e => e && typeof e === 'object' && typeof e.message === 'string')
+            .map(e => ({
+                timestamp: typeof e.timestamp === 'number' ? e.timestamp : Date.now(),
+                level: e.level,
+                origin: 'client',
+                message: e.message,
+                description: e.description,
+                source: e.source,
+                count: e.count,
+                platform: e.platform,
+                clientId: e.clientId,
+                userAgent: e.userAgent,
+            }));
+        const written = addLogBatch(prepared);
+        res.send({ success: true, written });
+    } catch (error) {
+        next(error);
+    }
+});
+
+app.get('/api/logs', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    try {
+        const parseCsv = (v) => typeof v === 'string' && v.length ? v.split(',').filter(Boolean) : undefined;
+        const filterArgs = {
+            level: typeof req.query.level === 'string' ? req.query.level : undefined,
+            origin: typeof req.query.origin === 'string' ? req.query.origin : undefined,
+            since: req.query.since ? Number(req.query.since) : undefined,
+            excludeLevels: parseCsv(req.query.exclude_levels),
+            excludeOrigins: parseCsv(req.query.exclude_origins),
+            excludeBackground: req.query.exclude_background === '1',
+        };
+        const rows = queryLogs({
+            ...filterArgs,
+            beforeId: req.query.before_id ? Number(req.query.before_id) : undefined,
+            limit: req.query.limit ? Number(req.query.limit) : undefined,
+        });
+        // total reflects rows matching the same filter — pagination math depends on it.
+        res.send({ success: true, content: rows, total: countLogs(filterArgs) });
+    } catch (error) {
+        next(error);
+    }
+});
+
+app.delete('/api/logs', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    if (!checkActiveSession(req, res)) return;
+    try {
+        clearLogs();
+        res.send({ success: true });
+    } catch (error) {
+        next(error);
+    }
+});
+
 app.post('/api/write', async (req, res, next) => {
     if(!await checkAuth(req, res)){
         return;
@@ -2783,13 +3513,40 @@ app.post('/api/write', async (req, res, next) => {
                     const incomingDb = await decodeRisuSave(fileContent);
                     await ensureChatStore();
                     const fullDb = reassembleFullDb(incomingDb);
+
+                    // Mirror the patch-persist guard (persistDbCacheWithChats):
+                    // a malformed full-write payload could carry chats with
+                    // neither `_stub` nor `message` (the v1.4.x metadata-only
+                    // pattern). reassembleFullDb passes them through unchanged
+                    // because there's no fullChat lookup to merge in, so they
+                    // would land on disk and silently strip user messages.
+                    // Normal clients are safe (RisuSaveEncoder runs chatToStub
+                    // on every chat first), but external tools / future
+                    // regressions could bypass that — keep the guard at the
+                    // disk boundary for defense in depth.
+                    const losses = findStubFlagLossChats(fullDb);
+                    if (losses.length > 0) {
+                        const sample = losses.slice(0, 3).map(l => `${l.chaId}/${l.chatId ?? l.chatIndex}`).join(', ');
+                        const err = new Error(
+                            `write aborted: ${losses.length} chat(s) lost _stub flag without upgrade — `
+                            + `would silently strip messages on disk. sample=[${sample}]`
+                        );
+                        recordPersistFailure(err, '/api/write:stub-flag-loss');
+                        logger.error(`[Write] ${err.message}`);
+                        res.status(500).json({ error: 'Write aborted: chat data integrity check failed' });
+                        return;
+                    }
+
                     const mergedContent = Buffer.from(encodeRisuSaveLegacy(fullDb));
                     // Re-init chat store from merged result
                     initChatStore(fullDb);
                     kvSet(key, mergedContent);
                 } catch (e) {
-                    console.error('[Write] Failed to merge chats into database.bin:', e.message);
-                    kvSet(key, fileContent);
+                    logger.error('[Write] Failed to merge chats into database.bin:', e.message);
+                    // Do NOT write stubs-only to disk — that would permanently
+                    // destroy existing full chat data. Preserve disk as-is.
+                    res.status(500).json({ error: 'Database merge failed' });
+                    return;
                 }
             } else {
                 kvSet(key, fileContent);
@@ -2864,7 +3621,9 @@ app.post('/api/patch', async (req, res, next) => {
             if (!dbCache[filePath]) {
                 const fileContent = kvGet(decodedKey);
                 if (fileContent) {
-                    const decoded = normalizeJSON(await decodeRisuSave(fileContent));
+                    const decoded = decodedKey === 'database/database.bin'
+                        ? await decodeDatabaseWithPersistentChatIds(fileContent)
+                        : normalizeJSON(await decodeRisuSave(fileContent));
                     if (decodedKey === 'database/database.bin') {
                         initChatStore(decoded);
                         dbCache[filePath] = normalizeJSON(stripChatsFromDb(decoded));
@@ -2874,6 +3633,39 @@ app.post('/api/patch', async (req, res, next) => {
                 } else {
                     dbCache[filePath] = {};
                 }
+            }
+
+            // Reject patch ops that touch chat-internal fields. Lazy loading
+            // strips chats to stubs in dbCache; the only legitimate chat ops
+            // are stub metadata (id, name, _stub, lastDate, folderId, modules)
+            // or whole-chat add/replace/remove. Field-level ops on chats —
+            // particularly remove of message/hypaV3Data/scriptstate/etc —
+            // strip the `_stub` flag and cause silent on-disk data loss when
+            // reassembleFullDb later sees the metadata-only chat. Reject as
+            // 409 so the client falls through to a full write and rebases its
+            // patcher baseline. See findStubFlagLossChats for the disk-side
+            // partner guard.
+            const chatInternalOps = decodedKey === 'database/database.bin'
+                ? findChatInternalFieldOps(patch)
+                : [];
+            if (chatInternalOps.length > 0) {
+                const sample = chatInternalOps.slice(0, 5).map(v => `${v.op} ${v.path}`).join(', ');
+                logger.warn(
+                    `[Patch] Rejected ${chatInternalOps.length} chat-internal field op(s) `
+                    + `(would corrupt lazy-loaded chats): ${sample}`
+                );
+                let currentEtag;
+                try {
+                    currentEtag = computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(dbCache[filePath])));
+                    dbEtag = currentEtag;
+                } catch {}
+                res.status(409).send({
+                    error: 'Patch rejected: chat-internal field ops not allowed for lazy-loaded chats',
+                    code: 'CHAT_GUARD_REJECTED',
+                    chatGuardRejected: true,
+                    currentEtag,
+                });
+                return;
             }
 
             const serverHash = calculateHash(dbCache[filePath]).toString(16);
@@ -2914,13 +3706,28 @@ app.post('/api/patch', async (req, res, next) => {
                         await persistDbCacheWithChats(filePath, decodedKey);
                     } else {
                         const data = Buffer.from(encodeRisuSaveLegacy(dbCache[filePath]));
-                        kvSet(decodedKey, data);
+                        try {
+                            kvSet(decodedKey, data);
+                        } catch (err) {
+                            if (err && typeof err === 'object') {
+                                try { err.attemptedSize = data.length; } catch {}
+                            }
+                            throw err;
+                        }
                     }
+                    // Persist succeeded — clear before backup so a backup-only
+                    // failure isn't attributed to data loss.
+                    clearPersistFailure();
                     if (decodedKey === 'database/database.bin') {
-                        createBackupAndRotate();
+                        try {
+                            createBackupAndRotate();
+                        } catch (backupErr) {
+                            logger.warn(`[Patch] Backup rotation failed for ${decodedKey}:`, backupErr);
+                        }
                     }
                 } catch (error) {
-                    console.error(`[Patch] Error saving ${decodedKey}:`, error);
+                    logger.error(`[Patch] Error saving ${decodedKey}:`, error);
+                    recordPersistFailure(error, `patch:${decodedKey}`);
                 } finally {
                     delete saveTimers[filePath];
                 }
@@ -2931,14 +3738,19 @@ app.post('/api/patch', async (req, res, next) => {
                 dbEtag = computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(dbCache[filePath])));
             }
 
-            res.send({
+            const responsePayload = {
                 success: true,
                 appliedOperations: result.length,
                 etag: decodedKey === 'database/database.bin' ? dbEtag : undefined,
-            });
+            };
+            const persistWarning = currentPersistWarning();
+            if (persistWarning) {
+                responsePayload.persistWarning = persistWarning;
+            }
+            res.send(responsePayload);
         });
     } catch (error) {
-        console.error(`[Patch] Error applying patch to ${filePath}:`, error.name);
+        logger.error(`[Patch] Error applying patch to ${filePath}:`, error.name);
         res.status(500).send({
             error: 'Patch application failed: ' + (error && error.message ? error.message : error)
         });
@@ -3041,9 +3853,15 @@ app.post('/api/assets/bulk-write', async (req, res, next) => {
 app.get('/api/backup/export', async (req, res, next) => {
     if(!await checkAuth(req, res)){ return; }
     try {
+        // ?target=upstream excludes NodeOnly-only inlay namespaces (inlay/,
+        // inlay_sidecar/, inlay_meta/). Their entry names contain a slash,
+        // which upstream RisuAI's import treats as a path under assets/ and
+        // fails with ENOENT. The export becomes lossy on inlay images but
+        // imports cleanly into upstream.
+        const target = req.query.target === 'upstream' ? 'upstream' : 'nodeonly';
         // Flush any pending patches to ensure export includes latest data
         await flushPendingDb();
-        const inlayFiles = await listInlayFiles();
+        const inlayFiles = target === 'upstream' ? [] : await listInlayFiles();
         const inlayEntries = await Promise.all(inlayFiles.map(async (entry) => {
             const stat = await fs.stat(entry.filePath);
             return {
@@ -3069,6 +3887,13 @@ app.get('/api/backup/export', async (req, res, next) => {
                 return null;
             }
         }));
+        const inlayMetaEntries = target === 'upstream' ? [] : kvListWithSizes('inlay_meta/').map((entry) => ({
+            kind: 'kv',
+            key: entry.key,
+            backupName: entry.key,
+            sortKey: entry.key,
+            size: entry.size,
+        }));
         const namespacedEntries = [
             ...kvListWithSizes('assets/').map((entry) => ({
                 kind: 'kv',
@@ -3077,13 +3902,8 @@ app.get('/api/backup/export', async (req, res, next) => {
                 sortKey: entry.key,
                 size: entry.size,
             })),
-            ...kvListWithSizes('inlay_meta/').map((entry) => ({
-                kind: 'kv',
-                key: entry.key,
-                backupName: entry.key,
-                sortKey: entry.key,
-                size: entry.size,
-            })),
+            ...listColdStorageBackupEntries(),
+            ...inlayMetaEntries,
             ...inlayEntries,
             ...sidecarEntries.filter(Boolean),
         ].sort((a, b) => a.sortKey.localeCompare(b.sortKey));
@@ -3092,8 +3912,9 @@ app.get('/api/backup/export', async (req, res, next) => {
             return sum + 8 + Buffer.byteLength(entry.backupName, 'utf-8') + entry.size;
         }, 0) + (dbSize ? 8 + Buffer.byteLength('database.risudat', 'utf-8') + dbSize : 0);
 
+        const filenameSuffix = target === 'upstream' ? '-upstream' : '';
         res.setHeader('content-type', 'application/octet-stream');
-        res.setHeader('content-disposition', `attachment; filename="risu-backup-${Date.now()}.bin"`);
+        res.setHeader('content-disposition', `attachment; filename="risu-backup-${Date.now()}${filenameSuffix}.bin"`);
         res.setHeader('content-length', totalBytes);
         res.setHeader('x-risu-backup-assets', namespacedEntries.length);
 
@@ -3117,7 +3938,9 @@ app.get('/api/backup/export', async (req, res, next) => {
             if (closed) break;
             const value = entry.kind === 'kv'
                 ? kvGet(entry.key)
-                : await fs.readFile(entry.sourcePath);
+                : entry.kind === 'buffer'
+                    ? entry.buffer
+                    : await fs.readFile(entry.sourcePath);
             if (closed) break;
             if (value) {
                 const ok = res.write(encodeBackupEntry(entry.backupName, value));
@@ -3193,6 +4016,13 @@ app.post('/api/backup/import', async (req, res, next) => {
     req.socket.setKeepAlive(true);
     if (req.socket.server) req.socket.server.requestTimeout = 0;
 
+    // NDJSON streaming keeps the response socket alive during long
+    // post-upload work (WAL checkpoint, cold-storage migration). Without it
+    // a reverse proxy in front of the server can hit its response timeout
+    // and bounce the request back to the client as 502 Bad Gateway.
+    const wantsNdjson = String(req.headers['accept'] ?? '').includes('application/x-ndjson');
+    let heartbeatTimer = null;
+
     try {
         const contentType = String(req.headers['content-type'] ?? '');
         if (contentType && !contentType.includes('application/x-risu-backup') && !contentType.includes('application/octet-stream')) {
@@ -3206,11 +4036,57 @@ app.post('/api/backup/import', async (req, res, next) => {
             return;
         }
 
-        const result = await importBackupFromSource(req, { maxBytes: BACKUP_IMPORT_MAX_BYTES });
-        res.json({ ok: true, assetsRestored: result.assetsRestored });
+        if (wantsNdjson) {
+            res.setHeader('content-type', 'application/x-ndjson');
+            res.setHeader('cache-control', 'no-cache, no-transform');
+            // Disable nginx response buffering so progress events flush immediately.
+            res.setHeader('x-accel-buffering', 'no');
+            res.flushHeaders();
+
+            // Periodic keepalive — covers the post-stream phase (commit,
+            // inlay dir swap, cold storage migration) where onProgress is silent.
+            heartbeatTimer = setInterval(() => {
+                if (!res.writableEnded) res.write('{"type":"heartbeat"}\n');
+            }, BACKUP_NDJSON_HEARTBEAT_MS);
+
+            let lastProgressWrite = 0;
+            const totalBytes = Number.isFinite(contentLength) ? contentLength : 0;
+            const result = await importBackupFromSource(req, {
+                maxBytes: BACKUP_IMPORT_MAX_BYTES,
+                totalBytes,
+                onProgress: (received, total) => {
+                    const now = Date.now();
+                    if (now - lastProgressWrite < 200) return;
+                    lastProgressWrite = now;
+                    res.write(JSON.stringify({ type: 'progress', bytes: received, totalBytes: total }) + '\n');
+                },
+            });
+            res.write(JSON.stringify({
+                type: 'done',
+                ok: true,
+                assetsRestored: result.assetsRestored,
+                coldStorageFailed: result.coldStorageFailed,
+            }) + '\n');
+            res.end();
+        } else {
+            const result = await importBackupFromSource(req, { maxBytes: BACKUP_IMPORT_MAX_BYTES });
+            res.json({
+                ok: true,
+                assetsRestored: result.assetsRestored,
+                coldStorageFailed: result.coldStorageFailed,
+            });
+        }
     } catch (error) {
-        next(error);
+        if (wantsNdjson && res.headersSent) {
+            try {
+                res.write(JSON.stringify({ type: 'error', message: error?.message || 'backup import failed' }) + '\n');
+                res.end();
+            } catch (_) {}
+        } else {
+            next(error);
+        }
     } finally {
+        if (heartbeatTimer) clearInterval(heartbeatTimer);
         importInProgress = false;
         if (req.socket.server && prevRequestTimeout !== undefined) {
             req.socket.server.requestTimeout = prevRequestTimeout;
@@ -3227,6 +4103,27 @@ app.post('/api/backup/server/save', async (req, res, next) => {
     try {
         await flushPendingDb();
 
+        // Pre-flight disk check — bail before streaming if the target dir
+        // can't fit the backup. Avoids wasted minutes + half-written tmp files.
+        try {
+            const estimate = await estimateServerBackupSize();
+            const required = Math.ceil(estimate * 1.05); // 5% safety margin
+            const sf = await fs.statfs(backupsDir);
+            const free = sf.bsize * sf.bavail;
+            if (estimate > 0 && free < required) {
+                return res.status(400).json({
+                    error: `Insufficient disk space (need ~${(required / 1024 / 1024).toFixed(0)} MB, free ${(free / 1024 / 1024).toFixed(0)} MB)`,
+                    code: 'insufficient_space',
+                    required,
+                    free,
+                });
+            }
+        } catch (e) {
+            // Non-fatal: log and proceed. statfs may be unavailable, in which
+            // case the streaming fallback path below still fails gracefully.
+            console.warn('[Backup] pre-flight disk check failed:', e?.message || e);
+        }
+
         const inlayFiles = await listInlayFiles();
         const inlayEntries = await Promise.all(inlayFiles.map(async (entry) => {
             const stat = await fs.stat(entry.filePath);
@@ -3242,6 +4139,7 @@ app.post('/api/backup/server/save', async (req, res, next) => {
 
         const namespacedEntries = [
             ...kvListWithSizes('assets/').map((e) => ({ kind: 'kv', key: e.key, backupName: path.basename(e.key), size: e.size })),
+            ...listColdStorageBackupEntries(),
             ...kvListWithSizes('inlay_meta/').map((e) => ({ kind: 'kv', key: e.key, backupName: e.key, size: e.size })),
             ...inlayEntries,
             ...sidecarEntries,
@@ -3275,7 +4173,9 @@ app.post('/api/backup/server/save', async (req, res, next) => {
                         if (closed) break;
                         const value = entry.kind === 'kv'
                             ? kvGet(entry.key)
-                            : await fs.readFile(entry.sourcePath);
+                            : entry.kind === 'buffer'
+                                ? entry.buffer
+                                : await fs.readFile(entry.sourcePath);
                         if (value) {
                             const ok = writeStream.write(encodeBackupEntry(entry.backupName, value));
                             if (!ok) await new Promise(r => writeStream.once('drain', r));
@@ -3403,7 +4303,12 @@ app.post('/api/backup/server/restore', async (req, res, next) => {
                 res.write(JSON.stringify({ type: 'progress', bytes: received, totalBytes: total }) + '\n');
             },
         });
-        res.write(JSON.stringify({ type: 'done', ok: true, assetsRestored: result.assetsRestored }) + '\n');
+        res.write(JSON.stringify({
+            type: 'done',
+            ok: true,
+            assetsRestored: result.assetsRestored,
+            coldStorageFailed: result.coldStorageFailed,
+        }) + '\n');
         res.end();
     } catch (error) {
         if (!res.headersSent) {
@@ -3472,8 +4377,93 @@ app.get('/api/backup/server/download/:filename', async (req, res, next) => {
 
 // ── Chat content endpoints (runtime lazy load) ─────────────────────────────
 
-// Cold storage compatibility: restore chat data stored in coldstorage/ KV entries
+// Cold storage compatibility: restore data stored in coldstorage/ KV entries
 const COLD_STORAGE_HEADER = '\uEF01COLDSTORAGE\uEF01';
+
+function restoreColdStorageCharacter(character) {
+    if (!character?.coldstorage) return true;
+    const key = character.coldstorage;
+    const entry = readColdStorageJsonEntry(key, {
+        migrateLegacy: true,
+    });
+    if (!entry) {
+        logger.error(`[ColdStorage] character data not found for key: ${key}`);
+        return false;
+    }
+    try {
+        const coldData = entry.coldData;
+        if (coldData?.character) {
+            Object.assign(character, coldData.character);
+            delete character.coldstorage;
+            delete character.coldStoragedChats;
+        } else {
+            logger.error(`[ColdStorage] unexpected character cold data format for key: ${key}`);
+            return false;
+        }
+        return true;
+    } catch (err) {
+        logger.error(`[ColdStorage] character restore failed for key ${key}:`, err.message);
+        return false;
+    }
+}
+
+function promoteFailedColdStorageStub(char) {
+    const coldKey = char.coldstorage;
+    // Fill in missing fields with safe defaults matching createBlankChar() in src/ts/characters.ts.
+    // SYNC: if createBlankChar() defaults change, update this object to match.
+    const defaults = {
+        firstMessage: '', desc: '', notes: '', chatFolders: [],
+        emotionImages: [], bias: [], viewScreen: 'none', globalLore: [],
+        sdData: [
+            ['always', 'solo, 1girl'], ['negative', ''],
+            ["|character's appearance", ''], ['current situation', ''],
+            ["$character's pose", ''], ["$character's emotion", ''],
+            ['current location', ''],
+        ],
+        utilityBot: false, customscript: [], exampleMessage: '',
+        creatorNotes: '', systemPrompt: '', postHistoryInstructions: '',
+        alternateGreetings: [], tags: [], creator: '', characterVersion: '',
+        personality: '', scenario: '',
+        firstMsgIndex: -1,
+        replaceGlobalNote: '', additionalText: '',
+        triggerscript: [
+            { comment: '', type: 'manual', conditions: [], effect: [{ type: 'v2Header', code: '', indent: 0 }] },
+            { comment: 'New Event', type: 'manual', conditions: [], effect: [] },
+        ],
+    };
+    for (const [key, value] of Object.entries(defaults)) {
+        if (char[key] === undefined || char[key] === null) {
+            char[key] = value;
+        }
+    }
+    // Force firstMsgIndex to -1 even if stub had 0 — prevents alternateGreetings[0] access on empty array
+    char.firstMsgIndex = -1;
+    // Ensure chats array is valid
+    if (!Array.isArray(char.chats) || char.chats.length === 0) {
+        char.chats = [{ message: [], note: '', name: 'Chat 1', localLore: [] }];
+    }
+    // Leave recovery breadcrumb and remove cold storage markers
+    char.desc = `[Cold storage restore failed. Original key: ${coldKey}]\n\n${char.desc || ''}`.trim();
+    delete char.coldstorage;
+    delete char.coldStoragedChats;
+}
+
+function restoreColdStorageCharactersInDb(dbObj) {
+    const result = { restored: 0, failed: 0, failedNames: [] };
+    if (!Array.isArray(dbObj?.characters)) return result;
+    for (let i = 0; i < dbObj.characters.length; i++) {
+        const char = dbObj.characters[i];
+        if (!char?.coldstorage) continue;
+        if (restoreColdStorageCharacter(char)) {
+            result.restored++;
+        } else {
+            result.failed++;
+            result.failedNames.push(char.name || `(index ${i})`);
+            promoteFailedColdStorageStub(char);
+        }
+    }
+    return result;
+}
 
 function isColdStorageChat(chat) {
     return chat?.message?.[0]?.data?.startsWith(COLD_STORAGE_HEADER);
@@ -3482,14 +4472,15 @@ function isColdStorageChat(chat) {
 function restoreColdStorageChat(chat) {
     if (!isColdStorageChat(chat)) return true;
     const key = chat.message[0].data.slice(COLD_STORAGE_HEADER.length);
-    const compressed = kvGet('coldstorage/' + key);
-    if (!compressed) {
-        console.error(`[ColdStorage] data not found for key: ${key}`);
+    const entry = readColdStorageJsonEntry(key, {
+        migrateLegacy: true,
+    });
+    if (!entry) {
+        logger.error(`[ColdStorage] data not found for key: ${key}`);
         return false;
     }
     try {
-        const decompressed = zlib.gunzipSync(compressed);
-        const coldData = JSON.parse(decompressed.toString('utf-8'));
+        const coldData = entry.coldData;
         if (Array.isArray(coldData)) {
             chat.message = coldData;
         } else if (coldData?.message) {
@@ -3501,7 +4492,7 @@ function restoreColdStorageChat(chat) {
         chat.lastDate = Date.now();
         return true;
     } catch (err) {
-        console.error(`[ColdStorage] restore failed for key ${key}:`, err.message);
+        logger.error(`[ColdStorage] restore failed for key ${key}:`, err.message);
         return false;
     }
 }
@@ -3513,15 +4504,12 @@ app.get('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
         const chaId = req.params.chaId;
         const chatIndex = parseInt(req.params.chatIndex, 10);
         const expectedChatId = req.headers['x-chat-id'];
-        console.warn(`[chat-content] GET chaId=${chaId?.substring(0,8)} idx=${chatIndex} expectedChatId=${expectedChatId?.substring(0,8) || 'none'}`);
 
         await ensureChatStore();
         // First try fullChatStore (fast path)
         const charChats = fullChatStore.get(chaId);
-        console.warn(`[chat-content] fullChatStore has cha: ${!!charChats}, size=${charChats?.size ?? 0}`);
         if (charChats && expectedChatId) {
             const chat = charChats.get(expectedChatId);
-            console.warn(`[chat-content] fullChatStore lookup chatId=${expectedChatId?.substring(0,8)} found=${!!chat}`);
             if (chat) {
                 if (!restoreColdStorageChat(chat)) {
                     return res.status(500).json({ error: 'Cold storage restore failed' });
@@ -3532,49 +4520,14 @@ app.get('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
             }
         }
 
-        // Fallback: try remote file first (per-character full data with chats)
-        console.warn(`[chat-content] falling back to remote file lookup`);
-        const remoteRaw = kvGet(`remotes/${chaId}.local.bin`);
-        if (remoteRaw) {
-            try {
-                const charData = JSON.parse(new TextDecoder().decode(remoteRaw));
-                const chats = charData.chats;
-                console.warn(`[chat-content] remote lookup chats.length=${chats?.length ?? 0}`);
-                if (Array.isArray(chats)) {
-                    // Try by expectedChatId first (more reliable than index)
-                    let chat = null;
-                    if (expectedChatId) {
-                        chat = chats.find(c => c?.id === expectedChatId);
-                    }
-                    if (!chat && chats[chatIndex]) {
-                        chat = chats[chatIndex];
-                    }
-                    if (chat) {
-                        // Cache to fullChatStore so subsequent reads are fast
-                        if (!fullChatStore.has(chaId)) fullChatStore.set(chaId, new Map());
-                        fullChatStore.get(chaId).set(chat.id, chat);
-                        const encoded = Buffer.from(encodeRisuSaveLegacy(chat));
-                        res.setHeader('Content-Type', 'application/octet-stream');
-                        console.warn(`[chat-content] served from remote file: chatId=${chat.id?.substring(0,8)} msgs=${chat.message?.length ?? 0}`);
-                        return res.send(encoded);
-                    }
-                }
-            } catch (e) {
-                console.warn(`[chat-content] remote file parse error:`, e.message);
-            }
-        }
-
-        // Final fallback: decode database.bin (REMOTE blocks are skipped — chats may be stubs)
+        // Fallback: load from disk and find by index
         const raw = kvGet('database/database.bin');
         if (!raw) {
-            console.warn(`[chat-content] 404 — database.bin not in kv`);
             return res.status(404).json({ error: 'Database not found' });
         }
         const dbObj = await decodeRisuSave(raw);
         const char = dbObj.characters?.find(c => c?.chaId === chaId);
-        console.warn(`[chat-content] disk lookup char found=${!!char}, chats.length=${char?.chats?.length ?? 0}`);
         if (!char?.chats?.[chatIndex]) {
-            console.warn(`[chat-content] 404 — chat at index ${chatIndex} not found`);
             return res.status(404).json({ error: 'Chat not found' });
         }
         const chat = char.chats[chatIndex];
@@ -3642,12 +4595,28 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
                         if (raw) {
                             const dbObj = normalizeJSON(await decodeRisuSave(raw));
                             const fullDb = reassembleFullDb(stripChatsFromDb(dbObj));
-                            kvSet('database/database.bin', Buffer.from(encodeRisuSaveLegacy(fullDb)));
+                            const encoded = Buffer.from(encodeRisuSaveLegacy(fullDb));
+                            try {
+                                kvSet('database/database.bin', encoded);
+                            } catch (err) {
+                                if (err && typeof err === 'object') {
+                                    try { err.attemptedSize = encoded.length; } catch {}
+                                }
+                                throw err;
+                            }
                         }
                     }
-                    createBackupAndRotate();
+                    // Persist succeeded — clear before backup so a backup-only
+                    // failure isn't attributed to data loss.
+                    clearPersistFailure();
+                    try {
+                        createBackupAndRotate();
+                    } catch (backupErr) {
+                        logger.warn('[ChatContent] Backup rotation failed:', backupErr);
+                    }
                 } catch (error) {
-                    console.error('[ChatContent] Error persisting chat:', error);
+                    logger.error('[ChatContent] Error persisting chat:', error);
+                    recordPersistFailure(error, 'chat-content');
                 } finally {
                     delete saveTimers[DB_HEX_KEY];
                 }
@@ -3691,6 +4660,18 @@ function clearExistingData() {
     kvDelPrefix('inlay_thumb/');
     kvDelPrefix('inlay_meta/');
     kvDelPrefix('inlay_info/');
+    // Drop the previous user's remote payloads. The new save folder usually
+    // brings its own remotes/<id>.local.bin files (INSERT OR REPLACE), but if
+    // the imported character ids reuse names from the prior user without
+    // shipping a matching payload, the migration's resolveRemote would silently
+    // stitch in stale cross-user data. Wiping here ensures only payloads
+    // that arrived in this import survive.
+    kvDelPrefix('remotes/');
+    // Clear remote-block migration marker — newly imported database.bin may
+    // contain REMOTE blocks (it usually does, since save-folder imports
+    // preserve upstream's split-character format) and we want the migration
+    // to re-evaluate against the new contents on the next ensureChatStore.
+    kvDel(REMOTE_MIGRATION_MARKER_KEY);
     clearEntities();
 }
 
@@ -3903,6 +4884,1380 @@ app.post('/api/migrate/save-folder/cleanup/execute', async (req, res, next) => {
         res.json({ ok: true, removed, freedBytes });
     } catch (error) {
         next(error);
+    }
+});
+
+// ── Storage dashboard endpoints ──────────────────────────────────────────────
+
+const DB_BLOB_KEY = 'database/database.bin';
+const DB_BACKUP_PREFIX = 'database/dbbackup-';
+const ASSET_PREFIXES = ['assets/', 'remotes/', 'inlay/', 'inlay_thumb/', 'inlay_meta/', 'inlay_info/', 'coldstorage/'];
+// Slightly above 2GB BLOB ceiling — better-sqlite3 throws RangeError near INT_MAX.
+const BLOB_INT_MAX = 2 * 1024 * 1024 * 1024 - 1;
+
+function statsBasename(s) {
+    if (!s) return '';
+    return String(s).replace(/\\/g, '/').split('/').pop();
+}
+
+// Mirrors src/ts/globalApi.svelte.ts:getUncleanables — every asset reference reachable from the DB.
+function buildUncleanableSet(dbObj) {
+    const set = new Set();
+    const add = (v) => {
+        const bn = statsBasename(v);
+        if (bn) set.add(bn);
+    };
+    if (!dbObj) return set;
+    add(dbObj.customBackground);
+    add(dbObj.userIcon);
+    if (Array.isArray(dbObj.characters)) {
+        for (const cha of dbObj.characters) {
+            if (!cha) continue;
+            add(cha.image);
+            if (Array.isArray(cha.emotionImages)) for (const em of cha.emotionImages) add(em?.[1]);
+            if (Array.isArray(cha.additionalAssets)) for (const em of cha.additionalAssets) add(em?.[1]);
+            if (cha.vits?.files) for (const k of Object.keys(cha.vits.files)) add(cha.vits.files[k]);
+            if (Array.isArray(cha.ccAssets)) for (const a of cha.ccAssets) add(a?.uri);
+        }
+    }
+    if (Array.isArray(dbObj.modules)) {
+        for (const m of dbObj.modules) if (Array.isArray(m?.assets)) for (const a of m.assets) add(a?.[1]);
+    }
+    if (Array.isArray(dbObj.personas)) for (const p of dbObj.personas) add(p?.icon);
+    if (Array.isArray(dbObj.characterOrder)) {
+        for (const item of dbObj.characterOrder) {
+            if (item && typeof item === 'object' && 'imgFile' in item) add(item.imgFile);
+        }
+    }
+    return set;
+}
+
+function statSafe(p) {
+    try { return require('fs').statSync(p); } catch { return null; }
+}
+
+async function diskFreeStat(dirPath) {
+    try {
+        const sf = await fs.statfs(dirPath);
+        return { free: sf.bsize * sf.bavail, total: sf.bsize * sf.blocks };
+    } catch { return { free: null, total: null }; }
+}
+
+// Sum the on-disk inlay payload (image files + sidecar JSONs in save/inlays).
+// Returns 0 if the directory is missing. Used by both the backup-size
+// estimator and the dashboard inlay total — kv inlay/* prefixes don't
+// reflect filesystem bytes after the inlay→fs migration.
+async function sumInlayFsBytes() {
+    let total = 0;
+    try {
+        const inlayFiles = await listInlayFiles();
+        await Promise.all(inlayFiles.map(async (entry) => {
+            try {
+                const st = await fs.stat(entry.filePath);
+                total += st.size;
+            } catch { /* missing — skip */ }
+            try {
+                const sst = await fs.stat(getInlaySidecarPath(entry.id));
+                total += sst.size;
+            } catch { /* sidecar may not exist */ }
+        }));
+    } catch { /* dir missing */ }
+    return total;
+}
+
+// Estimated server-backup size — mirrors the enumeration in
+// /api/backup/server/save without writing anything. Inlay files live on the
+// filesystem (post-migration), so we have to fs.stat them rather than read
+// kvSize. Cost: ~5-50 ms typical, ~200 ms for users with thousands of inlays.
+async function estimateServerBackupSize() {
+    let total = 0;
+    total += kvSize(DB_BLOB_KEY) || 0;
+    for (const it of kvListWithSizes('assets/')) total += it.size;
+    for (const it of kvListWithSizes('inlay_meta/')) total += it.size;
+    for (const e of listColdStorageBackupEntries()) total += e.size;
+    total += await sumInlayFsBytes();
+    return total;
+}
+
+app.get('/api/db/stats', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    try {
+        const saveDir = path.join(process.cwd(), 'save');
+        const dbFilePath = path.join(saveDir, 'risuai.db');
+        const walPath = dbFilePath + '-wal';
+        const shmPath = dbFilePath + '-shm';
+
+        const files = {
+            db: statSafe(dbFilePath)?.size ?? 0,
+            wal: statSafe(walPath)?.size ?? 0,
+            shm: statSafe(shmPath)?.size ?? 0,
+        };
+
+        const disk = await diskFreeStat(saveDir);
+        // Backup destination disk — same as save/ in the default config but
+        // can diverge when the user points backupsDir at a different mount.
+        // Surfaced separately so backup-side warnings target the right disk.
+        // `sameAsSaveDir` is true when both paths land on the same filesystem
+        // (compared by Stat.dev). Dashboard uses this to decide whether to
+        // count file backups against the save/ disk in the storage chart.
+        let backupDisk;
+        if (backupsDir === DEFAULT_BACKUPS_DIR) {
+            backupDisk = { ...disk, path: backupsDir, sameAsSaveDir: true };
+        } else {
+            const bDisk = await diskFreeStat(backupsDir);
+            let sameAsSaveDir = false;
+            try {
+                const saveStat = require('fs').statSync(saveDir);
+                const bStat = require('fs').statSync(backupsDir);
+                sameAsSaveDir = saveStat.dev === bStat.dev;
+            } catch { /* non-fatal */ }
+            backupDisk = { ...bDisk, path: backupsDir, sameAsSaveDir };
+        }
+
+        const pageSize = sqliteDb.pragma('page_size', { simple: true });
+        const pageCount = sqliteDb.pragma('page_count', { simple: true });
+        const freelistCount = sqliteDb.pragma('freelist_count', { simple: true });
+        const journalMode = sqliteDb.pragma('journal_mode', { simple: true });
+        const autoVacuum = sqliteDb.pragma('auto_vacuum', { simple: true });
+        const reclaimable = freelistCount * pageSize;
+
+        const dbBlobSize = kvSize(DB_BLOB_KEY) || 0;
+
+        // Prefix breakdown — split database/ into the live blob vs rotated backups.
+        const prefixes = {};
+        prefixes[DB_BLOB_KEY] = { totalSize: dbBlobSize, count: dbBlobSize > 0 ? 1 : 0 };
+        const backupKeys = kvList(DB_BACKUP_PREFIX);
+        let backupTotal = 0;
+        let backupOldest = null, backupNewest = null;
+        for (const k of backupKeys) {
+            const sz = kvSize(k) || 0;
+            backupTotal += sz;
+            const tsRaw = parseInt(k.slice(DB_BACKUP_PREFIX.length, -4), 10);
+            if (Number.isFinite(tsRaw)) {
+                const ts = tsRaw * 100;
+                if (!backupOldest || ts < backupOldest) backupOldest = ts;
+                if (!backupNewest || ts > backupNewest) backupNewest = ts;
+            }
+        }
+        prefixes[DB_BACKUP_PREFIX] = { totalSize: backupTotal, count: backupKeys.length };
+        for (const p of ASSET_PREFIXES) {
+            const items = kvListWithSizes(p);
+            let total = 0;
+            for (const it of items) total += it.size;
+            prefixes[p] = { totalSize: total, count: items.length };
+        }
+
+        const kvRows = sqliteDb.prepare('SELECT COUNT(*) AS c FROM kv').get().c;
+        const kvTotalBytes = sqliteDb.prepare('SELECT COALESCE(SUM(LENGTH(value)), 0) AS s FROM kv').get().s;
+
+        let fileBackups = { count: 0, totalSize: 0, oldest: null, newest: null };
+        try {
+            const entries = await fs.readdir(backupsDir, { withFileTypes: true });
+            for (const e of entries) {
+                if (!e.isFile() || !BACKUP_FILENAME_REGEX.test(e.name)) continue;
+                const st = await fs.stat(path.join(backupsDir, e.name));
+                fileBackups.count++;
+                fileBackups.totalSize += st.size;
+                const ts = st.mtimeMs;
+                if (!fileBackups.oldest || ts < fileBackups.oldest) fileBackups.oldest = ts;
+                if (!fileBackups.newest || ts > fileBackups.newest) fileBackups.newest = ts;
+            }
+        } catch { /* backups dir may not exist */ }
+
+        // Quick estimates from in-memory cache only — never decode the BLOB just for stats.
+        let trashed = { count: 0, expiredCount: 0, available: false };
+        let orphan = { count: 0, totalSize: 0, available: false };
+        const stripped = dbCache[DB_HEX_KEY];
+        if (stripped?.characters) {
+            const now = Date.now();
+            const GRACE = 1000 * 60 * 60 * 24 * 3;
+            for (const c of stripped.characters) {
+                if (c?.trashTime) {
+                    trashed.count++;
+                    if (c.trashTime + GRACE < now) trashed.expiredCount++;
+                }
+            }
+            trashed.available = true;
+        }
+        if (stripped) {
+            const uncleanable = buildUncleanableSet(stripped);
+            for (const it of kvListWithSizes('assets/')) {
+                if (!uncleanable.has(statsBasename(it.key))) {
+                    orphan.count++;
+                    orphan.totalSize += it.size;
+                }
+            }
+            orphan.available = true;
+        }
+
+        const estimatedBackupSize = await estimateServerBackupSize();
+        // Inlay payload now lives on the filesystem (post-migration) rather
+        // than in kv `inlay/*` prefixes. Surface explicitly so the dashboard
+        // chart can include it in the inlay slice instead of underreporting.
+        const inlayFsBytes = await sumInlayFsBytes();
+
+        res.json({
+            files,
+            disk,
+            backupDisk,
+            sqlite: { pageSize, pageCount, freelistCount, reclaimable, journalMode, autoVacuum },
+            blob: { dbSize: dbBlobSize, intMax: BLOB_INT_MAX },
+            prefixes,
+            kvRows,
+            kvTotalBytes,
+            estimatedBackupSize,
+            inlayFsBytes,
+            backups: {
+                kv: { count: backupKeys.length, totalSize: backupTotal, oldest: backupOldest, newest: backupNewest },
+                file: fileBackups,
+            },
+            trashed,
+            orphan,
+            etag: dbEtag,
+        });
+    } catch (err) { next(err); }
+});
+
+app.get('/api/db/stats/characters', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    try {
+        await ensureChatStore();
+        const raw = kvGet(DB_BLOB_KEY);
+        if (!raw) {
+            res.json({ characters: [], orphan: { count: 0, totalSize: 0 }, chatBytesNote: 'estimate' });
+            return;
+        }
+        const dbObj = await decodeRisuSave(raw);
+
+        const assetSize = new Map();
+        for (const it of kvListWithSizes('assets/')) {
+            assetSize.set(statsBasename(it.key), it.size);
+        }
+        // remotes/<chaId>.local.bin (+ optional .meta sidecar) → bucket by chaId.
+        const remoteSize = new Map();
+        for (const it of kvListWithSizes('remotes/')) {
+            const bn = statsBasename(it.key).replace(/\.meta$/, '');
+            const chaId = bn.replace(/\.local\.bin$/, '');
+            if (chaId) remoteSize.set(chaId, (remoteSize.get(chaId) || 0) + it.size);
+        }
+
+        const claimed = new Set();
+        const characters = [];
+        const list = Array.isArray(dbObj.characters) ? dbObj.characters : [];
+        for (const cha of list) {
+            if (!cha) continue;
+            const refs = [];
+            const collect = (v) => { if (v) refs.push(statsBasename(v)); };
+            collect(cha.image);
+            if (Array.isArray(cha.emotionImages)) for (const em of cha.emotionImages) collect(em?.[1]);
+            if (Array.isArray(cha.additionalAssets)) for (const em of cha.additionalAssets) collect(em?.[1]);
+            if (cha.vits?.files) for (const k of Object.keys(cha.vits.files)) collect(cha.vits.files[k]);
+            if (Array.isArray(cha.ccAssets)) for (const a of cha.ccAssets) collect(a?.uri);
+
+            // Same asset shared across characters is attributed to the first one we see — avoids double-counting.
+            let imgBytes = 0;
+            for (const bn of refs) {
+                if (!bn || claimed.has(bn)) continue;
+                const sz = assetSize.get(bn);
+                if (sz != null) {
+                    imgBytes += sz;
+                    claimed.add(bn);
+                }
+            }
+            const remoteBytes = remoteSize.get(cha.chaId) || 0;
+
+            let chatBytes = 0;
+            const charChats = fullChatStore?.get(cha.chaId);
+            if (charChats) {
+                for (const chat of charChats.values()) {
+                    try { chatBytes += JSON.stringify(chat).length; } catch { /* skip un-serializable */ }
+                }
+            }
+
+            // Card body = the character row minus chats (which we count separately).
+            // Asset URIs themselves are tiny strings — leaving them in card body is fine.
+            let cardBytes = 0;
+            try {
+                const { chats: _drop, ...body } = cha;
+                cardBytes = JSON.stringify(body).length;
+            } catch { /* skip un-serializable */ }
+
+            characters.push({
+                chaId: cha.chaId || '',
+                name: cha.name || '',
+                image: cha.image || '',
+                trashed: !!cha.trashTime,
+                cardBytes,
+                imgBytes: imgBytes + remoteBytes,
+                chatBytes,
+                totalBytes: cardBytes + imgBytes + remoteBytes + chatBytes,
+            });
+        }
+
+        const uncleanable = buildUncleanableSet(dbObj);
+        let orphanCount = 0, orphanTotal = 0;
+        for (const it of kvListWithSizes('assets/')) {
+            if (!uncleanable.has(statsBasename(it.key))) {
+                orphanCount++;
+                orphanTotal += it.size;
+            }
+        }
+
+        characters.sort((a, b) => b.totalBytes - a.totalBytes);
+        res.json({
+            characters,
+            orphan: { count: orphanCount, totalSize: orphanTotal },
+            chatBytesNote: 'JSON.stringify estimate; on-disk msgpack ~0.6×',
+            etag: dbEtag,
+        });
+    } catch (err) { next(err); }
+});
+
+// Per-module breakdown — modules live inside database.bin (no separate kv keys
+// for module bodies), so size = JSON.stringify of the module + sum of its
+// referenced assets. Assets attribution is independent from /characters; an
+// asset shared between a character and a module would be counted in both.
+app.get('/api/db/stats/modules', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    try {
+        const raw = kvGet(DB_BLOB_KEY);
+        if (!raw) {
+            res.json({ modules: [] });
+            return;
+        }
+        const dbObj = await decodeRisuSave(raw);
+        const list = Array.isArray(dbObj.modules) ? dbObj.modules : [];
+
+        const assetSize = new Map();
+        for (const it of kvListWithSizes('assets/')) {
+            assetSize.set(statsBasename(it.key), it.size);
+        }
+
+        const modules = [];
+        for (const m of list) {
+            if (!m) continue;
+
+            let bodyBytes = 0;
+            try {
+                const { assets: _drop, ...body } = m;
+                bodyBytes = JSON.stringify(body).length;
+            } catch { /* skip un-serializable */ }
+
+            let assetBytes = 0;
+            const seen = new Set();
+            if (Array.isArray(m.assets)) {
+                for (const a of m.assets) {
+                    const bn = statsBasename(a?.[1]);
+                    if (!bn || seen.has(bn)) continue;
+                    seen.add(bn);
+                    const sz = assetSize.get(bn);
+                    if (sz != null) assetBytes += sz;
+                }
+            }
+
+            modules.push({
+                id: m.id || m.namespace || m.name || '',
+                name: m.name || m.namespace || '',
+                bodyBytes,
+                assetBytes,
+                totalBytes: bodyBytes + assetBytes,
+            });
+        }
+
+        modules.sort((a, b) => b.totalBytes - a.totalBytes);
+        res.json({ modules, etag: dbEtag });
+    } catch (err) { next(err); }
+});
+
+app.post('/api/db/optimize', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    if (!checkActiveSession(req, res)) return;
+    try {
+        const saveDir = path.join(process.cwd(), 'save');
+        const dbFilePath = path.join(saveDir, 'risuai.db');
+        const preDbSize = statSafe(dbFilePath)?.size ?? 0;
+
+        const { free } = await diskFreeStat(saveDir);
+        if (preDbSize > 0 && free != null && free < preDbSize * 1.2) {
+            return res.status(400).json({
+                error: 'Insufficient disk space for VACUUM',
+                required: Math.ceil(preDbSize * 1.2),
+                free,
+            });
+        }
+
+        const result = await queueStorageOperation(async () => {
+            await flushPendingDb();
+            const t0 = Date.now();
+            try { checkpointWal('TRUNCATE'); } catch (e) { logger.warn('[Optimize] checkpoint failed:', e?.message || e); }
+            sqliteDb.exec('VACUUM');
+            // VACUUM streams the whole DB through the WAL; without this checkpoint the
+            // -wal file stays inflated until the next 5-min background TRUNCATE.
+            try { checkpointWal('TRUNCATE'); } catch (e) { logger.warn('[Optimize] post-VACUUM checkpoint failed:', e?.message || e); }
+            const elapsed = Date.now() - t0;
+            const postDbSize = statSafe(dbFilePath)?.size ?? 0;
+            return {
+                ok: true,
+                elapsedMs: elapsed,
+                preDbSize,
+                postDbSize,
+                reclaimed: Math.max(0, preDbSize - postDbSize),
+            };
+        });
+        res.json(result);
+    } catch (err) { next(err); }
+});
+
+app.post('/api/db/wal-checkpoint', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    if (!checkActiveSession(req, res)) return;
+    try {
+        const saveDir = path.join(process.cwd(), 'save');
+        const walFilePath = path.join(saveDir, 'risuai.db-wal');
+        const preWalSize = statSafe(walFilePath)?.size ?? 0;
+
+        const result = await queueStorageOperation(async () => {
+            await flushPendingDb();
+            const t0 = Date.now();
+            checkpointWal('TRUNCATE');
+            const elapsed = Date.now() - t0;
+            const postWalSize = statSafe(walFilePath)?.size ?? 0;
+            return {
+                ok: true,
+                elapsedMs: elapsed,
+                preWalSize,
+                postWalSize,
+                reclaimed: Math.max(0, preWalSize - postWalSize),
+            };
+        });
+        res.json(result);
+    } catch (err) { next(err); }
+});
+
+// ── Snapshot list (database/dbbackup-* keys) ─────────────────────────────────
+
+app.get('/api/db/snapshots/limits', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    try {
+        const { maxCount, maxBytes } = getSnapshotLimits();
+        const items = kvListWithSizes(DB_BACKUP_PREFIX);
+        const currentBytes = items.reduce((s, it) => s + it.size, 0);
+        res.json({
+            maxCount,
+            maxBytes,
+            currentCount: items.length,
+            currentBytes,
+            bounds: {
+                minCount: SNAPSHOT_LIMIT_MIN_COUNT,
+                maxCount: SNAPSHOT_LIMIT_MAX_COUNT,
+                minBytes: SNAPSHOT_LIMIT_MIN_BYTES,
+                maxBytes: SNAPSHOT_LIMIT_MAX_BYTES,
+            },
+            defaults: {
+                count: SNAPSHOT_LIMIT_DEFAULT_COUNT,
+                bytes: SNAPSHOT_LIMIT_DEFAULT_BYTES,
+            },
+        });
+    } catch (err) { next(err); }
+});
+
+app.put('/api/db/snapshots/limits', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    if (!checkActiveSession(req, res)) return;
+    try {
+        const rawCount = Number(req.body?.maxCount);
+        const rawBytes = Number(req.body?.maxBytes);
+        if (!Number.isFinite(rawCount) || rawCount < SNAPSHOT_LIMIT_MIN_COUNT || rawCount > SNAPSHOT_LIMIT_MAX_COUNT) {
+            return res.status(400).json({ error: `maxCount out of range (${SNAPSHOT_LIMIT_MIN_COUNT}-${SNAPSHOT_LIMIT_MAX_COUNT})` });
+        }
+        if (!Number.isFinite(rawBytes) || rawBytes < SNAPSHOT_LIMIT_MIN_BYTES || rawBytes > SNAPSHOT_LIMIT_MAX_BYTES) {
+            return res.status(400).json({ error: `maxBytes out of range` });
+        }
+        const maxCount = Math.floor(rawCount);
+        const maxBytes = Math.floor(rawBytes);
+        kvSet(SNAPSHOT_LIMIT_COUNT_KEY, Buffer.from(String(maxCount), 'utf-8'));
+        kvSet(SNAPSHOT_LIMIT_BYTES_KEY, Buffer.from(String(maxBytes), 'utf-8'));
+        const trim = trimSnapshotsToLimits();
+        const items = kvListWithSizes(DB_BACKUP_PREFIX);
+        const currentBytes = items.reduce((s, it) => s + it.size, 0);
+        res.json({
+            maxCount, maxBytes,
+            currentCount: items.length,
+            currentBytes,
+            removed: trim.removed,
+        });
+    } catch (err) { next(err); }
+});
+
+app.get('/api/db/snapshots', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    try {
+        const items = kvListWithSizes(DB_BACKUP_PREFIX);
+        const out = items.map((it) => {
+            const tsRaw = parseInt(it.key.slice(DB_BACKUP_PREFIX.length, -4), 10);
+            const ts = Number.isFinite(tsRaw) ? tsRaw * 100 : null;
+            return { key: it.key, size: it.size, timestamp: ts };
+        }).sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
+        res.json({ snapshots: out });
+    } catch (err) { next(err); }
+});
+
+app.delete('/api/db/snapshots', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    if (!checkActiveSession(req, res)) return;
+    try {
+        const key = typeof req.query?.key === 'string' ? req.query.key : '';
+        // Restrict to snapshot prefix — never let this endpoint touch other kv keys.
+        if (!key.startsWith(DB_BACKUP_PREFIX)) {
+            return res.status(400).json({ error: 'Invalid snapshot key' });
+        }
+        kvDel(key);
+        res.json({ ok: true });
+    } catch (err) { next(err); }
+});
+
+// Restore a snapshot atomically server-side: copy snapshot blob → live blob,
+// invalidate caches, rebuild chat store. Client-side setDatabase + reload is
+// racy because the patch-sync save loop is debounced and the reload can fire
+// before the snapshot data lands on disk.
+app.post('/api/db/snapshots/restore', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    if (!checkActiveSession(req, res)) return;
+    try {
+        const key = typeof req.body?.key === 'string' ? req.body.key : '';
+        if (!key.startsWith(DB_BACKUP_PREFIX)) {
+            return res.status(400).json({ error: 'Invalid snapshot key' });
+        }
+        const blob = kvGet(key);
+        if (!blob) {
+            return res.status(404).json({ error: 'Snapshot not found' });
+        }
+        await queueStorageOperation(async () => {
+            // Drain any pending debounced persist first — same pattern as
+            // /api/db/optimize. Without this, an in-flight save could land
+            // after kvCopyValue and overwrite the restored snapshot.
+            await flushPendingDb();
+            kvCopyValue(key, DB_BLOB_KEY);
+            invalidateDbCache();
+            // Snapshot may pre-date the remote-block migration. Clear the marker
+            // so migrateRemoteBlocksIfNeeded re-evaluates against the restored
+            // bytes instead of skipping based on the prior post-migration state.
+            kvDel(REMOTE_MIGRATION_MARKER_KEY);
+            // Pre-warm chat store from the just-restored blob so subsequent
+            // /api/read fetches and patch-sync baselines see the new data.
+            // Use decodeDatabaseWithPersistentChatIds so it runs the migration
+            // (now unmarked) and refreshes stale raw if the snapshot was a
+            // REMOTE-block format.
+            try {
+                const raw = kvGet(DB_BLOB_KEY);
+                if (raw) {
+                    const dbObj = await decodeDatabaseWithPersistentChatIds(raw, {
+                        createBackup: false,
+                    });
+                    initChatStore(dbObj);
+                    // Migration may have rewritten database.bin — etag must
+                    // reflect the post-migration bytes the next /api/read sends.
+                    const finalRaw = kvGet(DB_BLOB_KEY);
+                    if (finalRaw) dbEtag = computeBufferEtag(Buffer.from(finalRaw));
+                }
+            } catch (e) {
+                logger.warn('[Snapshot restore] post-restore decode failed:', e?.message || e);
+            }
+        });
+        res.json({ ok: true });
+    } catch (err) { next(err); }
+});
+
+// ── Boot-time backup reminder ───────────────────────────────────────────────
+
+const BOOT_REMINDER_KEY = 'config/boot-backup-reminder';
+
+function readBootReminder() {
+    try {
+        const raw = kvGet(BOOT_REMINDER_KEY);
+        if (!raw) return false;
+        return Buffer.from(raw).toString('utf-8').trim() === '1';
+    } catch { return false; }
+}
+
+app.get('/api/backup/boot-reminder', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    try {
+        res.json({ enabled: readBootReminder() });
+    } catch (err) { next(err); }
+});
+
+app.put('/api/backup/boot-reminder', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    if (!checkActiveSession(req, res)) return;
+    try {
+        const enabled = !!req.body?.enabled;
+        kvSet(BOOT_REMINDER_KEY, Buffer.from(enabled ? '1' : '0', 'utf-8'));
+        res.json({ enabled });
+    } catch (err) { next(err); }
+});
+
+// ── Backup directory configuration ──────────────────────────────────────────
+
+app.get('/api/backup/server/path', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    try {
+        res.json({
+            path: backupsDir,
+            default: DEFAULT_BACKUPS_DIR,
+            isDefault: backupsDir === DEFAULT_BACKUPS_DIR,
+        });
+    } catch (err) { next(err); }
+});
+
+app.put('/api/backup/server/path', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    if (!checkActiveSession(req, res)) return;
+    try {
+        const next = typeof req.body?.path === 'string' ? req.body.path.trim() : '';
+        if (!next) {
+            return res.status(400).json({ error: 'Path required' });
+        }
+        const resolved = path.resolve(next);
+        // Ensure parent exists / target is writable. Create the dir if missing.
+        try {
+            if (!existsSync(resolved)) {
+                mkdirSync(resolved, { recursive: true });
+            }
+            // Probe writability with a tmpfile.
+            const probe = path.join(resolved, `.risu-write-probe-${Date.now()}`);
+            require('fs').writeFileSync(probe, '');
+            require('fs').unlinkSync(probe);
+        } catch (e) {
+            return res.status(400).json({ error: 'Path is not writable: ' + (e?.message || String(e)) });
+        }
+        const previous = backupsDir;
+        backupsDir = resolved;
+        kvSet(BACKUP_PATH_CONFIG_KEY, Buffer.from(resolved, 'utf-8'));
+        res.json({
+            path: backupsDir,
+            previous,
+            default: DEFAULT_BACKUPS_DIR,
+            isDefault: backupsDir === DEFAULT_BACKUPS_DIR,
+        });
+    } catch (err) { next(err); }
+});
+
+// ── Inlay bulk compression endpoint ──────────────────────────────────────────
+const COMPRESS_IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'bmp']);
+
+app.post('/api/inlays/compress', sessionAuthMiddleware, async (req, res) => {
+    if (!checkActiveSession(req, res)) return;
+    const quality = typeof req.body?.quality === 'number' ? req.body.quality : 85;
+
+    res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+    });
+
+    const send = (data) => {
+        res.write(`data: ${JSON.stringify(data)}\n\n`);
+    };
+
+    try {
+        const files = await listInlayFiles();
+        const imageFiles = [];
+
+        for (const entry of files) {
+            if (!COMPRESS_IMAGE_EXTS.has(entry.ext)) continue;
+            const sidecar = await readInlaySidecar(entry.id);
+            if (sidecar && sidecar.type !== 'image') continue;
+            imageFiles.push(entry);
+        }
+
+        const total = imageFiles.length;
+        let compressed = 0;
+        let skipped = 0;
+        let totalSaved = 0;
+
+        const vips = await getVips()
+
+        for (let i = 0; i < imageFiles.length; i++) {
+            const entry = imageFiles[i];
+            try {
+                const original = await fs.readFile(entry.filePath);
+                const img = vips.Image.newFromBuffer(original)
+                let webpBuf
+                try {
+                    const out = img.writeToBuffer('.webp', { Q: quality })
+                    webpBuf = Buffer.from(out);
+                } finally {
+                    img.delete()
+                }
+
+                if (webpBuf.length < original.length) {
+                    const sidecar = await readInlaySidecar(entry.id);
+                    const info = sidecar || {};
+                    await writeInlayFile(entry.id, 'webp', webpBuf, { ...info, ext: 'webp' });
+                    // invalidate thumbnail cache
+                    kvDel(`inlay_thumb/${entry.id}`);
+                    const saved = original.length - webpBuf.length;
+                    totalSaved += saved;
+                    compressed++;
+                } else {
+                    skipped++;
+                }
+            } catch {
+                skipped++;
+            }
+
+            send({ type: 'progress', current: i + 1, total, compressed, skipped, totalSaved });
+        }
+
+        send({ type: 'done', total, compressed, skipped, totalSaved });
+    } catch (err) {
+        send({ type: 'error', message: err?.message || 'Unknown error' });
+    }
+
+    res.end();
+});
+
+// ── Public stats proxy ───────────────────────────────────────────────────────
+app.get('/api/public-stats', async (req, res) => {
+    try {
+        const r = await fetch(PUBLIC_STATS_URL);
+        if (!r.ok) { res.status(r.status).json({ error: 'upstream error' }); return; }
+        const data = await r.json();
+        res.json(data);
+    } catch {
+        res.status(502).json({ error: 'fetch failed' });
+    }
+});
+
+// ── Update check endpoint ────────────────────────────────────────────────────
+app.get('/api/update-check', async (req, res) => {
+    const currentVersion = getCurrentVersion();
+    if (UPDATE_CHECK_DISABLED) {
+        res.json({ currentVersion, hasUpdate: false, severity: 'none', disabled: true, deploymentType, canSelfUpdate: false });
+        return;
+    }
+    const result = await fetchLatestRelease(req.query.lang);
+    const response = result || { currentVersion, hasUpdate: false, severity: 'none' };
+    response.deploymentType = deploymentType;
+    response.canSelfUpdate = deploymentType === 'portable'
+        && !!response.hasUpdate
+        && !response.manualOnly
+        && !!getSelfUpdateAssetInfo(response.latestVersion);
+    res.json(response);
+});
+
+// ── Self-update endpoint (portable only) ─────────────────────────────────────
+let selfUpdateInProgress = false;
+
+app.post('/api/self-update', async (req, res) => {
+    if (!await checkAuth(req, res)) return;
+
+    if (deploymentType !== 'portable') {
+        res.status(400).json({ error: 'Self-update is only available for portable deployments' });
+        return;
+    }
+    if (selfUpdateInProgress) {
+        res.status(409).json({ error: 'Update already in progress' });
+        return;
+    }
+    selfUpdateInProgress = true;
+
+    // Track client disconnect — used to abort download, but NOT to release the lock.
+    // The lock stays held until the update fully completes or fails, preventing
+    // a second request from touching the same install directory concurrently.
+    let clientDisconnected = false;
+    res.on('close', () => {
+        clientDisconnected = true;
+        console.log('[Update] Client disconnected (update continues if past download stage).');
+    });
+
+    // NDJSON streaming response
+    res.writeHead(200, {
+        'Content-Type': 'application/x-ndjson',
+        'Cache-Control': 'no-cache',
+        'X-Accel-Buffering': 'no',
+    });
+    const send = (step, progress, message) => {
+        try { res.write(JSON.stringify({ step, progress, message }) + '\n'); } catch {}
+    };
+
+    let tmpDir = null;
+    try {
+        // 1. Check update
+        send('checking', 0, 'Checking for updates...');
+        const updateInfo = await fetchLatestRelease();
+        if (!updateInfo?.hasUpdate) {
+            send('done', 100, 'Already up to date.');
+            res.end();
+            selfUpdateInProgress = false;
+            return;
+        }
+
+        const targetVersion = updateInfo.latestVersion;
+        const assetInfo = getSelfUpdateAssetInfo(targetVersion);
+        if (!assetInfo) {
+            throw new Error(`No release asset for ${process.platform}-${process.arch}`);
+        }
+
+        // 2. Download
+        tmpDir = path.join(os.tmpdir(), `risu-update-${Date.now()}`);
+        await fs.mkdir(tmpDir, { recursive: true });
+        const archivePath = path.join(tmpDir, assetInfo.filename);
+
+        send('downloading', 0, 'Starting download...');
+        const dlRes = await fetch(assetInfo.url, { redirect: 'follow' });
+        if (!dlRes.ok) throw new Error(`Download failed: ${dlRes.status} ${dlRes.statusText}`);
+
+        const totalSize = parseInt(dlRes.headers.get('content-length'), 10) || 0;
+        const fileStream = require('fs').createWriteStream(archivePath);
+        let downloaded = 0;
+        let lastPct = -1;
+
+        const progress = new Transform({
+            transform(chunk, _enc, cb) {
+                if (clientDisconnected) { cb(new Error('Client disconnected')); return; }
+                downloaded += chunk.length;
+                if (totalSize > 0) {
+                    const pct = Math.round((downloaded / totalSize) * 100);
+                    if (pct >= lastPct + 5) {
+                        lastPct = pct;
+                        const dlMB = (downloaded / 1048576).toFixed(0);
+                        const totalMB = (totalSize / 1048576).toFixed(0);
+                        send('downloading', pct, `Downloading... ${pct}% (${dlMB}/${totalMB} MB)`);
+                    }
+                }
+                cb(null, chunk);
+            },
+        });
+        await pipeline(Readable.fromWeb(dlRes.body), progress, fileStream);
+        send('downloading', 100, 'Download complete.');
+
+        // 3. Extract
+        send('extracting', null, 'Extracting...');
+        const extractDir = path.join(tmpDir, 'extracted');
+        await fs.mkdir(extractDir, { recursive: true });
+
+        if (process.platform === 'win32') {
+            try {
+                // Windows 10 1803+ has tar.exe built-in, handles zip, much faster than PowerShell
+                execSync(`tar -xf "${archivePath}" -C "${extractDir}"`, { timeout: 300000 });
+            } catch {
+                execSync(
+                    `powershell -NoProfile -Command "Expand-Archive -Force -Path '${archivePath}' -DestinationPath '${extractDir}'"`,
+                    { timeout: 300000 },
+                );
+            }
+        } else {
+            execSync(`tar -xzf "${archivePath}" -C "${extractDir}"`, { timeout: 300000 });
+        }
+
+        // Resolve possibly nested root directory (same as updater.cjs resolveExtractedRoot)
+        const entries = await fs.readdir(extractDir);
+        let sourceDir = extractDir;
+        if (entries.length === 1) {
+            const candidate = path.join(extractDir, entries[0]);
+            if ((await fs.stat(candidate)).isDirectory()) sourceDir = candidate;
+        }
+
+        // 4. Validate extracted package (mirrors updater.cjs validateExtractedRoot)
+        const REQUIRED_ENTRIES = ['dist', 'server', 'package.json'];
+        const REQUIRED_DIST_FILES = ['index.html'];
+        for (const entry of REQUIRED_ENTRIES) {
+            try { await fs.access(path.join(sourceDir, entry)); }
+            catch { throw new Error(`Downloaded package is missing required entry: ${entry}`); }
+        }
+        for (const file of REQUIRED_DIST_FILES) {
+            try { await fs.access(path.join(sourceDir, 'dist', file)); }
+            catch { throw new Error(`Downloaded package is missing dist/${file}`); }
+        }
+        if (process.platform === 'win32') {
+            try { await fs.access(path.join(sourceDir, 'bin')); }
+            catch { throw new Error('Downloaded Windows package is missing bin/'); }
+        }
+
+        // 5. Replace files (follows updater.cjs Phase 1-4 pattern)
+        // Stop tunnel before replacing files to avoid file lock issues
+        stopTunnel();
+        send('replacing', null, 'Replacing files...');
+        const appDir = process.cwd();
+        const isWin = process.platform === 'win32';
+        const updateTmp = path.join(appDir, '.update-tmp');
+
+        // Restore from a previous interrupted update if leftover exists
+        const prevBackup = path.join(updateTmp, 'backup');
+        try {
+            await fs.access(prevBackup);
+            console.log('[Update] Restoring files from previous interrupted update...');
+            await restoreBackup(prevBackup, appDir);
+        } catch { /* no leftover */ }
+        await fs.rm(updateTmp, { recursive: true, force: true }).catch(() => {});
+        await fs.mkdir(updateTmp, { recursive: true });
+
+        // Carry over SSL certificates into new package before swap
+        const sslSrc = path.join(appDir, 'server', 'node', 'ssl', 'certificate');
+        try {
+            await fs.access(sslSrc);
+            const sslDst = path.join(sourceDir, 'server', 'node', 'ssl', 'certificate');
+            await fs.mkdir(path.dirname(sslDst), { recursive: true });
+            await fs.cp(sslSrc, sslDst, { recursive: true });
+        } catch { /* no user certs */ }
+
+        // Keep set — matches updater.cjs + user data/config that must survive updates
+        const keep = new Set(['save', 'backups', '.installed-version', '.update-tmp', 'scripts', '.env', '.npmrc', '.portable']);
+        if (isWin) keep.add('bin');
+
+        // Phase 1: move old files to backup — rollback immediately on any failure
+        const backupDir = path.join(updateTmp, 'backup');
+        await fs.mkdir(backupDir, { recursive: true });
+
+        const oldEntries = await fs.readdir(appDir);
+        for (const e of oldEntries) {
+            if (keep.has(e)) continue;
+            try {
+                await fs.rename(path.join(appDir, e), path.join(backupDir, e));
+            } catch (backupErr) {
+                logger.error(`[Update] Failed to back up ${e}: ${backupErr.message}`);
+                console.log('[Update] Restoring files already moved to backup...');
+                await restoreBackup(backupDir, appDir);
+                throw new Error(isWin
+                    ? 'Update failed: some files are in use. Close RisuAI first, then try again.'
+                    : 'Update failed: some files are in use. Stop the server first, then try again.');
+            }
+        }
+
+        // Phase 2: move new files from extracted to app root
+        const skipMove = new Set(['save', 'scripts']);
+        if (isWin) skipMove.add('bin');
+        const moved = [];
+        try {
+            const newEntries = await fs.readdir(sourceDir);
+            for (const e of newEntries) {
+                if (skipMove.has(e)) continue;
+                const dest = path.join(appDir, e);
+                await fs.rm(dest, { recursive: true, force: true }).catch(() => {});
+                await moveAcrossVolumes(path.join(sourceDir, e), dest);
+                moved.push(e);
+            }
+            // Post-move validation
+            for (const entry of REQUIRED_ENTRIES) {
+                if (!moved.includes(entry) && !existsSync(path.join(appDir, entry))) {
+                    throw new Error(`Required entry was not installed: ${entry}`);
+                }
+            }
+            for (const file of REQUIRED_DIST_FILES) {
+                if (!existsSync(path.join(appDir, 'dist', file))) {
+                    throw new Error(`Required file was not installed: dist/${file}`);
+                }
+            }
+        } catch (moveErr) {
+            logger.error(`[Update] Move failed: ${moveErr.message}`);
+            console.log('[Update] Restoring from backup...');
+            await restoreBackup(backupDir, appDir);
+            throw new Error('Update failed, previous version restored. Please try again.');
+        }
+
+        // Phase 3: update scripts/ from new release
+        const newScripts = path.join(sourceDir, 'scripts');
+        try {
+            await fs.access(newScripts);
+            await fs.mkdir(path.join(appDir, 'scripts'), { recursive: true });
+            for (const f of await fs.readdir(newScripts)) {
+                await fs.copyFile(path.join(newScripts, f), path.join(appDir, 'scripts', f));
+            }
+        } catch { /* no scripts in release */ }
+
+        // Phase 4 (Windows): stage bin/ for restart script to apply after exit
+        if (isWin) {
+            const newBin = path.join(sourceDir, 'bin');
+            const stagedBin = path.join(updateTmp, 'new-bin');
+            await fs.rm(stagedBin, { recursive: true, force: true }).catch(() => {});
+            await fs.cp(newBin, stagedBin, { recursive: true });
+            // Version marker — finalized after bin/ is applied
+            await fs.writeFile(path.join(updateTmp, 'latest-version'), `v${targetVersion}`);
+        } else {
+            await fs.writeFile(path.join(appDir, '.installed-version'), `v${targetVersion}`);
+        }
+
+        // Cleanup temp download (not .update-tmp — that stays on Windows for bin/ post-step)
+        fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+        tmpDir = null;
+        if (!isWin) {
+            fs.rm(updateTmp, { recursive: true, force: true }).catch(() => {});
+        }
+
+        send('restarting', 100, 'Update complete. Restarting...');
+        res.end();
+
+        // 6. Flush DB and restart
+        setTimeout(async () => {
+            try {
+            console.log(`[Update] Self-update to v${targetVersion} complete. Restarting...`);
+            try { await flushPendingDb(); } catch {}
+            try { checkpointWal('TRUNCATE'); } catch {}
+
+            const port = process.env.PORT || 6001;
+
+            if (isWin) {
+                // Windows: use a .bat script to apply bin/, finalize version, and restart.
+                // A bat script can replace bin/node.exe after the Node process exits,
+                // avoiding file-lock issues that a Node child process would hit.
+                const batScript = path.join(os.tmpdir(), `risu-restart-${Date.now()}.bat`);
+                const utmp = path.join(appDir, '.update-tmp');
+                const binDir = path.join(appDir, 'bin');
+                const binBackup = path.join(utmp, 'old-bin');
+                const batLines = [
+                    '@echo off',
+                    'timeout /t 3 /nobreak >nul',
+                    // Apply staged bin/: backup current → copy new → on failure restore backup
+                    `if exist "${path.join(utmp, 'new-bin')}\\" (`,
+                    `  if exist "${binDir}\\" (`,
+                    `    xcopy /E /I /Y "${binDir}\\*" "${binBackup}\\" >nul`,
+                    `  )`,
+                    `  xcopy /E /I /Y "${path.join(utmp, 'new-bin')}\\*" "${binDir}\\" >nul`,
+                    `  if errorlevel 1 (`,
+                    `    echo [Update] bin/ copy failed, restoring backup...`,
+                    `    if exist "${binBackup}\\" (`,
+                    `      xcopy /E /I /Y "${binBackup}\\*" "${binDir}\\" >nul`,
+                    `    )`,
+                    `    echo [Update] bin/ restored. Staged files kept for retry.`,
+                    `    goto start`,
+                    `  )`,
+                    `)`,
+                    // Finalize version marker only after successful bin/ copy
+                    `if exist "${path.join(utmp, 'latest-version')}" (`,
+                    `  copy /Y "${path.join(utmp, 'latest-version')}" "${path.join(appDir, '.installed-version')}" >nul`,
+                    `)`,
+                    // Cleanup .update-tmp (includes old-bin backup)
+                    `rmdir /s /q "${utmp}" 2>nul`,
+                    ':start',
+                    // Start server with correct working directory
+                    `cd /d "${appDir}"`,
+                    `start "" "${path.join(appDir, 'bin', 'node.exe')}" "${path.join(appDir, 'server', 'node', 'server.cjs')}"`,
+                    'exit /b 0',
+                ];
+                writeFileSync(batScript, batLines.join('\r\n'));
+                spawn('cmd.exe', ['/c', batScript], { detached: true, stdio: 'ignore' }).unref();
+            } else {
+                // Unix: Node restart helper with port-check to avoid clashing with process managers
+                const restartScript = path.join(os.tmpdir(), `risu-restart-${Date.now()}.cjs`);
+                writeFileSync(restartScript, [
+                    `const net = require('net');`,
+                    `const { spawn } = require('child_process');`,
+                    `setTimeout(() => {`,
+                    `  const s = net.createServer();`,
+                    `  s.once('error', () => process.exit(0));`,
+                    `  s.once('listening', () => {`,
+                    `    s.close();`,
+                    `    spawn(${JSON.stringify(process.execPath)}, ['server/node/server.cjs'], {`,
+                    `      cwd: ${JSON.stringify(appDir)},`,
+                    `      detached: true,`,
+                    `      stdio: 'inherit',`,
+                    `      env: Object.assign({}, process.env),`,
+                    `    }).unref();`,
+                    `    setTimeout(() => process.exit(0), 500);`,
+                    `  });`,
+                    `  s.listen(${Number(port)});`,
+                    `}, 3000);`,
+                ].join('\n'));
+                spawn(process.execPath, [restartScript], { detached: true, stdio: 'ignore' }).unref();
+            }
+            process.exit(0);
+            } catch (restartErr) {
+                logger.error('[Update] Restart failed:', restartErr);
+                selfUpdateInProgress = false;
+            }
+        }, 500);
+
+    } catch (e) {
+        logger.error('[Update] Self-update failed:', e);
+        send('error', null, `Update failed: ${e.message}`);
+        res.end();
+        selfUpdateInProgress = false;
+        if (tmpDir) fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+    }
+});
+
+// Helper: rename, falling back to copy+remove when src and dest are on
+// different volumes (Windows EXDEV — e.g. app on D:, os.tmpdir() on C:)
+async function moveAcrossVolumes(src, dest) {
+    try {
+        await fs.rename(src, dest);
+    } catch (err) {
+        if (err && err.code === 'EXDEV') {
+            await fs.cp(src, dest, { recursive: true, force: true });
+            await fs.rm(src, { recursive: true, force: true });
+            return;
+        }
+        throw err;
+    }
+}
+
+// Helper: restore files from backup directory into app root (mirrors updater.cjs restoreBackupIntoRoot)
+async function restoreBackup(backupDir, rootDir) {
+    try { await fs.access(backupDir); } catch { return; }
+    for (const entry of await fs.readdir(backupDir)) {
+        const src = path.join(backupDir, entry);
+        const dest = path.join(rootDir, entry);
+        try {
+            await fs.rm(dest, { recursive: true, force: true }).catch(() => {});
+            await moveAcrossVolumes(src, dest);
+        } catch { /* best effort */ }
+    }
+}
+
+// ── Cloudflare Quick Tunnel API ──────────────────────────────────────────────
+
+app.get('/api/tunnel/status', async (req, res) => {
+    if (!await checkAuth(req, res)) return;
+    res.json({
+        disabled: TUNNEL_DISABLED,
+        status: tunnelStatus,
+        url: tunnelUrl,
+        error: tunnelError,
+        platform: process.platform,
+    });
+});
+
+app.post('/api/tunnel/start', async (req, res) => {
+    if (!await checkAuth(req, res)) return;
+    if (TUNNEL_DISABLED) return res.status(403).json({ error: 'Tunnel is disabled via RISU_TUNNEL_DISABLED' });
+    if (tunnelStatus === 'running' || tunnelStatus === 'starting' || tunnelStatus === 'downloading') {
+        return res.status(409).json({ error: 'Tunnel is already ' + tunnelStatus });
+    }
+
+    let cfPath = findCloudflaredBinary();
+
+    // Auto-download if not found
+    if (!cfPath) {
+        tunnelStatus = 'downloading';
+        tunnelError = null;
+        res.json({ status: 'downloading' });
+
+        try {
+            cfPath = await downloadCloudflared();
+        } catch (e) {
+            logger.error('[Tunnel] Download failed:', e.message);
+            tunnelStatus = 'error';
+            tunnelError = `Failed to download cloudflared: ${e.message}`;
+            return;
+        }
+        // After download, start the tunnel (response already sent)
+        startTunnelProcess(cfPath);
+        return;
+    }
+
+    tunnelStatus = 'starting';
+    tunnelError = null;
+    tunnelUrl = null;
+    startTunnelProcess(cfPath);
+    res.json({ status: 'starting' });
+});
+
+function startTunnelProcess(cfPath) {
+    const port = process.env.PORT || 6001;
+    tunnelStatus = 'starting';
+    tunnelError = null;
+    tunnelUrl = null;
+
+    try {
+        tunnelProcess = spawn(cfPath, ['tunnel', '--url', 'http://localhost:' + port], {
+            stdio: ['ignore', 'pipe', 'pipe']
+        });
+
+        tunnelProcess.stderr.on('data', (chunk) => {
+            const text = chunk.toString();
+            const match = text.match(/https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com/);
+            if (match && tunnelStatus === 'starting') {
+                tunnelUrl = match[0];
+                tunnelStatus = 'running';
+                if (tunnelStartTimeout) { clearTimeout(tunnelStartTimeout); tunnelStartTimeout = null; }
+                console.log(`[Tunnel] Quick tunnel URL: ${tunnelUrl}`);
+            }
+        });
+
+        tunnelProcess.on('error', (err) => {
+            logger.error('[Tunnel] Process error:', err.message);
+            tunnelStatus = 'error';
+            tunnelError = err.message;
+            tunnelProcess = null;
+            if (tunnelStartTimeout) { clearTimeout(tunnelStartTimeout); tunnelStartTimeout = null; }
+        });
+
+        tunnelProcess.on('exit', (code) => {
+            if (tunnelStatus === 'running' || tunnelStatus === 'starting') {
+                console.log(`[Tunnel] Process exited with code ${code}`);
+                tunnelStatus = 'error';
+                tunnelError = `cloudflared exited unexpectedly (code ${code})`;
+            }
+            tunnelProcess = null;
+            tunnelUrl = null;
+            if (tunnelStartTimeout) { clearTimeout(tunnelStartTimeout); tunnelStartTimeout = null; }
+        });
+
+        tunnelStartTimeout = setTimeout(() => {
+            if (tunnelStatus === 'starting') {
+                tunnelStatus = 'error';
+                tunnelError = 'Tunnel failed to start within 30 seconds';
+                if (tunnelProcess) { try { tunnelProcess.kill('SIGTERM'); } catch {} tunnelProcess = null; }
+            }
+            tunnelStartTimeout = null;
+        }, 30000);
+    } catch (e) {
+        tunnelStatus = 'error';
+        tunnelError = e.message;
+        tunnelProcess = null;
+    }
+}
+
+app.post('/api/tunnel/stop', async (req, res) => {
+    if (!await checkAuth(req, res)) return;
+    stopTunnel();
+    res.json({ status: 'off' });
+});
+
+// ─── Express error middleware — must be registered after all routes ─────────
+app.use(expressErrorMiddleware);
+app.use((err, req, res, next) => {
+    if (res.headersSent) return next(err);
+    res.status(500).json({ error: err?.message || 'internal server error' });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function getHttpsOptions() {
+
+    const keyPath = path.join(sslPath, 'server.key');
+    const certPath = path.join(sslPath, 'server.crt');
+
+    try {
+ 
+        await fs.access(keyPath);
+        await fs.access(certPath);
+
+        const [key, cert] = await Promise.all([
+            fs.readFile(keyPath),
+            fs.readFile(certPath)
+        ]);
+       
+        return { key, cert };
+
+    } catch (error) {
+        if (error.code === 'ENOENT') {
+            logger.info('[Server] No SSL certificate found, starting with HTTP');
+        } else {
+            logger.error('[Server] SSL setup errors:', error.message);
+            console.log('[Server] Start the server with HTTP instead of HTTPS...');
+        }
+        return null;
+    }
+}
+
+// --- LLM Worker: Browser-as-worker bridge for /api/mcp/llm/call ---
+//
+// Instead of re-implementing routing/auth/format conversion for every model
+// provider in server.cjs, we forward MCP LLM requests to an active browser
+// session over WebSocket. The browser uses RisuAI's existing requestChatData
+// pipeline (with all its routing, retry, Vertex auth, etc.) and streams the
+// result back. New provider added to browser code automatically works for MCP.
+
+const llmWorkers = new Set() // active WebSocket connections
+const llmInflight = new Map() // reqId → { res, streaming, worker, closed, timer }
+
+function pickLLMWorker() {
+    for (const ws of llmWorkers) {
+        if (ws.readyState === ws.OPEN) return ws
+    }
+    return null
+}
+
+function setupLLMWorkerWebSocket(server) {
+    const wss = new WebSocketServer({ noServer: true })
+
+    server.on('upgrade', async (req, socket, head) => {
+        try {
+            const url = new URL(req.url, `http://${req.headers.host}`)
+            if (url.pathname !== '/ws/llm-worker') return
+
+            const auth = url.searchParams.get('risu-auth') || normalizeAuthHeader(req.headers['risu-auth'])
+            if (!await isAuthorizedProxyRequest({ headers: { 'risu-auth': auth } })) {
+                socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n')
+                socket.destroy()
+                return
+            }
+
+            wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req))
+        } catch (e) {
+            try { socket.write('HTTP/1.1 400 Bad Request\r\n\r\n'); socket.destroy() } catch {}
+        }
+    })
+
+    wss.on('connection', (ws) => {
+        llmWorkers.add(ws)
+        console.warn(`[LLMWorker] browser connected (${llmWorkers.size} total)`)
+
+        const pingTimer = setInterval(() => {
+            if (ws.readyState !== ws.OPEN) return
+            try { ws.ping() } catch {}
+        }, 30000)
+
+        ws.on('message', (raw) => {
+            let msg
+            try { msg = JSON.parse(raw.toString('utf-8')) } catch { return }
+            if (!msg?.reqId) return
+            const ctx = llmInflight.get(msg.reqId)
+            if (!ctx || ctx.closed) return
+
+            if (msg.type === 'chunk') {
+                if (ctx.streaming) {
+                    try { ctx.res.write(`data: ${JSON.stringify(msg.data || {})}\n\n`) } catch {}
+                }
+            } else if (msg.type === 'done') {
+                ctx.closed = true
+                clearTimeout(ctx.timer)
+                if (ctx.streaming) {
+                    try {
+                        ctx.res.write(`event: done\ndata: ${JSON.stringify(msg.response || {})}\n\n`)
+                        ctx.res.end()
+                    } catch {}
+                } else {
+                    try { ctx.res.status(200).json(msg.response || { content: [{ type: 'text', text: '' }] }) } catch {}
+                }
+                llmInflight.delete(msg.reqId)
+            } else if (msg.type === 'error') {
+                ctx.closed = true
+                clearTimeout(ctx.timer)
+                try {
+                    if (ctx.res.headersSent) {
+                        ctx.res.write(`event: error\ndata: ${JSON.stringify({ error: msg.error || 'Worker error' })}\n\n`)
+                        ctx.res.end()
+                    } else {
+                        ctx.res.status(500).json({ error: msg.error || 'Worker error' })
+                    }
+                } catch {}
+                llmInflight.delete(msg.reqId)
+            }
+        })
+
+        const cleanup = () => {
+            clearInterval(pingTimer)
+            llmWorkers.delete(ws)
+            console.warn(`[LLMWorker] browser disconnected (${llmWorkers.size} total)`)
+            // Fail any inflight tied to this worker
+            for (const [reqId, ctx] of llmInflight) {
+                if (ctx.worker !== ws || ctx.closed) continue
+                ctx.closed = true
+                clearTimeout(ctx.timer)
+                try {
+                    if (ctx.res.headersSent) ctx.res.end()
+                    else ctx.res.status(503).json({ error: 'Browser worker disconnected mid-request' })
+                } catch {}
+                llmInflight.delete(reqId)
+            }
+        }
+        ws.on('close', cleanup)
+        ws.on('error', cleanup)
+    })
     }
 });
 
@@ -4997,150 +7352,10 @@ app.post('/api/mcp/modules/lua/get', mcpAuthMiddleware, async (req, res) => {
         const db = await loadDatabase()
         const { id } = req.body || {}
         const mod = findModule((db.modules || []).filter(m => !m.mcp), id)
-        if (!mod) return res.status(404).json({ error: 'Module not found' })
-        const code = mod.trigger?.[0]?.effect?.[0]?.code || ''
-        res.json({ code })
-    } catch (e) {
-        res.status(500).json({ error: e.message })
-    }
-})
-
-app.post('/api/mcp/modules/lua/set', mcpAuthMiddleware, async (req, res) => {
-    try {
-        await queueStorageOperation(async () => {
-            const db = await loadDatabase()
-            const { id, code } = req.body || {}
-            const mod = findModule((db.modules || []).filter(m => !m.mcp), id)
-            if (!mod) return res.status(404).json({ error: 'Module not found' })
-            if (!mod.trigger) mod.trigger = [{ type: 'start', effect: [{ type: 'triggercode', code: '' }] }]
-            if (!mod.trigger[0]) mod.trigger[0] = { type: 'start', effect: [{ type: 'triggercode', code: '' }] }
-            if (!mod.trigger[0].effect) mod.trigger[0].effect = [{ type: 'triggercode', code: '' }]
-            if (!mod.trigger[0].effect[0]) mod.trigger[0].effect[0] = { type: 'triggercode', code: '' }
-            mod.trigger[0].effect[0].code = code || ''
-            scheduleDatabaseSave()
-            res.json({ success: true })
-        })
-    } catch (e) {
-        res.status(500).json({ error: e.message })
-    }
-})
-
-// ─── End RisuAI Access MCP API ──────────────────────────────────────────────
-const COMPRESS_IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'bmp']);
-
-app.post('/api/inlays/compress', sessionAuthMiddleware, async (req, res) => {
-    if (!checkActiveSession(req, res)) return;
-    const quality = typeof req.body?.quality === 'number' ? req.body.quality : 85;
-
-    res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-    });
-
-    const send = (data) => {
-        res.write(`data: ${JSON.stringify(data)}\n\n`);
-    };
-
-    try {
-        const files = await listInlayFiles();
-        const imageFiles = [];
-
-        for (const entry of files) {
-            if (!COMPRESS_IMAGE_EXTS.has(entry.ext)) continue;
-            const sidecar = await readInlaySidecar(entry.id);
-            if (sidecar && sidecar.type !== 'image') continue;
-            imageFiles.push(entry);
-        }
-
-        const total = imageFiles.length;
-        let compressed = 0;
-        let skipped = 0;
-        let totalSaved = 0;
-
-        for (let i = 0; i < imageFiles.length; i++) {
-            const entry = imageFiles[i];
-            try {
-                const original = await fs.readFile(entry.filePath);
-                const webpBuf = await sharp(original).webp({ quality }).toBuffer();
-
-                if (webpBuf.length < original.length) {
-                    const sidecar = await readInlaySidecar(entry.id);
-                    const info = sidecar || {};
-                    await writeInlayFile(entry.id, 'webp', webpBuf, { ...info, ext: 'webp' });
-                    // invalidate thumbnail cache
-                    kvDel(`inlay_thumb/${entry.id}`);
-                    const saved = original.length - webpBuf.length;
-                    totalSaved += saved;
-                    compressed++;
-                } else {
-                    skipped++;
-                }
-            } catch {
-                skipped++;
-            }
-
-            send({ type: 'progress', current: i + 1, total, compressed, skipped, totalSaved });
-        }
-
-        send({ type: 'done', total, compressed, skipped, totalSaved });
-    } catch (err) {
-        send({ type: 'error', message: err?.message || 'Unknown error' });
-    }
-
-    res.end();
-});
-
-// ── Public stats proxy ───────────────────────────────────────────────────────
-app.get('/api/public-stats', async (req, res) => {
-    try {
-        const r = await fetch(PUBLIC_STATS_URL);
-        if (!r.ok) { res.status(r.status).json({ error: 'upstream error' }); return; }
-        const data = await r.json();
-        res.json(data);
-    } catch {
-        res.status(502).json({ error: 'fetch failed' });
-    }
-});
-
-// ── Update check endpoint ────────────────────────────────────────────────────
-app.get('/api/update-check', async (req, res) => {
-    if (UPDATE_CHECK_DISABLED) {
-        res.json({ currentVersion, hasUpdate: false, severity: 'none', disabled: true });
-        return;
-    }
-    const result = await fetchLatestRelease();
-    res.json(result || { currentVersion, hasUpdate: false, severity: 'none' });
-});
-
-
-async function getHttpsOptions() {
-
-    const keyPath = path.join(sslPath, 'server.key');
-    const certPath = path.join(sslPath, 'server.crt');
-
-    try {
- 
-        await fs.access(keyPath);
-        await fs.access(certPath);
-
-        const [key, cert] = await Promise.all([
-            fs.readFile(keyPath),
-            fs.readFile(certPath)
-        ]);
-       
-        return { key, cert };
-
-    } catch (error) {
-        console.error('[Server] SSL setup errors:', error.message);
-        console.log('[Server] Start the server with HTTP instead of HTTPS...');
-        return null;
-    }
-}
-
 async function startServer() {
     try {
         await migrateInlaysToFilesystem();
+        await migrateRemoteBlocksIfNeeded();
         const port = process.env.PORT || 6001;
         const httpsOptions = await getHttpsOptions();
         let server;
@@ -5165,7 +7380,7 @@ async function startServer() {
             });
         }
     } catch (error) {
-        console.error('[Server] Failed to start server :', error);
+        logger.error('[Server] Failed to start server :', error);
         process.exit(1);
     }
 }
@@ -5174,7 +7389,8 @@ async function startServer() {
 for (const sig of ['SIGTERM', 'SIGINT']) {
     process.on(sig, async () => {
         console.log(`[Server] Received ${sig}, flushing pending data...`);
-        try { await flushPendingDb(); } catch (e) { console.error('[Server] Flush error:', e); }
+        stopTunnel();
+        try { await flushPendingDb(); } catch (e) { logger.error('[Server] Flush error:', e); }
         try { checkpointWal('TRUNCATE'); } catch { /* non-fatal */ }
         process.exit(0);
     });
@@ -5201,9 +7417,10 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
     await startServer();
 
     // Periodically checkpoint WAL to reclaim disk space.
-    // Without this, the -wal file grows unbounded as inlay/asset writes accumulate.
+    // TRUNCATE (vs RESTART) shrinks the -wal file on disk, not just the writer
+    // pointer — required for journal_size_limit to actually take effect.
     setInterval(() => {
-        try { checkpointWal('RESTART'); }
+        try { checkpointWal('TRUNCATE'); }
         catch { /* non-fatal */ }
     }, 5 * 60 * 1000); // every 5 minutes
 

@@ -1,5 +1,5 @@
 import { language } from "src/lang"
-import { alertClear, alertConfirm, alertError, alertModuleSelect, alertNormal, alertStore, alertWait } from "../alert"
+import { alertClear, alertConfirm, alertError, alertModuleSelect, alertNormal, alertStore, alertWait, notifySuccess } from "../alert"
 import { getCurrentCharacter, getCurrentChat, getDatabase, setCurrentCharacter, setDatabase, type customscript, type loreBook, type triggerscript } from "../storage/database.svelte"
 import { AppendableBuffer, downloadFile, forageStorage, readImage, saveAsset } from "../globalApi.svelte"
 import { selectSingleFile, sleep } from "../util"
@@ -89,7 +89,7 @@ export async function exportModule(module:RisuModule, arg:{
         await downloadFile(module.name + '.risum', apb.buffer)
     }
     if(alertEnd){
-        alertNormal(language.successExport)
+        notifySuccess(language.successExport)
     }
 
     return apb.buffer
@@ -238,6 +238,7 @@ export async function importModule(){
             const buf = Buffer.from(fileData)
             const module = await readModule(buf)
             db.modules.push(module)
+            notifySuccess(language.successImport)
         } catch (error) {
             console.error(error)
             alertError(language.errors.noData)
@@ -263,6 +264,7 @@ export async function importModule(){
                 }
             }
             db.modules.push(importData)
+            notifySuccess(language.successImport)
             return
         }
         // importData.type === 'risu' in conflict with HypaV3 preset exports
@@ -276,6 +278,7 @@ export async function importModule(){
                 id: v4()
             }
             db.modules.push(importModule)
+            notifySuccess(language.successImport)
             return
         }
         if(importData.entries){
@@ -287,6 +290,7 @@ export async function importModule(){
                 id: v4()
             }
             db.modules.push(importModule)
+            notifySuccess(language.successImport)
             return
         }
         if(importData.type === 'regex'  && importData.data){
@@ -298,6 +302,7 @@ export async function importModule(){
                 id: v4()
             }
             db.modules.push(importModule)
+            notifySuccess(language.successImport)
             return
         }
     } catch (error) {
@@ -482,7 +487,7 @@ export async function applyModule() {
 
     setCurrentCharacter(currentChar)
 
-    alertNormal(language.successApplyModule)
+    notifySuccess(language.successApplyModule)
 }
 
 let lastModuleIds:string = ''

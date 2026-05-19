@@ -8,7 +8,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: mrbart3885/risuai-nodeonly
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   build:
@@ -26,14 +26,18 @@ jobs:
       packages: write
 
     steps:
+      - name: Lowercase image name
+        id: lower
+        run: echo "image_name=${IMAGE_NAME,,}" >> $GITHUB_OUTPUT
+
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to the Container registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -45,11 +49,11 @@ jobs:
 
       - name: Build and push by digest
         id: build
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: ${{ matrix.platform }}
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ steps.lower.outputs.image_name }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ steps.slug.outputs.pair }}
           cache-to: type=gha,scope=${{ steps.slug.outputs.pair }},mode=max
 
@@ -60,7 +64,7 @@ jobs:
           touch "/tmp/digests/${digest#sha256:}"
 
       - name: Upload digest
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: digest-${{ steps.slug.outputs.pair }}
           path: /tmp/digests/*
@@ -75,18 +79,22 @@ jobs:
       packages: write
 
     steps:
+      - name: Lowercase image name
+        id: lower
+        run: echo "image_name=${IMAGE_NAME,,}" >> $GITHUB_OUTPUT
+
       - name: Download digests
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: /tmp/digests
           pattern: digest-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to the Container registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -111,16 +119,46 @@ jobs:
         working-directory: /tmp/digests
         shell: bash
         run: |
+          IMAGE="${{ env.REGISTRY }}/${{ steps.lower.outputs.image_name }}"
           TAGS=""
           if [[ "${{ steps.version.outputs.is_tag }}" == "true" ]]; then
-            TAGS="-t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
-            TAGS="$TAGS -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:v${{ steps.version.outputs.version }}"
-            TAGS="$TAGS -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:v${{ steps.version.outputs.minor }}"
+            TAGS="-t ${IMAGE}:latest"
+            TAGS="$TAGS -t ${IMAGE}:v${{ steps.version.outputs.version }}"
+            TAGS="$TAGS -t ${IMAGE}:v${{ steps.version.outputs.minor }}"
           else
-            TAGS="-t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}"
+            TAGS="-t ${IMAGE}:${{ steps.version.outputs.version }}"
           fi
           docker buildx imagetools create $TAGS \
-            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+            $(printf "${IMAGE}@sha256:%s " *)
+
+      # Dual publish to legacy GHCR path for v1.5.x Docker users
+      # (ghcr.io/mrbart3885/risuai-nodeonly). PAT belongs to mrbart3885 account.
+      # Required: if the PAT is missing/rotated, this step fails loudly so we don't
+      # silently leave existing Docker users on a stale image. Verify GHCR_LEGACY_PAT
+      # is set before tagging a release.
+      - name: Log in to legacy GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: mrbart3885
+          password: ${{ secrets.GHCR_LEGACY_PAT }}
+
+      - name: Create legacy manifest list and push
+        working-directory: /tmp/digests
+        shell: bash
+        run: |
+          NEW="${{ env.REGISTRY }}/${{ steps.lower.outputs.image_name }}"
+          LEGACY="${{ env.REGISTRY }}/mrbart3885/risuai-nodeonly"
+          TAGS=""
+          if [[ "${{ steps.version.outputs.is_tag }}" == "true" ]]; then
+            TAGS="-t ${LEGACY}:latest"
+            TAGS="$TAGS -t ${LEGACY}:v${{ steps.version.outputs.version }}"
+            TAGS="$TAGS -t ${LEGACY}:v${{ steps.version.outputs.minor }}"
+          else
+            TAGS="-t ${LEGACY}:${{ steps.version.outputs.version }}"
+          fi
+          docker buildx imagetools create $TAGS \
+            $(printf "${NEW}@sha256:%s " *)
 
   cleanup-old-images:
     needs: merge
@@ -134,13 +172,22 @@ jobs:
         with:
           script: |
             const owner = context.repo.owner;
-            const pkg = 'risuai-nodeonly';
+            const pkg = context.repo.repo.toLowerCase();
+
+            // Detect owner type — Organization vs User — to use the matching package API.
+            // PocketRisu/PocketRisu is an Organization, the previous mrbart3885/* was a User.
+            const { data: ownerInfo } = await github.rest.users.getByUsername({ username: owner });
+            const isOrg = ownerInfo.type === 'Organization';
+            core.info(`Owner '${owner}' type: ${ownerInfo.type}`);
 
             // 1. Get all package versions
-            const versions = await github.paginate(
-              github.rest.packages.getAllPackageVersionsForPackageOwnedByUser,
-              { package_type: 'container', package_name: pkg, username: owner, per_page: 100 }
-            );
+            const listFn = isOrg
+              ? github.rest.packages.getAllPackageVersionsForPackageOwnedByOrg
+              : github.rest.packages.getAllPackageVersionsForPackageOwnedByUser;
+            const listParams = isOrg
+              ? { package_type: 'container', package_name: pkg, org: owner, per_page: 100 }
+              : { package_type: 'container', package_name: pkg, username: owner, per_page: 100 };
+            const versions = await github.paginate(listFn, listParams);
 
             const tagged = versions.filter(v => v.metadata?.container?.tags?.length > 0);
             const untagged = versions.filter(v => !v.metadata?.container?.tags?.length);
@@ -218,12 +265,21 @@ jobs:
             for (const v of orphaned) {
               core.info(`DELETE ${v.name.substring(0, 27)}...`);
               try {
-                await github.rest.packages.deletePackageVersionForUser({
-                  package_type: 'container',
-                  package_name: pkg,
-                  username: owner,
-                  package_version_id: v.id
-                });
+                if (isOrg) {
+                  await github.rest.packages.deletePackageVersionForOrg({
+                    package_type: 'container',
+                    package_name: pkg,
+                    org: owner,
+                    package_version_id: v.id
+                  });
+                } else {
+                  await github.rest.packages.deletePackageVersionForUser({
+                    package_type: 'container',
+                    package_name: pkg,
+                    username: owner,
+                    package_version_id: v.id
+                  });
+                }
                 deleted++;
               } catch (e) {
                 core.warning(`Failed to delete ${v.id}: ${e.message}`);

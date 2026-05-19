@@ -26,24 +26,6 @@ const VOYAGE_API_URL = "https://api.voyageai.com/v1/contextualizedembeddings";
 const VOYAGE_MODEL = "voyage-context-3";
 const MAX_CHUNKS_PER_REQUEST = 16000;
 const MAX_INPUTS_PER_REQUEST = 1000;
-// Per-chunk: Voyage allows ~32k tokens. 42000 chars stays safely under that.
-const VOYAGE_MAX_CHARS = 42000;
-// Per-batch (sum across all chunks in one request): Voyage hard cap is 120k tokens.
-// Empirically observed: chars/3 estimate undercounted Korean content by ~1.4x
-// (100k estimated → 141k actual). Use chars/2 (CJK-realistic) and an 80k budget
-// for safety margin against tokenizer variance.
-const VOYAGE_MAX_BATCH_TOKENS_EST = 80_000;
-const CHARS_PER_TOKEN_EST = 2;
-
-function truncateForVoyage(text: string): string {
-    return text.length > VOYAGE_MAX_CHARS ? text.slice(0, VOYAGE_MAX_CHARS) : text;
-}
-
-function estimateTokens(group: string[]): number {
-    let chars = 0;
-    for (const c of group) chars += c.length;
-    return Math.ceil(chars / CHARS_PER_TOKEN_EST);
-}
 
 class VoyageContext3Provider implements ContextualEmbeddingProvider {
   readonly modelId = VOYAGE_MODEL;
@@ -59,10 +41,8 @@ class VoyageContext3Provider implements ContextualEmbeddingProvider {
 
   async embedDocumentGroups(groups: string[][]): Promise<VectorArray[][]> {
     const apiKey = this.getApiKey();
-    // Truncate per-chunk to Voyage's token limit before batching
-    const truncatedGroups = groups.map(g => g.map(truncateForVoyage));
-    const batches = this.batchGroups(truncatedGroups);
-    const allResults: VectorArray[][] = new Array(truncatedGroups.length);
+    const batches = this.batchGroups(groups);
+    const allResults: VectorArray[][] = new Array(groups.length);
 
     let groupOffset = 0;
     for (const batch of batches) {
@@ -97,38 +77,25 @@ class VoyageContext3Provider implements ContextualEmbeddingProvider {
 
   async embedQueries(queries: string[]): Promise<VectorArray[]> {
     const apiKey = this.getApiKey();
-    const truncated = queries.map(truncateForVoyage);
-    // Each query is its own one-element group for the API; reuse the
-    // document-batching helper to enforce the 120k token-per-batch cap.
-    const queryGroups = truncated.map(t => [t]);
-    const batches = this.batchGroups(queryGroups);
-    const out: VectorArray[] = new Array(truncated.length);
-
-    let offset = 0;
-    for (const batch of batches) {
-      const response = await globalFetch(VOYAGE_API_URL, {
-        headers: {
-          "Authorization": "Bearer " + apiKey,
-          "Content-Type": "application/json"
-        },
-        body: {
-          "inputs": batch,
-          "model": VOYAGE_MODEL,
-          "input_type": "query"
-        }
-      });
-
-      if (!response.ok || !response.data.data) {
-        throw new Error(JSON.stringify(response.data));
+    const response = await globalFetch(VOYAGE_API_URL, {
+      headers: {
+        "Authorization": "Bearer " + apiKey,
+        "Content-Type": "application/json"
+      },
+      body: {
+        "inputs": queries.map(s => [s]),
+        "model": VOYAGE_MODEL,
+        "input_type": "query"
       }
+    });
 
-      for (let i = 0; i < batch.length; i++) {
-        out[offset + i] = response.data.data[i].data[0].embedding;
-      }
-      offset += batch.length;
+    if (!response.ok || !response.data.data) {
+      throw new Error(JSON.stringify(response.data));
     }
 
-    return out;
+    return response.data.data.map(
+      (group: { data: { embedding: VectorArray }[] }) => group.data[0].embedding
+    );
   }
 
   getCacheKeySuffix(contextTexts?: string[]): string {
@@ -142,24 +109,19 @@ class VoyageContext3Provider implements ContextualEmbeddingProvider {
     const batches: string[][][] = [];
     let currentBatch: string[][] = [];
     let currentChunkCount = 0;
-    let currentTokenEst = 0;
 
     for (const group of groups) {
-      const groupTokens = estimateTokens(group);
       if (
         currentBatch.length > 0 &&
         (currentBatch.length + 1 > MAX_INPUTS_PER_REQUEST ||
-         currentChunkCount + group.length > MAX_CHUNKS_PER_REQUEST ||
-         currentTokenEst + groupTokens > VOYAGE_MAX_BATCH_TOKENS_EST)
+         currentChunkCount + group.length > MAX_CHUNKS_PER_REQUEST)
       ) {
         batches.push(currentBatch);
         currentBatch = [];
         currentChunkCount = 0;
-        currentTokenEst = 0;
       }
       currentBatch.push(group);
       currentChunkCount += group.length;
-      currentTokenEst += groupTokens;
     }
 
     if (currentBatch.length > 0) {

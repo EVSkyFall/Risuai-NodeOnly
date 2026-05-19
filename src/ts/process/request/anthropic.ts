@@ -11,7 +11,7 @@ import type { MultiModal } from "../index.svelte"
 import { extractJSON } from "../templates/jsonSchema"
 import { callTool, decodeToolCall, encodeToolCall } from "../mcp/mcp"
 import type { RequestDataArgumentExtended, requestDataResponse, StreamResponseChunk } from './request'
-import { applyParameters } from './shared'
+import { applyAdditionalParameters, applyParameters, getAdditionalParameters } from './shared'
 import { submitClaudeBatch, registerBatchStream, unregisterBatchStream, cancelClaudeBatch } from './claudeBatchTracker'
 
 interface Claude3TextBlock {
@@ -413,11 +413,15 @@ export async function requestClaude(arg:RequestDataArgumentExtended):Promise<req
         delete body.thinking
     }
 
-    if(systemPrompt === ''){
+    if(systemPrompt.trim() === ''){
         delete body.system
     }
 
     const bedrock = arg.modelInfo.format === LLMFormat.AWSBedrockClaude
+    const additionalParams = getAdditionalParameters(aiModel)
+    const hasCustomAnthropicBeta = additionalParams.some(([key]) => {
+        return key.startsWith('header::') && key.slice('header::'.length).toLocaleLowerCase() === 'anthropic-beta'
+    })
 
     if(bedrock && aiModel !== 'reverse_proxy'){
         function getCredentialParts(key:string) {
@@ -465,16 +469,22 @@ export async function requestClaude(arg:RequestDataArgumentExtended):Promise<req
             delete params.top_p
         }
 
+        let bedrockHeaders: Record<string, string> = {
+            ["Host"]: host,
+            ["Content-Type"]: "application/json",
+            ["accept"]: "application/json",
+        }
+
+        if(additionalParams.length > 0){
+            params = applyAdditionalParameters(params, bedrockHeaders, additionalParams)
+        }
+
         const rq = new HttpRequest({
             method: "POST",
             protocol: "https:",
             hostname: host,
             path: `/model/${awsModel}/invoke${stream ? "-with-response-stream" : ""}`,
-            headers: {
-              ["Host"]: host,
-              ["Content-Type"]: "application/json",
-              ["accept"]: "application/json",
-            },
+            headers: bedrockHeaders,
             body: JSON.stringify(params),
         });
         
@@ -553,8 +563,12 @@ export async function requestClaude(arg:RequestDataArgumentExtended):Promise<req
                 resText += '\n{{redacted_thinking}}\n'
             }
         }
-    
-    
+
+        if(thinking){
+            resText += "</Thoughts>\n\n"
+        }
+
+
         if(arg.extractJson && db.jsonSchemaEnabled){
             return {
                 type: 'success',
@@ -579,27 +593,9 @@ export async function requestClaude(arg:RequestDataArgumentExtended):Promise<req
 
     const isCopilot = isCopilotURL(replacerURL)
 
-    // Copilot: Bearer auth instead of x-api-key, drop anthropic-version
     if (isCopilot) {
         headers["Authorization"] = "Bearer " + apiKey
         delete headers['anthropic-version']
-    }
-
-    let betas:string[] = []
-
-    // Skip Anthropic-specific beta headers for Copilot
-    if (!isCopilot) {
-        if(body.max_tokens > 8192){
-            betas.push('output-128k-2025-02-19')
-        }
-
-        if(db.claude1HourCaching){
-            betas.push('extended-cache-ttl-2025-04-11')
-        }
-    }
-
-    if(betas.length > 0){
-        headers['anthropic-beta'] = betas.join(',')
     }
 
     if(db.usePlainFetch){
@@ -615,6 +611,26 @@ export async function requestClaude(arg:RequestDataArgumentExtended):Promise<req
             }
         })
 
+    }
+
+    if(additionalParams.length > 0){
+        body = applyAdditionalParameters(body, headers, additionalParams)
+    }
+
+    let betas:string[] = []
+
+    if (!isCopilot) {
+        if(body.max_tokens > 8192){
+            betas.push('output-128k-2025-02-19')
+        }
+
+        if(db.claude1HourCaching){
+            betas.push('extended-cache-ttl-2025-04-11')
+        }
+    }
+
+    if(betas.length > 0 && !hasCustomAnthropicBeta){
+        headers['anthropic-beta'] = betas.join(',')
     }
 
     if(arg.previewBody){
@@ -1087,15 +1103,12 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
                     }
                 }
 
-                // If stream broke with an error, emit it as text and close normally
-                // (controller.error() causes unhandled alert popups)
                 if(breakError){
                     controller.enqueue({ "0": text + `\n\n---\n**[${breakError}. Please retry (reroll).]**` })
                     controller.close()
                     return
                 }
 
-                // Rescue incomplete tool_use block that didn't get content_block_stop
                 if(currentToolBlock?.type === 'tool_use'){
                     const rawJson = currentToolBlock._inputJson || '{}'
                     try { currentToolBlock.input = JSON.parse(rawJson) } catch { currentToolBlock.input = {} }
@@ -1106,11 +1119,7 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
                     if(!streamStopReason) streamStopReason = 'tool_use'
                 }
 
-                // Handle tool_use in streaming: execute tools and send results back
                 console.warn(`%c[Stream End]`, 'color: #aaa', `stop_reason=${streamStopReason} | toolUseBlocks=${streamToolUseBlocks.length} | textLen=${text.length}`)
-                // Whenever the model produced tool_use blocks, run them and continue —
-                // regardless of stop_reason. Anthropic's signal varies (tool_use, pause_turn,
-                // sometimes end_turn via Vertex/Copilot proxies), so trust the content.
                 if(streamToolUseBlocks.length > 0){
                     const messages: Claude3ExtendedChat[] = body.messages
                     const filteredBlocks = streamContentBlocks.filter(b =>
@@ -1157,7 +1166,6 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
                         thinking = false
                         controller.enqueue({ "0": text })
                     }
-                    // Streaming continuation — retries handled by requestClaudeHTTP's fetch retry logic
                     body.stream = true
                     console.warn(`%c[Tool Continuation]`, 'color: #ce93d8; font-weight: bold', `Resuming with ${streamToolUseBlocks.length} tool result(s)...`)
                     const TOOL_CONT_MAX_RETRIES = 5
@@ -1182,7 +1190,6 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
                                     console.warn(`[Tool Continuation] Stream read error on attempt ${toolContAttempt + 1}: ${readErr?.message || readErr}`)
                                     contBroken = true
                                 }
-                                // Check if continuation actually produced meaningful output
                                 if(!contBroken && contChunks > 0 && contText && !contText.includes('[Tool continuation failed') && !contText.includes('[Stream failed')){
                                     toolContSuccess = true
                                     break
@@ -1191,7 +1198,6 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
                                     console.warn(`[Tool Continuation] Empty response on attempt ${toolContAttempt + 1}`)
                                     contBroken = true
                                 }
-                                // Fall through to retry
                             } else if(continuationResult.type === 'success'){
                                 controller.enqueue({ "0": text + continuationResult.result })
                                 toolContSuccess = true
@@ -1203,7 +1209,6 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
                         } catch(e: any) {
                             console.warn(`[Tool Continuation] Attempt ${toolContAttempt + 1}/${TOOL_CONT_MAX_RETRIES} error: ${e?.message || e}`)
                         }
-                        // Retry with backoff
                         if(toolContAttempt < TOOL_CONT_MAX_RETRIES - 1){
                             const waitMs = Math.min((toolContAttempt + 1) * 5000, 30000)
                             console.warn(`[Tool Continuation] Retrying in ${waitMs}ms...`)
@@ -1216,6 +1221,12 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
                     }
                 }
 
+                if(thinking){
+                    text += "</Thoughts>\n\n"
+                    controller.enqueue({
+                        "0": text
+                    })
+                }
                 controller.close()
             },
             cancel(){
@@ -1245,7 +1256,6 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
 
         if(res.ok && !res.data?.error) break
 
-        // Retry on transient errors (model_not_supported, overload, 429, 500+, unavailable)
         const errStr = JSON.stringify(res.data)
         const isRetryable = res.status === 429
             || res.status >= 500
@@ -1255,7 +1265,7 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
         if(!isRetryable || attempt >= MAX_RETRIES - 1) break
 
         const waitMs = RETRY_DELAYS_MS[attempt] ?? 30000
-        console.log(`[Anthropic] Retry ${attempt + 1}/${MAX_RETRIES} after ${waitMs}ms: ${errStr.substring(0, 100)}`)
+        console.warn(`[Anthropic] Retry ${attempt + 1}/${MAX_RETRIES} after ${waitMs}ms: ${errStr.substring(0, 100)}`)
         await sleep(waitMs)
     }
 
@@ -1392,6 +1402,9 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
         }
     }
 
+    if(thinking){
+        resText += "</Thoughts>\n\n"
+    }
 
     arg.additionalOutput ??= ""
     if(arg.extractJson && db.jsonSchemaEnabled){
