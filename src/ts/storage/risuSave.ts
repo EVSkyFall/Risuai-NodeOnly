@@ -75,7 +75,6 @@ export type toSaveType = {
     modules: boolean;
     loadouts: boolean;
     plugins: boolean;
-    pluginCustomStorage: boolean;
 }
 
 enum RisuSaveType {
@@ -161,12 +160,6 @@ export class RisuSaveEncoder {
             data: JSON.stringify(data.plugins),
             type: RisuSaveType.PLUGINS,
             name: 'plugins'
-        });
-        this.blocks['pluginStorage'] = await this.encodeBlock({
-            compression,
-            data: JSON.stringify(data.pluginCustomStorage),
-            type: RisuSaveType.PLUGIN_STORAGE,
-            name: 'pluginStorage'
         });
         this.characterHashes = {}
         for( const character of data.characters) {
@@ -283,15 +276,6 @@ export class RisuSaveEncoder {
                 data: JSON.stringify(data.loadouts),
                 type: RisuSaveType.LOADOUTS,
                 name: 'loadouts'
-            });
-        }
-
-        if(toSave.pluginCustomStorage){
-            this.blocks['pluginStorage'] = await this.encodeBlock({
-                compression: this.compression,
-                data: JSON.stringify(data.pluginCustomStorage),
-                type: RisuSaveType.PLUGIN_STORAGE,
-                name: 'pluginStorage'
             });
         }
 
@@ -863,6 +847,7 @@ export class RisuSavePatcher {
             this.lastSyncedDb.characters = [];
         }
         this.hashBlocks = {};
+        delete this.lastSyncedDb.pluginCustomStorage
 
         const keys = Object.keys(this.lastSyncedDb)
 
@@ -890,6 +875,7 @@ export class RisuSavePatcher {
             characters: lastCharacters = [],
             botPresets: lastBotPresets,
             modules: lastModules,
+            pluginCustomStorage: _lastPCS,
             ...lastRoot
         } = this.lastSyncedDb
 
@@ -897,6 +883,7 @@ export class RisuSavePatcher {
             characters: curCharacters = [],
             botPresets: curBotPresets,
             modules: curModules,
+            pluginCustomStorage: _curPCS,
             ...curRoot
         } = data
 

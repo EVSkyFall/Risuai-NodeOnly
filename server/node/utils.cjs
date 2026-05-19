@@ -191,7 +191,7 @@ class RisuSaveDecoder {
         // skipped (the historical behavior) — which loses any characters that
         // were saved as remote blocks by upstream RisuAI or by an earlier
         // NodeOnly version.
-        const { resolveRemote = null } = options;
+        const { resolveRemote = null, extractPluginStorage = false } = options;
         let offset = magicRisuSaveHeader.length;
         let db = {};
 
@@ -277,7 +277,11 @@ class RisuSaveDecoder {
                         break;
                     }
                     case RisuSaveType.PLUGIN_STORAGE: {
-                        db.pluginCustomStorage = JSON.parse(this.blocks[key].content);
+                        if (extractPluginStorage) {
+                            db.pluginCustomStorage = JSON.parse(this.blocks[key].content);
+                        } else {
+                            db.pluginCustomStorage = {};
+                        }
                         break;
                     }
                     case RisuSaveType.ROOT_COMPONENT: {

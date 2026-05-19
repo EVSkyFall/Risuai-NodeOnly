@@ -6,6 +6,7 @@ import { checkRisuUpdate } from "./update";
 import { fetchPublicStats } from "./publicStats";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, DBState, LoadingStatusState, bootBackupPromptStore } from "./stores.svelte";
 import { loadPlugins } from "./plugins/plugins.svelte";
+import { initPluginKvStorage } from "./plugins/pluginKvStorage";
 import { alertError, alertMd, alertTOS, waitAlert, alertConfirm, alertInput } from "./alert";
 import { characterURLImport } from "./characterCards";
 import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from "./storage/defaultPrompts";
@@ -100,6 +101,8 @@ export async function loadData() {
             }
             LoadingStatusState.text = "Loading Plugins..."
             try {
+                await initPluginKvStorage(getDatabase().pluginCustomStorage)
+                getDatabase().pluginCustomStorage = {}
                 await loadPlugins()
             } catch (error) { }
             try {

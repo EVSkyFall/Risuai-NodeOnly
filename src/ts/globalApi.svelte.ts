@@ -25,6 +25,7 @@ import { initMobileGesture } from "./hotkey";
 import { moduleUpdate } from "./process/modules";
 import { isLocalNetworkUrl } from "./network/localNetwork";
 import { decodeProxyJobWsChunk, formatProxyStreamErrorMessage, parseProxyJobWsEvent } from "./network/proxyJobWs";
+import { pluginCustomKv } from "./plugins/pluginKvStorage";
 
 export const forageStorage = new AutoStorage()
 
@@ -436,7 +437,6 @@ export async function saveDb() {
         modules: false,
         loadouts: false,
         plugins: false,
-        pluginCustomStorage: false
     }
 
     let encoder = new RisuSaveEncoder()
@@ -456,7 +456,6 @@ export async function saveDb() {
             toSave.modules ||
             toSave.loadouts ||
             toSave.plugins ||
-            toSave.pluginCustomStorage ||
             toSave.root ||
             toSave.character.length > 0 ||
             toSave.chat.length > 0
@@ -472,7 +471,6 @@ export async function saveDb() {
         changeTracker.modules = false
         changeTracker.loadouts = false
         changeTracker.plugins = false
-        changeTracker.pluginCustomStorage = false
         return toSave
     }
 
@@ -497,7 +495,6 @@ export async function saveDb() {
         let didInitModulesEffect = false
         let didInitLoadoutsEffect = false
         let didInitPluginsEffect = false
-        let didInitPluginStorageEffect = false
         let didInitGeneralEffect = false
         let trackedActiveChatKey = ''
 
@@ -528,6 +525,7 @@ export async function saveDb() {
                 skipBroadcast: true,
             })
             void flushServerDbKeepalive()
+            void pluginCustomKv.flushImmediate()
         }
         document.addEventListener('visibilitychange', () => {
             if (document.visibilityState === 'hidden') flushImmediate();
@@ -591,15 +589,6 @@ export async function saveDb() {
                 return
             }
             changeTracker.plugins = true
-            saveTimeoutExecute()
-        })
-        $effect(() => {
-            $state.snapshot(DBState.db.pluginCustomStorage)
-            if (!didInitPluginStorageEffect) {
-                didInitPluginStorageEffect = true
-                return
-            }
-            changeTracker.pluginCustomStorage = true
             saveTimeoutExecute()
         })
         $effect(() => {
@@ -691,7 +680,6 @@ export async function saveDb() {
         changeTracker.modules = changeTracker.modules || toSave.modules
         changeTracker.loadouts = changeTracker.loadouts || toSave.loadouts
         changeTracker.plugins = changeTracker.plugins || toSave.plugins
-        changeTracker.pluginCustomStorage = changeTracker.pluginCustomStorage || toSave.pluginCustomStorage
         changeTracker.root = changeTracker.root || toSave.root
     }
 

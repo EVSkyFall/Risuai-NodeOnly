@@ -9,31 +9,11 @@ import { DBState, hotReloading, pluginAlertModalStore, selectedCharID } from "..
 import type { ScriptMode } from "../process/scripts";
 import { checkCodeSafety } from "./pluginSafety";
 import { SafeDocument, SafeIdbFactory, SafeLocalStorage } from "./pluginSafeClass";
+import { pluginCustomKv, pluginBlobKv } from "./pluginKvStorage";
 import { loadV3Plugins } from "./apiV3/v3.svelte";
 import { pluginCodeTranspiler } from "./apiV3/transpiler";
 
 export const customProviderStore = writable([] as string[])
-
-// --- pluginBlobStorage: IDB-backed large-value storage that lives outside
-// the main DB serialization path. Solves OOM from pluginCustomStorage
-// holding hundreds of MB of embedding caches / diff history.
-const BLOB_DB_NAME = 'risuai-plugin-blobs'
-const BLOB_STORE_NAME = 'blobs'
-let _blobDB: IDBDatabase | null = null
-
-function getBlobDB(): Promise<IDBDatabase> {
-    if (_blobDB) return Promise.resolve(_blobDB)
-    return new Promise((resolve, reject) => {
-        const req = indexedDB.open(BLOB_DB_NAME, 1)
-        req.onupgradeneeded = () => {
-            if (!req.result.objectStoreNames.contains(BLOB_STORE_NAME)) {
-                req.result.createObjectStore(BLOB_STORE_NAME)
-            }
-        }
-        req.onsuccess = () => { _blobDB = req.result; resolve(_blobDB) }
-        req.onerror = () => reject(req.error)
-    })
-}
 
 interface ProviderPlugin {
     name: string
@@ -508,7 +488,6 @@ export const allowedDbKeys = [
     'pluginV2',
     'personas',
     'plugins',
-    'pluginCustomStorage',
     'temperature',
     'maxContext',
     'maxResponse',
@@ -695,11 +674,9 @@ export const getV2PluginAPIs = () => {
                     if (typeof prop === 'string' && allowedDbKeys.includes(prop)) {
                         return (target as any)[prop];
                     }
-                    else if(target.pluginCustomStorage){
-                        console.log('Getting custom db property', prop.toString());
-                        return target.pluginCustomStorage[prop.toString()];
+                    else{
+                        return pluginCustomKv.getItem(prop.toString());
                     }
-                    return undefined;
                 },
                 set(target, prop, value) {
                     if (typeof prop === 'string' && allowedDbKeys.includes(prop)) {
@@ -707,21 +684,30 @@ export const getV2PluginAPIs = () => {
                         return true;
                     }
                     else{
-                        console.log('Setting custom db property', prop.toString(), value);
-                        target.pluginCustomStorage ??= {}
-                        target.pluginCustomStorage[prop.toString()] = value;
+                        pluginCustomKv.setItem(prop.toString(), value);
                         return true;
                     }
                 },
                 ownKeys(target) {
-                    const keys = Reflect.ownKeys(target).filter(key => typeof key === 'string' && allowedDbKeys.includes(key));
-                    if(target.pluginCustomStorage){
-                        keys.push(...Object.keys(target.pluginCustomStorage));
+                    const nativeKeys = Reflect.ownKeys(target).filter(key => typeof key === 'string' && allowedDbKeys.includes(key));
+                    const customKeys = pluginCustomKv.keys();
+                    const seen = new Set<string | symbol>(nativeKeys);
+                    for (const k of customKeys) {
+                        if (!seen.has(k)) nativeKeys.push(k);
                     }
-                    return keys;
+                    return nativeKeys;
+                },
+                getOwnPropertyDescriptor(target, prop) {
+                    if (typeof prop === 'string' && allowedDbKeys.includes(prop)) {
+                        return Reflect.getOwnPropertyDescriptor(target, prop);
+                    }
+                    if (typeof prop === 'string' && pluginCustomKv.hasItem(prop)) {
+                        return { configurable: true, enumerable: true, writable: true, value: pluginCustomKv.getItem(prop) };
+                    }
+                    return undefined;
                 },
                 deleteProperty(target, prop) {
-                    console.log('Attempt to delete db.' + String(prop) + ' denied in safe database proxy.');
+                    console.warn('Attempt to delete db.' + String(prop) + ' denied in safe database proxy.');
                     return false;
                 },
                 getPrototypeOf(target) {
@@ -730,107 +716,45 @@ export const getV2PluginAPIs = () => {
             })
         },
         pluginStorage: {
-            getItem: (key: string) => {
-                const db = getDatabase({ snapshot: true });
-                db.pluginCustomStorage ??= {}
-                return db.pluginCustomStorage[key] || null;
-            },
-            setItem: (key: string, value: string) => {
-                const db = getDatabase();
-                db.pluginCustomStorage ??= {}
-                db.pluginCustomStorage[key] = value;
-            },
-            removeItem: (key: string) => {
-                const db = getDatabase();
-                db.pluginCustomStorage ??= {}
-                delete db.pluginCustomStorage[key];
-            },
-            clear: () => {
-                const db = getDatabase();
-                db.pluginCustomStorage = {};
-            },
-            key: (index: number) => {
-                const db = getDatabase();
-                db.pluginCustomStorage ??= {}
-                const keys = Object.keys(db.pluginCustomStorage);
-                return keys[index] || null;
-            },
-            keys: () => {
-                const db = getDatabase();
-                db.pluginCustomStorage ??= {}
-                return Object.keys(db.pluginCustomStorage);
-            },
-            length: () => {
-                const db = getDatabase();
-                db.pluginCustomStorage ??= {}
-                return Object.keys(db.pluginCustomStorage).length;
-            }
+            getItem: (key: string) => pluginCustomKv.getItem(key),
+            setItem: (key: string, value: any) => pluginCustomKv.setItem(key, value),
+            removeItem: (key: string) => pluginCustomKv.removeItem(key),
+            clear: () => pluginCustomKv.clear(),
+            key: (index: number) => pluginCustomKv.key(index),
+            keys: () => pluginCustomKv.keys(),
+            length: () => pluginCustomKv.length,
         },
         pluginBlobStorage: {
-            getItem: async (key: string): Promise<string | null> => {
-                const db = await getBlobDB()
-                return new Promise((resolve, reject) => {
-                    const tx = db.transaction(BLOB_STORE_NAME, 'readonly')
-                    const req = tx.objectStore(BLOB_STORE_NAME).get(key)
-                    req.onsuccess = () => resolve(req.result ?? null)
-                    req.onerror = () => reject(req.error)
-                })
-            },
-            setItem: async (key: string, value: string): Promise<void> => {
-                const db = await getBlobDB()
-                return new Promise((resolve, reject) => {
-                    const tx = db.transaction(BLOB_STORE_NAME, 'readwrite')
-                    const req = tx.objectStore(BLOB_STORE_NAME).put(value, key)
-                    req.onsuccess = () => resolve()
-                    req.onerror = () => reject(req.error)
-                })
-            },
-            removeItem: async (key: string): Promise<void> => {
-                const db = await getBlobDB()
-                return new Promise((resolve, reject) => {
-                    const tx = db.transaction(BLOB_STORE_NAME, 'readwrite')
-                    const req = tx.objectStore(BLOB_STORE_NAME).delete(key)
-                    req.onsuccess = () => resolve()
-                    req.onerror = () => reject(req.error)
-                })
-            },
-            keys: async (): Promise<string[]> => {
-                const db = await getBlobDB()
-                return new Promise((resolve, reject) => {
-                    const tx = db.transaction(BLOB_STORE_NAME, 'readonly')
-                    const req = tx.objectStore(BLOB_STORE_NAME).getAllKeys()
-                    req.onsuccess = () => resolve(req.result as string[])
-                    req.onerror = () => reject(req.error)
-                })
-            },
+            getItem: (key: string) => pluginBlobKv.getItem(key),
+            setItem: (key: string, value: string) => pluginBlobKv.setItem(key, value),
+            removeItem: (key: string) => pluginBlobKv.removeItem(key),
+            keys: () => pluginBlobKv.keys(),
         },
         setDatabaseLite: (newDb: any) => {
             const db = getDatabase();
-            db.pluginCustomStorage ??= {}
             for (const key of Object.keys(newDb)) {
                 if (allowedDbKeys.includes(key)) {
                     (db as any)[key] = newDb[key];
                 }
                 else{
-                    db.pluginCustomStorage[key] = newDb[key];
+                    pluginCustomKv.setItem(key, newDb[key]);
                 }
             }
             DBState.db = db;
         },
         setDatabase: async (newDb: any) => {
             const db = getDatabase();
-            db.pluginCustomStorage ??= {}
             for (const key of Object.keys(newDb)) {
                 if (key === 'plugins') {
                     console.warn('[WARN] Plugin attempted to access plugin directly. this would be blocked in future versions. Instead, use the provided APIs to manage plugins. Attempting to handle plugin installation via plugin for new plugins in the provided database object.')
                     newDb[key] = await handlePluginInstallViaPlugin(newDb.plugins)
                 }
-                
+
                 if (allowedDbKeys.includes(key)) {
                     (db as any)[key] = newDb[key];
                 }
                 else{
-                    db.pluginCustomStorage[key] = newDb[key];
+                    pluginCustomKv.setItem(key, newDb[key]);
                 }
             }
             setDatabase(db);

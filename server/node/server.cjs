@@ -415,8 +415,34 @@ async function decodeDatabaseWithPersistentChatIds(raw, options = {}) {
         const fresh = kvGet('database/database.bin');
         if (fresh) raw = fresh;
     }
-    const dbObj = normalizeJSON(await decodeRisuSave(raw));
+
+    const needsPluginMigration = !kvGet('_meta/plugin-storage-migrated');
+    const dbObj = normalizeJSON(await decodeRisuSave(raw, {
+        extractPluginStorage: needsPluginMigration,
+    }));
     let needsPersist = false;
+
+    if (needsPluginMigration) {
+        const pcs = dbObj.pluginCustomStorage;
+        if (pcs && typeof pcs === 'object') {
+            const pcsKeys = Object.keys(pcs);
+            if (pcsKeys.length > 0) {
+                for (const k of pcsKeys) {
+                    const encoded = Buffer.from(k, 'utf-8')
+                        .toString('base64')
+                        .replace(/\+/g, '-')
+                        .replace(/\//g, '_')
+                        .replace(/=+$/, '');
+                    const storageKey = `plugin-custom-storage/${encoded}.json`;
+                    kvSet(storageKey, Buffer.from(JSON.stringify(pcs[k]), 'utf-8'));
+                }
+                logger.info(`[Migration] Migrated ${pcsKeys.length} pluginCustomStorage entries to KV`);
+                dbObj.pluginCustomStorage = {};
+                needsPersist = true;
+            }
+        }
+        kvSet('_meta/plugin-storage-migrated', Buffer.from('1'));
+    }
 
     const hadMissingIds = assignMissingChatIds(dbObj);
     if (hadMissingIds) needsPersist = true;
@@ -2209,6 +2235,13 @@ function resolveBackupStorageKey(name) {
         return name;
     }
 
+    if (name.startsWith('plugin-custom-storage/') || name.startsWith('plugin-blob-storage/')) {
+        if (isInvalidBackupPathSegment(name)) {
+            throw new Error(`Invalid plugin storage backup entry name: ${name}`);
+        }
+        return name;
+    }
+
     // Upstream backups transport cold storage as coldstorage/<uuid>.json.
     // Normalize back to the runtime KV key: coldstorage/<uuid>.
     if (name.startsWith('coldstorage/')) {
@@ -2325,6 +2358,10 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
     // (.bin backups themselves never carry REMOTE blocks — legacy msgpack
     // format only — but a fresh import is a clear "data changed" signal.)
     kvDel(REMOTE_MIGRATION_MARKER_KEY);
+    kvDel('_meta/plugin-storage-migrated');
+    kvDel('_meta/plugin-blob-migrated');
+    kvDelPrefix('plugin-custom-storage/');
+    kvDelPrefix('plugin-blob-storage/');
     clearEntities();
 
     try {
@@ -3894,6 +3931,14 @@ app.get('/api/backup/export', async (req, res, next) => {
             sortKey: entry.key,
             size: entry.size,
         }));
+        const pluginStorageEntries = target === 'upstream' ? [] : [
+            ...kvListWithSizes('plugin-custom-storage/').map((entry) => ({
+                kind: 'kv', key: entry.key, backupName: entry.key, sortKey: entry.key, size: entry.size,
+            })),
+            ...kvListWithSizes('plugin-blob-storage/').map((entry) => ({
+                kind: 'kv', key: entry.key, backupName: entry.key, sortKey: entry.key, size: entry.size,
+            })),
+        ];
         const namespacedEntries = [
             ...kvListWithSizes('assets/').map((entry) => ({
                 kind: 'kv',
@@ -3903,6 +3948,7 @@ app.get('/api/backup/export', async (req, res, next) => {
                 size: entry.size,
             })),
             ...listColdStorageBackupEntries(),
+            ...pluginStorageEntries,
             ...inlayMetaEntries,
             ...inlayEntries,
             ...sidecarEntries.filter(Boolean),
@@ -4140,6 +4186,8 @@ app.post('/api/backup/server/save', async (req, res, next) => {
         const namespacedEntries = [
             ...kvListWithSizes('assets/').map((e) => ({ kind: 'kv', key: e.key, backupName: path.basename(e.key), size: e.size })),
             ...listColdStorageBackupEntries(),
+            ...kvListWithSizes('plugin-custom-storage/').map((e) => ({ kind: 'kv', key: e.key, backupName: e.key, size: e.size })),
+            ...kvListWithSizes('plugin-blob-storage/').map((e) => ({ kind: 'kv', key: e.key, backupName: e.key, size: e.size })),
             ...kvListWithSizes('inlay_meta/').map((e) => ({ kind: 'kv', key: e.key, backupName: e.key, size: e.size })),
             ...inlayEntries,
             ...sidecarEntries,
@@ -4672,6 +4720,10 @@ function clearExistingData() {
     // preserve upstream's split-character format) and we want the migration
     // to re-evaluate against the new contents on the next ensureChatStore.
     kvDel(REMOTE_MIGRATION_MARKER_KEY);
+    kvDel('_meta/plugin-storage-migrated');
+    kvDel('_meta/plugin-blob-migrated');
+    kvDelPrefix('plugin-custom-storage/');
+    kvDelPrefix('plugin-blob-storage/');
     clearEntities();
 }
 
@@ -4974,6 +5026,8 @@ async function estimateServerBackupSize() {
     total += kvSize(DB_BLOB_KEY) || 0;
     for (const it of kvListWithSizes('assets/')) total += it.size;
     for (const it of kvListWithSizes('inlay_meta/')) total += it.size;
+    for (const it of kvListWithSizes('plugin-custom-storage/')) total += it.size;
+    for (const it of kvListWithSizes('plugin-blob-storage/')) total += it.size;
     for (const e of listColdStorageBackupEntries()) total += e.size;
     total += await sumInlayFsBytes();
     return total;
@@ -5443,6 +5497,10 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
             // so migrateRemoteBlocksIfNeeded re-evaluates against the restored
             // bytes instead of skipping based on the prior post-migration state.
             kvDel(REMOTE_MIGRATION_MARKER_KEY);
+            kvDel('_meta/plugin-storage-migrated');
+            kvDel('_meta/plugin-blob-migrated');
+            kvDelPrefix('plugin-custom-storage/');
+            kvDelPrefix('plugin-blob-storage/');
             // Pre-warm chat store from the just-restored blob so subsequent
             // /api/read fetches and patch-sync baselines see the new data.
             // Use decodeDatabaseWithPersistentChatIds so it runs the migration
