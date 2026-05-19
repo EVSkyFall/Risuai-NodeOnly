@@ -57,9 +57,7 @@ if (nodeMajor < 24) {
 // Configuration flags for patch-based sync
 const enablePatchSync = true;
 
-// ─── Copilot Turn Session Manager ────────────────────────────────────────────
-const copilotTurnSessions = new Map()
-const COPILOT_SESSION_TTL_MS = 30 * 60_000
+// ─── Copilot Turn Header Manager ─────────────────────────────────────────────
 
 function isCopilotURL(url) {
     return typeof url === 'string' && (url.includes('githubcopilot.com') || url.includes('api.individual.githubcopilot.com'))
@@ -70,7 +68,6 @@ function deterministicUUID(seed) {
     return `${hash.slice(0,8)}-${hash.slice(8,12)}-${hash.slice(12,16)}-${hash.slice(16,20)}-${hash.slice(20,32)}`
 }
 
-const recentModelSessions = new Map()
 
 const _copilotIdPath = path.join(process.cwd(), 'save', '__copilot_ids.json')
 let _copilotIds = null
@@ -109,49 +106,14 @@ function applyCopilotTurnHeaders(header, targetUrl, turnId, requestBody) {
         model = body?.model || null
     } catch {}
 
-    const now = Date.now()
-    let effectiveTurnId = turnId
-    let autoBundled = false
-    if (model) {
-        const recent = recentModelSessions.get(model)
-        if (recent && (now - recent.lastUsed < COPILOT_SESSION_TTL_MS)) {
-            const recentSession = copilotTurnSessions.get(recent.key)
-            if (recentSession && recentSession.userSent && (now - recentSession.createdAt < COPILOT_SESSION_TTL_MS)) {
-                if (!turnId || !copilotTurnSessions.has(model ? `${turnId}::${model}` : turnId)) {
-                    effectiveTurnId = recent.turnId
-                    autoBundled = true
-                }
-            }
-        }
-    }
-
-    if (!effectiveTurnId) {
-        effectiveTurnId = nodeCrypto.randomUUID()
-        autoBundled = false
-    }
-
+    const effectiveTurnId = nodeCrypto.randomUUID()
     const key = model ? `${effectiveTurnId}::${model}` : effectiveTurnId
     const taskId = deterministicUUID(key + '-task')
     const interactionId = deterministicUUID(key + '-interaction')
 
-    let session = copilotTurnSessions.get(key)
-
-    if (!session || (now - session.createdAt > COPILOT_SESSION_TTL_MS)) {
-        session = { userSent: false, requestCount: 0, createdAt: now }
-        copilotTurnSessions.set(key, session)
-    }
-
-    session.requestCount++
-    const isUser = !session.userSent
-    if (isUser) session.userSent = true
-
-    if (model) {
-        recentModelSessions.set(model, { key, turnId: effectiveTurnId, lastUsed: now })
-    }
-
     header['X-Agent-Task-Id'] = taskId
     header['X-Interaction-Id'] = interactionId
-    header['X-Initiator'] = isUser ? 'user' : 'agent'
+    header['X-Initiator'] = 'user'
 
     const isMessagesEndpoint = targetUrl.includes('/v1/messages')
     if (isMessagesEndpoint) {
@@ -179,20 +141,12 @@ function applyCopilotTurnHeaders(header, targetUrl, turnId, requestBody) {
         header['X-GitHub-Api-Version'] = isMessagesEndpoint ? COPILOT_API_VERSION : '2025-05-01'
     }
 
-    const bundleTag = autoBundled ? ' [auto-bundled]' : ''
     const bucketTag = isMessagesEndpoint ? ' bucket=messages-proxy' : ' bucket=chat'
-    logger.info(`[Copilot Turn] ${isUser ? 'USER' : 'AGENT'} | turnId=${effectiveTurnId.substring(0,8)} model=${model || '?'} req#${session.requestCount} taskId=${taskId.substring(0,8)}${bundleTag}${bucketTag}`)
+    logger.info(`[Copilot Turn] USER | model=${model || '?'} taskId=${taskId.substring(0,8)}${bucketTag}`)
     return true
 }
 
 function markCopilotTurnSuccess(_turnId) {}
-
-setInterval(() => {
-    const now = Date.now()
-    for (const [key, session] of copilotTurnSessions) {
-        if (now - session.createdAt > COPILOT_SESSION_TTL_MS) copilotTurnSessions.delete(key)
-    }
-}, 60_000)
 
 // In-memory database cache for patch-based sync
 // dbCache stores the STRIPPED (stubs-only) version matching what the client sees.
