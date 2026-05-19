@@ -388,11 +388,9 @@ export async function requestGoogleCloudVertex(arg:RequestDataArgumentExtended):
             levelNum === 1  ? 'medium' :
                               'high'
 
-        // Use thinkingBudget for: Gemini 2.5 series, and `-latest` aliases
-        // (some alias targets reject thinkingLevel even when the underlying
-        // versioned model supports it — gemini-flash-lite-latest is one).
-        // Use thinkingLevel for: explicit Gemini 3+ versioned model IDs.
-        const useBudget = !!internalId && (/^gemini-2\.5-/.test(internalId) || /-latest$/.test(internalId))
+        // thinkingBudget: Gemini 2.5 series only.
+        // thinkingLevel: Gemini 3+ and all `-latest` aliases (now resolve to 3.x).
+        const useBudget = !!internalId && /^gemini-2\.5-/.test(internalId)
 
         if (useBudget) {
             const budget =
