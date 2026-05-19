@@ -1156,6 +1156,10 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
         _keyPluginStorage: oldApis.pluginStorage.key,
         _keysPluginStorage: oldApis.pluginStorage.keys,
         _lengthPluginStorage: oldApis.pluginStorage.length,
+        _getPluginBlobStorage: oldApis.pluginBlobStorage.getItem,
+        _setPluginBlobStorage: oldApis.pluginBlobStorage.setItem,
+        _removePluginBlobStorage: oldApis.pluginBlobStorage.removeItem,
+        _keysPluginBlobStorage: oldApis.pluginBlobStorage.keys,
         _getSafeLocalStorage: oldApis.safeLocalStorage.getItem,
         _setSafeLocalStorage: oldApis.safeLocalStorage.setItem,
         _removeSafeLocalStorage: oldApis.safeLocalStorage.removeItem,
@@ -1178,6 +1182,12 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
                     'key': '_keyPluginStorage',
                     'keys': '_keysPluginStorage',
                     'length': '_lengthPluginStorage',
+                },
+                'pluginBlobStorage':{
+                    'getItem': '_getPluginBlobStorage',
+                    'setItem': '_setPluginBlobStorage',
+                    'removeItem': '_removePluginBlobStorage',
+                    'keys': '_keysPluginBlobStorage',
                 },
                 'safeLocalStorage':{
                     'getItem': '_getSafeLocalStorage',

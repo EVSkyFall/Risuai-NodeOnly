@@ -231,6 +231,36 @@ export const LLMModels: LLMModel[] = [
         recommended: true,
         tokenizer: LLMTokenizer.Unknown
     },
+    {
+        name: 'OpenAI (Dynamic)',
+        id: 'openai-dynamic',
+        provider: LLMProvider.OpenAI,
+        format: LLMFormat.OpenAICompatible,
+        flags: [LLMFlags.hasFullSystemPrompt, LLMFlags.hasImageInput, LLMFlags.hasStreaming, LLMFlags.OAICompletionTokens, LLMFlags.DeveloperRole],
+        parameters: ['temperature', 'top_p', 'frequency_penalty', 'presence_penalty'],
+        recommended: true,
+        tokenizer: LLMTokenizer.tiktokenO200Base
+    },
+    {
+        name: 'Google AI (Dynamic)',
+        id: 'google-dynamic',
+        provider: LLMProvider.GoogleCloud,
+        format: LLMFormat.GoogleCloud,
+        flags: [LLMFlags.hasImageInput, LLMFlags.poolSupported, LLMFlags.hasAudioInput, LLMFlags.hasVideoInput, LLMFlags.hasStreaming, LLMFlags.requiresAlternateRole, LLMFlags.geminiThinking, LLMFlags.hasFirstSystemPrompt],
+        parameters: ['thinking_tokens', 'temperature', 'top_k', 'top_p', 'presence_penalty', 'frequency_penalty'],
+        recommended: true,
+        tokenizer: LLMTokenizer.GoogleCloud
+    },
+    {
+        name: 'Vercel AI Gateway',
+        id: 'vercel',
+        provider: LLMProvider.AsIs,
+        format: LLMFormat.OpenAICompatible,
+        flags: [LLMFlags.hasFullSystemPrompt, LLMFlags.hasImageInput, LLMFlags.hasStreaming],
+        parameters: ['temperature', 'top_p', 'frequency_penalty', 'presence_penalty'],
+        recommended: true,
+        tokenizer: LLMTokenizer.Unknown
+    },
     // Mistral models
     {
         name: 'Mistral Small Latest',
@@ -480,10 +510,71 @@ export const LLMModels: LLMModel[] = [
         provider: LLMProvider.DeepSeek,
         format: LLMFormat.OpenAICompatible,
         flags: [LLMFlags.hasFirstSystemPrompt, LLMFlags.requiresAlternateRole, LLMFlags.mustStartWithUserInput, LLMFlags.hasPrefill, LLMFlags.deepSeekPrefix, LLMFlags.deepSeekThinkingInput, LLMFlags.hasStreaming],
-        parameters: [],
+        parameters: ['reasoning_effort'],
         tokenizer: LLMTokenizer.DeepSeek,
         endpoint: 'https://api.deepseek.com/beta/chat/completions',
         keyIdentifier: 'deepseek',
+        recommended: true
+    },
+    // DeepSeek V4 Pro / Flash via DeepSeek's own API. /beta endpoint so
+    // chat_prefix_completion (prefix:true on last assistant msg) works.
+    // deepseek-chat / deepseek-reasoner are deprecated 2026-07-24 — V4 is
+    // the going-forward model id.
+    {
+        id: 'deepseek-v4-pro',
+        name: 'Deepseek V4 Pro',
+        provider: LLMProvider.DeepSeek,
+        format: LLMFormat.OpenAICompatible,
+        flags: [LLMFlags.hasFirstSystemPrompt, LLMFlags.requiresAlternateRole, LLMFlags.mustStartWithUserInput, LLMFlags.hasPrefill, LLMFlags.deepSeekPrefix, LLMFlags.deepSeekThinkingInput, LLMFlags.hasStreaming],
+        parameters: ['frequency_penalty', 'presence_penalty', 'temperature', 'top_p', 'reasoning_effort'],
+        tokenizer: LLMTokenizer.DeepSeek,
+        endpoint: 'https://api.deepseek.com/beta/chat/completions',
+        keyIdentifier: 'deepseek',
+        recommended: true
+    },
+    {
+        id: 'deepseek-v4-flash',
+        name: 'Deepseek V4 Flash',
+        provider: LLMProvider.DeepSeek,
+        format: LLMFormat.OpenAICompatible,
+        flags: [LLMFlags.hasFirstSystemPrompt, LLMFlags.requiresAlternateRole, LLMFlags.mustStartWithUserInput, LLMFlags.hasPrefill, LLMFlags.deepSeekPrefix, LLMFlags.deepSeekThinkingInput, LLMFlags.hasStreaming],
+        parameters: ['frequency_penalty', 'presence_penalty', 'temperature', 'top_p', 'reasoning_effort'],
+        tokenizer: LLMTokenizer.DeepSeek,
+        endpoint: 'https://api.deepseek.com/beta/chat/completions',
+        keyIdentifier: 'deepseek',
+        recommended: true
+    },
+    // DeepSeek V4 Pro served via Ollama Cloud (cloud-routed `:cloud` tag).
+    // Requires an Ollama Cloud API key — set under Settings → Custom API Keys
+    // with identifier "ollamaCloud". Routes through Ollama's OpenAI-compat
+    // endpoint, so reasoning_content / tool calls / streaming all work the
+    // same as the DeepSeek API path. Thinking is on by default for V4 Pro;
+    // reasoning_effort controls depth (DeepSeek coerces low/medium → high,
+    // high → high, max → max).
+    {
+        id: 'deepseek-v4-pro:cloud',
+        name: 'Deepseek V4 Pro (Ollama Cloud)',
+        internalID: 'deepseek-v4-pro:cloud',
+        provider: LLMProvider.DeepSeek,
+        format: LLMFormat.OpenAICompatible,
+        flags: [LLMFlags.hasFirstSystemPrompt, LLMFlags.hasPrefill, LLMFlags.deepSeekThinkingInput, LLMFlags.hasStreaming],
+        parameters: ['frequency_penalty', 'presence_penalty', 'temperature', 'top_p', 'reasoning_effort'],
+        tokenizer: LLMTokenizer.DeepSeek,
+        endpoint: 'https://ollama.com/v1/chat/completions',
+        keyIdentifier: 'ollamaCloud',
+        recommended: true
+    },
+    {
+        id: 'deepseek-v4-flash:cloud',
+        name: 'Deepseek V4 Flash (Ollama Cloud)',
+        internalID: 'deepseek-v4-flash:cloud',
+        provider: LLMProvider.DeepSeek,
+        format: LLMFormat.OpenAICompatible,
+        flags: [LLMFlags.hasFirstSystemPrompt, LLMFlags.hasPrefill, LLMFlags.deepSeekThinkingInput, LLMFlags.hasStreaming],
+        parameters: ['frequency_penalty', 'presence_penalty', 'temperature', 'top_p', 'reasoning_effort'],
+        tokenizer: LLMTokenizer.DeepSeek,
+        endpoint: 'https://ollama.com/v1/chat/completions',
+        keyIdentifier: 'ollamaCloud',
         recommended: true
     },
     // DeepInfra
@@ -661,7 +752,7 @@ export async function registerModelDynamic(){
                 const exists = LLMModels.find(m => m.id === model.id || m.internalID === model.id)
                 if(!exists){
                     const isAdaptiveOnly = isClaudeAdaptiveThinkingOnlyModel(model.id)
-                    const flags: number[] = [
+                    const flags: LLMFlags[] = [
                         LLMFlags.hasImageInput,
                         LLMFlags.hasFirstSystemPrompt,
                         LLMFlags.hasStreaming,

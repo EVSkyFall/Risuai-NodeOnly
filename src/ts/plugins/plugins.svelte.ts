@@ -14,6 +14,27 @@ import { pluginCodeTranspiler } from "./apiV3/transpiler";
 
 export const customProviderStore = writable([] as string[])
 
+// --- pluginBlobStorage: IDB-backed large-value storage that lives outside
+// the main DB serialization path. Solves OOM from pluginCustomStorage
+// holding hundreds of MB of embedding caches / diff history.
+const BLOB_DB_NAME = 'risuai-plugin-blobs'
+const BLOB_STORE_NAME = 'blobs'
+let _blobDB: IDBDatabase | null = null
+
+function getBlobDB(): Promise<IDBDatabase> {
+    if (_blobDB) return Promise.resolve(_blobDB)
+    return new Promise((resolve, reject) => {
+        const req = indexedDB.open(BLOB_DB_NAME, 1)
+        req.onupgradeneeded = () => {
+            if (!req.result.objectStoreNames.contains(BLOB_STORE_NAME)) {
+                req.result.createObjectStore(BLOB_STORE_NAME)
+            }
+        }
+        req.onsuccess = () => { _blobDB = req.result; resolve(_blobDB) }
+        req.onerror = () => reject(req.error)
+    })
+}
+
 interface ProviderPlugin {
     name: string
     displayName?: string
@@ -745,6 +766,44 @@ export const getV2PluginAPIs = () => {
                 db.pluginCustomStorage ??= {}
                 return Object.keys(db.pluginCustomStorage).length;
             }
+        },
+        pluginBlobStorage: {
+            getItem: async (key: string): Promise<string | null> => {
+                const db = await getBlobDB()
+                return new Promise((resolve, reject) => {
+                    const tx = db.transaction(BLOB_STORE_NAME, 'readonly')
+                    const req = tx.objectStore(BLOB_STORE_NAME).get(key)
+                    req.onsuccess = () => resolve(req.result ?? null)
+                    req.onerror = () => reject(req.error)
+                })
+            },
+            setItem: async (key: string, value: string): Promise<void> => {
+                const db = await getBlobDB()
+                return new Promise((resolve, reject) => {
+                    const tx = db.transaction(BLOB_STORE_NAME, 'readwrite')
+                    const req = tx.objectStore(BLOB_STORE_NAME).put(value, key)
+                    req.onsuccess = () => resolve()
+                    req.onerror = () => reject(req.error)
+                })
+            },
+            removeItem: async (key: string): Promise<void> => {
+                const db = await getBlobDB()
+                return new Promise((resolve, reject) => {
+                    const tx = db.transaction(BLOB_STORE_NAME, 'readwrite')
+                    const req = tx.objectStore(BLOB_STORE_NAME).delete(key)
+                    req.onsuccess = () => resolve()
+                    req.onerror = () => reject(req.error)
+                })
+            },
+            keys: async (): Promise<string[]> => {
+                const db = await getBlobDB()
+                return new Promise((resolve, reject) => {
+                    const tx = db.transaction(BLOB_STORE_NAME, 'readonly')
+                    const req = tx.objectStore(BLOB_STORE_NAME).getAllKeys()
+                    req.onsuccess = () => resolve(req.result as string[])
+                    req.onerror = () => reject(req.error)
+                })
+            },
         },
         setDatabaseLite: (newDb: any) => {
             const db = getDatabase();

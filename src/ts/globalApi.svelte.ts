@@ -1256,7 +1256,7 @@ export function getUncleanables(db: Database, uptype: 'basename' | 'pure' = 'bas
                 addUncleanable(em[1]);
             }
         }
-        if (cha.type !== 'group') {
+        if ((cha as any).type !== 'group') {
             if (cha.additionalAssets) {
                 for (const em of cha.additionalAssets) {
                     addUncleanable(em[1]);
@@ -1338,7 +1338,7 @@ export function replaceDbResources(db: Database, replacer: { [key: string]: stri
                 cha.emotionImages[i][1] = replaceData(cha.emotionImages[i][1]);
             }
         }
-        if (cha.type !== 'group') {
+        if ((cha as any).type !== 'group') {
             if (cha.additionalAssets) {
                 for (let i = 0; i < cha.additionalAssets.length; i++) {
                     cha.additionalAssets[i][1] = replaceData(cha.additionalAssets[i][1]);

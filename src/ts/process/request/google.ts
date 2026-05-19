@@ -315,6 +315,11 @@ export async function requestGoogleCloudVertex(arg:RequestDataArgumentExtended):
         }
     }
 
+    // Dynamic model: override internalID with user-selected model
+    if((arg.aiModel === 'google-dynamic' || arg.aiModel === 'google-dynamic-vertex') && db.googleRequestModel){
+        arg.modelInfo = { ...arg.modelInfo, internalID: db.googleRequestModel }
+    }
+
     let para:LLMParameter[] = ['temperature', 'top_p', 'top_k', 'presence_penalty', 'frequency_penalty']
 
     if(arg.modelInfo.flags.includes(LLMFlags.geminiThinking)){
@@ -361,33 +366,35 @@ export async function requestGoogleCloudVertex(arg:RequestDataArgumentExtended):
 
     if(arg.modelInfo.flags.includes(LLMFlags.geminiThinking)){
         const internalId = arg.modelInfo.internalID
-        const thinkingBudget = body.generation_config.thinkingBudget
+        // db.geminiThinkingLevel: -1=minimal, 0=low, 1=medium, 2=high (default 2)
+        const levelNum = (db.geminiThinkingLevel ?? 2) as number
+        const levelStr =
+            levelNum === -1 ? 'minimal' :
+            levelNum === 0  ? 'low' :
+            levelNum === 1  ? 'medium' :
+                              'high'
 
-        // Gemini 3 models use `thinking_level` (via thinkingConfig.thinkingLevel) instead of `thinking_budget`.
-        // Keep UI/param name 'thinking_tokens' but translate it here for compatibility.
-        if (internalId && /^gemini-3-/.test(internalId)) {
-            const budgetNum = typeof thinkingBudget === 'number' ? thinkingBudget : Number(thinkingBudget)
+        // Use thinkingBudget for: Gemini 2.5 series, and `-latest` aliases
+        // (some alias targets reject thinkingLevel even when the underlying
+        // versioned model supports it — gemini-flash-lite-latest is one).
+        // Use thinkingLevel for: explicit Gemini 3+ versioned model IDs.
+        const useBudget = !!internalId && (/^gemini-2\.5-/.test(internalId) || /-latest$/.test(internalId))
 
-            // Conservative mapping: keep levels coarse to avoid model-specific strict validation.
-            // - gemini-3-flash-preview: LOW/MEDIUM/HIGH
-            // - gemini-3-pro* (incl. image): LOW/HIGH
-            let thinkingLevel: 'LOW' | 'MEDIUM' | 'HIGH' = 'HIGH'
-            if (internalId === 'gemini-3-flash-preview') {
-                if (!Number.isFinite(budgetNum) || budgetNum >= 16384) thinkingLevel = 'HIGH'
-                else if (budgetNum >= 4096) thinkingLevel = 'MEDIUM'
-                else thinkingLevel = 'LOW'
-            } else {
-                if (!Number.isFinite(budgetNum) || budgetNum >= 8192) thinkingLevel = 'HIGH'
-                else thinkingLevel = 'LOW'
-            }
-
-            body.generation_config.thinkingConfig = {
-                "thinkingLevel": thinkingLevel,
-                "includeThoughts": true,
+        if (useBudget) {
+            const budget =
+                levelNum === -1 ? 0 :
+                levelNum === 0  ? 4096 :
+                levelNum === 1  ? 8192 :
+                                  16384
+            if (budget > 0) {
+                body.generation_config.thinkingConfig = {
+                    "thinkingBudget": budget,
+                    "includeThoughts": true,
+                }
             }
         } else {
             body.generation_config.thinkingConfig = {
-                "thinkingBudget": thinkingBudget,
+                "thinkingLevel": levelStr,
                 "includeThoughts": true,
             }
         }
@@ -418,6 +425,16 @@ export async function requestGoogleCloudVertex(arg:RequestDataArgumentExtended):
 
     if(db.gptVisionQuality === 'high'){
         body.generation_config.mediaResolution = "MEDIA_RESOLUTION_MEDIUM"
+    }
+
+    const isVertexFlexRequest = db.googleFlex && arg.modelInfo.format === LLMFormat.VertexAIGemini
+    if(db.googleFlex){
+        if(arg.modelInfo.format === LLMFormat.VertexAIGemini){
+            // Vertex uses HTTP headers for Flex, and requires the global endpoint.
+            headers['X-Vertex-AI-LLM-Shared-Request-Type'] = 'flex'
+        } else {
+            body.service_tier = "flex"
+        }
     }
 
     const PROJECT_ID = db.google.projectId
@@ -559,8 +576,8 @@ export async function requestGoogleCloudVertex(arg:RequestDataArgumentExtended):
     else if(arg.modelInfo.format === LLMFormat.VertexAIGemini){
         const endpoint = arg.useStreaming ? 'streamGenerateContent?alt=sse' : 'generateContent'
 
-        // Some models (e.g. Gemini 3 preview) are only available via the global endpoint.
-        const effectiveRegion = isVertexGlobalOnlyModel(arg.modelInfo.internalID) ? 'global' : REGION
+        // Some models (e.g. Gemini 3 preview) and Vertex Flex requests require the global endpoint.
+        const effectiveRegion = (isVertexFlexRequest || isVertexGlobalOnlyModel(arg.modelInfo.internalID)) ? 'global' : REGION
 
         url = effectiveRegion === 'global' ?
             `https://aiplatform.googleapis.com/v1/projects/${PROJECT_ID}/locations/${effectiveRegion}/publishers/google/models/${arg.modelInfo.internalID}:${endpoint}` :

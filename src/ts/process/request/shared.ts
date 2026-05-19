@@ -56,6 +56,9 @@ export function applyParameters(
             case 2: {
                 return 'high'
             }
+            case 3: {
+                return 'max'
+            }
             default: {
                 return 'medium'
             }

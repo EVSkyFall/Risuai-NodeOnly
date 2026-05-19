@@ -1,6 +1,24 @@
 import { LLMFlags, LLMFormat, LLMProvider, LLMTokenizer, OpenAIParameters, GPT5Parameters, type LLMModel } from '../types'
 
 export const OpenAIModels: LLMModel[] = [
+    // chat-latest — floating alias for the latest ChatGPT instant model (currently GPT-5.5)
+    {
+        id: 'chat-latest',
+        internalID: 'chat-latest',
+        name: 'Chat Latest (GPT 5.5)',
+        provider: LLMProvider.OpenAI,
+        format: LLMFormat.OpenAICompatible,
+        flags: [
+            LLMFlags.hasStreaming,
+            LLMFlags.OAICompletionTokens,
+            LLMFlags.hasFullSystemPrompt,
+            LLMFlags.hasImageInput,
+            LLMFlags.DeveloperRole
+        ],
+        parameters: OpenAIParameters,
+        tokenizer: LLMTokenizer.tiktokenO200Base,
+        recommended: true
+    },
     // GPT-5.4 (March 2026)
     {
         id: 'gpt-5.4',

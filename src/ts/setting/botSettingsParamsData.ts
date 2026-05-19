@@ -153,7 +153,8 @@ export const modelSpecificParameterItems: SettingItem[] = [
         bindKey: 'thinkingTokens',
         condition: (ctx) =>
             ctx.modelInfo.parameters.includes('thinking_tokens') &&
-            ctx.db.thinkingType === 'budget',
+            ctx.db.thinkingType === 'budget' &&
+            !ctx.modelInfo.flags.includes(LLMFlags.geminiThinking),
         options: {
             min: -1,
             max: 64000,
@@ -161,6 +162,22 @@ export const modelSpecificParameterItems: SettingItem[] = [
             disableable: true,
         },
         keywords: ['thinking', 'tokens', 'reasoning'],
+    },
+    {
+        id: 'params.geminiThinkingLevel',
+        type: 'segmented',
+        fallbackLabel: 'Thinking Level',
+        bindKey: 'geminiThinkingLevel',
+        condition: (ctx) => ctx.modelInfo.flags.includes(LLMFlags.geminiThinking),
+        options: {
+            segmentOptions: [
+                { value: -1, label: 'Minimal' },
+                { value: 0, label: 'Low' },
+                { value: 1, label: 'Medium' },
+                { value: 2, label: 'High' },
+            ],
+        },
+        keywords: ['thinking', 'level', 'effort', 'gemini'],
     },
     {
         id: 'params.adaptiveThinkingEffort',
@@ -256,16 +273,21 @@ export const modelSpecificParameterItems: SettingItem[] = [
     },
     {
         id: 'params.reasoningEffort',
-        type: 'slider',
+        type: 'segmented',
         fallbackLabel: 'Reasoning Effort',
         bindKey: 'reasoningEffort',
         condition: (ctx) => ctx.modelInfo.parameters.includes('reasoning_effort'),
         options: {
-            min: -1,
-            max: 2,
-            step: 1,
-            fixed: 0,
-            disableable: true,
+            segmentOptions: [
+                { value: -1, label: 'Minimal' },
+                { value: 0, label: 'Low' },
+                { value: 1, label: 'Medium' },
+                { value: 2, label: 'High' },
+                // DeepSeek V4 family adds a "max" tier above "high". OpenAI
+                // o-series / GPT-5 don't accept it — backend clamp handles
+                // those (see shared.ts getEffort + per-provider mapping).
+                { value: 3, label: 'Max' },
+            ],
         },
         keywords: ['reasoning', 'effort'],
     },
@@ -298,6 +320,7 @@ export const allBasicParameterItems: SettingItem[] = [
     // Model-specific sampling parameters (in user-specified order)
     modelSpecificParameterItems.find(i => i.id === 'params.thinkingType')!,
     modelSpecificParameterItems.find(i => i.id === 'params.thinkingTokens')!,
+    modelSpecificParameterItems.find(i => i.id === 'params.geminiThinkingLevel')!,
     modelSpecificParameterItems.find(i => i.id === 'params.adaptiveThinkingEffort')!,
     modelSpecificParameterItems.find(i => i.id === 'params.claudeAdaptiveDisplaySummarized')!,
     ...samplingParameterItems, // temperature

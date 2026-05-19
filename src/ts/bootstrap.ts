@@ -152,6 +152,7 @@ export async function loadData() {
             // polls them in the background and writes the result into the
             // matching message slot when the batch ends.
             import('./process/request/claudeBatchTracker').then(m => m.resumeClaudeBatches()).catch(() => {})
+            import('./process/request/openAIBatchTracker').then(m => m.initOpenAIBatchTracker()).catch(() => {})
             // Connect to /ws/llm-worker so /api/mcp/llm/call can route through
             // RisuAI's full requestChatData pipeline (provider routing, auth,
             // model translation) instead of server.cjs re-implementing it.

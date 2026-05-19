@@ -1,7 +1,7 @@
 import { language } from "src/lang"
 import { alertError } from "src/ts/alert";
 import { getDatabase } from "src/ts/storage/database.svelte"
-import { LLMFlags, LLMFormat } from "src/ts/model/modellist"
+import { LLMFlags, LLMFormat, LLMProvider } from "src/ts/model/modellist"
 import { strongBan, tokenizeNum } from "src/ts/tokenizer"
 import { getFreeOpenRouterModels } from "src/ts/model/openrouter"
 import { addFetchLog, fetchNative, globalFetch, textifyReadableStream } from "src/ts/globalApi.svelte"
@@ -227,7 +227,7 @@ export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<req
     }
 
 
-    let requestModel = (aiModel === 'reverse_proxy' || aiModel === 'openrouter') ? db.proxyRequestModel : aiModel
+    let requestModel = (aiModel === 'reverse_proxy' || aiModel === 'openrouter' || aiModel === 'vercel' || aiModel === 'openai-dynamic') ? db.proxyRequestModel : aiModel
     let openrouterRequestModel = db.openrouterRequestModel
     if(aiModel === 'reverse_proxy'){
         requestModel = db.customProxyRequestModel
@@ -367,6 +367,8 @@ export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<req
         [key:string]:any
     } = ({
         model: aiModel === 'openrouter' ? openrouterRequestModel :
+            aiModel === 'vercel' ? db.vercelRequestModel :
+            aiModel === 'openai-dynamic' ? db.openAIRequestModel :
             requestModel ===  'gpt35' ? 'gpt-3.5-turbo'
             : requestModel ===  'gpt35_0613' ? 'gpt-3.5-turbo-0613'
             : requestModel ===  'gpt35_16k' ? 'gpt-3.5-turbo-16k'
@@ -461,6 +463,10 @@ export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<req
         }
     }
 
+    if(db.openAIFlex && arg.modelInfo.provider === LLMProvider.OpenAI){
+        body.service_tier = "flex"
+    }
+
     body = applyParameters(
         body,
         arg.modelInfo.parameters,
@@ -470,6 +476,30 @@ export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<req
             modelId: arg.modelInfo.id
         }
     )
+
+    // DeepSeek V4 thinking enable: wire reasoning_effort alone has no effect
+    // — the API requires `thinking: {type: 'enabled'}` alongside it. We use
+    // the deepSeekThinkingInput flag as the signal (V4 Pro / Flash / reasoner
+    // all carry it). This also flows correctly through Ollama Cloud since
+    // it forwards extra fields to DeepSeek upstream.
+    if(arg.modelInfo.flags.includes(LLMFlags.deepSeekThinkingInput)){
+        if(body.reasoning_effort === 'minimal'){
+            body.thinking = { type: 'disabled' }
+            delete body.reasoning_effort
+        } else {
+            body.thinking = { type: 'enabled' }
+            // DeepSeek only honours "high" or "max"; coerce client-side so
+            // logs reflect what the server actually sees (low/medium would
+            // be silently mapped to "high" anyway).
+            if(body.reasoning_effort === 'low' || body.reasoning_effort === 'medium'){
+                body.reasoning_effort = 'high'
+            }
+        }
+    } else if(body.reasoning_effort === 'max'){
+        // Non-DeepSeek reasoning models (OpenAI o-series, GPT-5) reject "max"
+        // as 400 invalid_request. Clamp to "high".
+        body.reasoning_effort = 'high'
+    }
 
     if(arg.tools && arg.tools.length > 0){
         body.tools = arg.tools.map(tool => {
@@ -510,6 +540,7 @@ export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<req
     }
 
     let replacerURL = aiModel === 'openrouter' ? "https://openrouter.ai/api/v1/chat/completions" :
+        aiModel === 'vercel' ? "https://ai-gateway.vercel.sh/v1/chat/completions" :
         (arg.customURL) ?? ('https://api.openai.com/v1/chat/completions')
 
     if(arg.modelInfo?.endpoint){
@@ -540,7 +571,7 @@ export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<req
     }
 
     let headers = {
-        "Authorization": "Bearer " + (arg.key ?? (aiModel === 'reverse_proxy' ?  db.proxyKey : (aiModel === 'openrouter' ? db.openrouterKey : db.openAIKey))),
+        "Authorization": "Bearer " + (arg.key ?? (aiModel === 'reverse_proxy' ?  db.proxyKey : (aiModel === 'openrouter' ? db.openrouterKey : (aiModel === 'vercel' ? db.vercelKey : db.openAIKey)))),
         "Content-Type": "application/json"
     }
 
@@ -631,6 +662,20 @@ export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<req
         }
     }
 
+    // OpenAI Batch API: submit as async batch (50% discount, 24h)
+    if(db.openAIBatch && arg.modelInfo.provider === LLMProvider.OpenAI){
+        delete body.stream
+        try {
+            const { submitOpenAIBatch } = await import('../openAIBatchTracker')
+            const apiKey = db.openAIKey
+            const { batchId, placeholderStream } = await submitOpenAIBatch(body, apiKey)
+            arg.additionalBatchId = batchId
+            return { type: 'streaming', result: placeholderStream }
+        } catch (e: any) {
+            return { type: 'fail', result: e?.message || 'OpenAI Batch submission failed' }
+        }
+    }
+
     if(arg.useStreaming){
         body.stream = true
 
@@ -683,7 +728,7 @@ export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<req
 
         return {
             type: 'streaming',
-            result: wrapToolStream(transtream.readable, body, headers, replacerURL, arg)
+            result: wrapToolStream(transtream.readable, body, headers, replacerURL, arg, copilotTaskId)
         }
     }
 
@@ -1197,146 +1242,125 @@ export async function requestOpenAIResponseAPI(arg:RequestDataArgumentExtended):
 }
 
 function getTranStream(arg:RequestDataArgumentExtended):TransformStream<Uint8Array, StreamResponseChunk> {
-    let dataUint:Uint8Array|Buffer = new Uint8Array([])
+    // Incremental SSE parser. State persists across transform() calls so
+    // each chunk only processes its newly-arrived lines (prior O(n²) behavior
+    // re-split the entire growing buffer every chunk).
+    let buffer = ""
+    let readed: {[key:string]:string} = {}
     let reasoningContent = ""
+    const decoder = new TextDecoder('utf-8')
     const db = getDatabase()
+
+    const composeEnqueue = (control: TransformStreamDefaultController<StreamResponseChunk>) => {
+        if(arg.extractJson && (db.jsonSchemaEnabled || arg.schema)){
+            const JSONreaded:{[key:string]:string} = {}
+            for(const key in readed){
+                JSONreaded[key] = extractJSON(readed[key], arg.extractJson)
+            }
+            control.enqueue(JSONreaded)
+        } else if(reasoningContent){
+            // Stream reasoning live so the UI doesn't sit blank while a long
+            // chain-of-thought streams before the answer body starts.
+            control.enqueue({
+                ...readed,
+                "0": `<Thoughts>\n${reasoningContent}\n</Thoughts>\n${readed["0"] ?? ''}`
+            })
+        } else {
+            control.enqueue({ ...readed })
+        }
+    }
+
+    const processLine = (line: string, control: TransformStreamDefaultController<StreamResponseChunk>): boolean => {
+        if(!line.startsWith("data: ")) return false
+        const rawChunk = line.slice(6)
+        if(rawChunk === "[DONE]"){
+            if(arg.modelInfo.flags.includes(LLMFlags.deepSeekThinkingOutput) && readed["0"]){
+                readed["0"] = readed["0"].replace(/(.*)\<\/think\>/gms, (_m, p1) => {
+                    reasoningContent = p1
+                    return ""
+                })
+                if(reasoningContent){
+                    reasoningContent = reasoningContent.replace(/\<think\>/gm, '')
+                }
+            }
+            composeEnqueue(control)
+            return true
+        }
+        try {
+            const parsed = JSON.parse(rawChunk)
+            const choices = parsed.choices ?? []
+            for(const choice of choices){
+                const chunkText: string = choice.delta?.content ?? choice.text ?? ''
+                if(chunkText){
+                    const key = arg.multiGen ? choice.index.toString() : "0"
+                    const prev = readed[key] ?? ""
+                    // DeepSeek API ships cumulative chunks despite the spec.
+                    // Detect by prefix match and replace, otherwise quadratic
+                    // text bloat (every chunk re-emits all prior text).
+                    if(prev.length > 0 && chunkText.length > prev.length && chunkText.startsWith(prev)){
+                        readed[key] = chunkText
+                    } else {
+                        readed[key] = prev + chunkText
+                    }
+                }
+                if(choice?.delta?.tool_calls){
+                    if(!readed["__tool_calls"]){
+                        readed["__tool_calls"] = JSON.stringify({})
+                    }
+                    const toolCallsData = JSON.parse(readed["__tool_calls"])
+                    for(const toolCall of choice.delta.tool_calls){
+                        const index = toolCall.index ?? 0
+                        if(!toolCallsData[index]){
+                            toolCallsData[index] = {
+                                id: toolCall.id || null,
+                                type: 'function',
+                                function: { name: null, arguments: '' }
+                            }
+                        }
+                        if(toolCall.id) toolCallsData[index].id = toolCall.id
+                        if(toolCall.function?.name) toolCallsData[index].function.name = toolCall.function.name
+                        if(toolCall.function?.arguments) toolCallsData[index].function.arguments += toolCall.function.arguments
+                    }
+                    readed["__tool_calls"] = JSON.stringify(toolCallsData)
+                }
+                if(choice?.delta?.reasoning_content){
+                    const rc: string = choice.delta.reasoning_content
+                    if(reasoningContent.length > 0 && rc.length > reasoningContent.length && rc.startsWith(reasoningContent)){
+                        reasoningContent = rc
+                    } else {
+                        reasoningContent += rc
+                    }
+                }
+            }
+        } catch {}
+        return false
+    }
 
     return new TransformStream<Uint8Array, StreamResponseChunk>({
         transform(chunk, control) {
-            const combined = new Uint8Array(dataUint.length + chunk.length);
-            combined.set(dataUint, 0);
-            combined.set(chunk, dataUint.length);
-            dataUint = Buffer.from(combined);
-            let JSONreaded:{[key:string]:string} = {}
-                        try {
-                const datas = dataUint.toString().split('\n')
-                let readed:{[key:string]:string} = {}
-                for(const data of datas){
-                    if(data.startsWith("data: ")){
-                        try {
-                            const rawChunk = data.replace("data: ", "")
-                            if(rawChunk === "[DONE]"){
-                                if(arg.modelInfo.flags.includes(LLMFlags.deepSeekThinkingOutput)){
-                                    readed["0"] = readed["0"].replace(/(.*)\<\/think\>/gms, (m, p1) => {
-                                        reasoningContent = p1
-                                        return ""
-                                    })
-                
-                                    if(reasoningContent){
-                                        reasoningContent = reasoningContent.replace(/\<think\>/gm, '')
-                                    }
-                                }                
-                                if(arg.extractJson && (db.jsonSchemaEnabled || arg.schema)){
-                                    for(const key in readed){
-                                        const extracted = extractJSON(readed[key], arg.extractJson)
-                                        JSONreaded[key] = extracted
-                                    }
-                                    console.log(JSONreaded)
-                                    control.enqueue(JSONreaded)
-                                }
-                                else if(reasoningContent){
-                                    control.enqueue({
-                                        "0": `<Thoughts>\n${reasoningContent}\n</Thoughts>\n${readed["0"]}`
-                                    })
-                                }
-                                else{
-                                    control.enqueue(readed)
-                                }
-                                return
-                            }
-                            const choices = JSON.parse(rawChunk).choices
-                            for(const choice of choices){
-                                const chunk = choice.delta.content ?? choices.text
-                                if(chunk){
-                                    if(arg.multiGen){
-                                        const ind = choice.index.toString()
-                                        if(!readed[ind]){
-                                            readed[ind] = ""
-                                        }
-                                        readed[ind] += chunk
-                                    }
-                                    else{
-                                        if(!readed["0"]){
-                                            readed["0"] = ""
-                                        }
-                                        readed["0"] += chunk
-                                    }
-                                }
-                                // Check for tool calls in the delta
-                                if(choice?.delta?.tool_calls){
-                                    if(!readed["__tool_calls"]){
-                                        readed["__tool_calls"] = JSON.stringify({})
-                                    }
-                                    const toolCallsData = JSON.parse(readed["__tool_calls"])
-                                    
-                                    for(const toolCall of choice.delta.tool_calls) {
-                                        const index = toolCall.index ?? 0
-                                        const toolCallId = toolCall.id
-                                        
-                                        // Initialize tool call data if not exists
-                                        if(!toolCallsData[index]) {
-                                            toolCallsData[index] = {
-                                                id: toolCallId || null,
-                                                type: 'function',
-                                                function: {
-                                                    name: null,
-                                                    arguments: ''
-                                                }
-                                            }
-                                        }
-                                        
-                                        // Update tool call data incrementally
-                                        if(toolCall.id) {
-                                            toolCallsData[index].id = toolCall.id
-                                        }
-                                        if(toolCall.function?.name) {
-                                            toolCallsData[index].function.name = toolCall.function.name
-                                        }
-                                        if(toolCall.function?.arguments) {
-                                            toolCallsData[index].function.arguments += toolCall.function.arguments
-                                        }
-                                    }
-                                    
-                                    readed["__tool_calls"] = JSON.stringify(toolCallsData)
-                                }
-                                if(choice?.delta?.reasoning_content){
-                                    reasoningContent += choice.delta.reasoning_content
-                                }
-                            }
-                        } catch (error) {}
-                    }
-                }
-                
-                if(arg.modelInfo.flags.includes(LLMFlags.deepSeekThinkingOutput)){
-                    readed["0"] = readed["0"].replace(/(.*)\<\/think\>/gms, (m, p1) => {
-                        reasoningContent = p1
-                        return ""
-                    })
+            buffer += decoder.decode(chunk, { stream: true })
+            const lines = buffer.split('\n')
+            buffer = lines.pop() ?? ''  // keep incomplete tail for next call
 
-                    if(reasoningContent){
-                        reasoningContent = reasoningContent.replace(/\<think\>/gm, '')
-                    }
+            let terminated = false
+            for(const line of lines){
+                if(processLine(line, control)){
+                    terminated = true
+                    break
                 }
-                if(arg.extractJson && (db.jsonSchemaEnabled || arg.schema)){
-                    for(const key in readed){
-                        const extracted = extractJSON(readed[key], arg.extractJson)
-                        JSONreaded[key] = extracted
-                    }
-                    console.log(JSONreaded)
-                    control.enqueue(JSONreaded)
-                }
-                else if(reasoningContent){
-                    control.enqueue({
-                        "0": `<Thoughts>\n${reasoningContent}\n</Thoughts>\n${readed["0"]}`
-                    })
-                }
-                else{
-                    control.enqueue(readed)
-                }
-            } catch (error) {
-                
             }
-        }        
+            if(!terminated){
+                composeEnqueue(control)
+            }
+        },
+        flush(control){
+            const tail = buffer + decoder.decode()
+            buffer = ''
+            if(tail.trim()){
+                processLine(tail, control)
+            }
+            composeEnqueue(control)
+        }
     })
 }
 
@@ -1345,7 +1369,8 @@ function wrapToolStream(
     body:any,
     headers:Record<string,string>,
     replacerURL:string,
-    arg:RequestDataArgumentExtended
+    arg:RequestDataArgumentExtended,
+    copilotTaskId?: string
 ):ReadableStream<StreamResponseChunk> {
     return new ReadableStream<StreamResponseChunk>({
         async start(controller) {
@@ -1354,6 +1379,7 @@ function wrapToolStream(
             let reader = stream.getReader()
             let prefix = ''
             let lastValue
+            let currentCopilotTaskId = copilotTaskId
 
             while(true){
                 let {done, value} = await reader.read()
@@ -1437,7 +1463,7 @@ function wrapToolStream(
                         
                         body.messages = messages
                         // Reapply Copilot task headers for tool continuation (same taskId)
-                        applyCopilotTaskHeaders(headers, replacerURL, copilotTaskId, true)
+                        currentCopilotTaskId = applyCopilotTaskHeaders(headers, replacerURL, currentCopilotTaskId, true)
 
                         let resRec
                         let attempt = 0

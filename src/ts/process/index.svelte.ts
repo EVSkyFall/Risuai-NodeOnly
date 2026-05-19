@@ -251,7 +251,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         caculatedChatTokens += 3
     }
 
-    if(nowChatroom.type === 'group'){
+    if((nowChatroom as any).type === 'group'){
         alertError('Group chat is no longer supported.')
         return false
     }
@@ -1024,7 +1024,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     }
 
     //continue chat model
-    if(arg.continue && (DBState.db.aiModel.startsWith('claude') || DBState.db.aiModel.startsWith('gpt') || DBState.db.aiModel.startsWith('openrouter') || DBState.db.aiModel.startsWith('reverse_proxy'))){
+    if(arg.continue && (DBState.db.aiModel.startsWith('claude') || DBState.db.aiModel.startsWith('gpt') || DBState.db.aiModel.startsWith('openrouter') || DBState.db.aiModel.startsWith('reverse_proxy') || DBState.db.aiModel === 'vercel')){
         unformated.postEverything.push({
             role: 'system',
             content: '[Continue the last response]'
@@ -1036,7 +1036,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             if(!chat.content.trim() && !(chat.multimodals && chat.multimodals.length > 0)){
                 continue
             }
-            if(!(DBState.db.aiModel.startsWith('gpt') || DBState.db.aiModel.startsWith('claude') || DBState.db.aiModel === 'openrouter' || DBState.db.aiModel === 'reverse_proxy')){
+            if(!(DBState.db.aiModel.startsWith('gpt') || DBState.db.aiModel.startsWith('claude') || DBState.db.aiModel === 'openrouter' || DBState.db.aiModel === 'reverse_proxy' || DBState.db.aiModel === 'vercel')){
                 formated.push(chat)
                 continue
             }

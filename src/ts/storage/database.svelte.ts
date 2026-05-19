@@ -372,6 +372,11 @@ export function setDatabase(data:Database){
     data.ainconfig ??= safeStructuredClone(defaultAIN)
     data.openrouterKey ??= ''
     data.openrouterRequestModel ??= 'openai/gpt-3.5-turbo'
+    data.vercelKey ??= ''
+    data.vercelRequestModel ??= ''
+    data.openAIRequestModel ??= ''
+    data.googleRequestModel ??= ''
+    data.geminiThinkingLevel ??= 2
     data.nanogptKey ??= ''
     data.nanogptRequestModel ??= ''
     data.nanogptRequestModelName ??= ''
@@ -630,6 +635,10 @@ export function setDatabase(data:Database){
     data.authRefreshes ??= []
     data.rememberToolUsage ??= true
     data.simplifiedToolUse ??= false
+    data.claudeBatching ??= false
+    data.googleFlex ??= false
+    data.openAIFlex ??= false
+    data.openAIBatch ??= false
     data.streamGeminiThoughts ??= false
     data.settingsCloseButtonSize ??= 24
     data.showModelInSidebar ??= true
@@ -1018,6 +1027,11 @@ export interface Database{
     personaPrompt:string
     openrouterRequestModel:string
     openrouterKey:string
+    vercelRequestModel:string
+    vercelKey:string
+    openAIRequestModel:string
+    googleRequestModel:string
+    geminiThinkingLevel:number
     openrouterMiddleOut:boolean
     nanogptKey:string
     nanogptRequestModel:string
@@ -1291,6 +1305,9 @@ export interface Database{
     promptInfoInsideChat:boolean
     promptTextInfoInsideChat:boolean
     claudeBatching:boolean
+    googleFlex:boolean
+    openAIFlex:boolean
+    openAIBatch:boolean
     claude1HourCaching:boolean
     rememberToolUsage:boolean
     simplifiedToolUse:boolean

@@ -1,6 +1,6 @@
 import type { Tiktoken } from "@dqbd/tiktoken";
 import type { Tokenizer } from "@mlc-ai/web-tokenizers";
-import { type groupChat, type character, type Chat, getCurrentCharacter, getDatabase } from "./storage/database.svelte";
+import { type character, type Chat, getCurrentCharacter, getDatabase } from "./storage/database.svelte";
 import type { MultiModal, OpenAIChat } from "./process/index.svelte";
 import { supportsInlayImage } from "./process/files/inlays";
 import { risuChatParser } from "./parser/parser.svelte";
@@ -359,7 +359,7 @@ export async function encode(data:string):Promise<(number[]|Uint32Array|Int32Arr
 
     let result: number[] | Uint32Array | Int32Array;
 
-    if(db.aiModel === 'openrouter' || db.aiModel === 'reverse_proxy'){
+    if(db.aiModel === 'openrouter' || db.aiModel === 'reverse_proxy' || db.aiModel === 'vercel'){
         switch(db.customTokenizer){
             case 'mistral':
                 result = await tokenizeWebTokenizers(data, 'mistral'); break;
@@ -788,7 +788,7 @@ export async function strongBan(data:string, bias:{[key:number]:number}) {
     return bias
 }
 
-export async function getCharToken(char?:character|groupChat|null){
+export async function getCharToken(char?:character|null){
     let persistant = 0
     let dynamic = 0
 
@@ -796,7 +796,7 @@ export async function getCharToken(char?:character|groupChat|null){
         const c = getCurrentCharacter()
         char = c
     }
-    if(char.type === 'group'){
+    if((char as any).type === 'group'){
         return {persistant:0, dynamic:0}
     }
 

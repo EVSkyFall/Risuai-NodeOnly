@@ -138,7 +138,7 @@ export async function requestChatData(arg:requestDataArgument, model:ModelModeEx
             
             try{
                 const currentChar = getCurrentCharacter()
-                if(currentChar?.type !== 'group'){
+                if((currentChar as any)?.type !== 'group'){
                     const perf = performance.now()
                     const d = await runTrigger(currentChar, 'request', {
                         chat: getCurrentChat(),
@@ -260,7 +260,7 @@ export function reformater(formated:OpenAIChat[],modelInfo:LLMModel|LLMFlags[]){
         for(let i=0;i<formated.length;i++){
             if(formated[i].role === 'system'){
                 formated[i].content = db.systemContentReplacement ? db.systemContentReplacement.replace('{{slot}}', formated[i].content) : `system: ${formated[i].content}`
-                formated[i].role = db.systemRoleReplacement
+                formated[i].role = db.systemRoleReplacement || 'user'
             }
         }
     }
@@ -1034,18 +1034,51 @@ async function requestOllama(arg:RequestDataArgumentExtended):Promise<requestDat
         }
     }
 
+    // Models that emit a separate thinking channel via Ollama (DeepSeek V4 Pro,
+    // gpt-oss, qwq, etc). Sending `think: true` to a non-thinking model is a
+    // no-op, but we gate it on a name match so we don't change behavior for
+    // existing setups that didn't opt in.
+    const modelName = (db.ollamaModel || '').toLowerCase()
+    const isThinkingModel = /(?:^|[\/:_-])(deepseek-v4|deepseek-r1|deepseek-reasoner|gpt-oss|qwq|qwen3|magistral)/.test(modelName)
+
     const response = await ollama.chat({
         model: db.ollamaModel,
         messages: messages,
-        stream: true
+        stream: true,
+        ...(isThinkingModel ? { think: true } : {})
     })
 
     const readableStream = new ReadableStream<StreamResponseChunk>({
         async start(controller){
+            let thinkingBuf = ''
+            let thinkingHeaderEmitted = false
+            let inThinking = false
+            let contentBuf = ''
             for await(const chunk of response){
-                controller.enqueue({
-                    "0": chunk.message.content
-                })
+                const m: any = chunk.message ?? {}
+                const thinkingDelta: string = m.thinking ?? ''
+                const contentDelta: string = m.content ?? ''
+                if(thinkingDelta){
+                    if(!thinkingHeaderEmitted){
+                        thinkingHeaderEmitted = true
+                        inThinking = true
+                        contentBuf += '<Thoughts>\n'
+                    }
+                    thinkingBuf += thinkingDelta
+                    contentBuf += thinkingDelta
+                }
+                if(contentDelta){
+                    if(inThinking){
+                        inThinking = false
+                        contentBuf += '\n</Thoughts>\n'
+                    }
+                    contentBuf += contentDelta
+                }
+                controller.enqueue({ "0": contentBuf })
+            }
+            if(inThinking){
+                contentBuf += '\n</Thoughts>\n'
+                controller.enqueue({ "0": contentBuf })
             }
             controller.close()
         }

@@ -21,6 +21,9 @@
     import CheckInput from "src/lib/UI/GUI/CheckInput.svelte";
     import SegmentedControl from "src/lib/UI/GUI/SegmentedControl.svelte";
     import { getOpenRouterModels, toModelGridItem as orToGridItem } from "src/ts/model/openrouter";
+    import { getVercelModels, toModelGridItem as vcToGridItem } from "src/ts/model/vercel";
+    import { getOpenAIDynamicModels, toModelGridItem as oaiToGridItem } from "src/ts/model/openaiDynamic";
+    import { getGoogleDynamicModels, toModelGridItem as gglToGridItem } from "src/ts/model/googleDynamic";
     import { getNanoGPTModels, getNanoGPTSubscriptionModels, toModelGridItem as ngToGridItem } from "src/ts/model/nanogpt";
     import ModelGrid from "src/lib/UI/ModelGrid.svelte";
     import NanoGPTDashboard from "src/lib/UI/NanoGPTDashboard.svelte";
@@ -301,7 +304,34 @@
             <ModelGrid bind:value={DBState.db.openrouterRequestModel} items={(m ?? []).map(orToGridItem)} pinnedItems={openrouterPinnedItems} />
         {/await}
     {/if}
-    {#if DBState.db.aiModel === 'openrouter' || DBState.db.aiModel === 'reverse_proxy'}
+    {#if DBState.db.aiModel === 'vercel' || DBState.db.subModel === 'vercel'}
+        <span class="text-textcolor mt-4">Vercel AI Gateway {language.apiKey}</span>
+        <TextInput hideText={DBState.db.hideApiKey} marginBottom={false} size={"sm"} bind:value={DBState.db.vercelKey} />
+
+        <span class="text-textcolor mt-4">Vercel AI Gateway {language.model}</span>
+        {#await getVercelModels()}
+            <ModelGrid bind:value={DBState.db.vercelRequestModel} loading={true} />
+        {:then m}
+            <ModelGrid bind:value={DBState.db.vercelRequestModel} items={(m ?? []).map(vcToGridItem)} />
+        {/await}
+    {/if}
+    {#if DBState.db.aiModel === 'openai-dynamic' || DBState.db.subModel === 'openai-dynamic'}
+        <span class="text-textcolor mt-4">OpenAI {language.model}</span>
+        {#await getOpenAIDynamicModels()}
+            <ModelGrid bind:value={DBState.db.openAIRequestModel} loading={true} />
+        {:then m}
+            <ModelGrid bind:value={DBState.db.openAIRequestModel} items={(m ?? []).map(oaiToGridItem)} />
+        {/await}
+    {/if}
+    {#if DBState.db.aiModel === 'google-dynamic' || DBState.db.subModel === 'google-dynamic' || DBState.db.aiModel === 'google-dynamic-vertex' || DBState.db.subModel === 'google-dynamic-vertex'}
+        <span class="text-textcolor mt-4">Google AI {language.model}</span>
+        {#await getGoogleDynamicModels()}
+            <ModelGrid bind:value={DBState.db.googleRequestModel} loading={true} />
+        {:then m}
+            <ModelGrid bind:value={DBState.db.googleRequestModel} items={(m ?? []).map(gglToGridItem)} />
+        {/await}
+    {/if}
+    {#if DBState.db.aiModel === 'openrouter' || DBState.db.aiModel === 'reverse_proxy' || DBState.db.aiModel === 'vercel' || DBState.db.aiModel === 'openai-dynamic' || DBState.db.aiModel === 'google-dynamic' || DBState.db.aiModel === 'google-dynamic-vertex'}
         <span class="text-textcolor">{language.tokenizer}</span>
         <SelectInput bind:value={DBState.db.customTokenizer}>
             {#each tokenizerList as entry}
@@ -340,6 +370,20 @@
             <Check bind:check={DBState.db.NAIadventure} name={language.textAdventureNAI}/>
 
             <Check bind:check={DBState.db.NAIappendName} name={language.appendNameNAI}/>
+        {/if}
+
+        {#if modelInfo.provider === LLMProvider.Anthropic || subModelInfo.provider === LLMProvider.Anthropic}
+            <Check bind:check={DBState.db.claudeBatching} name="Claude Batching"/>
+        {/if}
+
+        {#if modelInfo.provider === LLMProvider.GoogleCloud || subModelInfo.provider === LLMProvider.GoogleCloud
+            || modelInfo.provider === LLMProvider.VertexAI || subModelInfo.provider === LLMProvider.VertexAI}
+            <Check bind:check={DBState.db.googleFlex} name="Google Flex Processing"/>
+        {/if}
+
+        {#if modelInfo.provider === LLMProvider.OpenAI || subModelInfo.provider === LLMProvider.OpenAI}
+            <Check bind:check={DBState.db.openAIFlex} name="OpenAI Flex"/>
+            <Check bind:check={DBState.db.openAIBatch} name="OpenAI Batch"/>
         {/if}
     </div>
 

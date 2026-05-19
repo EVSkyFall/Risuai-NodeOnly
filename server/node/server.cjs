@@ -103,10 +103,16 @@ function applyCopilotTurnHeaders(header, targetUrl, turnId, requestBody) {
     } catch {}
 
     // Auto-bundle: if no turnId or unknown turnId, try to attach to the most recent session for this model
+    // gpt-5.5 via /responses rejects agent-mode bundling ("extensions do not support agent mode")
+    // For these models, force a fresh turnId every request so X-Initiator: user is always sent.
     const now = Date.now()
     let effectiveTurnId = turnId
     let autoBundled = false
-    if (model) {
+    // Auto-bundling disabled — every request gets a fresh turnId (user-initiated).
+    // Copilot increasingly rejects agent mode for extensions ("extensions do not support agent mode").
+    if (true) {
+        effectiveTurnId = nodeCrypto.randomUUID()
+    } else if (model) {
         const recent = recentModelSessions.get(model)
         if (recent && (now - recent.lastUsed < COPILOT_SESSION_TTL_MS)) {
             const recentSession = copilotTurnSessions.get(recent.key)
@@ -3507,12 +3513,15 @@ app.get('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
         const chaId = req.params.chaId;
         const chatIndex = parseInt(req.params.chatIndex, 10);
         const expectedChatId = req.headers['x-chat-id'];
+        console.warn(`[chat-content] GET chaId=${chaId?.substring(0,8)} idx=${chatIndex} expectedChatId=${expectedChatId?.substring(0,8) || 'none'}`);
 
         await ensureChatStore();
         // First try fullChatStore (fast path)
         const charChats = fullChatStore.get(chaId);
+        console.warn(`[chat-content] fullChatStore has cha: ${!!charChats}, size=${charChats?.size ?? 0}`);
         if (charChats && expectedChatId) {
             const chat = charChats.get(expectedChatId);
+            console.warn(`[chat-content] fullChatStore lookup chatId=${expectedChatId?.substring(0,8)} found=${!!chat}`);
             if (chat) {
                 if (!restoreColdStorageChat(chat)) {
                     return res.status(500).json({ error: 'Cold storage restore failed' });
@@ -3523,14 +3532,49 @@ app.get('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
             }
         }
 
-        // Fallback: load from disk and find by index
+        // Fallback: try remote file first (per-character full data with chats)
+        console.warn(`[chat-content] falling back to remote file lookup`);
+        const remoteRaw = kvGet(`remotes/${chaId}.local.bin`);
+        if (remoteRaw) {
+            try {
+                const charData = JSON.parse(new TextDecoder().decode(remoteRaw));
+                const chats = charData.chats;
+                console.warn(`[chat-content] remote lookup chats.length=${chats?.length ?? 0}`);
+                if (Array.isArray(chats)) {
+                    // Try by expectedChatId first (more reliable than index)
+                    let chat = null;
+                    if (expectedChatId) {
+                        chat = chats.find(c => c?.id === expectedChatId);
+                    }
+                    if (!chat && chats[chatIndex]) {
+                        chat = chats[chatIndex];
+                    }
+                    if (chat) {
+                        // Cache to fullChatStore so subsequent reads are fast
+                        if (!fullChatStore.has(chaId)) fullChatStore.set(chaId, new Map());
+                        fullChatStore.get(chaId).set(chat.id, chat);
+                        const encoded = Buffer.from(encodeRisuSaveLegacy(chat));
+                        res.setHeader('Content-Type', 'application/octet-stream');
+                        console.warn(`[chat-content] served from remote file: chatId=${chat.id?.substring(0,8)} msgs=${chat.message?.length ?? 0}`);
+                        return res.send(encoded);
+                    }
+                }
+            } catch (e) {
+                console.warn(`[chat-content] remote file parse error:`, e.message);
+            }
+        }
+
+        // Final fallback: decode database.bin (REMOTE blocks are skipped — chats may be stubs)
         const raw = kvGet('database/database.bin');
         if (!raw) {
+            console.warn(`[chat-content] 404 — database.bin not in kv`);
             return res.status(404).json({ error: 'Database not found' });
         }
         const dbObj = await decodeRisuSave(raw);
         const char = dbObj.characters?.find(c => c?.chaId === chaId);
+        console.warn(`[chat-content] disk lookup char found=${!!char}, chats.length=${char?.chats?.length ?? 0}`);
         if (!char?.chats?.[chatIndex]) {
+            console.warn(`[chat-content] 404 — chat at index ${chatIndex} not found`);
             return res.status(404).json({ error: 'Chat not found' });
         }
         const chat = char.chats[chatIndex];
