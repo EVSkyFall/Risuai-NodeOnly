@@ -644,19 +644,25 @@ async function recoverChatsFromRemotes(dbObj) {
 
         let charRecovered = 0;
         for (let i = 0; i < char.chats.length; i++) {
-            const stub = char.chats[i];
-            if (!stub?._stub) continue;
+            const chat = char.chats[i];
+            if (!chat) continue;
+            // Recover stubs AND empty non-stubs (hybrid corruption: _stub flag
+            // was stripped but messages were never filled in).
+            const needsRecovery = chat._stub === true
+                || !Array.isArray(chat.message)
+                || chat.message.length === 0;
+            if (!needsRecovery) continue;
 
-            const candidates = remoteChatsByName.get(stub.name);
+            const candidates = remoteChatsByName.get(chat.name);
             if (!candidates || candidates.length === 0) continue;
             const remoteChat = candidates.shift();
 
             const merged = { ...remoteChat };
-            if (stub.id) merged.id = stub.id;
-            merged.name = stub.name;
-            if ('lastDate' in stub) merged.lastDate = stub.lastDate;
-            if ('folderId' in stub) merged.folderId = stub.folderId;
-            if ('modules' in stub) merged.modules = stub.modules;
+            if (chat.id) merged.id = chat.id;
+            merged.name = chat.name;
+            if ('lastDate' in chat) merged.lastDate = chat.lastDate;
+            if ('folderId' in chat) merged.folderId = chat.folderId;
+            if ('modules' in chat) merged.modules = chat.modules;
             delete merged._stub;
 
             char.chats[i] = merged;
