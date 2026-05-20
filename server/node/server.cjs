@@ -133,8 +133,18 @@ function applyCopilotTurnHeaders(header, targetUrl, turnId, requestBody) {
             header['anthropic-beta'] = 'interleaved-thinking-2025-05-14,advanced-tool-use-2025-11-20'
         }
     } else {
+        const ids = getCopilotIds()
         header['X-Request-Id'] = nodeCrypto.randomUUID()
         header['OpenAI-Intent'] = 'conversation-panel'
+        header['Copilot-Integration-Id'] = 'vscode-chat'
+        header['Editor-Version'] = COPILOT_EDITOR_VERSION
+        header['Editor-Plugin-Version'] = COPILOT_PLUGIN_VERSION
+        if (!header['User-Agent'] || !header['User-Agent'].includes('CopilotChat')) {
+            header['User-Agent'] = 'GitHubCopilotChat/0.22.0'
+        }
+        header['Editor-Device-Id'] = ids.deviceId
+        header['VSCode-MachineId'] = ids.machineId
+        header['VSCode-SessionId'] = _copilotSessionId
     }
 
     if (!header['X-GitHub-Api-Version'] && !header['X-Github-Api-Version'] && !header['x-github-api-version']) {
