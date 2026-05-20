@@ -427,11 +427,25 @@ async function decodeDatabaseWithPersistentChatIds(raw, options = {}) {
         }
     }
 
+    // One-time migration: recover stub chats from remotes/ KV files.
+    // When a legacy-format DB is imported, hasRemoteBlocks() returns false
+    // (it only detects risusave-block REMOTE entries). The migration marker
+    // gets set to "done" without ever resolving the remote files, leaving
+    // characters with empty stubs while their full chat data sits orphaned
+    // in remotes/<chaId>.local.bin.
+    const remoteRecoveryResult = await recoverChatsFromRemotes(dbObj);
+    if (remoteRecoveryResult.recovered > 0) needsPersist = true;
+
     if (needsPersist) {
         kvSet('database/database.bin', Buffer.from(encodeRisuSaveLegacy(dbObj)));
         if (createBackup) {
             createBackupAndRotate();
         }
+    }
+    // Set recovery marker AFTER successful persist — crash before this point
+    // leaves the marker unset so the next boot retries recovery.
+    if (!kvGet(REMOTE_CHAT_RECOVERY_MARKER) && remoteRecoveryResult.failed === 0) {
+        kvSet(REMOTE_CHAT_RECOVERY_MARKER, Buffer.from('1'));
     }
     if (migrationResult) {
         migrationResult.coldStorageFailed = coldRestoreResult.failed;
@@ -564,6 +578,105 @@ function reassembleFullDb(strippedDb) {
         };
     });
     return full;
+}
+
+// ─── Stub chat recovery from remotes/ files ────────────────────────────────
+//
+// When database.bin is in legacy msgpack format (not risusave blocks), the
+// REMOTE block migration skips it (hasRemoteBlocks returns false) and marks
+// itself done. But characters inside the DB may be stubs — their full chat
+// data lives only in the orphaned remotes/<chaId>.local.bin files.
+//
+// This recovery reads each remote file (raw JSON), matches stub chats by
+// name, and restores the full message arrays. Runs once, idempotent via KV
+// marker. Backup import clears the marker (it wipes _meta/ prefixes).
+
+const REMOTE_CHAT_RECOVERY_MARKER = '_meta/remote-chats-recovered';
+
+async function recoverChatsFromRemotes(dbObj) {
+    const result = { recovered: 0, characters: 0, failed: 0 };
+    if (kvGet(REMOTE_CHAT_RECOVERY_MARKER)) return result;
+    if (!Array.isArray(dbObj?.characters)) return result;
+
+    // Pre-recovery safety backup
+    const backupKey = `migration-backup/pre-remote-chat-recovery-${Date.now()}.bin`;
+    kvCopyValue('database/database.bin', backupKey);
+    logger.info(`[Migration] Pre-recovery backup: ${backupKey}`);
+
+    for (const char of dbObj.characters) {
+        if (!char?.chaId || !Array.isArray(char.chats)) continue;
+        const hasStubs = char.chats.some(c => c._stub === true);
+        if (!hasStubs) continue;
+
+        const remoteKey = `remotes/${char.chaId}.local.bin`;
+        const remoteData = kvGet(remoteKey);
+        if (!remoteData) continue;
+
+        let remoteChar;
+        try {
+            remoteChar = JSON.parse(remoteData.toString('utf-8'));
+        } catch {
+            try {
+                const decoded = await decodeRisuSave(remoteData);
+                // decodeRisuSave wraps characters in { characters: [...] }
+                if (Array.isArray(decoded?.characters)) {
+                    remoteChar = decoded.characters.find(c => c?.chaId === char.chaId)
+                        || decoded.characters[0];
+                } else {
+                    remoteChar = decoded;
+                }
+            } catch {
+                logger.error(`[Migration] Failed to parse remote for "${char.name || char.chaId}"`);
+                result.failed++;
+                continue;
+            }
+        }
+        if (!Array.isArray(remoteChar?.chats)) continue;
+
+        const remoteChatsByName = new Map();
+        for (const rc of remoteChar.chats) {
+            if (!rc?.name || !Array.isArray(rc.message) || rc.message.length === 0) continue;
+            if (!remoteChatsByName.has(rc.name)) {
+                remoteChatsByName.set(rc.name, []);
+            }
+            remoteChatsByName.get(rc.name).push(rc);
+        }
+
+        let charRecovered = 0;
+        for (let i = 0; i < char.chats.length; i++) {
+            const stub = char.chats[i];
+            if (!stub?._stub) continue;
+
+            const candidates = remoteChatsByName.get(stub.name);
+            if (!candidates || candidates.length === 0) continue;
+            const remoteChat = candidates.shift();
+
+            const merged = { ...remoteChat };
+            if (stub.id) merged.id = stub.id;
+            merged.name = stub.name;
+            if ('lastDate' in stub) merged.lastDate = stub.lastDate;
+            if ('folderId' in stub) merged.folderId = stub.folderId;
+            if ('modules' in stub) merged.modules = stub.modules;
+            delete merged._stub;
+
+            char.chats[i] = merged;
+            charRecovered++;
+        }
+
+        if (charRecovered > 0) {
+            result.recovered += charRecovered;
+            result.characters++;
+            logger.info(`[Migration] Recovered ${charRecovered} chat(s) for "${char.name || char.chaId}" from remotes/`);
+        }
+    }
+
+    if (result.recovered > 0) {
+        logger.info(`[Migration] Remote chat recovery: ${result.recovered} chat(s) across ${result.characters} character(s)`);
+    }
+    if (result.failed > 0) {
+        logger.error(`[Migration] ${result.failed} character(s) failed remote chat recovery — marker NOT set, will retry on next boot`);
+    }
+    return result;
 }
 
 // ─── Remote-block migration ─────────────────────────────────────────────────
@@ -2322,6 +2435,7 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
     // (.bin backups themselves never carry REMOTE blocks — legacy msgpack
     // format only — but a fresh import is a clear "data changed" signal.)
     kvDel(REMOTE_MIGRATION_MARKER_KEY);
+    kvDel(REMOTE_CHAT_RECOVERY_MARKER);
     kvDel('_meta/plugin-storage-migrated');
     kvDel('_meta/plugin-blob-migrated');
     kvDelPrefix('plugin-custom-storage/');
@@ -4684,6 +4798,7 @@ function clearExistingData() {
     // preserve upstream's split-character format) and we want the migration
     // to re-evaluate against the new contents on the next ensureChatStore.
     kvDel(REMOTE_MIGRATION_MARKER_KEY);
+    kvDel(REMOTE_CHAT_RECOVERY_MARKER);
     kvDel('_meta/plugin-storage-migrated');
     kvDel('_meta/plugin-blob-migrated');
     kvDelPrefix('plugin-custom-storage/');
@@ -5461,6 +5576,7 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
             // so migrateRemoteBlocksIfNeeded re-evaluates against the restored
             // bytes instead of skipping based on the prior post-migration state.
             kvDel(REMOTE_MIGRATION_MARKER_KEY);
+            kvDel(REMOTE_CHAT_RECOVERY_MARKER);
             kvDel('_meta/plugin-storage-migrated');
             kvDel('_meta/plugin-blob-migrated');
             kvDelPrefix('plugin-custom-storage/');
