@@ -15,9 +15,12 @@
     import OptionInput from "src/lib/UI/GUI/OptionInput.svelte";
     import CheckInput from "src/lib/UI/GUI/CheckInput.svelte";
     import TextAreaInput from "src/lib/UI/GUI/TextAreaInput.svelte";
-    import { hotReloadPluginFiles } from "src/ts/plugins/apiV3/developMode";
+    import { hotReloadPluginFiles, stopHotReload, requestResumeHotReload, isHotReloadActive, hasPersistedHandle } from "src/ts/plugins/apiV3/developMode";
 
     let showParams = $state([])
+    let hotReloadRunning = $state(isHotReloadActive())
+    let hasSavedHandle = $state(false)
+    hasPersistedHandle().then(v => { hasSavedHandle = v })
 </script>
 
 <SettingPage title={language.plugin}>
@@ -35,21 +38,43 @@
 
     <button
         onclick={async () => {
-            const v = parseInt(await alertSelect([
+            const options = [
                 "Import plugin with hot reload",
                 "Download plugin template",
-                language.cancel
-            ]))
+            ]
+            if (hotReloadRunning) {
+                options.push("Stop hot reload")
+            } else if (hasSavedHandle) {
+                options.push("Resume hot reload")
+            }
+            options.push(language.cancel)
+
+            const v = parseInt(await alertSelect(options))
             switch(v){
                 case 0:
                     await hotReloadPluginFiles()
+                    hotReloadRunning = isHotReloadActive()
+                    hasSavedHandle = await hasPersistedHandle()
                     break;
                 case 1:{
                     const a = document.createElement('a');
                     a.href = '/plugin_start.7z';
                     a.download = 'plugin_starter.7z';
                     document.body.appendChild(a);
+                    break;
                 }
+                case 2:
+                    if (hotReloadRunning) {
+                        await stopHotReload()
+                        hotReloadRunning = false
+                        hasSavedHandle = false
+                        hotReloading.length = 0
+                    } else if (hasSavedHandle) {
+                        const ok = await requestResumeHotReload()
+                        hotReloadRunning = ok
+                        if (!ok) notifySuccess("Permission denied — pick the file again via hot reload import.")
+                    }
+                    break;
             }
         }}
         class="hover:text-textcolor cursor-pointer"

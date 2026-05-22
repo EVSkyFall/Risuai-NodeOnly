@@ -163,6 +163,7 @@ export async function loadData() {
             // Resume any Claude batches that survived a tab close — the tracker
             // polls them in the background and writes the result into the
             // matching message slot when the batch ends.
+            import('./plugins/apiV3/developMode').then(m => m.resumeHotReload()).catch(() => {})
             import('./process/request/claudeBatchTracker').then(m => m.resumeClaudeBatches()).catch(() => {})
             import('./process/request/openAIBatchTracker').then(m => m.initOpenAIBatchTracker()).catch(() => {})
             // Connect to /ws/llm-worker so /api/mcp/llm/call can route through

@@ -2,19 +2,106 @@ import { notifyError } from "src/ts/alert"
 import { importPlugin } from "../plugins.svelte"
 import { sleep } from "src/ts/util"
 
-export async function hotReloadPluginFiles(){
+const IDB_NAME = 'risuai-dev-hotreload'
+const IDB_STORE = 'handles'
+const IDB_KEY = 'plugin-file'
 
-    const observerSupported = !("FileSystemObserver" in window)
+let activeAbort: AbortController | null = null
 
+async function openHandleDb(): Promise<IDBDatabase> {
+    return new Promise((resolve, reject) => {
+        const req = indexedDB.open(IDB_NAME, 1)
+        req.onupgradeneeded = () => {
+            if (!req.result.objectStoreNames.contains(IDB_STORE)) {
+                req.result.createObjectStore(IDB_STORE)
+            }
+        }
+        req.onsuccess = () => resolve(req.result)
+        req.onerror = () => reject(req.error)
+    })
+}
 
-    if(!('showOpenFilePicker' in window)){
+async function persistHandle(handle: FileSystemFileHandle): Promise<void> {
+    const db = await openHandleDb()
+    const tx = db.transaction(IDB_STORE, 'readwrite')
+    tx.objectStore(IDB_STORE).put(handle, IDB_KEY)
+    await new Promise<void>((res, rej) => {
+        tx.oncomplete = () => res()
+        tx.onerror = () => rej(tx.error)
+    })
+    db.close()
+}
+
+async function loadPersistedHandle(): Promise<FileSystemFileHandle | null> {
+    let db: IDBDatabase
+    try {
+        db = await openHandleDb()
+    } catch {
+        return null
+    }
+    try {
+        const tx = db.transaction(IDB_STORE, 'readonly')
+        const handle = await new Promise<FileSystemFileHandle | undefined>((res, rej) => {
+            const req = tx.objectStore(IDB_STORE).get(IDB_KEY)
+            req.onsuccess = () => res(req.result)
+            req.onerror = () => rej(req.error)
+        })
+        db.close()
+        return handle ?? null
+    } catch {
+        db.close()
+        return null
+    }
+}
+
+async function clearPersistedHandle(): Promise<void> {
+    try {
+        const db = await openHandleDb()
+        const tx = db.transaction(IDB_STORE, 'readwrite')
+        tx.objectStore(IDB_STORE).delete(IDB_KEY)
+        await new Promise<void>((res, rej) => {
+            tx.oncomplete = () => res()
+            tx.onerror = () => rej(tx.error)
+        })
+        db.close()
+    } catch { /* best-effort */ }
+}
+
+function startPolling(fileHandle: FileSystemFileHandle, signal: AbortSignal) {
+    let lastModified = 0;
+
+    (async () => {
+        while (!signal.aborted) {
+            try {
+                const file = await fileHandle.getFile()
+                if (file.lastModified !== lastModified) {
+                    console.warn("[HotReload] Detected change, reloading...")
+                    lastModified = file.lastModified
+                    const content = await file.text()
+                    await importPlugin(content, {
+                        isHotReload: true,
+                        isUpdate: true,
+                        isTypescript: file.name.endsWith(".ts")
+                    })
+                }
+            } catch (e) {
+                if (signal.aborted) break
+                console.error("[HotReload] Error reading file:", e)
+            }
+            await sleep(500)
+        }
+    })()
+}
+
+export async function hotReloadPluginFiles() {
+    if (!('showOpenFilePicker' in window)) {
         notifyError("Your browser does not support the File System Access API, which is required for hot-reloading plugin files.")
         return
     }
 
     let fileHandle: FileSystemFileHandle
     try {
-        [fileHandle] = await window.showOpenFilePicker({
+        [fileHandle] = await (window as any).showOpenFilePicker({
             types: [
                 {
                     description: "JavaScript or TypeScript Plugin File",
@@ -24,34 +111,61 @@ export async function hotReloadPluginFiles(){
                     }
                 }
             ]
-        })   
-    } catch (error) {
+        })
+    } catch {
         return
     }
 
-    let lastModified = 0
-    const callback = async () => {
-        try {
-            const file = await fileHandle.getFile()
-            if(file.lastModified === lastModified){
-                return
-            }
-            console.log("Detected change in plugin file, reloading...")
-            lastModified = file.lastModified
-            const content = await file.text()
-            await importPlugin(content, {
-                isHotReload: true,
-                isUpdate: true,
-                isTypescript: file.name.endsWith(".ts")
-            })
-        }
-        catch (e){
-            console.error("Error reading file:", e)
-        }
+    if (activeAbort) activeAbort.abort()
+    activeAbort = new AbortController()
+
+    await persistHandle(fileHandle)
+    startPolling(fileHandle, activeAbort.signal)
+}
+
+export async function resumeHotReload(): Promise<boolean> {
+    const handle = await loadPersistedHandle()
+    if (!handle) return false
+
+    const perm = await (handle as any).queryPermission({ mode: 'read' })
+    if (perm === 'granted') {
+        if (activeAbort) activeAbort.abort()
+        activeAbort = new AbortController()
+        startPolling(handle, activeAbort.signal)
+        return true
     }
 
-    while(true){
-        await callback()
-        await sleep(500)
+    // 'prompt' state — need user gesture to request, so skip auto-resume
+    return false
+}
+
+export async function requestResumeHotReload(): Promise<boolean> {
+    const handle = await loadPersistedHandle()
+    if (!handle) return false
+
+    const perm = await (handle as any).requestPermission({ mode: 'read' })
+    if (perm === 'granted') {
+        if (activeAbort) activeAbort.abort()
+        activeAbort = new AbortController()
+        startPolling(handle, activeAbort.signal)
+        return true
     }
+    return false
+}
+
+export async function stopHotReload() {
+    if (activeAbort) {
+        activeAbort.abort()
+        activeAbort = null
+    }
+    await clearPersistedHandle()
+}
+
+export function isHotReloadActive(): boolean {
+    return activeAbort !== null && !activeAbort.signal.aborted
+}
+
+export async function hasPersistedHandle(): Promise<boolean> {
+    const handle = await loadPersistedHandle()
+    return handle !== null
 }
