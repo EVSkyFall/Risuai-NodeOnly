@@ -1,5 +1,7 @@
 import { notifyError } from "src/ts/alert"
+import { toast } from "svelte-sonner"
 import { importPlugin } from "../plugins.svelte"
+import { hotReloading } from "src/ts/stores.svelte"
 import { sleep } from "src/ts/util"
 
 const IDB_NAME = 'risuai-dev-hotreload'
@@ -135,7 +137,22 @@ export async function resumeHotReload(): Promise<boolean> {
         return true
     }
 
-    // 'prompt' state — need user gesture to request, so skip auto-resume
+    toast.info(`Hot reload paused — ${handle.name}`, {
+        action: {
+            label: 'Resume',
+            onClick: async () => {
+                const granted = await (handle as any).requestPermission({ mode: 'read' })
+                if (granted === 'granted') {
+                    if (activeAbort) activeAbort.abort()
+                    activeAbort = new AbortController()
+                    startPolling(handle, activeAbort.signal)
+                    hotReloading.push(handle.name)
+                    toast.success(`Hot reload resumed — ${handle.name}`)
+                }
+            }
+        },
+        duration: 15000,
+    })
     return false
 }
 
