@@ -573,6 +573,20 @@ function reassembleFullDb(strippedDb) {
                 if (chat && chat._stub && chat.id) {
                     return mergeChatStubWithFullChat(chat, charChats.get(chat.id));
                 }
+                // Stale-cache loss guard: an empty-message chat (no _stub flag)
+                // whose id still has non-empty data in fullChatStore is a
+                // FLATTENED chat — e.g. a stale stripped dbCache persisted by the
+                // MCP path, or a stub that lost its _stub flag. Restoring from the
+                // store prevents the empty version overwriting real data on disk.
+                // A chat the user genuinely cleared has empty data in the store
+                // too (chat-content POST syncs it), so it is correctly left empty.
+                if (chat && chat.id
+                    && (!Array.isArray(chat.message) || chat.message.length === 0)) {
+                    const fullChat = charChats.get(chat.id);
+                    if (fullChat && Array.isArray(fullChat.message) && fullChat.message.length > 0) {
+                        return mergeChatStubWithFullChat({ ...chat, _stub: true }, fullChat);
+                    }
+                }
                 return chat;
             }),
         };
@@ -605,8 +619,13 @@ async function recoverChatsFromRemotes(dbObj) {
 
     for (const char of dbObj.characters) {
         if (!char?.chaId || !Array.isArray(char.chats)) continue;
-        const hasStubs = char.chats.some(c => c._stub === true);
-        if (!hasStubs) continue;
+        // Recover characters that have stubs OR empty-message chats. The latter
+        // covers the MCP-path / hybrid-corruption loss where a once-full chat
+        // came back as a message-less Chat (no _stub flag) — e.g. a renamed
+        // chat that lost its history.
+        const hasRecoverable = char.chats.some(c => c
+            && (c._stub === true || !Array.isArray(c.message) || c.message.length === 0));
+        if (!hasRecoverable) continue;
 
         const remoteKey = `remotes/${char.chaId}.local.bin`;
         const remoteData = kvGet(remoteKey);
@@ -633,13 +652,20 @@ async function recoverChatsFromRemotes(dbObj) {
         }
         if (!Array.isArray(remoteChar?.chats)) continue;
 
+        // Index remote chats by id (primary) and name (fallback). Id matching
+        // recovers chats the user renamed — the in-DB name no longer matches the
+        // remote name, but the persistent chat id does.
+        const remoteChatsById = new Map();
         const remoteChatsByName = new Map();
         for (const rc of remoteChar.chats) {
-            if (!rc?.name || !Array.isArray(rc.message) || rc.message.length === 0) continue;
-            if (!remoteChatsByName.has(rc.name)) {
-                remoteChatsByName.set(rc.name, []);
+            if (!rc || !Array.isArray(rc.message) || rc.message.length === 0) continue;
+            if (rc.id) remoteChatsById.set(rc.id, rc);
+            if (rc.name) {
+                if (!remoteChatsByName.has(rc.name)) {
+                    remoteChatsByName.set(rc.name, []);
+                }
+                remoteChatsByName.get(rc.name).push(rc);
             }
-            remoteChatsByName.get(rc.name).push(rc);
         }
 
         let charRecovered = 0;
@@ -653,9 +679,26 @@ async function recoverChatsFromRemotes(dbObj) {
                 || chat.message.length === 0;
             if (!needsRecovery) continue;
 
-            const candidates = remoteChatsByName.get(chat.name);
-            if (!candidates || candidates.length === 0) continue;
-            const remoteChat = candidates.shift();
+            // Prefer id match (survives rename); fall back to name match.
+            let remoteChat = null;
+            if (chat.id && remoteChatsById.has(chat.id)) {
+                remoteChat = remoteChatsById.get(chat.id);
+                remoteChatsById.delete(chat.id);
+                // Also drop it from the name bucket so a later name-only match
+                // can't reuse the same remote chat.
+                const nameList = remoteChatsByName.get(remoteChat.name);
+                if (nameList) {
+                    const idx = nameList.indexOf(remoteChat);
+                    if (idx !== -1) nameList.splice(idx, 1);
+                }
+            } else {
+                const candidates = remoteChatsByName.get(chat.name);
+                if (candidates && candidates.length > 0) {
+                    remoteChat = candidates.shift();
+                    if (remoteChat?.id) remoteChatsById.delete(remoteChat.id);
+                }
+            }
+            if (!remoteChat) continue;
 
             const merged = { ...remoteChat };
             if (chat.id) merged.id = chat.id;
@@ -7015,12 +7058,19 @@ async function loadDatabase() {
 /** Persist database changes with debounce (same pattern as /api/patch) */
 function scheduleDatabaseSave() {
     if (saveTimers[DB_HEX_KEY]) clearTimeout(saveTimers[DB_HEX_KEY])
-    saveTimers[DB_HEX_KEY] = setTimeout(() => {
+    saveTimers[DB_HEX_KEY] = setTimeout(async () => {
         try {
             if (dbCache[DB_HEX_KEY]) {
-                const data = Buffer.from(encodeRisuSaveLegacy(dbCache[DB_HEX_KEY]))
-                kvSet('database/database.bin', data)
-                dbEtag = computeBufferEtag(data)
+                // dbCache[DB_HEX_KEY] is SHARED with /api/read and /api/patch,
+                // which store the STRIPPED (stub-only) view of the DB. A raw
+                // encode here would flatten every chat to a message-less stub on
+                // disk — and poison the backup — permanently destroying full
+                // chat data. Route through persistDbCacheWithChats so full chats
+                // are reassembled from fullChatStore and the findStubFlagLossChats
+                // guard runs, identical to the /api/patch persist contract.
+                await persistDbCacheWithChats(DB_HEX_KEY, 'database/database.bin')
+                const persisted = kvGet('database/database.bin')
+                if (persisted) dbEtag = computeBufferEtag(persisted)
                 createBackupAndRotate()
             }
         } catch (e) {
