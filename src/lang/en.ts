@@ -733,6 +733,7 @@ export const languageEnglish = {
     otherBots: "Other Bots",
     user: "User",
     additionalAssets: "Additional Assets",
+    viewInAssetViewer: "View in Asset Viewer",
     editDisplay: "Modify Display",
     textBackgrounds: "Custom Text Screen Color",
     textBorder: "Text Outlines",

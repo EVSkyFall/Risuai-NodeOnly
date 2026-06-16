@@ -808,6 +808,7 @@ export const languageKorean = {
   otherBots: "기타 봇",
   user: "유저",
   additionalAssets: "추가 에셋",
+  viewInAssetViewer: "에셋 뷰어로 보기",
   editDisplay: "디스플레이 수정",
   textBackgrounds: "커스텀 채팅창 색깔",
   textBorder: "텍스트 윤곽선",

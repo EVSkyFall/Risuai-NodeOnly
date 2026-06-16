@@ -26,6 +26,8 @@
     import { checkCharOrder } from './ts/globalApi.svelte';
     import { ArrowUpIcon, GlobeIcon, PlusIcon } from '@lucide/svelte';
     import { hypaV3ModalOpen, hypaV3ProgressStore } from "./ts/stores.svelte";
+    import { assetViewerStore } from './ts/assetViewer.svelte';
+    import AssetViewer from './lib/Others/AssetViewer.svelte';
     import HypaV3Modal from './lib/Others/HypaV3Modal.svelte';
     import HypaV3Progress from './lib/Others/HypaV3Progress.svelte';
     import PluginAlertModal from './lib/Others/PluginAlertModal.svelte';
@@ -247,6 +249,9 @@
     {/if}
     {#if popUpEditorStore.open}
         <PopupEditor />
+    {/if}
+    {#if assetViewerStore.open}
+        <AssetViewer />
     {/if}
     <Toaster />
     <RequestStatusToaster />
