@@ -6,6 +6,7 @@ import SettingNumber from 'src/lib/Setting/Wrappers/SettingNumber.svelte';
 import SettingTextarea from 'src/lib/Setting/Wrappers/SettingTextarea.svelte';
 import SettingSlider from 'src/lib/Setting/Wrappers/SettingSlider.svelte';
 import SettingSelect from 'src/lib/Setting/Wrappers/SettingSelect.svelte';
+import SettingRadio from 'src/lib/Setting/Wrappers/SettingRadio.svelte';
 import SettingSegmented from 'src/lib/Setting/Wrappers/SettingSegmented.svelte';
 import SettingColor from 'src/lib/Setting/Wrappers/SettingColor.svelte';
 import SettingHeader from 'src/lib/Setting/Wrappers/SettingHeader.svelte';
@@ -22,6 +23,7 @@ export const settingRegistry: Record<SettingType, WrapperComponent> = {
     'textarea': SettingTextarea,
     'slider': SettingSlider,
     'select': SettingSelect,
+    'radio': SettingRadio,
     'segmented': SettingSegmented,
     'color': SettingColor,
     'header': SettingHeader,

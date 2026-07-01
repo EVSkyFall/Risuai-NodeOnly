@@ -15,13 +15,15 @@
 
 {#if DBState.db.textTheme === 'custom'}
     {#each colors as color}
-        <div class="flex items-center mt-2">
-            <ColorInput
-                nullable={color[2]}
-                bind:value={DBState.db.customTextTheme[color[0]]}
-                oninput={updateTextThemeAndCSS}
-            />
-            <span class="ml-2">{color[1]}</span>
+        <div class="flex items-center justify-between gap-3 py-2">
+            <span class="text-sm text-textcolor min-w-0 truncate">{color[1]}</span>
+            <div class="shrink-0">
+                <ColorInput
+                    nullable={color[2]}
+                    bind:value={DBState.db.customTextTheme[color[0]]}
+                    oninput={updateTextThemeAndCSS}
+                />
+            </div>
         </div>
     {/each}
 {/if}

@@ -7,23 +7,9 @@
 import type { SettingItem } from './types';
 import { changeFullscreen } from '../util';
 import { updateAnimationSpeed } from '../gui/animation';
-import { guiSizeText, updateGuisize } from '../gui/guisize';
+import { updateGuisize } from '../gui/guisize';
 import { updateTextThemeAndCSS } from '../gui/colorscheme';
-import { openThemePresetList } from '../stores.svelte';
-
 export const displayThemeSettingsItems: SettingItem[] = [
-    {
-        id: 'display.themePresets',
-        type: 'button',
-        labelKey: 'themePresets',
-        helpKey: 'themePresets',
-        classes: 'mt-4',
-        getValue: (db) => db.themePresets?.[db.themePresetsId]?.name ?? 'Default',
-        options: {
-            onClick: () => openThemePresetList.set(true),
-        },
-        keywords: ['theme', 'presets'],
-    },
     {
         id: 'display.theme',
         type: 'select',
@@ -229,35 +215,43 @@ export const displaySizeSettingsItems: SettingItem[] = [
         options: {
             min: -5,
             max: 5,
-            customText: (value) => guiSizeText(value),
+            customText: (value) => '×' + (1 + value * 0.1).toFixed(1),
         },
         keywords: ['textarea', 'input', 'size'],
     },
     {
         id: 'display.textAreaTextSize',
-        type: 'slider',
+        type: 'select',
         labelKey: 'textAreaTextSize',
         helpKey: 'textAreaTextSize',
-        bindKey: 'textAreaTextSize',
+        getValue: (db) => String(db.textAreaTextSize),
+        setValue: (db, v) => { db.textAreaTextSize = Number(v); },
         onChange: () => updateGuisize(),
         options: {
-            min: 0,
-            max: 3,
-            customText: (value) => guiSizeText(value),
+            selectOptions: [
+                { value: '0', label: '×1.0' },
+                { value: '1', label: '×1.25' },
+                { value: '2', label: '×1.5' },
+                { value: '3', label: '×1.75' },
+            ],
         },
         keywords: ['textarea', 'text', 'size'],
     },
     {
         id: 'display.sideBarSize',
-        type: 'slider',
+        type: 'select',
         labelKey: 'sideBarSize',
         helpKey: 'sideBarSize',
-        bindKey: 'sideBarSize',
+        getValue: (db) => String(db.sideBarSize),
+        setValue: (db, v) => { db.sideBarSize = Number(v); },
         onChange: () => updateGuisize(),
         options: {
-            min: 0,
-            max: 3,
-            customText: (value) => guiSizeText(value),
+            selectOptions: [
+                { value: '0', label: '×1.0' },
+                { value: '1', label: '×1.25' },
+                { value: '2', label: '×1.5' },
+                { value: '3', label: '×1.75' },
+            ],
         },
         keywords: ['sidebar', 'size'],
     },
@@ -272,7 +266,7 @@ export const displaySizeSettingsItems: SettingItem[] = [
             max: 40,
             step: 1,
             customText: (value) =>
-                value === -1 ? 'Unlimited' : value === 0 ? 'Hidden' : `${value.toFixed(1)} rem`,
+                value === -1 ? 'Unlimited' : value === 0 ? 'Hidden' : `${value} rem`,
         },
         keywords: ['asset', 'width'],
     },
@@ -307,25 +301,22 @@ export const displaySizeSettingsItems: SettingItem[] = [
     },
 ];
 
-export const displayOtherSettingsItems: SettingItem[] = [
-    {
-        id: 'display.fullScreen',
-        type: 'check',
-        labelKey: 'fullscreen',
-        helpKey: 'fullscreen',
-        bindKey: 'fullScreen',
-        onChange: () => changeFullscreen(),
-        keywords: ['fullscreen'],
-    },
-    { id: 'display.showMemoryLimit', type: 'check', labelKey: 'showMemoryLimit', helpKey: 'showMemoryLimit', bindKey: 'showMemoryLimit', keywords: ['memory', 'limit'] },
+export const displayOtherHomeItems: SettingItem[] = [
     { id: 'display.hideRealm', type: 'check', labelKey: 'hideRealm', helpKey: 'hideRealm', bindKey: 'hideRealm', keywords: ['realm', 'hide'] },
-    { id: 'display.hideAllImages', type: 'check', labelKey: 'hideAllImages', helpKey: 'hideAllImagesDesc', bindKey: 'hideAllImages', keywords: ['images', 'hide'] },
-    { id: 'display.hideMessagePageCount', type: 'check', labelKey: 'hideMessagePageCount', helpKey: 'hideMessagePageCountDesc', bindKey: 'hideMessagePageCount', keywords: ['message', 'page', 'count', 'hide'] },
     { id: 'display.showFolderName', type: 'check', labelKey: 'showFolderNameInIcon', helpKey: 'showFolderNameInIcon', bindKey: 'showFolderName', keywords: ['folder', 'name', 'icon'] },
-    { id: 'display.customBackground', type: 'custom', componentId: 'CustomBackgroundToggle', keywords: ['custom', 'background'] },
-    { id: 'display.playMessage', type: 'check', labelKey: 'playMessage', helpKey: 'msgSound', bindKey: 'playMessage', keywords: ['message', 'sound'] },
-    { id: 'display.playMessageOnTranslateEnd', type: 'check', labelKey: 'playMessageOnTranslateEnd', helpKey: 'playMessageOnTranslateEnd', bindKey: 'playMessageOnTranslateEnd', keywords: ['translate', 'sound'] },
     { id: 'display.roundIcons', type: 'check', labelKey: 'roundIcons', helpKey: 'roundIcons', bindKey: 'roundIcons', keywords: ['round', 'icons'] },
+    { id: 'display.hideMessagePageCount', type: 'check', labelKey: 'hideMessagePageCount', helpKey: 'hideMessagePageCountDesc', bindKey: 'hideMessagePageCount', keywords: ['message', 'page', 'count', 'hide'] },
+];
+
+export const displayOtherChatItems: SettingItem[] = [
+    { id: 'display.customBackground', type: 'custom', componentId: 'CustomBackgroundToggle', keywords: ['custom', 'background'] },
+    { id: 'display.hideAllImages', type: 'check', labelKey: 'hideAllImages', helpKey: 'hideAllImagesDesc', bindKey: 'hideAllImages', keywords: ['images', 'hide'] },
+    { id: 'display.useAdditionalAssetsPreview', type: 'check', labelKey: 'useAdditionalAssetsPreview', helpKey: 'useAdditionalAssetsPreview', bindKey: 'useAdditionalAssetsPreview', keywords: ['additional', 'assets', 'preview'] },
+    { id: 'display.showMemoryLimit', type: 'check', labelKey: 'showMemoryLimit', helpKey: 'showMemoryLimit', bindKey: 'showMemoryLimit', keywords: ['memory', 'limit'] },
+    { id: 'display.showSavingIcon', type: 'check', labelKey: 'showSavingIcon', helpKey: 'showSavingIcon', bindKey: 'showSavingIcon', keywords: ['saving', 'icon'] },
+];
+
+export const displayOtherBubbleItems: SettingItem[] = [
     {
         id: 'display.textScreenColor',
         type: 'custom',
@@ -338,10 +329,6 @@ export const displayOtherSettingsItems: SettingItem[] = [
         },
         keywords: ['text', 'background', 'color'],
     },
-    { id: 'display.textBorder', type: 'check', labelKey: 'textBorder', helpKey: 'textBorder', bindKey: 'textBorder', keywords: ['text', 'border'] },
-    { id: 'display.textScreenRounded', type: 'check', labelKey: 'textScreenRound', helpKey: 'textScreenRound', bindKey: 'textScreenRounded', keywords: ['text', 'round'] },
-    { id: 'display.showSavingIcon', type: 'check', labelKey: 'showSavingIcon', helpKey: 'showSavingIcon', bindKey: 'showSavingIcon', keywords: ['saving', 'icon'] },
-    { id: 'display.showPromptComparison', type: 'check', labelKey: 'showPromptComparison', helpKey: 'showPromptComparison', bindKey: 'showPromptComparison', keywords: ['prompt', 'comparison'] },
     {
         id: 'display.textScreenBorder',
         type: 'custom',
@@ -354,9 +341,11 @@ export const displayOtherSettingsItems: SettingItem[] = [
         },
         keywords: ['text', 'screen', 'border', 'color'],
     },
-    { id: 'display.useChatCopy', type: 'check', labelKey: 'useChatCopy', helpKey: 'useChatCopy', bindKey: 'useChatCopy', keywords: ['chat', 'copy'] },
-    { id: 'display.useAdditionalAssetsPreview', type: 'check', labelKey: 'useAdditionalAssetsPreview', helpKey: 'useAdditionalAssetsPreview', bindKey: 'useAdditionalAssetsPreview', keywords: ['additional', 'assets', 'preview'] },
-    { id: 'display.hideApiKey', type: 'check', labelKey: 'hideApiKeys', helpKey: 'hideApiKeys', bindKey: 'hideApiKey', keywords: ['api', 'key', 'hide'] },
+    { id: 'display.textScreenRounded', type: 'check', labelKey: 'textScreenRound', helpKey: 'textScreenRound', bindKey: 'textScreenRounded', keywords: ['text', 'round'] },
+    { id: 'display.textBorder', type: 'check', labelKey: 'textBorder', helpKey: 'textBorder', bindKey: 'textBorder', keywords: ['text', 'border'] },
+];
+
+export const displayOtherQuoteItems: SettingItem[] = [
     { id: 'display.unformatQuotes', type: 'check', labelKey: 'unformatQuotes', helpKey: 'unformatQuotes', bindKey: 'unformatQuotes', keywords: ['quotes'] },
     { id: 'display.blockquoteStyling', type: 'check', labelKey: 'blockquoteStyling', helpKey: 'blockquoteStyling', bindKey: 'blockquoteStyling', keywords: ['blockquote', 'quote'] },
     { id: 'display.customQuotes', type: 'check', labelKey: 'customQuotes', helpKey: 'customQuotes', bindKey: 'customQuotes', keywords: ['custom', 'quotes'] },
@@ -412,9 +401,22 @@ export const displayOtherSettingsItems: SettingItem[] = [
         },
         keywords: ['quote', 'single', 'trailing'],
     },
-    { id: 'display.betaMobileGUI', type: 'check', labelKey: 'betaMobileGUI', helpKey: 'betaMobileGUI', bindKey: 'betaMobileGUI', keywords: ['beta', 'mobile', 'gui'] },
+];
+
+export const displayOtherAdvancedItems: SettingItem[] = [
+    { id: 'display.hideApiKey', type: 'check', labelKey: 'hideApiKeys', helpKey: 'hideApiKeys', bindKey: 'hideApiKey', keywords: ['api', 'key', 'hide'] },
+    { id: 'display.showPromptComparison', type: 'check', labelKey: 'showPromptComparison', helpKey: 'showPromptComparison', bindKey: 'showPromptComparison', keywords: ['prompt', 'comparison'] },
+    {
+        id: 'display.fullScreen',
+        type: 'check',
+        labelKey: 'fullscreen',
+        helpKey: 'fullscreen',
+        bindKey: 'fullScreen',
+        onChange: () => changeFullscreen(),
+        keywords: ['fullscreen'],
+    },
     { id: 'display.menuSideBar', type: 'check', labelKey: 'menuSideBar', helpKey: 'menuSideBar', bindKey: 'menuSideBar', keywords: ['menu', 'sidebar'] },
-    { id: 'display.notification', type: 'custom', componentId: 'NotificationToggle', keywords: ['notification'] },
+    { id: 'display.betaMobileGUI', type: 'check', labelKey: 'betaMobileGUI', helpKey: 'betaMobileGUI', bindKey: 'betaMobileGUI', keywords: ['beta', 'mobile', 'gui'] },
     {
         id: 'display.useChatSticker',
         type: 'check',
@@ -430,5 +432,9 @@ export const displayOtherSettingsItems: SettingItem[] = [
 export const displaySettingsItems: SettingItem[] = [
     ...displayThemeSettingsItems,
     ...displaySizeSettingsItems,
-    ...displayOtherSettingsItems,
+    ...displayOtherHomeItems,
+    ...displayOtherChatItems,
+    ...displayOtherBubbleItems,
+    ...displayOtherQuoteItems,
+    ...displayOtherAdvancedItems,
 ];

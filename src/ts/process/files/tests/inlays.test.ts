@@ -89,7 +89,7 @@ vi.mock('uuid', () => ({
 }))
 
 const { getDatabaseMock } = vi.hoisted(() => ({
-    getDatabaseMock: vi.fn(),
+    getDatabaseMock: vi.fn<() => any>(() => ({ characters: [] })),
 }))
 
 vi.mock(import('src/ts/storage/database.svelte'), () => ({

@@ -435,7 +435,6 @@ export async function saveDb() {
         root: false,
         botPreset: false,
         modules: false,
-        loadouts: false,
         plugins: false,
     }
 
@@ -454,7 +453,6 @@ export async function saveDb() {
         return !!(
             toSave.botPreset ||
             toSave.modules ||
-            toSave.loadouts ||
             toSave.plugins ||
             toSave.root ||
             toSave.character.length > 0 ||
@@ -469,7 +467,6 @@ export async function saveDb() {
         changeTracker.root = false
         changeTracker.botPreset = false
         changeTracker.modules = false
-        changeTracker.loadouts = false
         changeTracker.plugins = false
         return toSave
     }
@@ -493,7 +490,6 @@ export async function saveDb() {
         let didInitRootEffect = false
         let didInitBotPresetEffect = false
         let didInitModulesEffect = false
-        let didInitLoadoutsEffect = false
         let didInitPluginsEffect = false
         let didInitGeneralEffect = false
         let trackedActiveChatKey = ''
@@ -536,7 +532,7 @@ export async function saveDb() {
             for (const key in DBState.db) {
                 if (
                     key !== 'characters' && key !== 'botPresets' && key !== 'modules' &&
-                    key !== 'loadouts' && key !== 'plugins' && key !== 'pluginCustomStorage'
+                    key !== 'plugins' && key !== 'pluginCustomStorage'
                 ) {
                     $state.snapshot(DBState.db[key])
                 }
@@ -571,15 +567,6 @@ export async function saveDb() {
                 return
             }
             changeTracker.modules = true
-            saveTimeoutExecute()
-        })
-        $effect(() => {
-            $state.snapshot(DBState.db.loadouts)
-            if (!didInitLoadoutsEffect) {
-                didInitLoadoutsEffect = true
-                return
-            }
-            changeTracker.loadouts = true
             saveTimeoutExecute()
         })
         $effect(() => {
@@ -678,7 +665,6 @@ export async function saveDb() {
         })
         changeTracker.botPreset = changeTracker.botPreset || toSave.botPreset
         changeTracker.modules = changeTracker.modules || toSave.modules
-        changeTracker.loadouts = changeTracker.loadouts || toSave.loadouts
         changeTracker.plugins = changeTracker.plugins || toSave.plugins
         changeTracker.root = changeTracker.root || toSave.root
     }
@@ -745,7 +731,7 @@ export async function saveDb() {
             for (const key in localDb) {
                 if (
                     key !== 'characters' && key !== 'botPresets' && key !== 'modules' &&
-                    key !== 'loadouts' && key !== 'plugins' && key !== 'pluginCustomStorage'
+                    key !== 'plugins' && key !== 'pluginCustomStorage'
                 ) {
                     mergedDb[key] = safeStructuredClone(localDb[key])
                 }
@@ -1503,6 +1489,15 @@ export function getUncleanables(db: Database, uptype: 'basename' | 'pure' = 'bas
 
     addUncleanable(db.customBackground);
     addUncleanable(db.userIcon);
+    // Uploaded notification sounds. Preset-id values (e.g. "bell") are not
+    // asset paths, so they add a harmless basename that matches no stored asset.
+    addUncleanable(db.messageSound);
+    addUncleanable(db.translateSound);
+    if (db.customSounds) {
+        for (const s of db.customSounds) {
+            addUncleanable(s.path);
+        }
+    }
 
     for (const cha of db.characters) {
         if (cha.image) {
@@ -1583,6 +1578,13 @@ export function replaceDbResources(db: Database, replacer: { [key: string]: stri
 
     db.customBackground = replaceData(db.customBackground);
     db.userIcon = replaceData(db.userIcon);
+    db.messageSound = replaceData(db.messageSound);
+    db.translateSound = replaceData(db.translateSound);
+    if (db.customSounds) {
+        for (const s of db.customSounds) {
+            s.path = replaceData(s.path);
+        }
+    }
 
     for (const cha of db.characters) {
         if (cha.image) {

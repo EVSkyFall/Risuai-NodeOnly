@@ -134,11 +134,6 @@ export const defaultHotkeys: Hotkey[] = [
         action: 'scrollToActiveChar'
     },
     {
-        key: 'o',
-        ctrl: true,
-        action: 'loadout'
-    },
-    {
         key: 'x',
         ctrl: true,
         action: 'popupEditor'

@@ -1,5 +1,7 @@
 import { helpEs } from "./help.es";
 export const languageSpanish = {
+    modelPresetToolUse: "Uso de herramientas",
+    modelPresetToolUseHelp: "Permite que este preajuste use las herramientas configuradas (MCP). Desactivado por defecto. Las ejecuciones de herramientas se envían sin streaming.",
     "formating": {
         "main": "Prompt Principal",
         "jailbreak": "Prompt Jailbreak",
@@ -582,7 +584,6 @@ export const languageSpanish = {
     "textColor": "Color del Texto",
     "classicRisu": "Risu Clásico",
     "highcontrast": "Alto Contraste",
-    "quickPreset": "Puedes cambiar rápidamente el preset con Ctrl + (Índice del Preset)",
     "requestretrys": "Reintentos de Solicitud al Fallar",
     "utilityBot": "Bot de Utilidad",
     "ShowLog": "Mostrar Registros de Solicitud",

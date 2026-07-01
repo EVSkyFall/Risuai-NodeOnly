@@ -4,6 +4,7 @@
     import { untrack } from 'svelte';
     import TextInput from 'src/lib/UI/GUI/TextInput.svelte';
     import Help from 'src/lib/Others/Help.svelte';
+    import SettingRowLayout from './SettingRowLayout.svelte';
 
     interface Props {
         item: SettingItem;
@@ -31,14 +32,27 @@
     });
 </script>
 
-<span class="text-textcolor {item.classes ?? ''}">
-    {getLabel(item)}
-    {#if item.helpKey}<Help key={item.helpKey as any}/>{/if}
-</span>
-<TextInput
-    className="mt-2"
-    marginBottom={true}
-    bind:value={localValue}
-    placeholder={item.options?.placeholder}
-    hideText={item.options?.hideText}
-/>
+{#if ctx.layout === 'row'}
+    <SettingRowLayout {item}>
+        {#snippet control()}
+            <TextInput
+                className="w-48 text-sm"
+                bind:value={localValue}
+                placeholder={item.options?.placeholder}
+                hideText={item.options?.hideText}
+            />
+        {/snippet}
+    </SettingRowLayout>
+{:else}
+    <span class="text-textcolor {item.classes ?? ''}">
+        {getLabel(item)}
+        {#if item.helpKey}<Help key={item.helpKey as any}/>{/if}
+    </span>
+    <TextInput
+        className="mt-2"
+        marginBottom={true}
+        bind:value={localValue}
+        placeholder={item.options?.placeholder}
+        hideText={item.options?.hideText}
+    />
+{/if}

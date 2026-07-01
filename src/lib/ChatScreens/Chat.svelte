@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { ArrowLeft, ArrowLeftRightIcon, ArrowRight, BookmarkIcon, BotIcon, CopyIcon, PowerOff, GitBranch, HamburgerIcon, LanguagesIcon, MenuIcon, PencilIcon, RefreshCcwIcon, SplitIcon, TrashIcon, UserIcon, Volume2Icon, Scissors } from "@lucide/svelte"
+    import { ArrowLeft, ArrowLeftRightIcon, ArrowRight, BookmarkIcon, BotIcon, CopyIcon, PowerOff, GitBranch, HamburgerIcon, LanguagesIcon, MenuIcon, PencilIcon, RefreshCcwIcon, SplitIcon, TrashIcon, UserIcon, Volume2Icon, Scissors, EyeOff } from "@lucide/svelte"
     import { aiLawApplies, changeChatTo, foldChatToMessage, getFileSrc, createChatCopyName } from "src/ts/globalApi.svelte"
     import { ColorSchemeTypeStore } from "src/ts/gui/colorscheme"
     import { getModelInfo } from "src/ts/model/modellist"
@@ -466,13 +466,13 @@
                 {@render translationButton()}
                 {#if window.innerWidth >= 640}
                     {@render majorIconButtonsBody(false)}
-                    {#if DBState.db.characters[selIdState.selId]}
+                    {#if DBState.db.characters[selIdState.selId] && idx > -1}
                         <PopupButton>
                             {@render minorIconButtonsBody(true)}
                         </PopupButton>
                     {/if}
                 {:else}
-                    {#if DBState.db.characters[selIdState.selId]}
+                    {#if DBState.db.characters[selIdState.selId] && idx > -1}
                         <PopupButton>
                             {@render majorIconButtonsBody(true)}
                             {@render minorIconButtonsBody(true)}
@@ -480,6 +480,19 @@
                     {:else}
                         {@render majorIconButtonsBody(false)}
                     {/if}
+                {/if}
+                {#if firstMessage}
+                    <button class={"flex items-center shrink-0 transition-colors " + (disabled === true ? 'text-red-500 hover:text-red-400' : 'hover:text-primary')} onclick={async () => {
+                        await sleep(1)
+                        const chat = DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage]
+                        if(chat.firstMessageDisabled){
+                            chat.firstMessageDisabled = false
+                        } else if(await alertConfirm(language.disableFirstMessageConfirm)){
+                            chat.firstMessageDisabled = true
+                        }
+                    }}>
+                        <EyeOff size={20}/>
+                    </button>
                 {/if}
                 <div class="flex items-center gap-1">
                     {@render rerolls()}
@@ -491,7 +504,7 @@
 
 
 {#snippet majorIconButtonsBody(showNames:boolean)}
-    {#if DBState.db.useChatCopy && !blankMessage}
+    {#if !blankMessage}
     <button class="flex items-center hover:text-primary transition-colors button-icon-copy" onclick={async ()=>{
         if(window.navigator.clipboard.write){
             try {
@@ -818,7 +831,7 @@
 {/snippet}
 
 {#snippet minorIconButtonsBody(showNames:boolean)}
-    
+    {#if idx > -1}
     {#if DBState.db.enableBookmark}
         <button class="flex items-center hover:text-primary transition-colors button-icon-bookmark {isBookmarked ? 'text-yellow-400' : ''}" onclick={async () => {
             await sleep(1)
@@ -903,6 +916,7 @@
             <span class="ml-1">{language.disableAbove}</span>
         {/if}
     </button>
+    {/if}
 {/snippet}
 
 {#snippet senderIcon(options:{rounded?:boolean,styleFix?:string} = {})}

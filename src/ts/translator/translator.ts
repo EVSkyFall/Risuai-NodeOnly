@@ -16,7 +16,7 @@ import { clearPersistentPrefix, listPersistentKeys, makeHashedStorageKey, readPe
 import { getModuleRegexScripts } from "../process/modules"
 import { getNodetextToSentence, sleep } from "../util"
 import { processScriptFull } from "../process/scripts"
-import sendSound from '../../etc/send.mp3'
+import { playNotificationSound } from '../notificationSound'
 
 let cache={
     origin: [''],
@@ -304,8 +304,7 @@ export async function translateHTML(html: string, reverse:boolean, charArg:simpl
         const from = db.translatorInputLanguage
         const r = await translateLLM(html, {to: tr, from: from, regenerate})
         if(db.playMessageOnTranslateEnd){
-            const audio = new Audio(sendSound);
-            audio.play().catch(() => {});
+            playNotificationSound(db.translateSound, db.translateSoundVolume)
         }
 
         return applyEdittransRegex(r, charArg, alwaysExistChar)

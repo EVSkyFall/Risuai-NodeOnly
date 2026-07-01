@@ -593,7 +593,7 @@
   {/if}
   <div class="mt-2 border-b border-b-selected w-full relative text-white" class:max-xs:hidden={$leftBarCollapsed}>
     {#if menuMode === 1}
-      <div class="absolute w-20 min-w-20 flex border-b-selected border-b bg-bgcolor flex-col items-center pt-2 rounded-b-md z-20 pb-2">
+      <div class="absolute w-20 min-w-20 flex border-b-selected border-b bg-bgcolor flex-col items-center pt-2 rounded-b-md z-20 pb-2 max-h-[calc(100dvh-4rem)] overflow-x-hidden overflow-y-auto hamburger-menu">
         <BarIcon
         onClick={() => {
           if ($settingsOpen) {
@@ -633,7 +633,7 @@
         }}><LayoutGridIcon /></BarIcon
       >
       {#if additionalHamburgerMenu.length > 0}
-        <div class="mt-2 h-px w-10 bg-selected"></div>
+        <div class="mt-2 h-px w-10 bg-selected shrink-0"></div>
         {#each additionalHamburgerMenu as menu}
           <div class="mt-2"></div>
           <BarIcon
@@ -918,7 +918,7 @@
   {#if DBState.db.hamburgerButtonBottom}
   <div class="border-t border-t-selected w-full relative text-white" class:max-xs:hidden={$leftBarCollapsed}>
     {#if menuMode === 1}
-      <div class="absolute bottom-full w-20 min-w-20 flex border-t-selected border-t bg-bgcolor flex-col items-center pt-2 rounded-t-md z-20 pb-2">
+      <div class="absolute bottom-full w-20 min-w-20 flex border-t-selected border-t bg-bgcolor flex-col items-center pt-2 rounded-t-md z-20 pb-2 max-h-[calc(100dvh-4rem)] overflow-x-hidden overflow-y-auto hamburger-menu">
         <BarIcon
         onClick={() => {
           if ($settingsOpen) {
@@ -958,7 +958,7 @@
         }}><LayoutGridIcon /></BarIcon
       >
       {#if additionalHamburgerMenu.length > 0}
-        <div class="mt-2 h-px w-10 bg-selected"></div>
+        <div class="mt-2 h-px w-10 bg-selected shrink-0"></div>
         {#each additionalHamburgerMenu as menu}
           <div class="mt-2"></div>
           <BarIcon
@@ -1274,5 +1274,12 @@
     animation-name: sidebar-dark-closing-transition;
     animation-duration: var(--risu-animation-speed);
     background-color: rgba(0,0,0,0)
+  }
+  .hamburger-menu {
+    scrollbar-width: none;
+    overscroll-behavior: none;
+  }
+  .hamburger-menu::-webkit-scrollbar {
+    display: none;
   }
 </style>

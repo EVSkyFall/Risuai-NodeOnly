@@ -7,6 +7,7 @@
     import ShToggle from 'src/lib/UI/GUI/ShToggle.svelte'
     import SystemDashboard from './SystemDashboard.svelte'
     import SystemBackup from './SystemBackup.svelte'
+    import PluginStorageViewer from './PluginStorageViewer.svelte'
     import { SystemSubmenuIndex } from 'src/ts/stores.svelte'
     import { Collapsible, Tooltip } from 'bits-ui'
     import {
@@ -365,6 +366,7 @@
         { label: language.systemDashboard, value: 0 },
         { label: language.systemBackups, value: 1 },
         { label: language.systemLogs, value: 2 },
+        { label: language.pluginStorageTab, value: 3 },
     ]} bind:selected={$SystemSubmenuIndex} />
 
     {#if $SystemSubmenuIndex === 0}
@@ -610,5 +612,7 @@
             </ShButton>
         </div>
     {/if}
+    {:else if $SystemSubmenuIndex === 3}
+    <PluginStorageViewer />
     {/if}
 </SettingPage>

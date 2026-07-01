@@ -2,6 +2,7 @@
     import { language } from "src/lang";
     import SettingPage from "src/lib/UI/GUI/SettingPage.svelte";
     import ShButton from "src/lib/UI/GUI/ShButton.svelte";
+    import ShAlert from "src/lib/UI/GUI/ShAlert.svelte";
     import ShAccordion from "src/lib/UI/GUI/ShAccordion.svelte";
     import Button from "src/lib/UI/GUI/Button.svelte";
     import { alertConfirm } from "src/ts/alert";
@@ -24,15 +25,15 @@
 <SettingPage title={language.migration}>
     <p class="text-textcolor2 text-sm leading-relaxed mb-4">{language.migrationDesc}</p>
 
-    <div class="bg-blue-900/30 border border-blue-700/40 rounded-md px-4 py-3 mb-4 flex items-center justify-between gap-3 flex-wrap text-blue-300">
-        <div class="flex items-center gap-2.5 min-w-0 flex-1">
-            <InfoIcon class="size-4 shrink-0 text-blue-400" />
-            <span class="leading-relaxed text-sm">{language.migrationInfoBackupMoved}</span>
-        </div>
-        <ShButton variant="outline" size="sm" onclick={gotoBackupTab}>
-            {language.migrationGotoBackupTab}
-        </ShButton>
-    </div>
+    <ShAlert variant="info" className="mb-4">
+        {#snippet icon()}<InfoIcon />{/snippet}
+        {#snippet title()}{language.migrationInfoBackupMoved}{/snippet}
+        {#snippet action()}
+            <ShButton variant="outline" size="sm" onclick={gotoBackupTab}>
+                {language.migrationGotoBackupTab}
+            </ShButton>
+        {/snippet}
+    </ShAlert>
 
     <!-- Migration: upstream RisuAI ↔ NodeOnly ─────────────────────────── -->
     <Button

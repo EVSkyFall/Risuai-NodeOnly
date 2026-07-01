@@ -35,6 +35,16 @@ export const settingsOpen = writable(false)
 export const botMakerMode = writable(false)
 export const moduleBackgroundEmbedding = writable('')
 export const openPresetList = writable(false)
+export const presetSelectCallback = writable<((index: number) => void) | null>(null)
+export const openModelPresetList = writable(false)
+export const modelPresetSelectCallback = writable<((id: string) => void) | null>(null)
+export const openModelProfileBrowser = writable(false)
+// When set to a preset id, the profile browser replaces that preset's profile
+// (migrating matching userValues) instead of creating a new preset. null = create.
+export const modelProfileReplaceTarget = writable<string | null>(null)
+// Set to a newly-created preset id so the ModelPreset settings page opens it
+// for editing immediately. Consumed (cleared) by ModelPresetSettings.
+export const openModelPresetEditId = writable<string | null>(null)
 export const openModuleListStore = writable(false)
 export const openThemePresetList = writable(false)
 export const openPersonaList = writable(false)
@@ -172,18 +182,11 @@ export const bodyIntercepterStore = $state([] as {
     id: string,
     callback: (body: any, type: string) => Promise<any>
 }[])
-export const easyPanelStore = $state({
-    open: false,
-})
 export const popupStore = $state({
     children: null as null | import("svelte").Snippet,
     mouseX: 0,
     mouseY: 0,
     openId: 0,
-})
-
-export const loadoutModalStore = $state({
-    open: false
 })
 
 export const popUpEditorStore = $state({

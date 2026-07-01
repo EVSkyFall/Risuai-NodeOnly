@@ -122,33 +122,66 @@ describe('diffArrayWithIdGuard — ID safety belt', () => {
     })
 })
 
-describe('diffArrayWithIdGuard — length-only mode (botPresets)', () => {
-    // botPresets has no stable id field, so we fall back to length-only
-    // structural detection.
+describe('diffArrayWithIdGuard — id-based mode (botPresets)', () => {
+    // S3 (3966c178) added a stable string `id` field to botPresets and a boot
+    // migration that backfills missing ids. The patcher now diffs botPresets
+    // by id, matching modules: same-length internal edits emit a scoped
+    // element-wise diff for that slot only, while add / delete / reorder all
+    // trip structural detection and emit a single /botPresets replace. The
+    // pre-S3 length-only mode could silently misalign slots on reorder; the
+    // id-based mode forces a safe replace in that case.
 
-    const P1 = { name: 'GPT-4', temperature: 80, mainPrompt: 'You are...' }
-    const P2 = { name: 'Claude', temperature: 70, mainPrompt: 'You are...' }
-    const P3 = { name: 'Local', temperature: 60, mainPrompt: 'You are...' }
+    const P1 = { id: 'preset-1', name: 'GPT-4', temperature: 80, mainPrompt: 'You are...' }
+    const P2 = { id: 'preset-2', name: 'Claude', temperature: 70, mainPrompt: 'You are...' }
+    const P3 = { id: 'preset-3', name: 'Local', temperature: 60, mainPrompt: 'You are...' }
 
     test('identical → no ops', () => {
-        expect(diffArrayWithIdGuard(compare, '/botPresets', [P1, P2], [P1, P2], null)).toEqual([])
+        expect(diffArrayWithIdGuard(compare, '/botPresets', [P1, P2], [P1, P2], 'id')).toEqual([])
     })
 
-    test('length match, one preset internally changed → element-wise diff', () => {
-        const P2x = { name: 'Claude', temperature: 75, mainPrompt: 'You are...' }
-        const ops = diffArrayWithIdGuard(compare, '/botPresets', [P1, P2], [P1, P2x], null)
+    test('one preset internally changed → element-wise diff (only that slot)', () => {
+        const P2x = { ...P2, temperature: 75 }
+        const ops = diffArrayWithIdGuard(compare, '/botPresets', [P1, P2], [P1, P2x], 'id')
         expect(ops.length).toBeGreaterThan(0)
         for (const op of ops) expect(op.path.startsWith('/botPresets/1')).toBe(true)
     })
 
     test('add preset → structural replace', () => {
-        const ops = diffArrayWithIdGuard(compare, '/botPresets', [P1, P2], [P1, P2, P3], null)
+        const ops = diffArrayWithIdGuard(compare, '/botPresets', [P1, P2], [P1, P2, P3], 'id')
         expect(ops).toEqual([{ op: 'replace', path: '/botPresets', value: [P1, P2, P3] }])
     })
 
     test('delete preset from middle → structural replace', () => {
-        const ops = diffArrayWithIdGuard(compare, '/botPresets', [P1, P2, P3], [P1, P3], null)
+        const ops = diffArrayWithIdGuard(compare, '/botPresets', [P1, P2, P3], [P1, P3], 'id')
         expect(ops).toEqual([{ op: 'replace', path: '/botPresets', value: [P1, P3] }])
+    })
+
+    test('reorder presets → structural replace', () => {
+        const ops = diffArrayWithIdGuard(compare, '/botPresets', [P1, P2, P3], [P3, P1, P2], 'id')
+        expect(ops).toEqual([{ op: 'replace', path: '/botPresets', value: [P3, P1, P2] }])
+    })
+
+    // Safety belt — backups predating S3 won't have ids until boot migration
+    // runs. If the patcher is invoked before then (defensive), missing ids
+    // force a structural replace rather than silently misaligning slots.
+    test('missing id on any preset → structural replace (safety belt)', () => {
+        const Pnoid = { name: 'Legacy', temperature: 50, mainPrompt: 'You are...' }
+        const ops = diffArrayWithIdGuard(compare, '/botPresets', [P1, P2], [P1, Pnoid], 'id')
+        expect(ops).toEqual([{ op: 'replace', path: '/botPresets', value: [P1, Pnoid] }])
+    })
+
+    test('duplicate ids → structural replace (safety belt)', () => {
+        const Pdup = { ...P2, id: P1.id }
+        const ops = diffArrayWithIdGuard(compare, '/botPresets', [P1, P2], [P1, Pdup], 'id')
+        expect(ops).toEqual([{ op: 'replace', path: '/botPresets', value: [P1, Pdup] }])
+    })
+
+    test('reorder + internal edit → structural replace (id mismatch at index)', () => {
+        // When ids don't line up at the same indices, structural replace wins —
+        // we do not attempt to chase the moved entry's internal diff.
+        const P2x = { ...P2, temperature: 75 }
+        const ops = diffArrayWithIdGuard(compare, '/botPresets', [P1, P2], [P2x, P1], 'id')
+        expect(ops).toEqual([{ op: 'replace', path: '/botPresets', value: [P2x, P1] }])
     })
 })
 
@@ -221,7 +254,6 @@ const emptyToSave = () => ({
     root: false,
     botPreset: false,
     modules: false,
-    loadouts: false,
     plugins: false,
     pluginCustomStorage: false,
 })
@@ -312,8 +344,10 @@ describe('RisuSavePatcher.set — modules path', () => {
 })
 
 describe('RisuSavePatcher.set — botPresets path', () => {
+    // Each preset gets a stable id (S3) — patcher diffs botPresets by id,
+    // same as modules. Reusing `name` as the id keeps fixtures terse.
     const preset = (name: string, extras: any = {}) => ({
-        name, temperature: 80, mainPrompt: 'You are...', ...extras,
+        id: name, name, temperature: 80, mainPrompt: 'You are...', ...extras,
     })
 
     test('deleting a preset from the middle emits a single replace op', async () => {

@@ -1,15 +1,18 @@
 <script lang="ts">
-    import { AccessibilityIcon, ActivityIcon, PackageIcon, BotIcon, CodeIcon, CogIcon, ContactIcon, FlaskConicalIcon, ImageIcon, LanguagesIcon, MonitorIcon, MonitorSmartphoneIcon, Sailboat, UserIcon, CircleXIcon, KeyboardIcon, SparkleIcon, TruckIcon } from "@lucide/svelte";
+    import { AccessibilityIcon, ActivityIcon, PackageIcon, BotIcon, CodeIcon, CogIcon, ContactIcon, FlaskConicalIcon, ImageIcon, LanguagesIcon, MonitorIcon, MonitorSmartphoneIcon, Sailboat, ScrollTextIcon, UserIcon, CircleXIcon, KeyboardIcon, TruckIcon, FileBoxIcon, Volume2Icon } from "@lucide/svelte";
     import { language } from "src/lang";
     import DisplaySettings from "./Pages/DisplaySettings.svelte";
+    import NotificationSoundSettings from "./Pages/NotificationSoundSettings.svelte";
     import MigrationSettings from "./Pages/MigrationSettings.svelte";
     import BotSettings from "./Pages/BotSettings.svelte";
+    import ModelPresetSettings from "./Pages/Model/ModelPresetSettings.svelte";
+    import PromptPresetSettings from "./Pages/PromptPresetSettings.svelte";
     import OtherBotSettings from "./Pages/OtherBotSettings.svelte";
     import PluginSettings from "./Pages/PluginSettings.svelte";
     import FilesSettings from "./Pages/FilesSettings.svelte";
     import AdvancedSettings from "./Pages/AdvancedSettings.svelte";
     import SystemSettings from "./Pages/SystemSettings.svelte";
-    import { additionalSettingsMenu, easyPanelStore, MobileGUI, SettingsMenuIndex, settingsOpen } from "src/ts/stores.svelte";
+    import { additionalSettingsMenu, MobileGUI, SettingsMenuIndex, settingsOpen } from "src/ts/stores.svelte";
     import { DBState } from "src/ts/stores.svelte";
     import GlobalLoreBookSettings from "./Pages/GlobalLoreBookSettings.svelte";
     import Lorepreset from "./lorepreset.svelte";
@@ -52,10 +55,28 @@
                         class:text-textcolor2={$SettingsMenuIndex !== 1 && $SettingsMenuIndex !== 13}
                         onclick={() => {
                             $SettingsMenuIndex = 1
-                            
+
                     }}>
                         <BotIcon />
                         <span>{language.chatBot}</span>
+                    </button>
+                    <button class="flex gap-2 items-center hover:text-textcolor"
+                        class:text-textcolor={$SettingsMenuIndex === 16}
+                        class:text-textcolor2={$SettingsMenuIndex !== 16}
+                        onclick={() => {
+                            $SettingsMenuIndex = 16
+                    }}>
+                        <FileBoxIcon />
+                        <span>{language.modelPresetMenu}</span>
+                    </button>
+                    <button class="flex gap-2 items-center hover:text-textcolor"
+                        class:text-textcolor={$SettingsMenuIndex === 17}
+                        class:text-textcolor2={$SettingsMenuIndex !== 17}
+                        onclick={() => {
+                            $SettingsMenuIndex = 17
+                    }}>
+                        <ScrollTextIcon />
+                        <span>{language.promptPresetMenu}</span>
                     </button>
                     <button class="flex gap-2 items-center hover:text-textcolor"
                         class:text-textcolor={$SettingsMenuIndex === 12}
@@ -83,6 +104,15 @@
                     }}>
                         <MonitorIcon />
                         <span>{language.display}</span>
+                    </button>
+                    <button class="flex gap-2 items-center hover:text-textcolor"
+                        class:text-textcolor={$SettingsMenuIndex === 7}
+                        class:text-textcolor2={$SettingsMenuIndex !== 7}
+                        onclick={() => {
+                            $SettingsMenuIndex = 7
+                    }}>
+                        <Volume2Icon />
+                        <span>{language.soundAndNotification}</span>
                     </button>
                 {/if}
                 <button class="flex gap-2 items-center hover:text-textcolor"
@@ -204,26 +234,6 @@
                         </button>
                     {/each}
 
-                    {#if DBState.db.enableRisuaiProTools && !DBState.db.hideEasyPanel}
-                        <button class="flex gap-2 items-center hover:text-textcolor"
-                            class:text-textcolor={$SettingsMenuIndex === 16}
-                            class:text-textcolor2={$SettingsMenuIndex !== 16}
-                            onclick={() => {
-                            easyPanelStore.open = true
-                        }}>
-                            <!-- From Lucide Icons, licensed under MIT/ISC License, modified to fit the design. see license from bundled lucide icons. -->
-                            <svg width={24} height={24}>
-                                <defs>
-                                    <linearGradient id={`grad1`} x1='0' y1='0' x2='1' y2='0'>
-                                    <stop offset='0%' style="stop-color:#587bff"/>
-                                    <stop offset='100%' style="stop-color:#00a1ad"/>
-                                    </linearGradient>
-                                </defs>
-                                    <SparkleIcon color="url(#grad1)" />
-                            </svg>
-                            <span>{language.easyPanel}</span>
-                        </button>
-                    {/if}
                 {/if}
                 {#if window.innerWidth < 700 && !$MobileGUI}
                     <button class="absolute top-2 right-2 hover:text-primary text-textcolor" onclick={() => {
@@ -239,13 +249,13 @@
                         {#if $SettingsMenuIndex === 0}
                             <MigrationSettings />
                         {:else if $SettingsMenuIndex === 1}
-                            <BotSettings goPromptTemplate={() => {
-                                $SettingsMenuIndex = 13
-                            }} />
+                            <BotSettings />
                         {:else if $SettingsMenuIndex === 2}
                             <OtherBotSettings />
                         {:else if $SettingsMenuIndex === 3}
                             <DisplaySettings />
+                        {:else if $SettingsMenuIndex === 7}
+                            <NotificationSoundSettings />
                         {:else if $SettingsMenuIndex === 4}
                             <PluginSettings />
                         {:else if $SettingsMenuIndex === 5}
@@ -270,6 +280,10 @@
                             }}/>
                         {:else if $SettingsMenuIndex === 15 && window.innerWidth >= 768}
                             <HotkeySettings/>
+                        {:else if $SettingsMenuIndex === 16}
+                            <ModelPresetSettings/>
+                        {:else if $SettingsMenuIndex === 17}
+                            <PromptPresetSettings/>
                         {:else if $SettingsMenuIndex === 23}
                             <InlayImageGallery/>
                         {:else if $SettingsMenuIndex === 21}

@@ -39,9 +39,11 @@
         </SelectInput>
 
         {#each colors as color}
-            <div class="flex items-center mt-2">
-                <ColorInput bind:value={DBState.db.colorScheme[color[0]]} oninput={updateColorScheme} />
-                <span class="ml-2">{color[1]}</span>
+            <div class="flex items-center justify-between gap-3 py-2">
+                <span class="text-sm text-textcolor min-w-0 truncate">{color[1]}</span>
+                <div class="shrink-0">
+                    <ColorInput bind:value={DBState.db.colorScheme[color[0]]} oninput={updateColorScheme} />
+                </div>
             </div>
         {/each}
 

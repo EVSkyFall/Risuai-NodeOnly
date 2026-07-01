@@ -1,5 +1,6 @@
 import { toGetter } from "../globalApi.svelte";
 import { clearPersistentPrefix, decodeStorageKeyComponent, listPersistentKeys, makeEncodedStorageKey, readPersistentJson, removePersistentKey, writePersistentJson } from "../storage/persistentKv";
+import { recordOwner, removeOwner, clearOwners } from "./pluginStorageMeta";
 
 const pluginStorage = new Map<string, unknown>();
 const pluginStoragePrefix = 'cache/plugin-storage/';
@@ -48,6 +49,14 @@ export class SafeLocalStorage {
 
 export class SafeLocalPluginStorage {
     __classType = 'REMOTE_REQUIRED' as const;
+    // The originating plugin, set when the instance is created via the V3
+    // getLocalPluginStorage() API. Used to tag new writes with their origin in
+    // the sidecar meta store. Undefined (e.g. when instantiated by the built-in
+    // storage viewer) means writes don't touch ownership metadata.
+    private owner?: string;
+    constructor(owner?: string) {
+        this.owner = owner;
+    }
     async getItem<T>(key: string): Promise<T | null> {
         const cacheKey = `safe_plugin_${key}`;
         if (pluginStorage.has(cacheKey)) {
@@ -63,10 +72,12 @@ export class SafeLocalPluginStorage {
         const cacheKey = `safe_plugin_${key}`;
         pluginStorage.set(cacheKey, value);
         await writePersistentJson(makeEncodedStorageKey(pluginStoragePrefix, key), value);
+        if (this.owner) await recordOwner('idb', key, this.owner);
     }
     async removeItem(key: string): Promise<void> {
         pluginStorage.delete(`safe_plugin_${key}`);
         await removePersistentKey(makeEncodedStorageKey(pluginStoragePrefix, key));
+        if (this.owner) await removeOwner('idb', key);
     }
     async keys(): Promise<string[]> {
         const keys: string[] = [];
@@ -84,6 +95,7 @@ export class SafeLocalPluginStorage {
             }
         }
         await clearPersistentPrefix(pluginStoragePrefix);
+        if (this.owner) await clearOwners('idb');
     }
 }
 

@@ -5,6 +5,7 @@
     import SelectInput from 'src/lib/UI/GUI/SelectInput.svelte';
     import OptionInput from 'src/lib/UI/GUI/OptionInput.svelte';
     import Help from 'src/lib/Others/Help.svelte';
+    import SettingRowLayout from './SettingRowLayout.svelte';
     import { language } from 'src/lang';
 
     interface Props {
@@ -45,14 +46,28 @@
     });
 </script>
 
-<span class="text-textcolor {item.classes ?? 'mt-4'}">
-    {getLabel(item)}
-    {#if item.helpKey}<Help key={item.helpKey as any}/>{/if}
-</span>
-<SelectInput className="mt-2 mb-4" bind:value={localValue}>
-    {#each processedOptions as opt}
-        <OptionInput value={opt.value}>
-            {opt.labelKey ? (language as any)[opt.labelKey] : opt.label}
-        </OptionInput>
-    {/each}
-</SelectInput>
+{#if ctx.layout === 'row'}
+    <SettingRowLayout {item}>
+        {#snippet control()}
+            <SelectInput className="w-48" size="sm" bind:value={localValue}>
+                {#each processedOptions as opt}
+                    <OptionInput value={opt.value}>
+                        {opt.labelKey ? (language as any)[opt.labelKey] : opt.label}
+                    </OptionInput>
+                {/each}
+            </SelectInput>
+        {/snippet}
+    </SettingRowLayout>
+{:else}
+    <span class="text-textcolor {item.classes ?? 'mt-4'}">
+        {getLabel(item)}
+        {#if item.helpKey}<Help key={item.helpKey as any}/>{/if}
+    </span>
+    <SelectInput className="mt-2 mb-4" bind:value={localValue}>
+        {#each processedOptions as opt}
+            <OptionInput value={opt.value}>
+                {opt.labelKey ? (language as any)[opt.labelKey] : opt.label}
+            </OptionInput>
+        {/each}
+    </SelectInput>
+{/if}

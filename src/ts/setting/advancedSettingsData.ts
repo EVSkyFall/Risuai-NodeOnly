@@ -123,8 +123,6 @@ export const advancedSettingsItems: SettingItem[] = [
     { id: 'adv.allowExt', type: 'check', fallbackLabel: 'Allow all in file select', bindKey: 'allowAllExtentionFiles', helpKey: 'allowAllExtentionFiles', classes: 'mt-4' },
     { id: 'adv.dynamicModelRegistry', type: 'check', labelKey: 'dynamicModelRegistry', bindKey: 'dynamicModelRegistry', helpKey: 'dynamicModelRegistry', classes: 'mt-4' },
     { id: 'adv.disableSeperateParameterChangeOnPresetChange', type: 'check', labelKey: 'disableSeperateParameterChangeOnPresetChange', bindKey: 'disableSeperateParameterChangeOnPresetChange', helpKey: 'disableSeperateParameterChangeOnPresetChange', classes: 'mt-4' },
-    { id: 'adv.hideLoadout', type: 'check', labelKey: 'hideLoadout', bindKey: 'hideLoadout', helpKey: 'hideLoadout', classes: 'mt-4' },
-    { id: 'adv.hideEasyPanel', type: 'check', labelKey: 'hideEasyPanel', bindKey: 'hideEasyPanel', helpKey: 'hideEasyPanel', classes: 'mt-4' },
     {
         id: 'adv.allowV2Plugin', type: 'check', labelKey: 'allowV2Plugin', bindKey: 'allowV2Plugin',
         helpKey: 'allowV2Plugin', helpUnrecommended: true, classes: 'mt-4',
@@ -189,7 +187,6 @@ export const advancedSettingsItems: SettingItem[] = [
     { id: 'adv.simpleTool', type: 'check', labelKey: 'simplifiedToolUse', bindKey: 'simplifiedToolUse', helpKey: 'simplifiedToolUse', classes: 'mt-4' },
     { id: 'adv.tokCache', type: 'check', labelKey: 'useTokenizerCaching', bindKey: 'useTokenizerCaching', helpKey: 'useTokenizerCaching', classes: 'mt-4' },
     { type: 'custom', id: 'adv.claudeTokenCalib', componentId: 'ClaudeTokenizerCalibration' },
-    { id: 'adv.auxModelUnderModelSettings', type: 'check', labelKey: 'auxModelUnderModelSettings', bindKey: 'auxModelUnderModelSettings', helpKey: 'auxModelUnderModelSettings', classes: 'mt-4' },
     { id: 'adv.devMode', type: 'check', labelKey: 'pluginDevelopMode', bindKey: 'pluginDevelopMode', helpKey: 'pluginDevelopMode', classes: 'mt-4' },
 
     // More Experimental (Condition: useExperimental)
@@ -226,6 +223,5 @@ export const advancedSettingsItems: SettingItem[] = [
 
     // Custom Components
     { type: 'custom', id: 'adv.banChar', componentId: 'BanCharacterSetSettings' },
-    { type: 'custom', id: 'adv.customModels', componentId: 'CustomModelsSettings' },
     { type: 'custom', id: 'adv.export', componentId: 'SettingsExportButtons' },
 ];

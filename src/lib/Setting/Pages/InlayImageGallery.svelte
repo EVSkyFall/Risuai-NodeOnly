@@ -167,6 +167,15 @@
     return fallback.replace(/[<>:"/\\|?*\u0000-\u001F]/g, '_')
   }
 
+  function withExtension(name: string, ext: string): string {
+    const safeExt = (ext ?? '').trim() || 'bin'
+    const lowerName = name.toLowerCase()
+    if (lowerName.endsWith(`.${safeExt.toLowerCase()}`)) return name
+    const lastDot = name.lastIndexOf('.')
+    const base = lastDot > 0 ? name.slice(0, lastDot) : name
+    return `${base}.${safeExt}`
+  }
+
   function revokeViewerUrl() {
     viewerUrl = ''
   }
@@ -214,7 +223,7 @@
         return
       }
       const buffer = new Uint8Array(await asset.data.arrayBuffer())
-      await downloadFile(sanitizeFileName(item.name), buffer)
+      await downloadFile(sanitizeFileName(withExtension(asset.name, asset.ext)), buffer)
       notifySuccess(language.successExport)
     } catch (error) {
       notifyError(`${error}`)
@@ -633,6 +642,9 @@
               {currentViewerItem?.name ?? viewerId}
             </p>
             <p class="text-white/30 text-xs font-mono break-all leading-snug">{viewerId}</p>
+            {#if currentViewerItem?.ext}
+              <p class="text-white/50 text-xs uppercase font-mono">.{currentViewerItem.ext}</p>
+            {/if}
             {#if currentViewerItem?.width && currentViewerItem?.height}
               <p class="text-white/50 text-xs">{currentViewerItem.width} × {currentViewerItem.height} px</p>
             {/if}

@@ -11,21 +11,20 @@
   <Check bind:check={DBState.db.seperateModelsForAxModels} name={language.seperateModelsForAxModels}></Check>
 </div>
 {#if DBState.db.seperateModelsForAxModels}
-  <Check bind:check={DBState.db.doNotChangeSeperateModels} name={language.doNotChangeSeperateModels}></Check>
   <Accordion name={language.axModelsDef} styled>
-    <span class="text-textcolor mt-4"> Memory </span>
-    <ModelList bind:value={DBState.db.seperateModels.memory} blankable />
+    <span class="text-textcolor mt-4">{language.axModelMemory}</span>
+    <ModelList bind:value={DBState.db.seperateModels.memory} blankable blankLabel={language.useDefaultSubModel} />
 
-    <span class="text-textcolor mt-4"> Translations </span>
-    <ModelList bind:value={DBState.db.seperateModels.translate} blankable />
+    <span class="text-textcolor mt-4">{language.axModelTranslate}</span>
+    <ModelList bind:value={DBState.db.seperateModels.translate} blankable blankLabel={language.useDefaultSubModel} />
 
-    <span class="text-textcolor mt-4"> Emotion </span>
+    <span class="text-textcolor mt-4">{language.axModelEmotion}</span>
 
-    <ModelList bind:value={DBState.db.seperateModels.emotion} blankable />
+    <ModelList bind:value={DBState.db.seperateModels.emotion} blankable blankLabel={language.useDefaultSubModel} />
 
-    <span class="text-textcolor mt-4"> OtherAx </span>
+    <span class="text-textcolor mt-4">{language.axModelOther}</span>
 
-    <ModelList bind:value={DBState.db.seperateModels.otherAx} blankable />
+    <ModelList bind:value={DBState.db.seperateModels.otherAx} blankable blankLabel={language.useDefaultSubModel} />
   </Accordion>
 {/if}
 

@@ -1,8 +1,12 @@
 <script lang="ts">
 
     import Suggestion from './Suggestion.svelte';
-    import { CameraIcon, ChevronUpIcon, ChevronDownIcon, DatabaseIcon, GlobeIcon, ImagePlusIcon, LanguagesIcon, Laugh, MenuIcon, MicOffIcon, PackageIcon, Plus, RefreshCcwIcon, ReplyIcon, Send, StepForwardIcon, XIcon, BrainIcon, ArrowDown, SparkleIcon, ZapIcon } from "@lucide/svelte";
-    import { selectedCharID, PlaygroundStore, createSimpleCharacter, hypaV3ModalOpen, ScrollToMessageStore, additionalChatMenu, additionalFloatingActionButtons, easyPanelStore, chatDeselected } from "../../ts/stores.svelte";
+    import { CameraIcon, ChevronUpIcon, ChevronDownIcon, ChevronsUpIcon, ChevronsDownIcon, DatabaseIcon, GlobeIcon, ImagePlusIcon, LanguagesIcon, Laugh, MenuIcon, MicOffIcon, PackageIcon, Plus, RefreshCcwIcon, ReplyIcon, Send, StepForwardIcon, XIcon, BrainIcon, ArrowDown, ZapIcon, Maximize2, Minimize2 } from "@lucide/svelte";
+    import ShDropdownMenu from 'src/lib/UI/GUI/ShDropdownMenu.svelte';
+    import ShDropdownMenuTrigger from 'src/lib/UI/GUI/ShDropdownMenuTrigger.svelte';
+    import ShDropdownMenuContent from 'src/lib/UI/GUI/ShDropdownMenuContent.svelte';
+    import ShDropdownMenuItem from 'src/lib/UI/GUI/ShDropdownMenuItem.svelte';
+    import { selectedCharID, PlaygroundStore, createSimpleCharacter, hypaV3ModalOpen, ScrollToMessageStore, additionalChatMenu, additionalFloatingActionButtons, chatDeselected } from "../../ts/stores.svelte";
     import { tick } from 'svelte';
     import Chat from "./Chat.svelte";
     import { type Chat as ChatData, type Message } from "../../ts/storage/database.svelte";
@@ -14,7 +18,8 @@
     import { language } from "../../lang";
     import { isExpTranslator, translate } from "../../ts/translator/translator";
     import { alertError, alertWait, notifySuccess, notifyError } from "../../ts/alert";
-    import sendSound from '../../etc/send.mp3'
+    import { playNotificationSound } from '../../ts/notificationSound'
+import { isMobile } from 'src/ts/platform'
     import { processScript } from "src/ts/process/scripts";
     import CreatorQuote from "./CreatorQuote.svelte";
     import { stopTTS } from "src/ts/process/tts";
@@ -34,7 +39,21 @@
     import PluginDefinedIcon from '../Others/PluginDefinedIcon.svelte';
 
     const loadPlaygroundMenu = () => import('../Playground/PlaygroundMenu.svelte').then(m => m.default);
-    
+
+    // Whether an Enter keydown should send (vs insert a newline), based on the
+    // per-platform send-key mode. Mobile uses sendKeyMobile, desktop sendKeyPC.
+    function shouldSendOnEnter(e: KeyboardEvent): boolean {
+        const mode = isMobile ? DBState.db.sendKeyMobile : DBState.db.sendKeyPC;
+        // Match the configured combo EXACTLY — every other modifier must be absent,
+        // so e.g. Alt+Enter or Ctrl+Shift+Enter inserts a newline instead of sending.
+        switch (mode) {
+            case 'enter': return !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey;
+            case 'ctrl-enter': return (e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey;
+            case 'shift-enter': return e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey;
+            default: return false; // 'button'
+        }
+    }
+
     interface Props {
         openModuleList?: boolean;
         openChatList?: boolean;
@@ -72,6 +91,36 @@
 
     function scrollToBottom() {
         chatsInstance?.scrollToLatestMessage();
+    }
+
+    function bumpScrollNav() {
+        showScrollNav = true
+        if (scrollNavTimer) clearTimeout(scrollNavTimer)
+        scrollNavTimer = setTimeout(() => { showScrollNav = false }, 1500)
+    }
+
+    function getLoadedMessages(container: HTMLElement) {
+        return Array.from(container.querySelectorAll('[data-chat-index]'))
+            .map(el => ({ el: el as HTMLElement, idx: parseInt(el.getAttribute('data-chat-index')!) }))
+            .sort((a, b) => a.idx - b.idx)
+    }
+
+    // Top of currently loaded messages (no force-load of older pages).
+    function scrollToLoadedTop() {
+        const container = document.querySelector('.default-chat-screen') as HTMLElement | null
+        if (!container) return
+        const messages = getLoadedMessages(container)
+        if (messages.length === 0) return
+        scrollWithinContainer(messages[0].el, container, { block: 'start', behavior: 'smooth' })
+    }
+
+    // Literal bottom of the scroll (end of the latest message).
+    function scrollToLoadedBottom() {
+        const container = document.querySelector('.default-chat-screen') as HTMLElement | null
+        if (!container) return
+        const messages = getLoadedMessages(container)
+        if (messages.length === 0) return
+        scrollWithinContainer(messages[messages.length - 1].el, container, { block: 'end', behavior: 'smooth' })
     }
 
     function navigateMessage(direction: 'prev' | 'next') {
@@ -273,6 +322,42 @@
 
     }
 
+    // Fullscreen compose mode: the same messageInput, just shown in a full-screen
+    // editor. Enter inserts a newline (no send); sending is via the Send button.
+    let composerFullscreen = $state(false)
+    let fullscreenEle:HTMLTextAreaElement = $state()
+    $effect(() => {
+        if (composerFullscreen && fullscreenEle) {
+            const el = fullscreenEle
+            requestAnimationFrame(() => {
+                el.focus()
+                el.selectionStart = el.selectionEnd = el.value.length
+            })
+        }
+    })
+    async function exitFullscreen(){
+        composerFullscreen = false
+        await tick()   // let the inline composer re-measure with the latest text
+        updateInputSizeAll()
+        updateInputTransateMessage(false)
+    }
+    function sendFullscreen(){
+        composerFullscreen = false
+        send()
+    }
+
+    // With an empty input (and no attachments) and the last message being the
+    // user's, pressing send doesn't add a new message — it regenerates a reply
+    // to that last message. Surface that as a reroll affordance.
+    const willResend = $derived.by(() => {
+        if (messageInput !== '' || fileInput.length > 0) return false
+        const cha = DBState.db.characters[$selectedCharID]
+        if (!cha) return false
+        const msgs = cha.chats?.[cha.chatPage]?.message
+        if (!msgs || msgs.length === 0) return false
+        return msgs[msgs.length - 1].role === 'user'
+    })
+
     function getLastCharMsg() {
         const msgs = DBState.db.characters[$selectedCharID]?.chats[DBState.db.characters[$selectedCharID].chatPage]?.message
         if (!msgs || msgs.length === 0) return null
@@ -394,8 +479,7 @@
         }
         $doingChat = false
         if(DBState.db.playMessage){
-            const audio = new Audio(sendSound);
-            audio.play().catch(() => {});
+            playNotificationSound(DBState.db.messageSound, DBState.db.messageSoundVolume)
         }
         return generated
     }
@@ -429,6 +513,8 @@
     })
 
     let inputHeight = $state("44px")
+    let multiline = $state(false)
+    let inputOverflow = $state(false)
     let inputEle:HTMLTextAreaElement = $state()
     let inputTranslateHeight = $state("44px")
     let inputTranslateEle:HTMLTextAreaElement = $state()
@@ -445,11 +531,56 @@
             inputTranslateEle.style.height = inputTranslateHeight
         }
     }
+    // Measure the textarea's content height at a given css width (empty = current
+    // flex width), restoring the override afterwards.
+    function measureHeightAt(cssWidth:string):number {
+        const prev = inputEle.style.width
+        inputEle.style.height = "0"
+        if(cssWidth) inputEle.style.width = cssWidth
+        const h = inputEle.scrollHeight
+        inputEle.style.width = prev
+        return h
+    }
+
+    // Width the textarea would have on a single inline row (pill content minus the
+    // icon buttons and gaps). Computed from layout-independent sizes — the pill is
+    // always full width and the icons are fixed-size — so it does NOT depend on the
+    // current `multiline` state. That's what stops the 1↔2 line flip-flop.
+    function inlineColWidth():number {
+        const pill = inputEle.parentElement
+        if(!pill) return 0
+        const cs = getComputedStyle(pill)
+        const padX = (parseFloat(cs.paddingLeft) || 0) + (parseFloat(cs.paddingRight) || 0)
+        const gap = parseFloat(cs.columnGap || cs.gap || '0') || 0
+        let used = 0, others = 0
+        for(const c of Array.from(pill.children) as HTMLElement[]){
+            if(c === inputEle) continue
+            used += c.offsetWidth
+            others++
+        }
+        return pill.clientWidth - padX - used - gap * others
+    }
+
     function updateInputSize() {
         if(inputEle){
-            inputEle.style.height = "0";
-            inputHeight = (inputEle.scrollHeight) + "px";
+            const col = inlineColWidth()
+            const ref = col > 0 ? col + "px" : ""
+            // Gemini-style hysteresis: once the text grows past one line it stays
+            // multiline until the input is fully cleared. Reflow is therefore a
+            // one-way latch (cleared only on empty), so the layout toggle can never
+            // feed back into the width measurement and flip-flop 1↔2 lines.
+            if(messageInput === ''){
+                multiline = false
+            } else if(!multiline && measureHeightAt(ref) > 50){
+                multiline = true
+            }
+            // Height for the width that will actually be shown.
+            const sh = measureHeightAt(multiline ? "100%" : ref)
+            // Cap the composer at ~60% of the viewport; beyond that it scrolls.
+            const maxH = Math.round(window.innerHeight * 0.6)
+            inputHeight = Math.min(sh, maxH) + "px"
             inputEle.style.height = inputHeight
+            inputOverflow = sh > maxH
         }
     }
 
@@ -570,25 +701,43 @@
     openMenu = false
 }}>
     
-    {#if DBState.db.useNodeOnlyScrollButton && currentChat.length > 0}
+    {#if DBState.db.nodeOnlyScrollButtonType !== 'off' && currentChat.length > 0}
         <div
             class="absolute right-3 bottom-16 z-40 flex flex-col rounded-lg bg-bgcolor/70 backdrop-blur-sm border border-darkborderc border-opacity-30 shadow-lg overflow-hidden transition-opacity duration-300"
             class:opacity-0={!showScrollNav}
             class:pointer-events-none={!showScrollNav}
         >
+            {#if DBState.db.nodeOnlyScrollButtonType === 'four'}
+                <button
+                    class="w-9 h-9 text-textcolor2 hover:text-textcolor hover:bg-darkbg/50 flex items-center justify-center transition-colors"
+                    onclick={() => { bumpScrollNav(); scrollToLoadedTop() }}
+                >
+                    <ChevronsUpIcon size={18} />
+                </button>
+                <div class="border-t border-darkborderc border-opacity-30"></div>
+            {/if}
             <button
                 class="w-9 h-9 text-textcolor2 hover:text-textcolor hover:bg-darkbg/50 flex items-center justify-center transition-colors"
-                onclick={() => { showScrollNav = true; if (scrollNavTimer) clearTimeout(scrollNavTimer); scrollNavTimer = setTimeout(() => { showScrollNav = false }, 1500); navigateMessage('prev') }}
+                onclick={() => { bumpScrollNav(); navigateMessage('prev') }}
             >
                 <ChevronUpIcon size={18} />
             </button>
             <div class="border-t border-darkborderc border-opacity-30"></div>
             <button
                 class="w-9 h-9 text-textcolor2 hover:text-textcolor hover:bg-darkbg/50 flex items-center justify-center transition-colors"
-                onclick={() => { showScrollNav = true; if (scrollNavTimer) clearTimeout(scrollNavTimer); scrollNavTimer = setTimeout(() => { showScrollNav = false }, 1500); navigateMessage('next') }}
+                onclick={() => { bumpScrollNav(); navigateMessage('next') }}
             >
                 <ChevronDownIcon size={18} />
             </button>
+            {#if DBState.db.nodeOnlyScrollButtonType === 'four'}
+                <div class="border-t border-darkborderc border-opacity-30"></div>
+                <button
+                    class="w-9 h-9 text-textcolor2 hover:text-textcolor hover:bg-darkbg/50 flex items-center justify-center transition-colors"
+                    onclick={() => { bumpScrollNav(); scrollToLoadedBottom() }}
+                >
+                    <ChevronsDownIcon size={18} />
+                </button>
+            {/if}
         </div>
     {/if}
 
@@ -657,10 +806,8 @@
             class:no-chat-width-wide={DBState.db.theme === '' && DBState.db.nodeOnlyStandardChatWidth === 'wide'}
             class:no-chat-width-full={DBState.db.theme === '' && DBState.db.nodeOnlyStandardChatWidth === 'full'}
             onscroll={(e) => {
-            if (DBState.db.useNodeOnlyScrollButton) {
-                showScrollNav = true
-                if (scrollNavTimer) clearTimeout(scrollNavTimer)
-                scrollNavTimer = setTimeout(() => { showScrollNav = false }, 1500)
+            if (DBState.db.nodeOnlyScrollButtonType !== 'off') {
+                bumpScrollNav()
             }
             //@ts-expect-error scrollHeight/clientHeight/scrollTop don't exist on EventTarget, but target is HTMLElement here
             const scrolled = (e.target.scrollHeight - e.target.clientHeight + e.target.scrollTop)
@@ -676,25 +823,123 @@
             }
         }}>
             <div
-                    class="{DBState.db.fixedChatTextarea ? 'sticky pt-2 pb-2 right-0 bottom-0 bg-bgcolor' : 'mt-2 mb-2'} flex items-stretch w-full"
+                    class="{DBState.db.fixedChatTextarea ? 'sticky pt-2 pb-2 right-0 bottom-0 bg-bgcolor' : 'mt-2 mb-2'} w-full"
                     style="{DBState.db.fixedChatTextarea ? 'z-index:29;' : ''}"
             >
-                {#if DBState.db.useChatSticker}
-                    <div onclick={()=>{toggleStickers = !toggleStickers}}
-                         class={"ml-4 bg-textcolor2 flex justify-center items-center  w-12 h-12 rounded-md hover:bg-primary/30 transition-colors "+(toggleStickers ? 'text-green-500':'text-textcolor')}>
-                        <Laugh/>
+              <div class="mx-auto w-full max-w-3xl px-2">
+                <div class="flex flex-wrap items-center gap-1 rounded-3xl border border-darkborderc bg-bgcolor px-2 py-1.5 transition-colors focus-within:border-textcolor">
+                {#if DBState.db.characters[$selectedCharID]?.chaId !== '§playground'}
+                    <ShDropdownMenu bind:open={openMenu}>
+                        <ShDropdownMenuTrigger>
+                            {#snippet child({ props })}
+                                <button {...props}
+                                        aria-label="menu"
+                                        class="shrink-0 flex justify-center items-center w-9 h-9 rounded-full text-textcolor hover:bg-primary/20 transition-colors">
+                                    <MenuIcon size={20} />
+                                </button>
+                            {/snippet}
+                        </ShDropdownMenuTrigger>
+                        <ShDropdownMenuContent side="top" align="start" class="min-w-48 max-h-[70vh] overflow-y-auto">
+                            {#if DBState.db.characters[$selectedCharID].ttsMode === 'webspeech' || DBState.db.characters[$selectedCharID].ttsMode === 'elevenlab'}
+                                <ShDropdownMenuItem onSelect={() => stopTTS()}>
+                                    <MicOffIcon /><span>{language.ttsStop}</span>
+                                </ShDropdownMenuItem>
+                            {/if}
+                            <ShDropdownMenuItem
+                                disabled={(DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message.length < 2) || (DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message[DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message.length - 1].role !== 'char')}
+                                onSelect={() => sendContinue()}>
+                                <StepForwardIcon /><span>{language.continueResponse}</span>
+                            </ShDropdownMenuItem>
+                            {#if DBState.db.showMenuChatList}
+                                <ShDropdownMenuItem onSelect={() => { openChatList = true }}>
+                                    <DatabaseIcon /><span>{language.chatList}</span>
+                                </ShDropdownMenuItem>
+                            {/if}
+                            {#each additionalChatMenu as menu}
+                                <ShDropdownMenuItem onSelect={() => { menu.callback() }}>
+                                    <PluginDefinedIcon ico={menu} /><span>{menu.name}</span>
+                                </ShDropdownMenuItem>
+                            {/each}
+                            {#if DBState.db.showMenuHypaMemoryModal && DBState.db.hypaV3}
+                                <ShDropdownMenuItem onSelect={() => { $hypaV3ModalOpen = true }}>
+                                    <BrainIcon /><span>{language.hypaMemoryV3Modal}</span>
+                                </ShDropdownMenuItem>
+                            {/if}
+                            {#if DBState.db.translator !== ''}
+                                <ShDropdownMenuItem class={DBState.db.useAutoTranslateInput ? 'text-green-500' : ''} onSelect={() => { DBState.db.useAutoTranslateInput = !DBState.db.useAutoTranslateInput }}>
+                                    <GlobeIcon /><span>{language.autoTranslateInput}</span>
+                                </ShDropdownMenuItem>
+                            {/if}
+                            <ShDropdownMenuItem onSelect={() => { screenShot() }}>
+                                <CameraIcon /><span>{language.screenshot}</span>
+                            </ShDropdownMenuItem>
+                            <ShDropdownMenuItem onSelect={async () => {
+                                const results = await postChatFile(messageInput)
+                                if(!results) return
+                                for(const res of results){
+                                    if(res?.type === 'asset'){
+                                        fileInput.push(res.data)
+                                    }
+                                    if(res?.type === 'text'){
+                                        messageInput += `{{file::${res.name}::${res.data}}}`
+                                    }
+                                }
+                                updateInputSizeAll()
+                            }}>
+                                <ImagePlusIcon /><span>{language.postFile}</span>
+                            </ShDropdownMenuItem>
+                            <ShDropdownMenuItem class={DBState.db.useAutoSuggestions ? 'text-green-500' : ''} onSelect={() => { DBState.db.useAutoSuggestions = !DBState.db.useAutoSuggestions }}>
+                                <ReplyIcon /><span>{language.autoSuggest}</span>
+                            </ShDropdownMenuItem>
+                            <ShDropdownMenuItem onSelect={() => {
+                                DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].modules ??= []
+                                openModuleList = true
+                            }}>
+                                <PackageIcon /><span>{language.modules}</span>
+                            </ShDropdownMenuItem>
+                            {#if DBState.db.sideMenuRerollButton}
+                                <ShDropdownMenuItem onSelect={() => { reroll() }}>
+                                    <RefreshCcwIcon /><span>{language.reroll}</span>
+                                </ShDropdownMenuItem>
+                            {/if}
+                            <ShDropdownMenuItem onSelect={() => { quickMenu() }}>
+                                <ZapIcon /><span>{language.hotkeyDesc.quickMenu}</span>
+                            </ShDropdownMenuItem>
+                        </ShDropdownMenuContent>
+                    </ShDropdownMenu>
+                {:else}
+                    <div onclick={(e) => {
+                        DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message.push({
+                            role: 'char',
+                            data: ''
+                        })
+                        DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage] = DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage]
+                    }}
+                         class="shrink-0 flex justify-center items-center w-9 h-9 rounded-full text-textcolor hover:bg-primary/20 transition-colors cursor-pointer"
+                    >
+                        <Plus size={20} />
                     </div>
                 {/if}
 
-                <textarea class="peer text-input-area focus:border-textcolor transition-colors outline-hidden text-textcolor p-2 min-w-0 border border-r-0 bg-transparent rounded-md rounded-r-none input-text text-xl grow ml-4 border-darkborderc resize-none overflow-y-hidden overflow-x-hidden max-w-full placeholder:text-sm"
+                {#if DBState.db.useChatSticker}
+                    <div onclick={()=>{toggleStickers = !toggleStickers}}
+                         class={"shrink-0 flex justify-center items-center w-9 h-9 rounded-full hover:bg-primary/20 transition-colors cursor-pointer "+(toggleStickers ? 'text-green-500':'text-textcolor')}>
+                        <Laugh size={20}/>
+                    </div>
+                {/if}
+
+                <textarea class="text-input-area outline-hidden text-textcolor px-2 py-1.5 min-w-0 bg-transparent input-text text-base resize-none overflow-x-hidden max-w-full"
+                          class:flex-1={!multiline}
+                          class:basis-full={multiline}
+                          class:order-first={multiline}
+                          class:overflow-y-auto={inputOverflow}
+                          class:overflow-y-hidden={!inputOverflow}
+                          placeholder={willResend ? language.resendLastMessage : language.enterMessagePlaceholder}
                           bind:value={messageInput}
                           bind:this={inputEle}
                           onkeydown={(e) => {
                         if(e.key.toLocaleLowerCase() === "enter" && !e.isComposing){
-                            if(DBState.db.sendWithEnter && (!e.shiftKey)){
-                                send()
-                                e.preventDefault()
-                            }else if(!DBState.db.sendWithEnter && e.shiftKey){
+                            if(shouldSendOnEnter(e)){
                                 send()
                                 e.preventDefault()
                             }
@@ -747,49 +992,37 @@
                           style:height={inputHeight}
                 ></textarea>
 
+                <button
+                        onclick={() => composerFullscreen = true}
+                        aria-label={language.chatInputExpandTitle}
+                        class="shrink-0 flex justify-center items-center w-9 h-9 rounded-full text-textcolor hover:bg-primary/20 transition-colors"
+                        class:ml-auto={multiline}
+                >
+                    <Maximize2 size={18} />
+                </button>
 
                 {#if $doingChat || doingChatInputTranslate}
                     <button
                             aria-labelledby="cancel"
-                            class="peer-focus:border-textcolor  flex justify-center border-y border-darkborderc items-center text-gray-100 p-3 hover:bg-primary/30 transition-colors" onclick={abortChat}
-                            style:height={inputHeight}
+                            class="shrink-0 flex justify-center items-center w-9 h-9 rounded-full text-textcolor hover:bg-primary/20 transition-colors" onclick={abortChat}
                     >
                         <div class="loadmove chat-process-stage-{$chatProcessStage}"></div>
                     </button>
                 {:else}
                     <button
                             onclick={send}
-                            class="flex justify-center border-y border-darkborderc items-center text-gray-100 p-3 peer-focus:border-textcolor hover:bg-primary/30 transition-colors button-icon-send"
-                            style:height={inputHeight}
+                            aria-label={willResend ? language.reroll : language.send}
+                            class="shrink-0 flex justify-center items-center w-9 h-9 rounded-full bg-primary text-white hover:bg-primary/80 transition-colors button-icon-send"
                     >
-                        <Send />
+                        {#if willResend}
+                            <RefreshCcwIcon size={18} />
+                        {:else}
+                            <Send size={18} />
+                        {/if}
                     </button>
                 {/if}
-                {#if DBState.db.characters[$selectedCharID]?.chaId !== '§playground'}
-                    <button
-                            onclick={(e) => {
-                            openMenu = !openMenu
-                            e.stopPropagation()
-                        }}
-                            class="peer-focus:border-textcolor mr-2 flex border-y border-r border-darkborderc justify-center items-center text-gray-100 p-3 rounded-r-md hover:bg-primary/30 transition-colors"
-                            style:height={inputHeight}
-                    >
-                        <MenuIcon />
-                    </button>
-                {:else}
-                    <div onclick={(e) => {
-                        DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message.push({
-                            role: 'char',
-                            data: ''
-                        })
-                        DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage] = DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage]
-                    }}
-                         class="peer-focus:border-textcolor mr-2 flex border-y border-r border-darkborderc justify-center items-center text-gray-100 p-3 rounded-r-md hover:bg-primary/30 transition-colors"
-                         style:height={inputHeight}
-                    >
-                        <Plus />
-                    </div>
-                {/if}
+                </div>
+              </div>
             </div>
             {#if DBState.db.useAutoTranslateInput && DBState.db.characters[$selectedCharID]?.chaId !== '§playground'}
                 <div class="flex items-center mt-2 mb-2">
@@ -800,8 +1033,8 @@
                               bind:value={messageInputTranslate}
                               bind:this={inputTranslateEle}
                               onkeydown={(e) => {
-                            if(e.key.toLocaleLowerCase() === "enter" && (!e.shiftKey)){
-                                if(DBState.db.sendWithEnter){
+                            if(e.key.toLocaleLowerCase() === "enter" && !e.isComposing){
+                                if(shouldSendOnEnter(e)){
                                     send()
                                     e.preventDefault()
                                 }
@@ -918,7 +1151,8 @@
                     role='char'
                     img={getCharImage(DBState.db.characters[$selectedCharID].image, 'css')}
                     idx={-1}
-                    altGreeting={DBState.db.characters[$selectedCharID].alternateGreetings.length > 0 && DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message.length === 0}
+                    altGreeting={DBState.db.characters[$selectedCharID].alternateGreetings.length > 0}
+                    disabled={DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].firstMessageDisabled === true}
                     largePortrait={DBState.db.characters[$selectedCharID].largePortrait}
                     firstMessage={true}
                     onReroll={() => {
@@ -958,148 +1192,6 @@
 
             {/if}
 
-            {#if openMenu}
-                <div class="{DBState.db.fixedChatTextarea ? 'fixed' : 'absolute'} right-2 bottom-16 p-5 bg-darkbg flex flex-col gap-3 text-textcolor rounded-md" onclick={(e) => {
-                    e.stopPropagation()
-                }}>
-                    <!-- svelte-ignore block_empty -->
-                    {#if DBState.db.characters[$selectedCharID].ttsMode === 'webspeech' || DBState.db.characters[$selectedCharID].ttsMode === 'elevenlab'}
-                        <div class="flex items-center cursor-pointer hover:text-primary transition-colors" onclick={() => {
-                            stopTTS()
-                        }}>
-                            <MicOffIcon />
-                            <span class="ml-2">{language.ttsStop}</span>
-                        </div>
-                    {/if}
-
-                    <div class="flex items-center cursor-pointer hover:text-primary transition-colors"
-                        class:text-textcolor2={(DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message.length < 2) || (DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message[DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message.length - 1].role !== 'char')}
-                        onclick={() => {
-                            if((DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message.length < 2) || (DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message[DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message.length - 1].role !== 'char')){
-                                return
-                            }
-                            sendContinue();
-                        }}
-                    >
-                        <StepForwardIcon />
-                        <span class="ml-2">{language.continueResponse}</span>
-                    </div>
-
-
-                    {#if DBState.db.showMenuChatList}
-                        <div class="flex items-center cursor-pointer hover:text-primary transition-colors" onclick={() => {
-                            openChatList = true
-                            openMenu = false
-                        }}>
-                            <DatabaseIcon />
-                            <span class="ml-2">{language.chatList}</span>
-                        </div>
-                    {/if}
-
-                    
-                    {#if DBState.db.enableRisuaiProTools && !DBState.db.hideEasyPanel}
-                        <div class="flex items-center cursor-pointer hover:text-primary transition-colors" onclick={() => {
-                            easyPanelStore.open = !easyPanelStore.open
-                        }}>
-                            <SparkleIcon />
-                            <span class="ml-2">{language.easyPanel}</span>
-                        </div>
-                    {/if}
-
-                    {#each additionalChatMenu as menu}
-                        <div class="flex items-center cursor-pointer hover:text-primary transition-colors" onclick={() => {
-                            menu.callback()
-                            openMenu = false
-                        }}>
-                            <PluginDefinedIcon ico={menu} />
-                            <span class="ml-2">{menu.name}</span>
-                        </div>
-                    {/each}
-
-                    {#if DBState.db.showMenuHypaMemoryModal}
-                        {#if DBState.db.hypaV3}
-                            <div class="flex items-center cursor-pointer hover:text-primary transition-colors" onclick={() => {
-                                $hypaV3ModalOpen = true
-                                openMenu = false
-                            }}>
-                                <BrainIcon />
-                                <span class="ml-2">
-                                    {language.hypaMemoryV3Modal}
-                                </span>
-                            </div>
-                        {/if}
-                    {/if}
-                    
-                    {#if DBState.db.translator !== ''}
-                        <div class={"flex items-center cursor-pointer "+ (DBState.db.useAutoTranslateInput ? 'text-green-500':'lg:hover:text-primary')} onclick={() => {
-                            DBState.db.useAutoTranslateInput = !DBState.db.useAutoTranslateInput
-                        }}>
-                            <GlobeIcon />
-                            <span class="ml-2">{language.autoTranslateInput}</span>
-                        </div>
-                        
-                    {/if}
-            
-                    <div class="flex items-center cursor-pointer hover:text-primary transition-colors" onclick={() => {
-                        screenShot()
-                    }}>
-                        <CameraIcon />
-                        <span class="ml-2">{language.screenshot}</span>
-                    </div>
-
-                    <div class="flex items-center cursor-pointer hover:text-primary transition-colors" onclick={async () => {
-                        const results = await postChatFile(messageInput)
-                        if(!results) return
-                        for(const res of results){
-                            if(res?.type === 'asset'){
-                                fileInput.push(res.data)
-                            }
-                            if(res?.type === 'text'){
-                                messageInput += `{{file::${res.name}::${res.data}}}`
-                            }
-                        }
-                        updateInputSizeAll()
-                    }}>
-
-                        <ImagePlusIcon />
-                        <span class="ml-2">{language.postFile}</span>
-                    </div>
-
-
-                    <div class={"flex items-center cursor-pointer "+ (DBState.db.useAutoSuggestions ? 'text-green-500':'lg:hover:text-primary')} onclick={async () => {
-                        DBState.db.useAutoSuggestions = !DBState.db.useAutoSuggestions
-                    }}>
-                        <ReplyIcon />
-                        <span class="ml-2">{language.autoSuggest}</span>
-                    </div>
-
-
-                    <div class="flex items-center cursor-pointer hover:text-primary transition-colors" onclick={() => {
-                        DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].modules ??= []
-                        openModuleList = true
-                        openMenu = false
-                    }}>
-                        <PackageIcon />
-                        <span class="ml-2">{language.modules}</span>
-                    </div>
-
-                    {#if DBState.db.sideMenuRerollButton}
-                        <div class="flex items-center cursor-pointer hover:text-primary transition-colors" onclick={reroll}>
-                            <RefreshCcwIcon />
-                            <span class="ml-2">{language.reroll}</span>
-                        </div>
-                    {/if}
-
-                    <div class="flex items-center cursor-pointer hover:text-primary transition-colors" onclick={() => {
-                        openMenu = false
-                        quickMenu()
-                    }}>
-                        <ZapIcon />
-                        <span class="ml-2">{language.hotkeyDesc.quickMenu}</span>
-                    </div>
-                </div>
-
-            {/if}
         </div>
 
     {/if}
@@ -1114,6 +1206,33 @@
                 <PluginDefinedIcon ico={button} />
             </button>
         {/each}
+    </div>
+{/if}
+
+{#if composerFullscreen}
+    <div class="fixed inset-0 z-50 bg-bgcolor flex flex-col p-4">
+        <div class="mx-auto w-full max-w-3xl flex flex-col flex-1 min-h-0">
+            <div class="flex items-center justify-between mb-2">
+                <span class="text-textcolor text-sm">{language.chatInputExpandTitle}</span>
+                <button onclick={exitFullscreen} aria-label="minimize"
+                        class="shrink-0 flex justify-center items-center w-9 h-9 rounded-full text-textcolor hover:bg-primary/20 transition-colors">
+                    <Minimize2 size={18} />
+                </button>
+            </div>
+            <textarea
+                    bind:value={messageInput}
+                    bind:this={fullscreenEle}
+                    placeholder={language.enterMessagePlaceholder}
+                    class="flex-1 min-h-0 w-full resize-none rounded-md border border-darkborderc bg-transparent p-3 text-textcolor text-base outline-hidden overflow-y-auto focus:border-textcolor transition-colors"
+            ></textarea>
+            <div class="flex justify-end mt-3">
+                <button onclick={sendFullscreen} aria-label="send"
+                        class="flex items-center gap-1 px-4 h-10 rounded-full bg-primary text-white hover:bg-primary/80 transition-colors">
+                    <Send size={18} />
+                    <span>{language.send}</span>
+                </button>
+            </div>
+        </div>
     </div>
 {/if}
 <style>

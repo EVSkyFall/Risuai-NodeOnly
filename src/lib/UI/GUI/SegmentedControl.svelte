@@ -120,7 +120,7 @@
         top: 4px;
         bottom: 4px;
         border-radius: 0.375rem;
-        background-color: var(--risu-theme-borderc);
+        background-color: var(--risu-theme-primary);
         transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1),
                     width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
         will-change: transform, width;

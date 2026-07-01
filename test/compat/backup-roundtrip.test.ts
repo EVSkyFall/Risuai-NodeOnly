@@ -8,6 +8,8 @@
  * and binary encoding.
  */
 import { describe, test, expect, afterAll } from 'vitest'
+import path from 'node:path'
+import { readFile } from 'node:fs/promises'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
 import { createClient } from './helpers/client.js'
 import { createSeedBackup } from './helpers/seed.js'
@@ -29,6 +31,41 @@ describe('server smoke', () => {
     servers.push(srv)
     const client = await createClient(srv.port, srv.password)
     expect(client.token).toBeTruthy()
+  })
+
+  test('backup path config rejects app-managed dirs and records safe custom dirs', async () => {
+    const srv = await spawnServer()
+    servers.push(srv)
+    const client = await createClient(srv.port, srv.password)
+
+    const pathInfoRes = await client.fetch('/api/backup/server/path')
+    expect(pathInfoRes.status).toBe(200)
+    const pathInfo = await pathInfoRes.json() as { default: string }
+    const serverRoot = path.dirname(pathInfo.default)
+
+    const managedPath = path.join(serverRoot, 'server', 'backups')
+    const managedRes = await client.fetch('/api/backup/server/path', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ path: managedPath }),
+    })
+    expect(managedRes.status).toBe(400)
+    const managedBody = await managedRes.json() as { error?: string }
+    expect(managedBody.error).toContain('PocketRisu app files')
+
+    const safePath = path.join(serverRoot, 'data', 'backups')
+    const safeRes = await client.fetch('/api/backup/server/path', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ path: safePath }),
+    })
+    expect(safeRes.status).toBe(200)
+    const safeBody = await safeRes.json() as { path: string; isDefault: boolean }
+    expect(safeBody.path).toBe(safePath)
+    expect(safeBody.isDefault).toBe(false)
+
+    const marker = await readFile(path.join(srv.cwd, 'save', '__backup_path'), 'utf-8')
+    expect(marker.trim()).toBe(safePath)
   })
 })
 

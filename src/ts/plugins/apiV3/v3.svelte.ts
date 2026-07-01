@@ -2,6 +2,7 @@ import { allowedDbKeys, customProviderStore, getV2PluginAPIs, handlePluginInstal
 import { SandboxHost } from "./factory";
 import { getDatabase, normalizeChat } from "src/ts/storage/database.svelte";
 import { SafeLocalPluginStorage, tagWhitelist } from "../pluginSafeClass";
+import { recordOwner, removeOwner, clearOwners } from "../pluginStorageMeta";
 import DOMPurify from 'dompurify';
 import { additionalChatMenu, additionalFloatingActionButtons, additionalHamburgerMenu, additionalSettingsMenu, bodyIntercepterStore, DBState, selectedCharID, type MenuDef } from "src/ts/stores.svelte";
 import { v4 } from "uuid";
@@ -1159,7 +1160,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             }
         },
         getLocalPluginStorage: () => {
-            return new SafeLocalPluginStorage()
+            return new SafeLocalPluginStorage(plugin.name)
         },
         checkCharOrder: checkCharOrder,
         requestPluginPermission: (permission:string) => {
@@ -1180,9 +1181,20 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             return v;
         },
         _getPluginStorage: oldApis.pluginStorage.getItem,
-        _setPluginStorage: oldApis.pluginStorage.setItem,
-        _removePluginStorage: oldApis.pluginStorage.removeItem,
-        _clearPluginStorage: oldApis.pluginStorage.clear,
+        // Wrapped (not aliased) so we can record the originating plugin into the
+        // sidecar meta map. The value write is unchanged; reads stay aliased.
+        _setPluginStorage: (key: string, value: any) => {
+            oldApis.pluginStorage.setItem(key, value)
+            recordOwner('save', key, plugin.name)
+        },
+        _removePluginStorage: (key: string) => {
+            oldApis.pluginStorage.removeItem(key)
+            removeOwner('save', key)
+        },
+        _clearPluginStorage: () => {
+            oldApis.pluginStorage.clear()
+            clearOwners('save')
+        },
         _keyPluginStorage: oldApis.pluginStorage.key,
         _keysPluginStorage: oldApis.pluginStorage.keys,
         _lengthPluginStorage: oldApis.pluginStorage.length,
@@ -1191,9 +1203,18 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
         _removePluginBlobStorage: oldApis.pluginBlobStorage.removeItem,
         _keysPluginBlobStorage: oldApis.pluginBlobStorage.keys,
         _getSafeLocalStorage: oldApis.safeLocalStorage.getItem,
-        _setSafeLocalStorage: oldApis.safeLocalStorage.setItem,
-        _removeSafeLocalStorage: oldApis.safeLocalStorage.removeItem,
-        _clearSafeLocalStorage: oldApis.safeLocalStorage.clear,
+        _setSafeLocalStorage: (key: string, value: string) => {
+            oldApis.safeLocalStorage.setItem(key, value)
+            recordOwner('local', key, plugin.name)
+        },
+        _removeSafeLocalStorage: (key: string) => {
+            oldApis.safeLocalStorage.removeItem(key)
+            removeOwner('local', key)
+        },
+        _clearSafeLocalStorage: () => {
+            oldApis.safeLocalStorage.clear()
+            clearOwners('local')
+        },
         _keySafeLocalStorage: oldApis.safeLocalStorage.key,
         _keysSafeLocalStorage: oldApis.safeLocalStorage.keys,
         searchTranslationCache: async (partialKey: string) => {

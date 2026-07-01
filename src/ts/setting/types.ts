@@ -16,6 +16,11 @@ export interface SettingContext {
     db: Database;
     modelInfo: LLMModel;
     subModelInfo: LLMModel;
+    /** Render mode for row-capable wrappers (select/text/slider). 'row' puts the
+     * label + inline help on the left and the control right-aligned & vertically
+     * centered; 'stacked' (default) keeps the label above the control. Multiline
+     * textareas always stay stacked regardless. */
+    layout?: 'stacked' | 'row';
 }
 
 /**
@@ -28,6 +33,7 @@ export type SettingType =
     | 'textarea'   // Multiline text (TextAreaInput)
     | 'slider'     // Slider (SliderInput)
     | 'select'     // Dropdown (SelectInput)
+    | 'radio'      // Vertical radio group (ShRadio)
     | 'segmented'  // Sliding segmented control (SegmentedControl)
     | 'color'      // Color picker (ColorInput)
     | 'header'     // Section header (h2, span, warning)

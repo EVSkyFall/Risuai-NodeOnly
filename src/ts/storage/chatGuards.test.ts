@@ -18,7 +18,7 @@ describe('findDangerousChatOps — path matching', () => {
     test('passes ops outside the chats subtree', () => {
         expect(findDangerousChatOps([
             { op: 'replace', path: '/characters/0/customCSS', value: '...' },
-            { op: 'add', path: '/loadouts/2', value: {} },
+            { op: 'add', path: '/modules/2', value: {} },
             { op: 'replace', path: '/lastModelSelected', value: 'gpt-4' },
         ])).toEqual([])
     })
@@ -152,7 +152,7 @@ describe('findDangerousChatOps — disallowed op types (move/copy/test)', () => 
     test('passes move/copy that doesn\'t touch chat-internal paths', () => {
         // move/copy are fine outside the chats subtree.
         expect(findDangerousChatOps([
-            { op: 'move', from: '/loadouts/0', path: '/loadouts/2' },
+            { op: 'move', from: '/modules/0', path: '/modules/2' },
             { op: 'copy', from: '/characters/0/customCSS', path: '/characters/1/customCSS' },
         ])).toEqual([])
     })

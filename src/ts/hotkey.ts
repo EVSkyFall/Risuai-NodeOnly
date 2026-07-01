@@ -1,7 +1,7 @@
 import { get } from "svelte/store"
-import { alertMd, alertSelect, notifyInfo, alertWait, doingAlert, alertRequestLogs } from "./alert"
-import { changeToPreset as changeToPreset2, getDatabase  } from "./storage/database.svelte"
-import { alertStore, DBState, loadoutModalStore, MobileGUIStack, MobileSideBar, openPersonaList, personaSelectCallback, openPresetList, openHypaV3PresetList, openThemePresetList, OpenRealmStore, PlaygroundStore, QuickSettings, SafeModeStore, selectedCharID, settingsOpen } from "./stores.svelte"
+import { alertMd, alertSelect, alertWait, doingAlert, alertRequestLogs } from "./alert"
+import { getDatabase  } from "./storage/database.svelte"
+import { alertStore, DBState, MobileGUIStack, MobileSideBar, openPersonaList, personaSelectCallback, openPresetList, openHypaV3PresetList, openThemePresetList, OpenRealmStore, PlaygroundStore, QuickSettings, SafeModeStore, selectedCharID, settingsOpen } from "./stores.svelte"
 import { language } from "src/lang"
 import { updateTextThemeAndCSS } from "./gui/colorscheme"
 import { defaultHotkeys } from "./defaulthotkeys"
@@ -158,12 +158,6 @@ export function initHotkey(){
                     }
                     break
                 }
-                case 'loadout':{
-                    if(!database.hideLoadout){
-                        loadoutModalStore.open = !loadoutModalStore.open
-                    }
-                    break
-                }
                 default:{
                     hotKeyRanThisTime = false
                 }
@@ -182,64 +176,6 @@ export function initHotkey(){
         }
 
 
-        if(ev.ctrlKey){
-            switch (ev.key){
-                case "1":{
-                    changeToPreset(0)
-                    ev.preventDefault()
-                    ev.stopPropagation()
-                    break
-                }
-                case "2":{
-                    changeToPreset(1)
-                    ev.preventDefault()
-                    ev.stopPropagation()
-                    break
-                }
-                case "3":{
-                    changeToPreset(2)
-                    ev.preventDefault()
-                    ev.stopPropagation()
-                    break
-                }
-                case "4":{
-                    changeToPreset(3)
-                    ev.preventDefault()
-                    ev.stopPropagation()
-                    break
-                }
-                case "5":{
-                    changeToPreset(4)
-                    ev.preventDefault()
-                    ev.stopPropagation()
-                    break
-                }
-                case "6":{
-                    changeToPreset(5)
-                    ev.preventDefault()
-                    ev.stopPropagation()
-                    break
-                }
-                case "7":{
-                    changeToPreset(6)
-                    ev.preventDefault()
-                    ev.stopPropagation()
-                    break
-                }
-                case "8":{
-                    changeToPreset(7)
-                    ev.preventDefault()
-                    ev.stopPropagation()
-                    break
-                }
-                case "9":{
-                    changeToPreset(8)
-                    ev.preventDefault()
-                    ev.stopPropagation()
-                    break
-                }
-            }
-        }
         if(ev.key === 'Escape'){
             // 모달(AlertComp 팝업 또는 Sh*Dialog)이 열려있을 땐 전역 ESC 동작을 중단한다.
             // bits-ui Dialog는 preventDefault만 하고 stopPropagation은 하지 않기 때문에,
@@ -314,14 +250,11 @@ export async function quickMenu(){
     const db = getDatabase()
     const showHypaV3 = db.hypaV3 && db.hypaV3Presets?.length > 1
 
-    const showLoadout = !db.hideLoadout
-
     const options = [
         language.presets,
         language.themePresets,
         language.persona,
         ...(showHypaV3 ? [language.longTermMemory + ' ' + language.presets] : []),
-        ...(showLoadout ? [language.hotkeyDesc.loadout] : []),
         language.cancel
     ]
 
@@ -339,9 +272,6 @@ export async function quickMenu(){
     }
     else if(showHypaV3 && sel === idx++){
         openHypaV3PresetList.set(true)
-    }
-    else if(showLoadout && sel === idx++){
-        loadoutModalStore.open = !(loadoutModalStore.open)
     }
 }
 
@@ -430,15 +360,4 @@ export function initMobileGesture(){
     }, {
         passive: true
     })
-}
-
-function changeToPreset(num:number){
-    if(!doingAlert()){
-        let db = getDatabase()
-        let pres = db.botPresets
-        if(pres.length > num){
-            notifyInfo(`Changed to Preset: ${pres[num].name}`)
-            changeToPreset2(num)
-        }
-    }
 }

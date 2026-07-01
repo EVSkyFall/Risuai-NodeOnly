@@ -672,6 +672,27 @@ function hello(): string {
             </div>
         </div>
 
+        <!-- ShAlert + action (CTA banner) -->
+        <div class="flex flex-col gap-1.5">
+            <span class="text-xs text-textcolor2">ShAlert action 슬롯 (info + CTA 버튼, 우측 정렬·모바일 wrap)</span>
+            <div class="flex flex-col gap-2 max-w-md">
+                <ShAlert variant="info">
+                    {#snippet icon()}<InfoIcon />{/snippet}
+                    {#snippet title()}아이콘 + 텍스트 + 우측 버튼. 액션이 있는 안내 배너.{/snippet}
+                    {#snippet action()}
+                        <ShButton variant="outline" size="sm">바로가기</ShButton>
+                    {/snippet}
+                </ShAlert>
+                <ShAlert variant="warning">
+                    {#snippet icon()}<TriangleAlertIcon />{/snippet}
+                    {#snippet title()}경고 톤에서도 동일하게 동작합니다.{/snippet}
+                    {#snippet action()}
+                        <ShButton variant="outline" size="sm">조치</ShButton>
+                    {/snippet}
+                </ShAlert>
+            </div>
+        </div>
+
         <!-- ShInput / ShSelect / ShButton 정렬 검증 -->
         <div class="flex flex-col gap-1.5">
             <span class="text-xs text-textcolor2">폼 정렬 (ShInput + ShSelect + ShButton 모두 h-10)</span>
