@@ -148,6 +148,43 @@ await (async function() {
         window.parent.postMessage(payload, '*', transferables);
     }
 
+    // Chromium cannot deserialize a ReadableStream transferred out of a
+    // sandboxed (opaque-origin) iframe — the parent receives event.data === null.
+    // Relay streams through a MessagePort instead: ports cross the origin
+    // boundary reliably, and the host rebuilds a ReadableStream on its side.
+    function portifyStreams(obj) {
+        if (obj instanceof ReadableStream) {
+            const channel = new MessageChannel();
+            const reader = obj.getReader();
+            const port = channel.port1;
+            port.onmessage = function(ev) {
+                if (ev.data && ev.data.c) { try { reader.cancel(); } catch (e) {} }
+            };
+            (async function() {
+                try {
+                    while (true) {
+                        const r = await reader.read();
+                        if (r.done) { port.postMessage({ d: 1 }); break; }
+                        port.postMessage({ v: r.value });
+                    }
+                } catch (err) {
+                    try { port.postMessage({ e: (err && err.message) || String(err) }); } catch (e2) {}
+                }
+            })();
+            return { __type: 'STREAM_PORT', port: channel.port2 };
+        }
+        if (!obj || typeof obj !== 'object') return obj;
+        if (Array.isArray(obj)) {
+            for (let i = 0; i < obj.length; i++) obj[i] = portifyStreams(obj[i]);
+            return obj;
+        }
+        if (obj.constructor === Object) {
+            for (const key of Object.keys(obj)) obj[key] = portifyStreams(obj[key]);
+            return obj;
+        }
+        return obj;
+    }
+
     function sendRequest(type, payload) {
         return new Promise((resolve, reject) => {
             const reqId = Math.random().toString(36).substring(7);
@@ -226,9 +263,10 @@ await (async function() {
             for (const id of usedAbortIds) {
                 abortControllers.delete(id);
             }
-            // If posting fails (e.g. DataCloneError on stream transfer), the host
-            // would await this reqId forever — degrade instead of hanging:
-            // drain a stream result to text, and as a last resort send an error.
+            if (response.result) response.result = portifyStreams(response.result);
+            // If posting fails (e.g. DataCloneError), the host would await this
+            // reqId forever — degrade instead of hanging: drain a stream result
+            // to text, and as a last resort send an error.
             try {
                 send(response, collectTransferables(response));
             } catch (err) {
@@ -389,6 +427,41 @@ export class SandboxHost {
         return transferables;
     }
 
+    // Counterpart of the guest's portifyStreams(): a stream sent out of the
+    // sandboxed iframe arrives as {__type:'STREAM_PORT', port} because Chromium
+    // fails to deserialize a ReadableStream transferred across the opaque-origin
+    // boundary (event.data arrives null). Rebuild a host-realm stream from the port.
+    private reviveStreamPorts(obj: any): any {
+        if (!obj || typeof obj !== 'object') return obj;
+        if (obj.__type === 'STREAM_PORT' && obj.port instanceof MessagePort) {
+            const port = obj.port as MessagePort;
+            return new ReadableStream({
+                start(controller) {
+                    port.onmessage = (ev) => {
+                        const m = ev.data;
+                        if (!m) return;
+                        if (m.d) { try { controller.close(); } catch (_) {} port.close(); }
+                        else if (m.e !== undefined) { try { controller.error(new Error(String(m.e))); } catch (_) {} port.close(); }
+                        else { try { controller.enqueue(m.v); } catch (_) {} }
+                    };
+                },
+                cancel() {
+                    try { port.postMessage({ c: 1 }); } catch (_) {}
+                    try { port.close(); } catch (_) {}
+                }
+            });
+        }
+        if (Array.isArray(obj)) {
+            for (let i = 0; i < obj.length; i++) obj[i] = this.reviveStreamPorts(obj[i]);
+            return obj;
+        }
+        if (obj.constructor === Object) {
+            for (const key of Object.keys(obj)) obj[key] = this.reviveStreamPorts(obj[key]);
+            return obj;
+        }
+        return obj;
+    }
+
 
     private serialize(val: any): any {
         if (
@@ -536,13 +609,16 @@ export class SandboxHost {
         const messageHandler = async (event: MessageEvent) => {
             if (event.source !== this.iframe.contentWindow) return;
             const data = event.data as RpcMessage;
-
+            // event.data can be null when the sender transferred something this
+            // realm cannot deserialize (e.g. a ReadableStream from the sandboxed
+            // iframe) — guard instead of crashing the whole RPC handler.
+            if (!data || typeof data.type !== 'string') return;
 
             if (data.type === 'CALLBACK_RETURN') {
                 const req = this.pendingCallbacks.get(data.reqId!);
                 if (req) {
                     if (data.error) req.reject(new Error(data.error));
-                    else req.resolve(data.result);
+                    else req.resolve(this.reviveStreamPorts(data.result));
                     this.pendingCallbacks.delete(data.reqId!);
                 }
                 return;
