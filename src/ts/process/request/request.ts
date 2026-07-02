@@ -1401,7 +1401,9 @@ async function requestPlugin(arg:RequestDataArgumentExtended):Promise<requestDat
             presence_penalty: (db.PresensePenalty / 100),
             frequency_penalty: (db.frequencyPenalty / 100)
         })
-    
+
+        console.warn('[RisuBridge] plugin provider result:', d && typeof d, d && typeof d === 'object' ? 'keys=' + Object.keys(d).join(',') : '', d?.content?.constructor?.name ?? typeof d?.content)
+
         if(!d){
             return {
                 type: 'fail',

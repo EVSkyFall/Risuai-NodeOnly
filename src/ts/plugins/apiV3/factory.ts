@@ -226,8 +226,31 @@ await (async function() {
             for (const id of usedAbortIds) {
                 abortControllers.delete(id);
             }
-            const transferables = collectTransferables(response);
-            send(response, transferables);
+            // If posting fails (e.g. DataCloneError on stream transfer), the host
+            // would await this reqId forever — degrade instead of hanging:
+            // drain a stream result to text, and as a last resort send an error.
+            try {
+                send(response, collectTransferables(response));
+            } catch (err) {
+                console.error('[RisuBridge] CALLBACK_RETURN transfer failed, buffering result:', err);
+                try {
+                    const r = response.result;
+                    if (r && typeof r === 'object' && r.content instanceof ReadableStream) {
+                        let text = '';
+                        const reader = r.content.getReader();
+                        const decoder = new TextDecoder();
+                        while (true) {
+                            const chunk = await reader.read();
+                            if (chunk.done) break;
+                            text += typeof chunk.value === 'string' ? chunk.value : decoder.decode(chunk.value, { stream: true });
+                        }
+                        response.result = Object.assign({}, r, { content: text });
+                    }
+                    send(response, collectTransferables(response));
+                } catch (err2) {
+                    send({ type: 'CALLBACK_RETURN', reqId: data.reqId, error: 'plugin bridge transfer failed: ' + (err2 && err2.message || err2) });
+                }
+            }
         }
     });
 
