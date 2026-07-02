@@ -114,6 +114,15 @@ await (async function() {
     }
 
     function collectTransferables(obj, transferables = []) {
+        // ReadableStream check must precede the first "return transferables" —
+        // guest-source sniffers (e.g. CPM) lazily match up to that point to
+        // decide whether transferable-stream bridging is supported.
+        if (obj instanceof ReadableStream ||
+            obj instanceof WritableStream ||
+            obj instanceof TransformStream) {
+            transferables.push(obj);
+            return transferables;
+        }
         if (!obj || typeof obj !== 'object') return transferables;
 
         if (obj instanceof ArrayBuffer ||
