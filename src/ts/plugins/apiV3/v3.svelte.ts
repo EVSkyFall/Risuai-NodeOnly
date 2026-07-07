@@ -1511,7 +1511,14 @@ type V3PluginInstance = {
 const v3PluginInstances: V3PluginInstance[] = [];
 
 export async function loadV3Plugins(plugins:RisuPlugin[]){
-    await Promise.all(v3PluginInstances.map(async (instance) => {
+    // Snapshot before iterating: unloadV3Plugin splices v3PluginInstances
+    // SYNCHRONOUSLY (before its first await), so mapping over the live array
+    // skips every other instance. The skipped survivor then hits
+    // executePluginV3's "already running" guard, its script never re-runs,
+    // and — since reload now clears the pluginV2 replacer Sets — it silently
+    // loses its replacer registration until a full page reload.
+    const instances = [...v3PluginInstances];
+    await Promise.all(instances.map(async (instance) => {
         await unloadV3Plugin(instance.name);
     }));
     const loadPromises = plugins.map(plugin => executePluginV3(plugin));
