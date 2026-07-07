@@ -123,12 +123,15 @@ export interface StreamResponseChunk{[key:string]:string}
 
 // v3-plugin replacer hardening (D1 of the 2026-07-06 replacer hardening request):
 // a plugin replacer that throws, returns garbage, or never resolves must not kill
-// or freeze the request — the request path is fail-open by contract. Timeouts are
-// generous because analysis plugins (e.g. MARP full) legitimately run 60-120s
-// pipelines on main-model requests; the timeout only exists to unfreeze requests
-// whose bridge reply was lost (dead stub, transfer failure, plugin reload).
-const REPLACER_BEFORE_TIMEOUT_MS = 180000
-const REPLACER_AFTER_TIMEOUT_MS = 30000
+// or freeze the request — the request path is fail-open by contract. The timeout
+// is a LAST-RESORT backstop for a reply that was genuinely lost while the iframe
+// looks alive — the common loss modes (stale stub, postMessage throw, terminate)
+// already fast-reject. It must sit far above legitimate heavy replacers: MARP full
+// runs 60-120s analysis, Omninode memory tasks occasionally take 5+ minutes on a
+// turn — a timeout that fires on real work silently drops that turn's memory
+// injection, which is worse than waiting.
+const REPLACER_BEFORE_TIMEOUT_MS = 600000
+const REPLACER_AFTER_TIMEOUT_MS = 60000
 function replacerWithTimeout<T>(run: () => T | Promise<T>, ms: number): Promise<T> {
     return new Promise<T>((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error(`plugin replacer timed out after ${ms}ms`)), ms)
