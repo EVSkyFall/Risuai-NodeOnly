@@ -805,6 +805,13 @@ export async function loadV2Plugin(plugins: RisuPlugin[]) {
         pluginV2.editoutput.clear()
         pluginV2.editprocess.clear()
         pluginV2.editinput.clear()
+        // D2 of the replacer hardening request: replacer Sets were the only
+        // registration surviving reload — v3 iframes get terminated and
+        // re-created right after this (loadV3Plugins runs after loadV2Plugin),
+        // so stale stubs accumulated and every stub call froze its request.
+        // Both v2 in-page and v3 bridge plugins re-register on load.
+        pluginV2.replacerbeforeRequest.clear()
+        pluginV2.replacerafterRequest.clear()
     }
 
     pluginV2.loaded = true

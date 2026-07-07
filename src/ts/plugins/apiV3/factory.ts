@@ -516,6 +516,15 @@ export class SandboxHost {
 
                 const wrapper = async (...innerArgs: any[]) => {
                     return new Promise((resolve, reject) => {
+                        // Stale-stub guard (D2): after a plugin reload the old factory's
+                        // iframe is gone — its stubs may still sit in host Sets (e.g.
+                        // pluginV2.replacer*). postMessage via `contentWindow?.` was a
+                        // silent no-op, leaving the await pending forever. Reject fast
+                        // instead so guarded callers fail open immediately.
+                        if (!this.iframe || !this.iframe.contentWindow) {
+                            reject(new Error('plugin iframe is gone (stale callback stub)'));
+                            return;
+                        }
                         const reqId = 'cb_req_' + Math.random().toString(36).substring(2);
                         this.pendingCallbacks.set(reqId, { resolve, reject });
 
@@ -551,8 +560,16 @@ export class SandboxHost {
                             reqId,
                             args: sanitizedArgs
                         };
-                        const transferables = this.collectTransferables(message);
-                        this.iframe.contentWindow?.postMessage(message, '*', transferables);
+                        // A postMessage throw (e.g. DataCloneError on the args) must
+                        // reject AND release the pending slot — an executor throw
+                        // rejects the promise but would leak the pendingCallbacks entry.
+                        try {
+                            const transferables = this.collectTransferables(message);
+                            this.iframe.contentWindow.postMessage(message, '*', transferables);
+                        } catch (e) {
+                            this.pendingCallbacks.delete(reqId);
+                            reject(e);
+                        }
                     });
                 };
                 this.callbackWrapperCache.set(cbRef.id, wrapper);
@@ -744,10 +761,20 @@ export class SandboxHost {
             window.removeEventListener('message', messageHandler);
             this.iframe.remove();
             this.instanceRegistry.clear();
-            this.pendingCallbacks.clear();
+            this.rejectPendingCallbacks('plugin unloaded');
             this.abortControllers.clear();
             this.callbackWrapperCache.clear();
         };
+    }
+
+    // D2 of the replacer hardening request: a bare pendingCallbacks.clear()
+    // abandons in-flight callback awaits — whatever request was awaiting that
+    // replacer freezes forever. Reject them so guarded callers fail open.
+    private rejectPendingCallbacks(reason: string) {
+        for (const { reject } of this.pendingCallbacks.values()) {
+            try { reject(new Error(reason)); } catch (_) { /* already settled */ }
+        }
+        this.pendingCallbacks.clear();
     }
 
     public terminate() {
@@ -755,7 +782,7 @@ export class SandboxHost {
             this.iframe.remove();
         }
         this.instanceRegistry.clear();
-        this.pendingCallbacks.clear();
+        this.rejectPendingCallbacks('plugin unloaded');
         this.abortControllers.clear();
         this.callbackWrapperCache.clear();
     }

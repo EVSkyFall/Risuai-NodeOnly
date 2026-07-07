@@ -121,6 +121,24 @@ export type requestDataResponse = {
 
 export interface StreamResponseChunk{[key:string]:string}
 
+// v3-plugin replacer hardening (D1 of the 2026-07-06 replacer hardening request):
+// a plugin replacer that throws, returns garbage, or never resolves must not kill
+// or freeze the request — the request path is fail-open by contract. Timeouts are
+// generous because analysis plugins (e.g. MARP full) legitimately run 60-120s
+// pipelines on main-model requests; the timeout only exists to unfreeze requests
+// whose bridge reply was lost (dead stub, transfer failure, plugin reload).
+const REPLACER_BEFORE_TIMEOUT_MS = 180000
+const REPLACER_AFTER_TIMEOUT_MS = 30000
+function replacerWithTimeout<T>(run: () => T | Promise<T>, ms: number): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`plugin replacer timed out after ${ms}ms`)), ms)
+        Promise.resolve().then(run).then(
+            v => { clearTimeout(timer); resolve(v) },
+            e => { clearTimeout(timer); reject(e) }
+        )
+    })
+}
+
 export async function requestChatData(arg:requestDataArgument, model:ModelModeExtended, abortSignal:AbortSignal=null):Promise<requestDataResponse> {
     const db = getDatabase()
     const fallBackModels:string[] = safeStructuredClone(db?.fallbackModels?.[model] ?? [])
@@ -157,7 +175,13 @@ export async function requestChatData(arg:requestDataArgument, model:ModelModeEx
     
             if(pluginV2.replacerbeforeRequest.size > 0){
                 for(const replacer of pluginV2.replacerbeforeRequest){
-                    arg.formated = await replacer(arg.formated, model)
+                    try {
+                        const next = await replacerWithTimeout(() => replacer(arg.formated, model), REPLACER_BEFORE_TIMEOUT_MS)
+                        if (Array.isArray(next)) arg.formated = next
+                        else console.warn('[plugin] beforeRequest replacer returned a non-array — keeping previous messages')
+                    } catch (e) {
+                        console.warn('[plugin] beforeRequest replacer failed or timed out — skipping (fail-open):', e)
+                    }
                 }
             }
             
@@ -201,7 +225,11 @@ export async function requestChatData(arg:requestDataArgument, model:ModelModeEx
             if(da.type === 'success' && da.toolExecuted){
                 if(arg.escape) da.result = risuEscape(da.result)
                 for(const replacer of pluginV2.replacerafterRequest){
-                    try { da.result = await replacer(da.result, model) }
+                    try {
+                        const next = await replacerWithTimeout(() => replacer(da.result, model), REPLACER_AFTER_TIMEOUT_MS)
+                        if (typeof next === 'string') da.result = next
+                        else console.warn('[ModelPreset] after-replacer returned a non-string — keeping previous result')
+                    }
                     catch(e){ console.error('[ModelPreset] after-replacer failed', e) }
                 }
                 return {
@@ -223,7 +251,13 @@ export async function requestChatData(arg:requestDataArgument, model:ModelModeEx
 
             if(da.type === 'success' && pluginV2.replacerafterRequest.size > 0){
                 for(const replacer of pluginV2.replacerafterRequest){
-                    da.result = await replacer(da.result, model)
+                    try {
+                        const next = await replacerWithTimeout(() => replacer(da.result, model), REPLACER_AFTER_TIMEOUT_MS)
+                        if (typeof next === 'string') da.result = next
+                        else console.warn('[plugin] afterRequest replacer returned a non-string — keeping previous result')
+                    } catch (e) {
+                        console.warn('[plugin] afterRequest replacer failed or timed out — skipping (fail-open):', e)
+                    }
                 }
             }
 

@@ -907,6 +907,9 @@ export async function runScripted(code:string, arg:{
                 }, 'otherAx')
 
                 if(result.type === 'fail'){
+                    // Surface silent aux failures (see v2RunLLM warn) — Lua callers
+                    // often ignore success:false, hiding the death entirely.
+                    console.warn('[lua] axLLM request failed:', result.result)
                     return JSON.stringify({
                         success: false,
                         result: 'Error: ' + result.result

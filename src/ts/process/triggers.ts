@@ -1891,6 +1891,9 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                     }, effect.model)
 
                     if(result.type === 'fail' || result.type === 'multiline'){
+                        // Silent aux-request death made the 2026-07-06 replacer-freeze
+                        // incident nearly untraceable — surface the failure.
+                        console.warn(`[trigger] v2RunLLM (${effect.model || 'model'}) failed — outputVar set to 'null':`, result.result)
                         setVar(risuChatParser(effect.outputVar, {chara:char}), 'null')
                     }
                     else if(result.type === 'streaming'){
