@@ -310,22 +310,56 @@ class SafeElement {
 
         }
 
+        // Zombie-listener self-healing (2026-07-08): a plugin reload/unload tears its
+        // iframe down, but nothing removes the instance's document-level listeners.
+        // Every later event then fires the stale callback stub, which fast-rejects
+        // ("plugin iframe is gone (stale callback stub)") — on move/scroll-class
+        // events that floods the console indefinitely. A global sweep at unload
+        // would kill OTHER live plugins' listeners (MARP + Omninode coexist), so
+        // instead each wrapper detaches ITSELF the first time its stub reports the
+        // iframe gone. Non-stale errors keep their previous (unhandled) surfacing.
         if(allowedDocumentEventListeners.includes(type)){
+            const detachIfStale = (e: any) => {
+                if (!String(e?.message ?? e).includes('stale callback stub')) return false;
+                document.removeEventListener(type, modifiedListener, realOptions);
+                this.#eventIdMap.delete(id);
+                return true;
+            }
             const modifiedListener = (event: any) => {
-                listener(trimEvent(event))
+                try {
+                    const r: any = listener(trimEvent(event))
+                    if (r && typeof r.catch === 'function') r.catch((e: any) => {
+                        if (!detachIfStale(e)) throw e;
+                    });
+                } catch (e) {
+                    if (!detachIfStale(e)) throw e;
+                }
             }
             this.#eventIdMap.set(id, modifiedListener)
             document.addEventListener(type, modifiedListener, realOptions)
             return id;
         }
         else if(allowedDelayedEventListeners.includes(type)){
+            const detachIfStale = (e: any) => {
+                if (!String(e?.message ?? e).includes('stale callback stub')) return false;
+                document.removeEventListener(type, modifiedListener, realOptions);
+                this.#eventIdMap.delete(id);
+                return true;
+            }
             const modifiedListener = (event: any) => {
                 let delay = 0;
                 try {
-                    delay = (crypto.getRandomValues(new Uint32Array(1))[0] / 100) % 100; //0-99 ms              
+                    delay = (crypto.getRandomValues(new Uint32Array(1))[0] / 100) % 100; //0-99 ms
                 } catch (error) {}
                 setTimeout(() => {
-                    listener(trimEvent(event));
+                    try {
+                        const r: any = listener(trimEvent(event));
+                        if (r && typeof r.catch === 'function') r.catch((e: any) => {
+                            if (!detachIfStale(e)) throw e;
+                        });
+                    } catch (e) {
+                        if (!detachIfStale(e)) throw e;
+                    }
                 }, delay);
             }
             this.#eventIdMap.set(id, modifiedListener)
