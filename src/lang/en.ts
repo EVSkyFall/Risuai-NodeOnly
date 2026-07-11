@@ -502,6 +502,7 @@ export const languageEnglish = {
     emotion: "Emotion Name",
     value: "Value",
     reroll: "Regenerate",
+    rerollExactTooltip: "Reroll with the exact same request as the last generation (prompt-cache friendly)",
     hideMessagePageCount: "Hide Message Page Counter",
     deleteRerollMessage: "Delete Regenerated Message",
     deleteRerollMessageConfirm: "Delete the currently selected regenerated message?",

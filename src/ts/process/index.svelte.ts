@@ -9,6 +9,7 @@ import { parseChatML } from "../parser/chatML";
 import { loadLoreBookV3Prompt } from "./lorebook.svelte";
 import { findCharacterbyId, getAuthorNoteDefaultText, getPersonaPrompt, getUserName, isLastCharPunctuation, trimUntilPunctuation, parseToggleSyntax, prebuiltAssetCommand } from "../util";
 import { requestChatData } from "./request/request";
+import { commitMainRequestSnapshot, type MainRequestSnapshot } from "./request/requestReplay";
 import { stableDiff } from "./stableDiff";
 import { processScript, processScriptFull, risuChatParser } from "./scripts";
 import { exampleMessage } from "./exampleMessages";
@@ -67,6 +68,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     preview?:boolean
     previewPrompt?:boolean
     copilotTurnId?:string
+    replayRequest?:MainRequestSnapshot
 } = {}):Promise<boolean> {
 
     chatProcessStage.set(0)
@@ -1397,7 +1399,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     }
 
     const req = await requestChatData({
-        formated: formated,
+        formated: arg.replayRequest ? safeStructuredClone(arg.replayRequest.formated) : formated,
         biasString: biases,
         currentChar: currentChar,
         useStreaming: true,
@@ -1409,7 +1411,16 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         previewBody: arg.previewPrompt,
         escape: nowChatroom.type === 'character' && nowChatroom.escapeOutput,
         rememberToolUsage: DBState.db.rememberToolUsage,
+        replayExact: !!arg.replayRequest || undefined,
+        replayStaticModel: arg.replayRequest?.staticModel,
+        replayTools: arg.replayRequest?.tools,
     }, 'model', abortSignal)
+
+    // Commit the staged replay snapshot only for responses that will actually
+    // land in the chat — a failed attempt keeps the previous snapshot valid.
+    if(req.type === 'success' || req.type === 'streaming' || req.type === 'multiline'){
+        commitMainRequestSnapshot(generationId)
+    }
 
     console.log(req)
     if(req.model){

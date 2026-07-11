@@ -567,6 +567,7 @@ export const languageKorean = {
   emotion: "감정 이름",
   value: "값",
   reroll: "재생성",
+  rerollExactTooltip: "직전 생성과 동일한 요청으로 리롤 (프롬프트 캐시 히트)",
   deleteRerollMessage: "재생성된 메세지 삭제",
   deleteRerollMessageConfirm: "현재 선택된 재생성 메세지를 삭제할까요?",
   rerollConfirm: "재생성하여 신규 메세지를 목록에 추가 할까요?",

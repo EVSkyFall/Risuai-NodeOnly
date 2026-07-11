@@ -31,7 +31,7 @@
     }:{
         messages: Message[]
         currentCharacter: character
-        onReroll: () => void
+        onReroll: (exact?: boolean) => void
         onNextSwipe?: () => void
         unReroll: () => void
         onDeleteSwipe?: () => void

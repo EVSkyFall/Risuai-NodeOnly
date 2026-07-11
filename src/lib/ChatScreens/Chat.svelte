@@ -43,7 +43,7 @@
         rerollIcon?: boolean|'dynamic'|'force';
         role?: string;
         totalLength?: number;
-        onReroll?: () => void;
+        onReroll?: (exact?: boolean) => void;
         onNextSwipe?: () => void;
         unReroll?: () => void;
         onDeleteSwipe?: () => void;
@@ -795,7 +795,7 @@
             {#if !DBState.db.hideMessagePageCount}
                 <span class="flex items-center text-xs text-textcolor2 shrink overflow-hidden whitespace-nowrap min-w-0">{currentPage}/{totalPages}</span>
             {/if}
-            <button class="flex items-center shrink-0 hover:text-primary transition-colors button-icon-reroll" onclick={onReroll}>
+            <button class="flex items-center shrink-0 hover:text-primary transition-colors button-icon-reroll" onclick={() => onReroll()}>
                 <ArrowRight size={22}/>
             </button>
         {:else}
@@ -821,8 +821,8 @@
             }}>
                 <ArrowRight size={22}/>
             </button>
-            <button class="flex items-center shrink-0 hover:text-primary transition-colors button-icon-reroll" class:dyna-icon={rerollIcon === 'dynamic' || rerollIcon === 'force'} class:force-show={rerollIcon === 'force'} onclick={async () => {
-                if (!DBState.db.confirmReroll || await alertConfirm(language.rerollConfirm)) onReroll()
+            <button class="flex items-center shrink-0 hover:text-primary transition-colors button-icon-reroll" class:dyna-icon={rerollIcon === 'dynamic' || rerollIcon === 'force'} class:force-show={rerollIcon === 'force'} title={language.rerollExactTooltip} onclick={async () => {
+                if (!DBState.db.confirmReroll || await alertConfirm(language.rerollConfirm)) onReroll(true)
             }}>
                 <RefreshCcwIcon size={20}/>
             </button>

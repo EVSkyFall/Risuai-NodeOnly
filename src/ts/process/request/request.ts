@@ -33,6 +33,7 @@ import {
 } from "src/ts/preset/adapter";
 import { TOOL_CAPABLE_ADAPTER_KINDS, VISION_CAPABLE_ADAPTER_KINDS, type AdapterKind, type ModelPreset } from "src/ts/preset/types";
 import { pumpPresetStream } from "./presetStreamPump";
+import { stageMainRequestSnapshot } from "./requestReplay";
 import { resolveChatModelBinding, buildModelPresetCredential, applyPromptPresetParams } from "./modelPresetBinding";
 import { expandAdapterMessages, toAdapterMessage, toolResponseText } from "./modelPresetMessages";
 import { isLocalNetworkUrl } from "src/ts/network/localNetwork";
@@ -68,6 +69,9 @@ interface requestDataArgument{
     staticModel?: string
     escape?:boolean
     tools?: MCPTool[]
+    replayExact?: boolean
+    replayStaticModel?: string
+    replayTools?: MCPTool[]
     rememberToolUsage?: boolean
     forceStreaming?: boolean
     blockPlugins?: boolean
@@ -144,9 +148,11 @@ function replacerWithTimeout<T>(run: () => T | Promise<T>, ms: number): Promise<
 
 export async function requestChatData(arg:requestDataArgument, model:ModelModeExtended, abortSignal:AbortSignal=null):Promise<requestDataResponse> {
     const db = getDatabase()
-    const fallBackModels:string[] = safeStructuredClone(db?.fallbackModels?.[model] ?? [])
-    const tools = arg.tools ?? (await getTools())
-    fallBackModels.push('')
+    const fallBackModels:string[] = arg.replayExact
+        ? [arg.replayStaticModel ?? '']
+        : safeStructuredClone(db?.fallbackModels?.[model] ?? [])
+    const tools = arg.replayTools ?? arg.tools ?? (await getTools())
+    if(!arg.replayExact) fallBackModels.push('')
     let da:requestDataResponse
 
     if(arg.escape){
@@ -154,10 +160,13 @@ export async function requestChatData(arg:requestDataArgument, model:ModelModeEx
         console.warn('Escape is enabled, disabling streaming')
     }
 
-    const originalFormated = safeStructuredClone(arg.formated).map(m => {
-        m.content = risuUnescape(m.content)
-        return m
-    })
+    // Replay snapshots were captured after unescaping, which is not guaranteed to be idempotent.
+    const originalFormated = arg.replayExact
+        ? safeStructuredClone(arg.formated)
+        : safeStructuredClone(arg.formated).map(m => {
+            m.content = risuUnescape(m.content)
+            return m
+        })
 
     for(let fallbackIndex=0;fallbackIndex<fallBackModels.length;fallbackIndex++){
         let trys = 0
@@ -176,7 +185,7 @@ export async function requestChatData(arg:requestDataArgument, model:ModelModeEx
                 }
             }
     
-            if(pluginV2.replacerbeforeRequest.size > 0){
+            if(!arg.replayExact && pluginV2.replacerbeforeRequest.size > 0){
                 for(const replacer of pluginV2.replacerbeforeRequest){
                     try {
                         const next = await replacerWithTimeout(() => replacer(arg.formated, model), REPLACER_BEFORE_TIMEOUT_MS)
@@ -188,29 +197,48 @@ export async function requestChatData(arg:requestDataArgument, model:ModelModeEx
                 }
             }
             
-            try{
-                const currentChar = getCurrentCharacter()
-                if(currentChar){
-                    const perf = performance.now()
-                    const d = await runTrigger(currentChar, 'request', {
-                        chat: getCurrentChat(),
-                        displayMode: true,
-                        displayData: JSON.stringify(arg.formated)
-                    })
-        
-                    const got = JSON.parse(d.displayData)
-                    if(!got || !Array.isArray(got)){
-                        throw new Error('Invalid return')
+            if(!arg.replayExact){
+                try{
+                    const currentChar = getCurrentCharacter()
+                    if(currentChar){
+                        const perf = performance.now()
+                        const d = await runTrigger(currentChar, 'request', {
+                            chat: getCurrentChat(),
+                            displayMode: true,
+                            displayData: JSON.stringify(arg.formated)
+                        })
+
+                        const got = JSON.parse(d.displayData)
+                        if(!got || !Array.isArray(got)){
+                            throw new Error('Invalid return')
+                        }
+                        arg.formated = got
+                        console.log('Trigger time', performance.now() - perf)
                     }
-                    arg.formated = got
-                    console.log('Trigger time', performance.now() - perf)
+                }
+                catch(e){
+                    console.error(e)
                 }
             }
-            catch(e){
-                console.error(e)
+
+            if(model === 'model' && arg.chatId && !arg.continue && !arg.previewBody){
+                // Staged here, committed by sendChat only once the response
+                // actually produces a message — a failed attempt must not
+                // clobber the committed snapshot of the surviving message.
+                // staticModel '' (primary-slot attempt) intentionally
+                // re-resolves the live model / ModelPreset binding at replay
+                // time: pinning a concrete id would bypass the ModelPreset
+                // binding path, and a user-initiated model switch invalidates
+                // provider prompt caches anyway.
+                stageMainRequestSnapshot({
+                    formated: safeStructuredClone(arg.formated),
+                    staticModel: fallBackModels[fallbackIndex] ?? '',
+                    tools: tools ? safeStructuredClone(tools) : undefined,
+                    forGenerationId: arg.chatId,
+                    capturedAt: Date.now()
+                })
             }
-            
-    
+
             da = await requestChatDataMain({
                 ...arg,
                 staticModel: fallBackModels[fallbackIndex],
@@ -229,7 +257,7 @@ export async function requestChatData(arg:requestDataArgument, model:ModelModeEx
                 if(arg.escape) da.result = risuEscape(da.result)
                 for(const replacer of pluginV2.replacerafterRequest){
                     try {
-                        const next = await replacerWithTimeout(() => replacer(da.result, model), REPLACER_AFTER_TIMEOUT_MS)
+                        const next = await replacerWithTimeout(() => replacer(da.result as string, model), REPLACER_AFTER_TIMEOUT_MS)
                         if (typeof next === 'string') da.result = next
                         else console.warn('[ModelPreset] after-replacer returned a non-string — keeping previous result')
                     }
@@ -255,7 +283,7 @@ export async function requestChatData(arg:requestDataArgument, model:ModelModeEx
             if(da.type === 'success' && pluginV2.replacerafterRequest.size > 0){
                 for(const replacer of pluginV2.replacerafterRequest){
                     try {
-                        const next = await replacerWithTimeout(() => replacer(da.result, model), REPLACER_AFTER_TIMEOUT_MS)
+                        const next = await replacerWithTimeout(() => replacer(da.result as string, model), REPLACER_AFTER_TIMEOUT_MS)
                         if (typeof next === 'string') da.result = next
                         else console.warn('[plugin] afterRequest replacer returned a non-string — keeping previous result')
                     } catch (e) {

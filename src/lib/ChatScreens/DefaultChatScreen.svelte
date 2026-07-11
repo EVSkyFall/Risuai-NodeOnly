@@ -14,6 +14,7 @@
     import { DBState } from 'src/ts/stores.svelte';
     import { getCharImage } from "../../ts/characters";
     import { chatProcessStage, doingChat, sendChat } from "../../ts/process/index.svelte";
+    import { getReplayableSnapshot, type MainRequestSnapshot } from '../../ts/process/request/requestReplay';
     import { ensureCurrentChatReady } from "../../ts/storage/chatStorage";
     import { sleep } from "../../ts/util";
     import { language } from "../../lang";
@@ -445,10 +446,11 @@ import { isMobile } from 'src/ts/platform'
         return null
     }
 
-    async function reroll() {
+    async function reroll(exact = false) {
         if($doingChat) return
         const lastMsg = getLastCharMsg()
         if (!lastMsg) return
+        const replayRequest = exact ? getReplayableSnapshot(lastMsg.chatId) ?? undefined : undefined
 
         // Save existing swipes before clone replaces the array
         const savedSwipes = lastMsg.swipes ? [...lastMsg.swipes] : [lastMsg.data]
@@ -477,7 +479,7 @@ import { isMobile } from 'src/ts/platform'
             if(!msg) return
         }
         DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message = cha
-        const generated = await sendChatMain()
+        const generated = await sendChatMain(false, replayRequest)
 
         const currentMsgs = DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message
 
@@ -541,7 +543,7 @@ import { isMobile } from 'src/ts/platform'
 
     let abortController:null|AbortController = null
 
-    async function sendChatMain(continued:boolean = false) {
+    async function sendChatMain(continued:boolean = false, replayRequest?:MainRequestSnapshot) {
 
         messageInput = ''
         abortController = new AbortController()
@@ -549,7 +551,8 @@ import { isMobile } from 'src/ts/platform'
         try {
             generated = await sendChat(-1, {
                 signal:abortController.signal,
-                continue:continued
+                continue:continued,
+                ...(replayRequest ? { replayRequest } : {})
             })
         } catch (error) {
             console.error(error)
