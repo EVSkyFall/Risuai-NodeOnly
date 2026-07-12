@@ -3,6 +3,7 @@ import { commitMainRequestSnapshot, getReplayableSnapshot, stageMainRequestSnaps
 
 const snap = (id: string) => ({
     formated: [{ role: 'user' as const, content: 'hello' }],
+    biasString: [['needle', 0.25]] as [string, number][],
     staticModel: '',
     tools: [],
     forGenerationId: id,
@@ -19,6 +20,7 @@ describe('request replay snapshot', () => {
         expect(getReplayableSnapshot(undefined)).toBeNull()
         expect(getReplayableSnapshot('generation-b')).toBeNull()
         expect(getReplayableSnapshot('generation-a')).toBe(a)
+        expect(getReplayableSnapshot('generation-a')?.biasString).toEqual([['needle', 0.25]])
     })
 
     it('a failed (uncommitted) attempt does not clobber the committed snapshot', () => {

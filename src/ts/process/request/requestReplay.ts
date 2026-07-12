@@ -3,6 +3,7 @@ import type { MCPTool } from '../mcp/mcplib'
 
 export interface MainRequestSnapshot {
     formated: OpenAIChat[]
+    biasString: [string, number][]
     staticModel: string
     tools?: MCPTool[]
     forGenerationId: string

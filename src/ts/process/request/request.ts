@@ -232,6 +232,7 @@ export async function requestChatData(arg:requestDataArgument, model:ModelModeEx
                 // provider prompt caches anyway.
                 stageMainRequestSnapshot({
                     formated: safeStructuredClone(arg.formated),
+                    biasString: safeStructuredClone(arg.biasString ?? []),
                     staticModel: fallBackModels[fallbackIndex] ?? '',
                     tools: tools ? safeStructuredClone(tools) : undefined,
                     forGenerationId: arg.chatId,

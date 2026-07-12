@@ -286,6 +286,12 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
     }
 
+    let formated:OpenAIChat[] = []
+    let biases:[string,number][] = []
+    let inputTokens = 0
+    let outputTokens:number
+
+    if(!arg.replayRequest){
     chatProcessStage.set(1)
     stageTimings.stage1Start = Date.now()
     let unformated = {
@@ -996,7 +1002,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
     }
 
-    let biases:[string,number][] = DBState.db.bias.concat(currentChar.bias).map((v) => {
+    biases = DBState.db.bias.concat(currentChar.bias).map((v) => {
         return [risuChatParser(v[0].replaceAll("\\n","\n").replaceAll("\\r","\r").replaceAll("\\\\","\\"), {chara: currentChar}),v[1]]
     })
 
@@ -1061,7 +1067,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     
     //make into one
 
-    let formated:OpenAIChat[] = []
+    formated = []
     const formatOrder = safeStructuredClone(DBState.db.formatingOrder)
     if(formatOrder){
         formatOrder.push('postEverything')
@@ -1344,7 +1350,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     }
 
     //token rechecking
-    let inputTokens = 0
+    inputTokens = 0
 
     for(const chat of formated){
         inputTokens += await tokenizer.tokenizeChat(chat)
@@ -1369,9 +1375,26 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     }
 
     //estimate tokens
-    let outputTokens = maxResponseTokens
+    outputTokens = maxResponseTokens
     if(inputTokens + outputTokens > maxContextTokens){
         outputTokens = maxContextTokens - inputTokens
+    }
+    }
+    else{
+        // Replay intentionally bypasses the whole build phase, including the start
+        // trigger (and its stopSending short-circuit), editprocess/inlays, HypaV3
+        // persistence, and editRequest. Stage 1/2 timings remain zero by design.
+        // Preview flags are meaningless without a built prompt — normalize them
+        // off so neither the pre-dispatch preview return nor the post-dispatch
+        // previewPrompt handler can swallow a replayed response.
+        arg.preview = false
+        arg.previewPrompt = false
+        // inputTokens stays 0 and promptInfo.promptText stays absent on replay;
+        // both are cosmetic because the captured request is dispatched unchanged.
+        outputTokens = maxResponseTokens
+        if(inputTokens + outputTokens > maxContextTokens){
+            outputTokens = maxContextTokens - inputTokens
+        }
     }
     const generationId = v4()
     const generationModel = getGenerationModelString()
@@ -1400,7 +1423,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
 
     const req = await requestChatData({
         formated: arg.replayRequest ? safeStructuredClone(arg.replayRequest.formated) : formated,
-        biasString: biases,
+        biasString: arg.replayRequest ? (arg.replayRequest.biasString ?? []) : biases,
         currentChar: currentChar,
         useStreaming: true,
         isGroupChat: false,

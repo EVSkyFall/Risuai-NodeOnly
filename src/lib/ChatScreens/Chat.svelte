@@ -813,8 +813,10 @@
                 <span class="flex items-center text-xs text-textcolor2 shrink overflow-hidden whitespace-nowrap min-w-0" class:dyna-icon={rerollIcon === 'dynamic' || rerollIcon === 'force'} class:force-show={rerollIcon === 'force'}>{currentPage}/{totalPages}</span>
             {/if}
             <button class="flex items-center shrink-0 hover:text-primary transition-colors button-icon-reroll" class:dyna-icon={rerollIcon === 'dynamic' || rerollIcon === 'force'} class:force-show={rerollIcon === 'force'} onclick={async () => {
-                if (totalPages <= 1) {
-                    if (!DBState.db.confirmReroll || await alertConfirm(language.noSwipesRerollConfirm)) onReroll()
+                if (currentPage >= totalPages) {
+                    // At the end of the swipe list the arrow generates a fresh
+                    // swipe (upstream behavior) instead of wrapping to the first.
+                    if (!DBState.db.confirmReroll || await alertConfirm(totalPages <= 1 ? language.noSwipesRerollConfirm : language.rerollConfirm)) onReroll()
                 } else {
                     onNextSwipe()
                 }
