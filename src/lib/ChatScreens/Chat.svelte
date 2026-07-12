@@ -117,6 +117,14 @@
         if (msg.swipes && msg.swipeId !== undefined) {
             msg.swipes[msg.swipeId] = message
         }
+        // Edits are interactions, not streaming: bump the reload pointer so
+        // the stable-identity reconciler remounts this message (clearing any
+        // open edit/translation session), matching the old content-hash
+        // remount behavior.
+        ReloadChatPointer.update((v) => {
+            v[idx] = (v[idx] ?? 0) + 1
+            return v
+        })
     }
 
     function handlePartialEditSave(e: CustomEvent<{ newData: string }>) {
@@ -128,6 +136,11 @@
                 msg.swipes[msg.swipeId] = e.detail.newData
             }
             displaya(e.detail.newData)
+            // Same rationale as edit(): remount after a partial-edit save.
+            ReloadChatPointer.update((v) => {
+                v[idx] = (v[idx] ?? 0) + 1
+                return v
+            })
         }
     }
 

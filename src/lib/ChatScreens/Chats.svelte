@@ -43,8 +43,17 @@
     } = $props();
 
     let chatBody: HTMLDivElement;
-    let hashes: Set<number> = new Set();
-    let mountInstances: Map<number, {}> = new Map();
+    // Mounted Chat instances keyed by a STABLE identity, not by content:
+    // streaming mutates message.data every chunk, and keying on content used
+    // to unmount+remount the whole Chat subtree per chunk (full flicker,
+    // every <img> refetched). Streaming-time changes (data, generationInfo,
+    // names) update the mounted component in place through its reactive
+    // $state props. Everything a user INTERACTION can change (swipes,
+    // disabled, reload pointers, reroll target, room switch) stays in the
+    // identity so those transitions remount — in-place updates there would
+    // leak open edit/translation sessions across semantically new content.
+    type MountRecord = { inst: {}, props: Record<string, any>, content: string, el: HTMLElement };
+    let mountRecords: Map<string, MountRecord> = new Map();
 
     //Non-cryptographic hash function to generate a unique hash for each message
     function hashCode(str:string):number {
@@ -60,16 +69,23 @@
         return hash;
     }
 
+    const noopSwipe = () => {};
+
     const updateChatBody = () => {
         if(!chatBody){
             return
         }
 
-        let nextHash = 0;
-        let currentHashes: Set<number> = new Set();
+        let nextHash = '';
+        let currentHashes: Set<string> = new Set();
         const charImage = getCharImage(currentCharacter.image, 'css')
         const userImage = getCharImage(userIcon, 'css')
         const simpleChar = createSimpleCharacter(currentCharacter);
+        // Once per pass: room scoping for identity (branch clones copy message
+        // chatIds verbatim) and a deep character signature so mid-chat edits
+        // to scripts/assets propagate into mounted components.
+        const roomId = getCurrentChatRoomId() ?? 'noroom';
+        const simpleCharSig = hashCode(JSON.stringify(simpleChar) ?? 'null').toString();
         let loadStart = messages.length - 1
         let loadEnd = messages.length - loadPages
 
@@ -100,79 +116,90 @@
             const messageLargePortrait = message.role === 'user' ? (userIconPortrait ?? false) : ((currentCharacter as character).largePortrait ?? false);
             const reloadPointer = reloadPointerMap[i] ?? 0;
             const isRerollTarget = i === lastRealCharIdx;
-            let hashd = message.data + (message.chatId ?? '') + i.toString() + messageLargePortrait.toString() + message.disabled?.toString() + reloadPointer.toString() + (message.swipeId ?? 0).toString() + (message.swipes?.length ?? 0).toString() + isRerollTarget.toString();
-            const currentHash = hashCode(hashd);
-            currentHashes.add(currentHash);
-            if(!hashes.has(currentHash)){
+            const swipes = message.swipes;
+            const swipeId = message.swipeId ?? 0;
+
+            // Identity = the old content hash MINUS message.data (plus room
+            // scoping): any interaction-driven transition (swipe, disable,
+            // reload, reroll-target shift, room switch) remounts exactly as
+            // before. Only streaming-time mutations flow through the content
+            // string into in-place prop updates.
+            const identity = 'id|' + roomId + '|' + (message.chatId ?? '') + '|' + (message.time ?? '') + '|' + i.toString() + '|' + message.role + '|' + swipeId.toString() + '|' + (swipes?.length ?? 0).toString() + '|' + message.disabled?.toString() + '|' + (message.isComment ?? false).toString() + '|' + reloadPointer.toString() + '|' + messageLargePortrait.toString() + '|' + isRerollTarget.toString();
+            const content = message.data + '|' + simpleCharSig + '|' + currentUsername + '|' + currentCharacter.name + '|' + messages.length.toString() + '|' + JSON.stringify(message.generationInfo ?? null);
+            currentHashes.add(identity);
+
+            const existing = mountRecords.get(identity);
+            if(existing){
+                if(existing.content !== content){
+                    const p = existing.props;
+                    p.message = message.data;
+                    p.totalLength = messages.length;
+                    p.character = simpleChar;
+                    p.messageGenerationInfo = message.generationInfo;
+                    p.name = message.role === 'user' ? currentUsername : currentCharacter.name;
+                    existing.content = content;
+                }
+            }
+            else{
                 const b = document.createElement('div');
-                b.setAttribute('x-hashed', currentHash.toString());
                 b.classList.add('chat-message-container');
-                const swipes = message.swipes;
-                const swipeId = message.swipeId ?? 0;
+                const props = $state({
+                    message: message.data,
+                    isLastMemory: false,
+                    idx: i,
+                    totalLength: messages.length,
+                    img: message.role === 'user' ? userImage : charImage,
+                    onReroll: onReroll,
+                    onNextSwipe: isRerollTarget ? onNextSwipe : noopSwipe,
+                    unReroll: unReroll,
+                    onDeleteSwipe: isRerollTarget ? onDeleteSwipe : noopSwipe,
+                    rerollIcon: (isRerollTarget ? 'force' : false) as 'force' | false,
+                    character: simpleChar,
+                    largePortrait: messageLargePortrait,
+                    messageGenerationInfo: message.generationInfo,
+                    role: message.role,
+                    name: message.role === 'user' ? currentUsername : currentCharacter.name,
+                    isComment: message.isComment ?? false,
+                    disabled: message.disabled ?? false,
+                    currentPage: isRerollTarget ? swipeId + 1 : 1,
+                    totalPages: isRerollTarget ? (swipes?.length ?? 1) : 1,
+                });
                 const inst = mount(Chat, {
                     target: b,
-                    props: {
-                        message: message.data,
-                        isLastMemory: false,
-                        idx: i,
-                        totalLength: messages.length,
-                        img: message.role === 'user' ? userImage : charImage,
-                        onReroll: onReroll,
-                        onNextSwipe: i === lastRealCharIdx ? onNextSwipe : () => {},
-                        unReroll: unReroll,
-                        onDeleteSwipe: i === lastRealCharIdx ? onDeleteSwipe : () => {},
-                        rerollIcon: i === lastRealCharIdx ? 'force' : false,
-                        character: simpleChar,
-                        largePortrait: message.role === 'user' ? (userIconPortrait ?? false) : ((currentCharacter as character).largePortrait ?? false),
-                        messageGenerationInfo: message.generationInfo,
-                        role: message.role,
-                        name: message.role === 'user' ? currentUsername : currentCharacter.name,
-                        isComment: message.isComment ?? false,
-                        disabled: message.disabled ?? false,
-                        ...(i === lastRealCharIdx ? {
-                            currentPage: (swipeId ?? 0) + 1,
-                            totalPages: swipes?.length ?? 1,
-                        } : {}),
-                    },
-
+                    props,
                 })
-                mountInstances.set(currentHash, inst);
-                const nextElement = nextHash === 0 ? null : chatBody.querySelector(`[x-hashed="${nextHash}"]`);
+                mountRecords.set(identity, { inst, props, content, el: b });
+                // Container elements are tracked in mountRecords — identities
+                // contain arbitrary ids, so no attribute-selector queries.
+                const nextElement = nextHash === '' ? null : (mountRecords.get(nextHash)?.el ?? null);
                 if(nextElement){
-                    chatBody.insertBefore(b, nextElement?.nextSibling);
+                    chatBody.insertBefore(b, nextElement.nextSibling);
                 }
                 else{
                     chatBody.prepend(b);
                 }
             }
-            nextHash = currentHash;
+            nextHash = identity;
 
         }
 
         //@ts-expect-error Set<T> requires type arg, and Set.difference needs 'esnext' lib (polyfilled by Core-js)
-        const toRemove:Set = hashes.difference(currentHashes);
+        const toRemove:Set = new Set(mountRecords.keys()).difference(currentHashes);
         toRemove.forEach((hash) => {
-            const inst = mountInstances.get(hash);
-            if(inst){
-                unmount(inst);
-                mountInstances.delete(hash);
-            }
-            const element = chatBody.querySelector(`[x-hashed="${hash}"]`);
-            if(element){
-                chatBody.removeChild(element);
+            const rec = mountRecords.get(hash);
+            if(rec){
+                unmount(rec.inst);
+                rec.el.remove();
+                mountRecords.delete(hash);
             }
         });
-
-        hashes = currentHashes;
     };
 
     onDestroy(() => {
-        console.log('Unmounting Chats');
-        hashes.clear();
-        mountInstances.forEach((inst) => {
-            unmount(inst);
+        mountRecords.forEach((rec) => {
+            unmount(rec.inst);
         });
-        mountInstances.clear();
+        mountRecords.clear();
     })
 
     function checkIfAtBottom() {

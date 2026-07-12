@@ -57,6 +57,11 @@
         selectedRange: null,
     });
 
+    // Ranges are byte offsets into the text they were computed from. If the
+    // message changes while an edit/delete is open (streaming correction,
+    // external navigation), saving against the new text would corrupt it.
+    let matchSourceText = '';
+
     let showMatchFailedModal = $state(false);
 
     const SELECTOR = EDITABLE_BLOCK_SELECTORS.join(', ');
@@ -207,6 +212,7 @@
     ) {
         if (!elementOrText || !messageData) return;
 
+        matchSourceText = messageData;
         matchingState.mode = mode;
 
         // Set matching options based on mode
@@ -317,6 +323,11 @@
     // Save edited text
     function handleSave() {
         if (!matchingState.selectedRange) return;
+        if (messageData !== matchSourceText) {
+            showMatchFailedModal = true;
+            closeEdit();
+            return;
+        }
 
         const newData = replaceRange(messageData, matchingState.selectedRange, editText);
         dispatch('save', { newData });
@@ -355,6 +366,11 @@
     // Confirm deletion
     function handleConfirmDelete() {
         if (!matchingState.selectedRange) return;
+        if (messageData !== matchSourceText) {
+            showMatchFailedModal = true;
+            closeDeleteConfirm();
+            return;
+        }
 
         let newData = replaceRange(messageData, matchingState.selectedRange, '');
         newData = newData.replace(/\n{3,}/g, '\n\n').trim();

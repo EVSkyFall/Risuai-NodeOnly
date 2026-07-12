@@ -9,6 +9,7 @@
     import { getModuleAssets } from "src/ts/process/modules";
     import { getCurrentCharacter } from "src/ts/storage/database.svelte";
     import { getFileSrc } from "src/ts/globalApi.svelte";
+    import { morphHtml } from "./morphHtml";
 
     interface Props {
         character?: simpleCharacterArgument|string|null
@@ -36,6 +37,10 @@
         bodyRoot,
         modelShortName = '',
     }: Props =  $props()
+
+    // Shown while an LLM translation is in flight — the previous message DOM
+    // stays visible underneath (the old code replaced the whole body with it).
+    const TRANSLATION_SPINNER = `<div style="display:flex;justify-content:center;align-items:center;height:48px;"><div style="animation: spin 1s linear infinite; border-radius: 50%; height: 32px; width: 32px; border: 2px solid #3b82f6; border-top: 2px solid transparent;"></div></div><style>@keyframes spin { to { transform: rotate(360deg); } }</style>`
 
     // svelte-ignore non_reactive_update
     let lastParsed = ''
@@ -241,21 +246,40 @@
         }
     }
 
-    let markParsingResult = $derived.by(() => markParsing(msgDisplay, character, idx))
+    // Invoked from an $effect (not $derived.by): markParsing mutates the
+    // translated/translating bindables and lastParsed, which is unsafe inside
+    // a derived. The effect tracks the same synchronous reads.
+    let markParsingResult: Promise<string> | undefined = $state()
+    $effect(() => {
+        markParsingResult = markParsing(msgDisplay, character, idx)
+    })
+
+    // Only the RAW resolved markdown is stored; trimMarkdown/addMetadataToElement
+    // run in a $derived so their DBState reads (hideAllImages etc.) stay
+    // reactive — with the old {#await}{@html} they were tracked by the template.
+    let resolvedMd = $state('')
+    let displayHtml = $derived(addMetadataToElement(trimMarkdown(resolvedMd), modelShortName))
 
     $effect(() => {
-        markParsingResult
+        const parse = markParsingResult
+        if (!parse) return
         checkImg()
-        markParsingResult.then(async () => {
+        parse.then(async (md) => {
+            // A newer parse may have superseded this one while it was in flight.
+            if (parse !== markParsingResult) return
+            resolvedMd = md
+            await tick() // Wait for Svelte to apply the morph into the DOM
             checkImg()
-            await tick() // Wait for Svelte to re-render the {:then} block into DOM
             if (bodyRoot) resolveInlayPlaceholders(bodyRoot)
         })
     })
 </script>
 
-{#await markParsingResult}
-    {@html addMetadataToElement(trimMarkdown(lastParsed), modelShortName)}
-{:then md}
-    {@html addMetadataToElement(trimMarkdown(md), modelShortName)}
-{/await}
+<!-- Applied through the prefix-preserving morph action instead of {@html}:
+     a streamed chunk only replaces children from the first changed node
+     onward, so earlier blocks (and their <img> elements) survive intact.
+     While a new parse is pending the previous DOM stays as-is. -->
+{#if translating && DBState.db.showTranslationLoading}
+    {@html TRANSLATION_SPINNER}
+{/if}
+<div style:display="contents" use:morphHtml={displayHtml}></div>
