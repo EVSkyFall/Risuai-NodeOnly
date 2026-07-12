@@ -96,7 +96,62 @@ export function resetScriptCache(){
     processScriptCache = new Map()
 }
 
+// Streaming script circuit breaker: while a message is streaming, one
+// pathologically slow edit-script pass (heavy Lua triggers / catastrophic
+// regex on partial text) must not be repeated on every chunk — a single
+// over-budget pass suspends mid-stream edit passes for THAT message until
+// the stream ends. The final full pass at stream end always runs, so the
+// persisted result is byte-identical to today's behavior.
+const STREAM_SCRIPT_BUDGET_MS = 1000
+const streamingScriptCircuit = {
+    active: false,
+    msgIndex: -1,
+    tripped: false,
+}
+export function armStreamingScriptCircuit(msgIndex: number){
+    streamingScriptCircuit.active = true
+    streamingScriptCircuit.msgIndex = msgIndex
+    streamingScriptCircuit.tripped = false
+}
+export function disarmStreamingScriptCircuit(){
+    streamingScriptCircuit.active = false
+    streamingScriptCircuit.msgIndex = -1
+    streamingScriptCircuit.tripped = false
+}
+export function isStreamingScriptTripped(){
+    return streamingScriptCircuit.active && streamingScriptCircuit.tripped
+}
+
 export async function processScriptFull(char:character|simpleCharacterArgument, data:string, mode:ScriptMode, chatID = -1, cbsConditions:CbsConditions = {}){
+    const circuitTarget = (mode === 'editoutput' || mode === 'editdisplay')
+        && streamingScriptCircuit.active
+        && chatID === streamingScriptCircuit.msgIndex
+    if(circuitTarget && streamingScriptCircuit.tripped){
+        return {data, emoChanged: false}
+    }
+    const start = performance.now()
+    try{
+        return await processScriptFullInner(char, data, mode, chatID, cbsConditions)
+    }
+    finally{
+        const dur = performance.now() - start
+        // Re-check live circuit state: a pass that started under a previous
+        // stream may resolve after disarm (or after the next stream re-armed),
+        // and must not trip the circuit for an unrelated message.
+        const stillTarget = circuitTarget
+            && streamingScriptCircuit.active
+            && chatID === streamingScriptCircuit.msgIndex
+        if(stillTarget && dur > STREAM_SCRIPT_BUDGET_MS){
+            streamingScriptCircuit.tripped = true
+            console.warn(`[StreamScriptCircuit] ${mode} pass took ${Math.round(dur)}ms (budget ${STREAM_SCRIPT_BUDGET_MS}ms) — suspending mid-stream script passes for message ${chatID} until stream end`)
+        }
+        else if(dur > 500){
+            console.warn(`[ScriptPerf] processScriptFull ${mode} took ${Math.round(dur)}ms (msg ${chatID})`)
+        }
+    }
+}
+
+async function processScriptFullInner(char:character|simpleCharacterArgument, data:string, mode:ScriptMode, chatID = -1, cbsConditions:CbsConditions = {}){
     let db = getDatabase()
     let emoChanged = false
     data = await runLuaEditTrigger(char, mode, data, { index:chatID })
@@ -335,7 +390,12 @@ export async function processScriptFull(char:character|simpleCharacterArgument, 
     }
     for (const script of parsedScripts){
         try {
-            executeScript(script)            
+            const start = performance.now()
+            executeScript(script)
+            const dur = performance.now() - start
+            if(dur > 250){
+                console.warn(`[ScriptPerf] customscript '${script.script.comment || script.script.in.slice(0, 40)}' (${mode}) took ${Math.round(dur)}ms`)
+            }
         } catch (error) {
             console.error(error)
         }

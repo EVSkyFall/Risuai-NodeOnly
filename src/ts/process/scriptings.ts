@@ -1389,6 +1389,7 @@ export async function runLuaEditTrigger<T extends string|OpenAIChat[]>(char:char
     
         for(let trigger of triggers){
             if(trigger?.effect?.[0]?.type === 'triggerlua'){
+                const start = performance.now()
                 const runResult = await runScripted(trigger.effect[0].code, {
                     char: char,
                     lowLevelAccess: false,
@@ -1396,6 +1397,10 @@ export async function runLuaEditTrigger<T extends string|OpenAIChat[]>(char:char
                     data,
                     meta,
                 })
+                const dur = performance.now() - start
+                if(dur > 250){
+                    console.warn(`[ScriptPerf] Lua trigger '${trigger.comment || 'unnamed'}' (${mode}) took ${Math.round(dur)}ms`)
+                }
                 data = runResult.res ?? data
             }
         }

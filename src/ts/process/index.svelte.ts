@@ -11,7 +11,7 @@ import { findCharacterbyId, getAuthorNoteDefaultText, getPersonaPrompt, getUserN
 import { requestChatData } from "./request/request";
 import { commitMainRequestSnapshot, type MainRequestSnapshot } from "./request/requestReplay";
 import { stableDiff } from "./stableDiff";
-import { processScript, processScriptFull, risuChatParser } from "./scripts";
+import { armStreamingScriptCircuit, disarmStreamingScriptCircuit, isStreamingScriptTripped, processScript, processScriptFull, risuChatParser } from "./scripts";
 import { exampleMessage } from "./exampleMessages";
 import { sayTTS } from "./tts";
 import { v4 } from "uuid";
@@ -1492,11 +1492,13 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             })
         }
         DBState.db.characters[selectedChar].chats[selectedChat].isStreaming = true
+        armStreamingScriptCircuit(msgIndex)
         DBState.db.characters[selectedChar].reloadKeys += 1
         let lastResponseChunk:{[key:string]:string} = {}
         let streamAborted:boolean = abortSignal.aborted
         const SCRIPT_THROTTLE_MS = 150
         let lastScriptProcessTime = 0
+        let lastScriptDurationMs = 0
         let pendingFinalProcess = false
         const abortReader = () => {
             streamAborted = true
@@ -1526,14 +1528,29 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     if(DBState.db.removeIncompleteResponse){
                         result = trimUntilPunctuation(result)
                     }
-                    // Throttle editdisplay processing to reduce flickering (especially for Claude full-text streaming)
+                    // Throttle editdisplay processing to reduce flickering (especially for Claude full-text streaming).
+                    // The gap scales with the previous pass's duration so a slow (but under-budget)
+                    // script pass cannot occupy the majority of main-thread time. Once the
+                    // circuit is tripped the raw path is cheap, so the duration-scaled gap
+                    // must not apply — the tripping pass's own duration would otherwise
+                    // freeze raw growth for 3x that long.
                     const now = performance.now()
-                    if (now - lastScriptProcessTime >= SCRIPT_THROTTLE_MS) {
-                        let result2 = await processScriptFull(nowChatroom, reformatContent(prefix + result), 'editoutput', msgIndex)
-                        DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = result2.data
-                        emoChanged = result2.emoChanged
+                    const requiredGap = isStreamingScriptTripped() ? SCRIPT_THROTTLE_MS : Math.max(SCRIPT_THROTTLE_MS, lastScriptDurationMs * 3)
+                    if (now - lastScriptProcessTime >= requiredGap) {
+                        if (isStreamingScriptTripped()) {
+                            // Circuit tripped: keep the text visibly growing with the raw
+                            // accumulated stream; the full script pipeline runs once over the
+                            // complete text in the finally block below.
+                            DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = reformatContent(prefix + result)
+                            lastScriptDurationMs = 0
+                        } else {
+                            let result2 = await processScriptFull(nowChatroom, reformatContent(prefix + result), 'editoutput', msgIndex)
+                            DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = result2.data
+                            emoChanged = result2.emoChanged
+                            lastScriptDurationMs = performance.now() - now
+                        }
                         DBState.db.characters[selectedChar].reloadKeys += 1
-                        lastScriptProcessTime = now
+                        lastScriptProcessTime = performance.now()
                         pendingFinalProcess = true
                     } else {
                         pendingFinalProcess = true
@@ -1546,6 +1563,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
         finally {
             abortSignal.removeEventListener('abort', abortReader)
+            disarmStreamingScriptCircuit()
             // Process final pending chunk that was throttled
             if (pendingFinalProcess && result) {
                 let result2 = await processScriptFull(nowChatroom, reformatContent(prefix + result), 'editoutput', msgIndex)
