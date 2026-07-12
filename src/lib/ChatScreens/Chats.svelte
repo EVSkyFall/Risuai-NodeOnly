@@ -82,10 +82,12 @@
         const userImage = getCharImage(userIcon, 'css')
         const simpleChar = createSimpleCharacter(currentCharacter);
         // Once per pass: room scoping for identity (branch clones copy message
-        // chatIds verbatim) and a deep character signature so mid-chat edits
-        // to scripts/assets propagate into mounted components.
+        // chatIds verbatim). NOTE: no deep character signature here — reading
+        // a large character (Omninode-scale triggerscript/assets) through the
+        // $state proxy inside this $effect registers a dependency per leaf and
+        // saturates the main thread on long chats. Character changes propagate
+        // on remount only, exactly like the old content-hash behavior.
         const roomId = getCurrentChatRoomId() ?? 'noroom';
-        const simpleCharSig = hashCode(JSON.stringify(simpleChar) ?? 'null').toString();
         let loadStart = messages.length - 1
         let loadEnd = messages.length - loadPages
 
@@ -125,7 +127,10 @@
             // before. Only streaming-time mutations flow through the content
             // string into in-place prop updates.
             const identity = 'id|' + roomId + '|' + (message.chatId ?? '') + '|' + (message.time ?? '') + '|' + i.toString() + '|' + message.role + '|' + swipeId.toString() + '|' + (swipes?.length ?? 0).toString() + '|' + message.disabled?.toString() + '|' + (message.isComment ?? false).toString() + '|' + reloadPointer.toString() + '|' + messageLargePortrait.toString() + '|' + isRerollTarget.toString();
-            const content = message.data + '|' + simpleCharSig + '|' + currentUsername + '|' + currentCharacter.name + '|' + messages.length.toString() + '|' + JSON.stringify(message.generationInfo ?? null);
+            // Only shallow, streaming-relevant reads here — generationId is a
+            // single leaf; deep-serializing generationInfo (or the character)
+            // in a tracked context is a long-chat performance landmine.
+            const content = message.data + '|' + currentUsername + '|' + currentCharacter.name + '|' + messages.length.toString() + '|' + (message.generationInfo?.generationId ?? '');
             currentHashes.add(identity);
 
             const existing = mountRecords.get(identity);
@@ -134,7 +139,6 @@
                     const p = existing.props;
                     p.message = message.data;
                     p.totalLength = messages.length;
-                    p.character = simpleChar;
                     p.messageGenerationInfo = message.generationInfo;
                     p.name = message.role === 'user' ? currentUsername : currentCharacter.name;
                     existing.content = content;
