@@ -28,9 +28,17 @@ let lastRequestsCount = 0
 interface BasicScriptingEngineState {
     code?: string;
     mutex: Mutex;
+    lastUsedAt?: number;
+    inUse?: number;
     chat?: Chat;
     setVar?: (key:string, value:string) => void,
     getVar?: (key:string) => string,
+    // Per-run context for API closures: declareAPI callbacks are created once
+    // at engine init and would otherwise capture the init run's locals — with
+    // persistent engines those captures go permanently stale. Closures must
+    // read these state fields, refreshed at the start of every run.
+    stopSending?: boolean;
+    char?: character|simpleCharacterArgument;
 }
 
 interface LuaScriptingEngineState extends BasicScriptingEngineState {
@@ -45,9 +53,61 @@ interface PythonScriptingEngineState extends BasicScriptingEngineState {
 
 type ScriptingEngineState = LuaScriptingEngineState | PythonScriptingEngineState;
 
-let ScriptingEngines = new Map<string, ScriptingEngineState>()
+// One persistent engine per distinct script code (not per mode): listenEdit
+// registers all mode handlers in a single Lua state and callListenMain(mode, ...)
+// dispatches per call, so a single engine correctly serves every mode. Keying by
+// mode (the old scheme) made scripts sharing a mode slot evict each other on
+// every call, re-running doString over MB-scale Lua each time.
+let ScriptingEngines = new Map<'lua'|'py', Map<string, ScriptingEngineState>>()
 let luaFactoryPromise: Promise<void> | null = null;
-let pendingEngineCreations = new Map<string, Promise<ScriptingEngineState>>();
+let pendingEngineCreations = new Map<'lua'|'py', Map<string, Promise<ScriptingEngineState>>>();
+const MAX_SCRIPT_ENGINES = 16
+let engineUseCounter = 0
+
+function evictUnusedScriptEngines() {
+    let totalEngines = 0
+    for (const enginesByCode of ScriptingEngines.values()) {
+        totalEngines += enginesByCode.size
+    }
+
+    while (totalEngines > MAX_SCRIPT_ENGINES) {
+        let evictionCandidate: {
+            type: 'lua'|'py',
+            code: string,
+            state: ScriptingEngineState,
+            lastUsedAt: number,
+        } | undefined
+
+        for (const [type, enginesByCode] of ScriptingEngines) {
+            for (const [code, state] of enginesByCode) {
+                if ((state.inUse ?? 0) !== 0) {
+                    continue
+                }
+                const lastUsedAt = state.lastUsedAt ?? 0
+                if (!evictionCandidate || lastUsedAt < evictionCandidate.lastUsedAt) {
+                    evictionCandidate = { type, code, state, lastUsedAt }
+                }
+            }
+        }
+
+        if (!evictionCandidate) {
+            break
+        }
+
+        if (evictionCandidate.state.type === 'lua') {
+            evictionCandidate.state.engine?.global.close()
+        }
+        else {
+            evictionCandidate.state.pyodide?.close()
+        }
+        // A closed engine must never pass the code-match check again — any
+        // straggling reference will re-initialize instead of running dead.
+        evictionCandidate.state.code = undefined
+        ScriptingEngines.get(evictionCandidate.type)?.delete(evictionCandidate.code)
+        totalEngines--
+        console.warn(`[ScriptPerf] evicted script engine (cap ${MAX_SCRIPT_ENGINES})`)
+    }
+}
 
 export async function runScripted(code:string, arg:{
     char?:character|simpleCharacterArgument,
@@ -69,25 +129,32 @@ export async function runScripted(code:string, arg:{
     const mode = arg.mode ?? 'manual'
 
     let chat = arg.chat ?? getCurrentChat()
-    let stopSending = false
     let lowLevelAccess = arg.lowLevelAccess ?? false
 
     if(type === 'lua'){
         await ensureLuaFactory()
     }
-    let ScriptingEngineState = await getOrCreateEngineState(mode, type);
-    
-    return await ScriptingEngineState.mutex.runExclusive(async () => {
+    let ScriptingEngineState = await getOrCreateEngineState(type, code);
+    try {
+        ScriptingEngineState.lastUsedAt = ++engineUseCounter
+        evictUnusedScriptEngines()
+
+        return await ScriptingEngineState.mutex.runExclusive(async () => {
         ScriptingEngineState.chat = chat
         ScriptingEngineState.setVar = setVar
         ScriptingEngineState.getVar = getVar
+        ScriptingEngineState.stopSending = false
+        ScriptingEngineState.char = char
         if (code !== ScriptingEngineState.code) {
+            const initStart = performance.now()
             let declareAPI:(name: string, func:Function) => void
 
             if(ScriptingEngineState.type === 'lua'){
                 console.log('Creating new Lua engine for mode:', mode)
                 ScriptingEngineState.engine?.global.close()
-                ScriptingEngineState.code = code
+                // code is stamped only after doString succeeds (like the py path):
+                // stamping early would leave a poisoned persistent state on init
+                // failure — later calls would skip re-init and run a dead engine.
                 ScriptingEngineState.engine = await luaFactory.createEngine({injectObjects: true})
                 const luaEngine = ScriptingEngineState.engine
                 declareAPI = (name:string, func:Function) => {
@@ -118,7 +185,7 @@ export async function runScripted(code:string, arg:{
                 if(!ScriptingSafeIds.has(id)){
                     return
                 }
-                stopSending = true
+                ScriptingEngineState.stopSending = true
             })
             declareAPI('alertError', (id:string, value:string) => {
                 if(!ScriptingSafeIds.has(id)){
@@ -364,7 +431,7 @@ export async function runScripted(code:string, arg:{
                 if(!ScriptingLowLevelIds.has(id)){
                     return
                 }
-                const gen = await generateAIImage(value, char as character, negValue, 'inlay')
+                const gen = await generateAIImage(value, (ScriptingEngineState.char ?? char) as character, negValue, 'inlay')
                 if(!gen){
                     return 'Error: Image generation failed'
                 }
@@ -1028,6 +1095,10 @@ export async function runScripted(code:string, arg:{
                 await ScriptingEngineState.pyodide?.init(code)
             }
             ScriptingEngineState.code = code
+            const initDuration = performance.now() - initStart
+            if (initDuration > 250) {
+                console.warn(`[ScriptPerf] script engine init took ${Math.round(initDuration)}ms (${Math.round(code.length / 1024)}KB ${type})`)
+            }
         }
         let accessKey = v4()
         if(mode === 'editDisplay'){
@@ -1092,7 +1163,7 @@ export async function runScripted(code:string, arg:{
                     }
                 }   
                 if(res === false){
-                    stopSending = true
+                    ScriptingEngineState.stopSending = true
                 }
             } catch (error) {
                 console.error(error)
@@ -1135,9 +1206,12 @@ export async function runScripted(code:string, arg:{
         chat = ScriptingEngineState.chat
 
         return {
-            stopSending, chat, res
+            stopSending: ScriptingEngineState.stopSending ?? false, chat, res
         }
-    })
+        })
+    } finally {
+        ScriptingEngineState.inUse = ScriptingEngineState.inUse! - 1
+    }
 }
 
 async function makeLuaFactory(){
@@ -1181,33 +1255,53 @@ async function ensureLuaFactory() {
 }
 
 async function getOrCreateEngineState(
-    mode: string, 
-    type: 'lua'|'py'
+    type: 'lua'|'py',
+    code: string,
 ): Promise<ScriptingEngineState> {
-    let engineState = ScriptingEngines.get(mode);
+    let enginesByCode = ScriptingEngines.get(type);
+    if (!enginesByCode) {
+        enginesByCode = new Map<string, ScriptingEngineState>()
+        ScriptingEngines.set(type, enginesByCode)
+    }
+
+    let engineState = enginesByCode.get(code);
     if (engineState) {
+        engineState.inUse = (engineState.inUse ?? 0) + 1
         return engineState;
     }
-    
-    let pendingCreation = pendingEngineCreations.get(mode);
-    if (pendingCreation) {
-        return pendingCreation;
+
+    let pendingByCode = pendingEngineCreations.get(type)
+    if (!pendingByCode) {
+        pendingByCode = new Map<string, Promise<ScriptingEngineState>>()
+        pendingEngineCreations.set(type, pendingByCode)
     }
-    
-    const creationPromise = (() => {
+
+    let pendingCreation = pendingByCode.get(code);
+    if (pendingCreation) {
+        const pendingState = await pendingCreation;
+        pendingState.inUse = (pendingState.inUse ?? 0) + 1
+        return pendingState;
+    }
+
+    const creationPromise = Promise.resolve().then(() => {
         const engineState: ScriptingEngineState = {
             mutex: new Mutex(),
             type: type,
+            lastUsedAt: ++engineUseCounter,
+            inUse: 1,
         };
-        ScriptingEngines.set(mode, engineState);
+        enginesByCode.set(code, engineState);
+        return engineState;
+    });
 
-        pendingEngineCreations.delete(mode);
+    pendingByCode.set(code, creationPromise);
+    const clearPendingCreation = () => {
+        if (pendingByCode.get(code) === creationPromise) {
+            pendingByCode.delete(code)
+        }
+    }
+    void creationPromise.then(clearPendingCreation, clearPendingCreation)
 
-        return Promise.resolve(engineState);
-    })();
-    
-    pendingEngineCreations.set(mode, creationPromise);
-    
     return creationPromise;
 }
 
