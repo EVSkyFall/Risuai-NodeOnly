@@ -26,6 +26,7 @@ const getVips = () => {
 const { kvGet, kvSet, kvDel, kvList,
         kvDelPrefix, kvListWithSizes, kvSize, kvGetUpdatedAt, kvCopyValue, clearEntities, checkpointWal,
         gcChunks, reclaimableChunkBytes, isDbBlobChunked, snapshotFootprint, db: sqliteDb } = require('./db.cjs');
+const { preparePluginStorageImport, writePluginStorageRescue } = require('./pluginStorageSafety.cjs');
 const {
     addLogBatch, queryLogs, clearLogs, countLogs,
     logger, installProcessHandlers, expressErrorMiddleware,
@@ -413,6 +414,7 @@ async function decodeDatabaseWithPersistentChatIds(raw, options = {}) {
         if (pcs && typeof pcs === 'object') {
             const pcsKeys = Object.keys(pcs);
             if (pcsKeys.length > 0) {
+                let migratedCount = 0;
                 for (const k of pcsKeys) {
                     const encoded = Buffer.from(k, 'utf-8')
                         .toString('base64')
@@ -420,9 +422,12 @@ async function decodeDatabaseWithPersistentChatIds(raw, options = {}) {
                         .replace(/\//g, '_')
                         .replace(/=+$/, '');
                     const storageKey = `plugin-custom-storage/${encoded}.json`;
+                    // A lost marker must not let legacy save data overwrite live KV storage.
+                    if (kvGet(storageKey) !== null) continue;
                     kvSet(storageKey, Buffer.from(JSON.stringify(pcs[k]), 'utf-8'));
+                    migratedCount++;
                 }
-                logger.info(`[Migration] Migrated ${pcsKeys.length} pluginCustomStorage entries to KV`);
+                logger.info(`[Migration] Migrated ${migratedCount} pluginCustomStorage entries to KV`);
                 dbObj.pluginCustomStorage = {};
                 needsPersist = true;
             }
@@ -1122,6 +1127,19 @@ if(!existsSync(backupsDir)){
     catch { backupsDir = DEFAULT_BACKUPS_DIR; mkdirSync(backupsDir, { recursive: true }); }
 }
 writeBackupPathMarker(backupsDir);
+
+async function dumpPluginStorageRescue() {
+    const rescueDir = backupsDir;
+    return writePluginStorageRescue({
+        backupsDir: rescueDir,
+        kvList,
+        kvGet,
+        // logger persists to the queryable logs DB — this message is the
+        // forensic breadcrumb for locating the rescue file after an incident.
+        log: (message) => { logger.info(message); console.log(message); },
+    });
+}
+
 const BACKUP_FILENAME_REGEX = /^risu-backup-\d+\.bin$/;
 
 const passwordPath = path.join(process.cwd(), 'save', '__password')
@@ -2425,7 +2443,7 @@ function resolveBackupStorageKey(name) {
     return `assets/${name}`;
 }
 
-function parseBackupChunk(buffer, onEntry) {
+async function parseBackupChunk(buffer, onEntry) {
     let offset = 0;
     while (offset + 4 <= buffer.length) {
         const nameLength = buffer.readUInt32LE(offset);
@@ -2444,7 +2462,7 @@ function parseBackupChunk(buffer, onEntry) {
         if (dataEnd > buffer.length) {
             break;
         }
-        onEntry(name, buffer.subarray(dataStart, dataEnd));
+        await onEntry(name, buffer.subarray(dataStart, dataEnd));
         offset = dataEnd;
     }
     return buffer.subarray(offset);
@@ -2464,6 +2482,8 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
     let assetsRestored = 0;
     let bytesReceived = 0;
     let batchCount = 0;
+    // Backups may omit plugin data, so only an actual plugin entry authorizes replacement.
+    let pluginWipeDone = false;
     const seenEntryNames = new Set();
     const importedInlayIds = new Set();
     const importedSidecarIds = new Set();
@@ -2532,10 +2552,6 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
     // format only — but a fresh import is a clear "data changed" signal.)
     kvDel(REMOTE_MIGRATION_MARKER_KEY);
     kvDel(REMOTE_CHAT_RECOVERY_MARKER);
-    kvDel('_meta/plugin-storage-migrated');
-    kvDel('_meta/plugin-blob-migrated');
-    kvDelPrefix('plugin-custom-storage/');
-    kvDelPrefix('plugin-blob-storage/');
     clearEntities();
 
     try {
@@ -2556,7 +2572,7 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
             pendingChunks = [];
             pendingTotal = 0;
 
-            const remaining = parseBackupChunk(buffer, (name, data) => {
+            const remaining = await parseBackupChunk(buffer, async (name, data) => {
                 if (seenEntryNames.has(name)) {
                     throw new Error(`Duplicate backup entry: ${name}`);
                 }
@@ -2624,6 +2640,12 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
                     // Skip deprecated thumbnail entries from legacy backups
                 } else {
                     const storageKey = resolveBackupStorageKey(name);
+                    pluginWipeDone = await preparePluginStorageImport({
+                        storageKey,
+                        pluginWipeDone,
+                        dumpPluginStorageRescue,
+                        kvDelPrefix,
+                    });
                     const storageValue = storageKey.startsWith('coldstorage/')
                         ? encodeColdStorageCanonicalBuffer(
                             parseColdStorageJsonBuffer(data, name, { allowPlainJson: true }).coldData
@@ -2675,6 +2697,14 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
             if (importedInlayIds.has(id) && !importedSidecarIds.has(id)) {
                 writeStagingSidecarSync(id, info);
             }
+        }
+        // Markers commit with the FINAL batch. Multi-batch imports (>5000
+        // entries) may commit the deferred wipe in an earlier batch; a crash
+        // before this point leaves the markers absent, which is safe — the
+        // next-boot migration re-checks key existence and never overwrites.
+        if (pluginWipeDone) {
+            kvSet('_meta/plugin-storage-migrated', Buffer.from('1'));
+            kvSet('_meta/plugin-blob-migrated', Buffer.from('1'));
         }
         sqliteDb.exec('COMMIT');
     } catch (error) {
@@ -4994,10 +5024,6 @@ function clearExistingData() {
     // to re-evaluate against the new contents on the next ensureChatStore.
     kvDel(REMOTE_MIGRATION_MARKER_KEY);
     kvDel(REMOTE_CHAT_RECOVERY_MARKER);
-    kvDel('_meta/plugin-storage-migrated');
-    kvDel('_meta/plugin-blob-migrated');
-    kvDelPrefix('plugin-custom-storage/');
-    kvDelPrefix('plugin-blob-storage/');
     clearEntities();
 }
 
@@ -5796,10 +5822,6 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
             // bytes instead of skipping based on the prior post-migration state.
             kvDel(REMOTE_MIGRATION_MARKER_KEY);
             kvDel(REMOTE_CHAT_RECOVERY_MARKER);
-            kvDel('_meta/plugin-storage-migrated');
-            kvDel('_meta/plugin-blob-migrated');
-            kvDelPrefix('plugin-custom-storage/');
-            kvDelPrefix('plugin-blob-storage/');
             // Pre-warm chat store from the just-restored blob so subsequent
             // /api/read fetches and patch-sync baselines see the new data.
             // Use decodeDatabaseWithPersistentChatIds so it runs the migration
