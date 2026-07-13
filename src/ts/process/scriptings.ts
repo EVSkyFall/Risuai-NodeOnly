@@ -53,16 +53,32 @@ interface PythonScriptingEngineState extends BasicScriptingEngineState {
 
 type ScriptingEngineState = LuaScriptingEngineState | PythonScriptingEngineState;
 
-// One persistent engine per distinct script code (not per mode): listenEdit
-// registers all mode handlers in a single Lua state and callListenMain(mode, ...)
-// dispatches per call, so a single engine correctly serves every mode. Keying by
-// mode (the old scheme) made scripts sharing a mode slot evict each other on
-// every call, re-running doString over MB-scale Lua each time.
-let ScriptingEngines = new Map<'lua'|'py', Map<string, ScriptingEngineState>>()
+// One persistent engine per distinct script code within an execution class.
+// listenEdit registers all edit-mode handlers in a single Lua state and
+// callListenMain(mode, ...) dispatches per call, so one engine correctly
+// serves every edit mode (keying each edit mode separately — the original
+// scheme — made scripts sharing a mode slot evict each other on every call,
+// re-running doString over MB-scale Lua each time). Non-edit calls
+// (output/onButtonClick/start/manual…) get a SEPARATE engine per code:
+// runScripted holds the engine mutex for the whole call, and a long-running
+// call there (image generation, aux LLM requests) would otherwise block
+// every editdisplay render pass behind it — observed as a blank chat while
+// an illustration module generates.
+let ScriptingEngines = new Map<string, Map<string, ScriptingEngineState>>()
 let luaFactoryPromise: Promise<void> | null = null;
-let pendingEngineCreations = new Map<'lua'|'py', Map<string, Promise<ScriptingEngineState>>>();
-const MAX_SCRIPT_ENGINES = 16
+let pendingEngineCreations = new Map<string, Map<string, Promise<ScriptingEngineState>>>();
+const MAX_SCRIPT_ENGINES = 24
 let engineUseCounter = 0
+
+// Bucket = engine type + execution class. Edit modes share one engine per
+// code; everything else runs isolated from the render path. Exact whitelist,
+// not a prefix check: manual triggers pass their user-defined name as `mode`
+// (triggers.ts manualName), and a trigger named "editSomething" must not land
+// in the render-path bucket.
+const EDIT_ENGINE_MODES = new Set(['editRequest', 'editDisplay', 'editInput', 'editOutput'])
+function engineBucket(type: 'lua'|'py', mode: string){
+    return type + ':' + (EDIT_ENGINE_MODES.has(mode) ? 'edit' : 'main')
+}
 
 function evictUnusedScriptEngines() {
     let totalEngines = 0
@@ -72,20 +88,20 @@ function evictUnusedScriptEngines() {
 
     while (totalEngines > MAX_SCRIPT_ENGINES) {
         let evictionCandidate: {
-            type: 'lua'|'py',
+            bucket: string,
             code: string,
             state: ScriptingEngineState,
             lastUsedAt: number,
         } | undefined
 
-        for (const [type, enginesByCode] of ScriptingEngines) {
+        for (const [bucket, enginesByCode] of ScriptingEngines) {
             for (const [code, state] of enginesByCode) {
                 if ((state.inUse ?? 0) !== 0) {
                     continue
                 }
                 const lastUsedAt = state.lastUsedAt ?? 0
                 if (!evictionCandidate || lastUsedAt < evictionCandidate.lastUsedAt) {
-                    evictionCandidate = { type, code, state, lastUsedAt }
+                    evictionCandidate = { bucket, code, state, lastUsedAt }
                 }
             }
         }
@@ -103,7 +119,7 @@ function evictUnusedScriptEngines() {
         // A closed engine must never pass the code-match check again — any
         // straggling reference will re-initialize instead of running dead.
         evictionCandidate.state.code = undefined
-        ScriptingEngines.get(evictionCandidate.type)?.delete(evictionCandidate.code)
+        ScriptingEngines.get(evictionCandidate.bucket)?.delete(evictionCandidate.code)
         totalEngines--
         console.warn(`[ScriptPerf] evicted script engine (cap ${MAX_SCRIPT_ENGINES})`)
     }
@@ -134,7 +150,7 @@ export async function runScripted(code:string, arg:{
     if(type === 'lua'){
         await ensureLuaFactory()
     }
-    let ScriptingEngineState = await getOrCreateEngineState(type, code);
+    let ScriptingEngineState = await getOrCreateEngineState(type, engineBucket(type, mode), code);
     try {
         ScriptingEngineState.lastUsedAt = ++engineUseCounter
         evictUnusedScriptEngines()
@@ -1256,12 +1272,13 @@ async function ensureLuaFactory() {
 
 async function getOrCreateEngineState(
     type: 'lua'|'py',
+    bucket: string,
     code: string,
 ): Promise<ScriptingEngineState> {
-    let enginesByCode = ScriptingEngines.get(type);
+    let enginesByCode = ScriptingEngines.get(bucket);
     if (!enginesByCode) {
         enginesByCode = new Map<string, ScriptingEngineState>()
-        ScriptingEngines.set(type, enginesByCode)
+        ScriptingEngines.set(bucket, enginesByCode)
     }
 
     let engineState = enginesByCode.get(code);
@@ -1270,10 +1287,10 @@ async function getOrCreateEngineState(
         return engineState;
     }
 
-    let pendingByCode = pendingEngineCreations.get(type)
+    let pendingByCode = pendingEngineCreations.get(bucket)
     if (!pendingByCode) {
         pendingByCode = new Map<string, Promise<ScriptingEngineState>>()
-        pendingEngineCreations.set(type, pendingByCode)
+        pendingEngineCreations.set(bucket, pendingByCode)
     }
 
     let pendingCreation = pendingByCode.get(code);
