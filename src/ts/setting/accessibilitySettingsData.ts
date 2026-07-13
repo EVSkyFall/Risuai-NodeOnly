@@ -178,29 +178,11 @@ export const accessibilitySettingsItems: SettingItem[] = [
         keywords: ['translation', 'loading', 'indicator']
     },
     {
-        id: 'acc.autoScrollToNewMessage',
-        type: 'check',
-        labelKey: 'autoScrollToNewMessage',
-        bindKey: 'autoScrollToNewMessage',
-        helpKey: 'autoScrollToNewMessage',
-        keywords: ['auto', 'scroll', 'new', 'message']
-    },
-    {
-        id: 'acc.alwaysScrollToNewMessage',
-        type: 'check',
-        labelKey: 'alwaysScrollToNewMessage',
-        bindKey: 'alwaysScrollToNewMessage',
-        helpKey: 'alwaysScrollToNewMessage',
-        condition: (ctx) => ctx.db.autoScrollToNewMessage,
-        keywords: ['always', 'scroll', 'new', 'message']
-    },
-    {
         id: 'acc.newMessageButtonStyle',
         type: 'select',
         labelKey: 'newMessageButtonStyle',
         bindKey: 'newMessageButtonStyle',
         helpKey: 'newMessageButtonStyle',
-        condition: (ctx) => ctx.db.autoScrollToNewMessage && !ctx.db.alwaysScrollToNewMessage,
         options: {
             selectOptions: [
                 { value: 'bottom-center', labelKey: 'newMessageButtonBottomCenter' },
@@ -375,8 +357,6 @@ export const accessibilityEditingItems = pick([
 ]);
 
 export const accessibilityScrollItems = pick([
-    'acc.autoScrollToNewMessage',
-    'acc.alwaysScrollToNewMessage',
     'acc.newMessageButtonStyle',
     'acc.nodeOnlyScrollButtonType',
     'acc.chatLoadInitialPages',

@@ -241,17 +241,14 @@
         const currentChatRoomId = getCurrentChatRoomId();
         const isSameChat = currentChatRoomId === previousChatRoomId;
 
-        // Only auto-scroll if it's the same chat and new messages were added
+        // New responses never auto-scroll — the forced jump kept misfiring,
+        // especially against streaming growth. When the user is not at the
+        // bottom the unread pill is the only signal; when they are, the
+        // column-reverse layout keeps the view pinned naturally.
         if(isSameChat && messages.length > previousLength){
             const lastMsg = messages[messages.length - 1];
-            if(lastMsg && lastMsg.role === 'char' && DBState.db.autoScrollToNewMessage){
-                if(wasAtBottom || DBState.db.alwaysScrollToNewMessage){
-                    setTimeout(() => {
-                        scrollLatestIntoChatScreen();
-                    }, 700);
-                } else {
-                    hasNewUnreadMessage = true;
-                }
+            if(lastMsg && lastMsg.role === 'char' && !wasAtBottom){
+                hasNewUnreadMessage = true;
             }
         }
         previousLength = messages.length;
