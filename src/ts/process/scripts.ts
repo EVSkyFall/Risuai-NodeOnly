@@ -6,7 +6,7 @@ import { alertError, notifySuccess } from "../alert";
 import { language } from "src/lang";
 import { selectSingleFile } from "../util";
 import { assetRegex, type CbsConditions, risuChatParser as risuChatParserOrg, type simpleCharacterArgument } from "../parser/parser.svelte";
-import { getModuleAssets, getModuleRegexScripts } from "./modules";
+import { getModuleAssets, getModuleRegexScripts, getModuleTriggers } from "./modules";
 import { HypaProcesser } from "./memory/hypamemory";
 import { runLuaEditTrigger } from "./scriptings";
 import { pluginV2 } from "../plugins/plugins.svelte";
@@ -68,6 +68,49 @@ export async function importRegex(o?:customscript[]):Promise<customscript[]>{
 let bestMatchCache = new Map<string, string>()
 let processScriptCache = new Map<string, string>()
 
+// Whole-pass result cache for editdisplay: processScriptCache only covers the
+// post-Lua CBS+regex stage, so remount cascades re-ran every Lua edit trigger
+// for identical message text. This memoizes the full pass keyed on the pre-Lua
+// input + script/trigger identity. Staleness tradeoff is the same one
+// processScriptCache already accepts for CBS variable reads: output that
+// depends on state other than the inputs serves a stale result until the text
+// changes or the GUI reloads (resetScriptCache).
+const EDIT_DISPLAY_PASS_CACHE_MAX = 128
+let editDisplayPassCache = new Map<string, string>()
+let triggerCodeHashCache = new Map<string, string>()
+
+function hashTriggerCode(code: string){
+    const cached = triggerCodeHashCache.get(code)
+    if(cached !== undefined){
+        return cached
+    }
+    let hash = 5381
+    for(let i = 0; i < code.length; i++){
+        hash = ((hash << 5) + hash + code.charCodeAt(i)) | 0
+    }
+    const result = hash.toString(36) + ':' + code.length.toString(36)
+    triggerCodeHashCache.set(code, result)
+    return result
+}
+
+function getTriggerCodeSignature(char: character|simpleCharacterArgument){
+    // Mirrors runLuaEditTrigger's trigger sourcing (char triggers + module triggers).
+    const triggers = (char.triggerscript ?? []).concat(getModuleTriggers())
+    let sig = ''
+    for(const trigger of triggers){
+        if(trigger?.effect?.[0]?.type === 'triggerlua'){
+            sig += hashTriggerCode(trigger.effect[0].code ?? '') + ';'
+        }
+        else if(trigger?.type === 'display'){
+            // v2 display triggers run inside the cached pass (runTrigger 'display');
+            // their effect definitions are part of the pass identity — editing one
+            // does not bump ReloadGUIPointer, so the key must catch it.
+            sig += 'd' + hashTriggerCode(JSON.stringify(trigger.effect ?? null)) + ';'
+        }
+    }
+    return sig
+}
+
 function generateScriptCacheKey(scripts: customscript[], data: string, mode: ScriptMode, chatID = -1, cbsConditions: CbsConditions = {}) {
     let hash = data + '|||' + mode + '|||';
     for (const script of scripts) {
@@ -94,6 +137,8 @@ function getScriptCache(hash:string){
 
 export function resetScriptCache(){
     processScriptCache = new Map()
+    editDisplayPassCache = new Map()
+    triggerCodeHashCache = new Map()
 }
 
 // Streaming script circuit breaker: while a message is streaming, one
@@ -102,16 +147,29 @@ export function resetScriptCache(){
 // over-budget pass suspends mid-stream edit passes for THAT message until
 // the stream ends. The final full pass at stream end always runs, so the
 // persisted result is byte-identical to today's behavior.
-const STREAM_SCRIPT_BUDGET_MS = 1000
+export const STREAM_SCRIPT_BUDGET_MS = 1000
 const streamingScriptCircuit = {
     active: false,
     msgIndex: -1,
     tripped: false,
+    // Stream epoch: an abandoned pass can resolve after its own stream ended
+    // and a NEW stream re-armed the same message index (rerolls). The finally
+    // trip must only apply to the stream that started the pass.
+    token: 0,
 }
 export function armStreamingScriptCircuit(msgIndex: number){
     streamingScriptCircuit.active = true
     streamingScriptCircuit.msgIndex = msgIndex
     streamingScriptCircuit.tripped = false
+    streamingScriptCircuit.token += 1
+}
+// Immediate trip for the stream loop's race timeout: without it, the global
+// circuit stays untripped until the abandoned pass resolves, and every raw
+// text update would launch a fresh render-side editdisplay pass in between.
+export function tripStreamingScriptCircuit(){
+    if(streamingScriptCircuit.active){
+        streamingScriptCircuit.tripped = true
+    }
 }
 export function disarmStreamingScriptCircuit(){
     streamingScriptCircuit.active = false
@@ -126,21 +184,54 @@ export async function processScriptFull(char:character|simpleCharacterArgument, 
     const circuitTarget = (mode === 'editoutput' || mode === 'editdisplay')
         && streamingScriptCircuit.active
         && chatID === streamingScriptCircuit.msgIndex
+    const circuitToken = streamingScriptCircuit.token
     if(circuitTarget && streamingScriptCircuit.tripped){
         return {data, emoChanged: false}
     }
+    let passCacheKey: string | null = null
+    if(mode === 'editdisplay'){
+        // Mirrors the scripts array construction inside processScriptFullInner.
+        const db = getDatabase()
+        const scripts = (db.presetRegex ?? []).concat(char.customscript).concat(getModuleRegexScripts())
+        // chatID and cbsConditions are appended unconditionally: generateScriptCacheKey
+        // only folds them in per matching editdisplay regex script, so with zero such
+        // scripts two messages with identical raw text would collide even though CBS
+        // output ({{chatindex}}, {{role}}, {{isfirstmsg}}, ...) depends on them. The
+        // pluginV2 hook-set size keeps runtime hook add/remove from serving stale passes.
+        passCacheKey = generateScriptCacheKey(scripts, data, mode, chatID, cbsConditions)
+            + '|||CTX|' + chatID + '|' + (cbsConditions.firstmsg ? 1 : 0) + '|' + (cbsConditions.chatRole ?? '')
+            + '|||P|' + pluginV2[mode].size
+            + '|||LUA|' + getTriggerCodeSignature(char)
+        const cached = editDisplayPassCache.get(passCacheKey)
+        if(cached !== undefined){
+            return {data: cached, emoChanged: false}
+        }
+    }
     const start = performance.now()
     try{
-        return await processScriptFullInner(char, data, mode, chatID, cbsConditions)
+        const res = await processScriptFullInner(char, data, mode, chatID, cbsConditions)
+        // Don't store passes for the actively streaming message: every chunk is
+        // a unique input, and dozens of one-shot entries would churn the FIFO
+        // cap and evict the static-message entries right before the post-stream
+        // remount cascade needs them. The final post-disarm pass stores normally.
+        if(passCacheKey !== null && !circuitTarget){
+            editDisplayPassCache.set(passCacheKey, res.data)
+            if(editDisplayPassCache.size > EDIT_DISPLAY_PASS_CACHE_MAX){
+                editDisplayPassCache.delete(editDisplayPassCache.keys().next().value)
+            }
+        }
+        return res
     }
     finally{
         const dur = performance.now() - start
         // Re-check live circuit state: a pass that started under a previous
-        // stream may resolve after disarm (or after the next stream re-armed),
-        // and must not trip the circuit for an unrelated message.
+        // stream may resolve after disarm (or after the next stream re-armed,
+        // possibly on the SAME message index after a reroll), and must not trip
+        // the circuit for a stream it did not run under.
         const stillTarget = circuitTarget
             && streamingScriptCircuit.active
             && chatID === streamingScriptCircuit.msgIndex
+            && circuitToken === streamingScriptCircuit.token
         if(stillTarget && dur > STREAM_SCRIPT_BUDGET_MS){
             streamingScriptCircuit.tripped = true
             console.warn(`[StreamScriptCircuit] ${mode} pass took ${Math.round(dur)}ms (budget ${STREAM_SCRIPT_BUDGET_MS}ms) — suspending mid-stream script passes for message ${chatID} until stream end`)

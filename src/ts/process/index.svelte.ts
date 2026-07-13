@@ -11,7 +11,7 @@ import { findCharacterbyId, getAuthorNoteDefaultText, getPersonaPrompt, getUserN
 import { requestChatData } from "./request/request";
 import { commitMainRequestSnapshot, type MainRequestSnapshot } from "./request/requestReplay";
 import { stableDiff } from "./stableDiff";
-import { armStreamingScriptCircuit, disarmStreamingScriptCircuit, isStreamingScriptTripped, processScript, processScriptFull, risuChatParser } from "./scripts";
+import { armStreamingScriptCircuit, disarmStreamingScriptCircuit, isStreamingScriptTripped, processScript, processScriptFull, risuChatParser, STREAM_SCRIPT_BUDGET_MS, tripStreamingScriptCircuit } from "./scripts";
 import { exampleMessage } from "./exampleMessages";
 import { sayTTS } from "./tts";
 import { v4 } from "uuid";
@@ -1499,6 +1499,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         const SCRIPT_THROTTLE_MS = 150
         let lastScriptProcessTime = 0
         let lastScriptDurationMs = 0
+        let racedOut = false
         let pendingFinalProcess = false
         const abortReader = () => {
             streamAborted = true
@@ -1535,19 +1536,46 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     // must not apply — the tripping pass's own duration would otherwise
                     // freeze raw growth for 3x that long.
                     const now = performance.now()
-                    const requiredGap = isStreamingScriptTripped() ? SCRIPT_THROTTLE_MS : Math.max(SCRIPT_THROTTLE_MS, lastScriptDurationMs * 3)
+                    const requiredGap = (isStreamingScriptTripped() || racedOut) ? SCRIPT_THROTTLE_MS : Math.max(SCRIPT_THROTTLE_MS, lastScriptDurationMs * 3)
                     if (now - lastScriptProcessTime >= requiredGap) {
-                        if (isStreamingScriptTripped()) {
+                        if (isStreamingScriptTripped() || racedOut) {
                             // Circuit tripped: keep the text visibly growing with the raw
                             // accumulated stream; the full script pipeline runs once over the
                             // complete text in the finally block below.
                             DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = reformatContent(prefix + result)
                             lastScriptDurationMs = 0
                         } else {
-                            let result2 = await processScriptFull(nowChatroom, reformatContent(prefix + result), 'editoutput', msgIndex)
-                            DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = result2.data
-                            emoChanged = result2.emoChanged
-                            lastScriptDurationMs = performance.now() - now
+                            const passInput = reformatContent(prefix + result)
+                            const passPromise = processScriptFull(nowChatroom, passInput, 'editoutput', msgIndex)
+                            let raceTimer: ReturnType<typeof setTimeout>
+                            let raced: { done: true, r: Awaited<typeof passPromise> } | { done: false }
+                            try {
+                                raced = await Promise.race([
+                                    passPromise.then((r) => ({ done: true as const, r })),
+                                    new Promise<{ done: false }>((res) => { raceTimer = setTimeout(() => res({ done: false }), STREAM_SCRIPT_BUDGET_MS) }),
+                                ])
+                            } finally {
+                                clearTimeout(raceTimer)
+                            }
+                            if (raced.done) {
+                                DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = raced.r.data
+                                emoChanged = raced.r.emoChanged
+                                lastScriptDurationMs = performance.now() - now
+                            } else {
+                                // The pass exceeded the budget mid-stream (e.g. a Lua handler awaiting
+                                // an aux LLM call). Don't hold the stream hostage: show raw text now,
+                                // skip mid-stream passes for the rest of this stream, and discard the
+                                // abandoned pass's result. The final pass in the finally block still
+                                // runs over the complete text after disarm. The global circuit is
+                                // tripped immediately — otherwise every raw update would launch a
+                                // fresh render-side editdisplay pass until the abandoned pass resolves.
+                                racedOut = true
+                                tripStreamingScriptCircuit()
+                                passPromise.catch(() => {})
+                                console.warn(`[StreamScriptCircuit] editoutput pass exceeded ${STREAM_SCRIPT_BUDGET_MS}ms budget mid-stream — switching to raw streaming display`)
+                                DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = passInput
+                                lastScriptDurationMs = 0
+                            }
                         }
                         DBState.db.characters[selectedChar].reloadKeys += 1
                         lastScriptProcessTime = performance.now()
