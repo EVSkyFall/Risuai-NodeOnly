@@ -6,6 +6,7 @@ import App from "./App.svelte";
 import { loadData } from "./ts/bootstrap";
 import { initHotkey } from "./ts/hotkey";
 import { preLoadCheck } from "./preload";
+import { installRootScrollGuard } from "./ts/rootScrollGuard";
 import { mount } from "svelte";
 
 window.addEventListener('vite:preloadError', (event) => {
@@ -14,6 +15,7 @@ window.addEventListener('vite:preloadError', (event) => {
 });
 
 preLoadCheck()
+installRootScrollGuard()
 let app = mount(App, {
     target: document.getElementById("app"),
 });
