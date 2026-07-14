@@ -20,6 +20,28 @@ export class ConflictError extends Error {
     }
 }
 
+export interface ChatContentBackupWarning {
+    message: string
+    source: string
+}
+
+export interface DurableChatSaveResult {
+    success: true
+    durable: true
+    backupWarning?: ChatContentBackupWarning
+}
+
+export class DurableChatSaveError extends Error {
+    status: number
+    source?: string
+    constructor(message: string, status: number, source?: string) {
+        super(message)
+        this.name = 'DurableChatSaveError'
+        this.status = status
+        this.source = source
+    }
+}
+
 // Warning the server attaches to /api/patch responses when the most recent
 // debounced persist failed (Stage 1 visibility — see issues.md).
 export interface PersistWarning {
@@ -649,6 +671,45 @@ export class NodeStorage{
             body: encoded,
         })
         if (da.status < 200 || da.status >= 300) throw new Error(`saveChatContent error: ${da.status}`)
+    }
+
+    async saveChatContentStrict(chaId: string, chatIndex: number, chatId: string, chat: any): Promise<DurableChatSaveResult> {
+        const encoded = encodeRisuSaveLegacy(chat)
+        let da: Response
+        try {
+            da = await this.authFetch(`/api/chat-content/${encodeURIComponent(chaId)}/${chatIndex}`, {
+                method: 'POST',
+                headers: {
+                    'content-type': 'application/octet-stream',
+                    'x-chat-id': chatId,
+                    'x-strict-flush': '1',
+                },
+                body: encoded,
+            })
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            throw new DurableChatSaveError(`saveChatContentStrict request failed: ${message}`, 0)
+        }
+
+        let decoded: unknown
+        try {
+            decoded = await da.json()
+        } catch {
+            throw new DurableChatSaveError(`saveChatContentStrict invalid response: ${da.status}`, da.status)
+        }
+
+        const data = decoded !== null && typeof decoded === 'object'
+            ? decoded as Record<string, unknown>
+            : null
+        if (!da.ok || data?.success !== true || data.durable !== true) {
+            const message = typeof data?.error === 'string'
+                ? data.error
+                : `saveChatContentStrict did not receive a durable ACK: ${da.status}`
+            const source = typeof data?.source === 'string' ? data.source : undefined
+            throw new DurableChatSaveError(message, da.status, source)
+        }
+
+        return data as unknown as DurableChatSaveResult
     }
 
     // ── Save-folder migration ─────────────────────────────────────────────────

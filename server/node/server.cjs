@@ -324,6 +324,82 @@ function createBackupAndRotate() {
     trimSnapshotsToLimits();
 }
 
+const CHAT_CONTENT_PERSIST_SOURCE = 'chat-content';
+const CHAT_CONTENT_BACKUP_SOURCE = 'chat-content-backup';
+
+async function persistChatContentNow() {
+    let didPersist = false;
+
+    // If dbCache has stripped DB, persist with merged chats
+    if (dbCache[DB_HEX_KEY]) {
+        await persistDbCacheWithChats(DB_HEX_KEY, 'database/database.bin');
+        didPersist = true;
+    } else {
+        // No stripped cache — load, merge, save
+        const raw = kvGet('database/database.bin');
+        if (raw) {
+            const dbObj = normalizeJSON(await decodeRisuSave(raw));
+            const fullDb = reassembleFullDb(stripChatsFromDb(dbObj));
+            const encoded = Buffer.from(encodeRisuSaveLegacy(fullDb));
+            try {
+                kvSet('database/database.bin', encoded);
+                didPersist = true;
+            } catch (err) {
+                if (err && typeof err === 'object') {
+                    try { err.attemptedSize = encoded.length; } catch {}
+                }
+                throw err;
+            }
+        }
+    }
+
+    // Persist succeeded — clear before backup so a backup-only failure isn't
+    // attributed to data loss.
+    clearPersistFailure();
+    let backupWarning;
+    try {
+        createBackupAndRotate();
+    } catch (backupErr) {
+        logger.warn('[ChatContent] Backup rotation failed:', backupErr);
+        backupWarning = {
+            message: String(backupErr?.message || backupErr || 'unknown error'),
+            source: CHAT_CONTENT_BACKUP_SOURCE,
+        };
+    }
+    return { didPersist, backupWarning };
+}
+
+function recordChatContentPersistError(error) {
+    logger.error('[ChatContent] Error persisting chat:', error);
+    recordPersistFailure(error, CHAT_CONTENT_PERSIST_SOURCE);
+}
+
+function scheduleChatContentPersist() {
+    if (saveTimers[DB_HEX_KEY]) {
+        clearTimeout(saveTimers[DB_HEX_KEY]);
+    }
+    const timer = setTimeout(() => {
+        void queueStorageOperation(async () => {
+            if (saveTimers[DB_HEX_KEY] !== timer) return;
+            try {
+                await persistChatContentNow();
+            } catch (error) {
+                recordChatContentPersistError(error);
+            } finally {
+                if (saveTimers[DB_HEX_KEY] === timer) {
+                    delete saveTimers[DB_HEX_KEY];
+                }
+            }
+        }).catch((error) => {
+            if (saveTimers[DB_HEX_KEY] === timer) {
+                delete saveTimers[DB_HEX_KEY];
+            }
+            recordChatContentPersistError(error);
+        });
+    }, SAVE_INTERVAL);
+    saveTimers[DB_HEX_KEY] = timer;
+}
+
 async function flushPendingDb() {
     if (saveTimers[DB_HEX_KEY]) {
         clearTimeout(saveTimers[DB_HEX_KEY]);
@@ -4904,6 +4980,7 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
             const chaId = req.params.chaId;
             const chatIndex = parseInt(req.params.chatIndex, 10);
             const expectedChatId = req.headers['x-chat-id'];
+            const strictFlush = req.headers['x-strict-flush'] === '1';
             let chatData;
             if (Buffer.isBuffer(req.body)) {
                 // Binary msgpack body (application/octet-stream)
@@ -4921,6 +4998,14 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
                 return res.status(400).json({ error: 'Chat data and x-chat-id required' });
             }
 
+            if (strictFlush && chatData.id !== expectedChatId) {
+                return res.status(409).json({
+                    success: false,
+                    error: 'Chat ID mismatch — submitted chat does not match x-chat-id',
+                    source: 'chat-content-validation',
+                });
+            }
+
             await ensureChatStore();
 
             // Update fullChatStore
@@ -4929,48 +5014,37 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
             }
             fullChatStore.get(chaId).set(expectedChatId, chatData);
 
-            // Schedule debounced persist (reuses existing timer mechanism)
-            if (saveTimers[DB_HEX_KEY]) {
-                clearTimeout(saveTimers[DB_HEX_KEY]);
-            }
-            saveTimers[DB_HEX_KEY] = setTimeout(async () => {
+            if (strictFlush) {
+                const pendingTimer = saveTimers[DB_HEX_KEY];
                 try {
-                    // If dbCache has stripped DB, persist with merged chats
-                    if (dbCache[DB_HEX_KEY]) {
-                        await persistDbCacheWithChats(DB_HEX_KEY, 'database/database.bin');
-                    } else {
-                        // No stripped cache — load, merge, save
-                        const raw = kvGet('database/database.bin');
-                        if (raw) {
-                            const dbObj = normalizeJSON(await decodeRisuSave(raw));
-                            const fullDb = reassembleFullDb(stripChatsFromDb(dbObj));
-                            const encoded = Buffer.from(encodeRisuSaveLegacy(fullDb));
-                            try {
-                                kvSet('database/database.bin', encoded);
-                            } catch (err) {
-                                if (err && typeof err === 'object') {
-                                    try { err.attemptedSize = encoded.length; } catch {}
-                                }
-                                throw err;
-                            }
-                        }
+                    // WAL + synchronous=NORMAL makes this ACK process-crash durable,
+                    // but not OS/power-loss durable; that is the accepted P0 boundary.
+                    const { didPersist, backupWarning } = await persistChatContentNow();
+                    if (!didPersist) {
+                        throw new Error('Database not found; chat content was not persisted');
                     }
-                    // Persist succeeded — clear before backup so a backup-only
-                    // failure isn't attributed to data loss.
-                    clearPersistFailure();
-                    try {
-                        createBackupAndRotate();
-                    } catch (backupErr) {
-                        logger.warn('[ChatContent] Backup rotation failed:', backupErr);
+                    if (pendingTimer && saveTimers[DB_HEX_KEY] === pendingTimer) {
+                        clearTimeout(pendingTimer);
+                        delete saveTimers[DB_HEX_KEY];
                     }
+                    return res.json({
+                        success: true,
+                        durable: true,
+                        ...(backupWarning ? { backupWarning } : {}),
+                    });
                 } catch (error) {
-                    logger.error('[ChatContent] Error persisting chat:', error);
-                    recordPersistFailure(error, 'chat-content');
-                } finally {
-                    delete saveTimers[DB_HEX_KEY];
+                    recordChatContentPersistError(error);
+                    scheduleChatContentPersist();
+                    return res.status(500).json({
+                        success: false,
+                        error: String(error?.message || error || 'unknown error'),
+                        source: CHAT_CONTENT_PERSIST_SOURCE,
+                    });
                 }
-            }, SAVE_INTERVAL);
+            }
 
+            // Keep the legacy path debounced: its 200 is not a durable ACK.
+            scheduleChatContentPersist();
             res.json({ success: true });
         });
     } catch (error) {
