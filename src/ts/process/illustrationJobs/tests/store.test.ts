@@ -1,0 +1,1253 @@
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
+import type {
+    IllustrationJobRecordV1,
+    IllustrationJobState,
+    IllustrationJobTransitionPatch,
+    IllustrationTurnRecordV1,
+    PlanManifestV1,
+} from '../types'
+import { InMemoryLockManager } from './inMemoryLockManager'
+
+const { storageMap, storageControl } = vi.hoisted(() => ({
+    storageMap: new Map<string, Uint8Array>(),
+    storageControl: {
+        failSetKey: null as string | null,
+        failSetCount: 0,
+    },
+}))
+
+vi.mock('src/ts/globalApi.svelte', () => ({
+    forageStorage: {
+        async Init() {},
+        async keys(prefix = '') {
+            return [...storageMap.keys()].filter((key) => key.startsWith(prefix))
+        },
+        async getItem(key: string) {
+            return storageMap.get(key) ?? null
+        },
+        async setItem(key: string, value: Uint8Array) {
+            if (storageControl.failSetKey === key && storageControl.failSetCount > 0) {
+                storageControl.failSetCount -= 1
+                throw new Error(`injected set failure: ${key}`)
+            }
+            storageMap.set(key, new Uint8Array(value))
+        },
+        async removeItem(key: string) {
+            storageMap.delete(key)
+        },
+    },
+}))
+
+vi.mock('src/ts/parser/parser.svelte', () => ({
+    hasher: vi.fn(async () => new Uint8Array(32)),
+}))
+
+const storeModule = await import('../store')
+const lockModule = await import('../locks')
+const errorModule = await import('../errors')
+
+const {
+    IllustrationJobStore,
+    JOB_LEASE_DURATION_MS,
+    MAX_JOBS_PER_TURN,
+    TERMINAL_RECORD_TTL_MS,
+    TURN_LEASE_DURATION_MS,
+    illustrationJobKey,
+    illustrationManifestKey,
+    illustrationTurnKey,
+    illustrationTurnJobsKey,
+    validateHolderWrite,
+} = storeModule
+const {
+    resetIllustrationLockManagerAccessorForTests,
+    setIllustrationLockManagerAccessorForTests,
+} = lockModule
+const {
+    IllustrationLedgerConfirmationRequiredError,
+    IllustrationLedgerCorruptError,
+    IllustrationLedgerHolderMismatchError,
+    IllustrationLedgerLeaseConflictError,
+    IllustrationLedgerUnavailableError,
+    IllustrationLedgerValidationError,
+    IllustrationLedgerVersionConflictError,
+} = errorModule
+
+const store = new IllustrationJobStore()
+const BASE_TIME = Date.UTC(2026, 0, 1)
+let transitionSequence = 0
+let lockManager: InMemoryLockManager
+
+function jobIdFor(turnId: string, index = 0): string {
+    return `${turnId}:job:${index}`
+}
+
+function makeManifest(
+    turnId: string,
+    jobCount = 1,
+    dataFactory: (index: number) => unknown = (index) => ({ description: `scene-${index}` }),
+): Omit<PlanManifestV1, 'phase' | 'version'> {
+    return {
+        turnId,
+        planHash: `plan:${turnId}`,
+        expectedCount: jobCount,
+        sourceRevisionHash: `source:${turnId}`,
+        jobs: Array.from({ length: jobCount }, (_, index) => ({
+            jobId: jobIdFor(turnId, index),
+            slotToken: `slot:${turnId}:${index}`,
+            insertAfterUtf16: index * 2,
+            sceneId: `scene:${turnId}:${index}`,
+            scenePayload: {
+                schemaVersion: 1,
+                data: dataFactory(index),
+            },
+        })),
+    }
+}
+
+async function createClaimedTurn(turnId: string): Promise<{
+    turn: IllustrationTurnRecordV1
+    leaseId: string
+}> {
+    const leaseId = `lease:${turnId}`
+    const created = await store.createTurn({ turnId, idempotencyKey: `create:${turnId}` })
+    const awaiting = await store.updateTurn({
+        turnId,
+        expectedVersion: created.version,
+        mutate: (draft) => {
+            draft.state = 'awaiting_plan'
+        },
+    })
+    const turn = await store.claimTurn({ turnId, expectedVersion: awaiting.version, leaseId })
+    return { turn, leaseId }
+}
+
+async function createPreparedJobs(
+    turnId: string,
+    manifestInput = makeManifest(turnId),
+): Promise<IllustrationJobRecordV1[]> {
+    const { turn, leaseId } = await createClaimedTurn(turnId)
+    const manifest = await store.createManifestPrepared({
+        manifest: manifestInput,
+        turnExpectedVersion: turn.version,
+        leaseId,
+        fence: turn.fence,
+        idempotencyKey: `submit:${turnId}`,
+    })
+    return await store.createJobsFromManifest({
+        turnId,
+        expectedManifestVersion: manifest.version,
+    })
+}
+
+async function transition(
+    jobId: string,
+    to: IllustrationJobState,
+    patch: IllustrationJobTransitionPatch = {},
+    holder?: { leaseId: string; fence: number },
+): Promise<IllustrationJobRecordV1> {
+    const current = await store.getJob(jobId)
+    if (!current) throw new Error(`missing test job: ${jobId}`)
+    return await store.transitionJob({
+        jobId,
+        expectedVersion: current.version,
+        to,
+        patch: {
+            ...patch,
+            idempotencyKey: patch.idempotencyKey ?? `transition:${jobId}:${++transitionSequence}`,
+        },
+        ...(holder ?? {}),
+    })
+}
+
+async function queueJob(jobId: string): Promise<IllustrationJobRecordV1> {
+    let current = await store.getJob(jobId)
+    if (!current) throw new Error(`missing test job: ${jobId}`)
+    if (current.state === 'prepared') current = await transition(jobId, 'awaiting_prompt')
+    if (current.state !== 'awaiting_prompt') throw new Error(`cannot queue ${current.state}`)
+    const leaseId = `tagger:${jobId}`
+    const claimed = await store.claimJob({ jobId, expectedVersion: current.version, leaseId })
+    return await store.transitionJob({
+        jobId,
+        expectedVersion: claimed.version,
+        to: 'queued',
+        leaseId,
+        fence: claimed.fence,
+        patch: {
+            idempotencyKey: `supply:${jobId}:${++transitionSequence}`,
+            prompt: { positive: `positive:${jobId}`, negative: `negative:${jobId}` },
+        },
+    })
+}
+
+type BuildableJobState =
+    | 'prepared'
+    | 'awaiting_prompt'
+    | 'queued'
+    | 'blocked_config'
+    | 'generating'
+    | 'cancel_requested'
+    | 'asset_writing'
+    | 'asset_ready'
+    | 'committing'
+    | 'uncertain'
+
+async function createJobAtState(turnId: string, targetState: BuildableJobState): Promise<IllustrationJobRecordV1> {
+    const [prepared] = await createPreparedJobs(turnId)
+    if (targetState === 'prepared') return prepared
+
+    const awaiting = await transition(prepared.jobId, 'awaiting_prompt')
+    if (targetState === 'awaiting_prompt') return awaiting
+
+    const queued = await queueJob(prepared.jobId)
+    if (targetState === 'queued') return queued
+    if (targetState === 'blocked_config') return await transition(prepared.jobId, 'blocked_config')
+
+    const generating = await transition(prepared.jobId, 'generating', {
+        attemptId: `attempt:${prepared.jobId}`,
+        assetId: `asset:${prepared.jobId}`,
+    })
+    if (targetState === 'generating') return generating
+    if (targetState === 'cancel_requested') {
+        return await store.requestCancel({ jobId: prepared.jobId, expectedVersion: generating.version })
+    }
+    if (targetState === 'uncertain') {
+        return await transition(prepared.jobId, 'uncertain', {
+            error: { code: 'provider_timeout', certainty: 'uncertain' },
+        })
+    }
+
+    const writing = await transition(prepared.jobId, 'asset_writing')
+    if (targetState === 'asset_writing') return writing
+    const ready = await transition(prepared.jobId, 'asset_ready')
+    if (targetState === 'asset_ready') return ready
+    return await transition(prepared.jobId, 'committing')
+}
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+    let resolve!: () => void
+    const promise = new Promise<void>((done) => {
+        resolve = done
+    })
+    return { promise, resolve }
+}
+
+function decodeStored<T>(key: string): T | null {
+    const value = storageMap.get(key)
+    return value ? (JSON.parse(new TextDecoder().decode(value)) as T) : null
+}
+
+function encodeStored(key: string, value: unknown): void {
+    storageMap.set(key, new TextEncoder().encode(JSON.stringify(value)))
+}
+
+beforeEach(() => {
+    storageMap.clear()
+    storageControl.failSetKey = null
+    storageControl.failSetCount = 0
+    transitionSequence = 0
+    vi.useFakeTimers()
+    vi.setSystemTime(BASE_TIME)
+    lockManager = new InMemoryLockManager()
+    setIllustrationLockManagerAccessorForTests(() => lockManager)
+})
+
+afterEach(() => {
+    resetIllustrationLockManagerAccessorForTests()
+    vi.useRealTimers()
+})
+
+describe('turn records and version CAS', () => {
+    test('creates idempotently and rejects a stale expectedVersion', async () => {
+        const created = await store.createTurn({ turnId: 'turn-cas', idempotencyKey: 'create-cas' })
+        const duplicate = await store.createTurn({ turnId: 'turn-cas', idempotencyKey: 'create-cas' })
+        expect(duplicate).toEqual(created)
+
+        const updated = await store.updateTurn({
+            turnId: 'turn-cas',
+            expectedVersion: created.version,
+            mutate: (draft) => {
+                draft.state = 'awaiting_plan'
+            },
+        })
+        expect(updated.version).toBe(2)
+        await expect(
+            store.updateTurn({
+                turnId: 'turn-cas',
+                expectedVersion: created.version,
+                mutate: (draft) => {
+                    draft.state = 'blocked_capture'
+                },
+            }),
+        ).rejects.toBeInstanceOf(IllustrationLedgerVersionConflictError)
+    })
+
+    test('serializes interleaved mutations without a lost update', async () => {
+        const created = await store.createTurn({ turnId: 'turn-race', idempotencyKey: 'create-race' })
+        const entered = deferred()
+        const release = deferred()
+        const first = store.updateTurn({
+            turnId: created.turnId,
+            expectedVersion: created.version,
+            mutate: async (draft) => {
+                entered.resolve()
+                await release.promise
+                draft.state = 'awaiting_plan'
+            },
+        })
+        await entered.promise
+        const second = store.updateTurn({
+            turnId: created.turnId,
+            expectedVersion: created.version,
+            mutate: (draft) => {
+                draft.state = 'blocked_capture'
+            },
+        })
+        release.resolve()
+
+        await expect(first).resolves.toMatchObject({ state: 'awaiting_plan', version: 2 })
+        await expect(second).rejects.toBeInstanceOf(IllustrationLedgerVersionConflictError)
+        await expect(store.getTurn(created.turnId)).resolves.toMatchObject({
+            state: 'awaiting_plan',
+            version: 2,
+        })
+    })
+
+    test('increments the durable worker epoch under the ledger lock', async () => {
+        await expect(store.acquireWorkerEpoch()).resolves.toBe(1)
+        await expect(store.acquireWorkerEpoch()).resolves.toBe(2)
+    })
+})
+
+describe('manifest and job materialization', () => {
+    test('advances manifest phases one step forward only', async () => {
+        const { turn, leaseId } = await createClaimedTurn('turn-phase')
+        const prepared = await store.createManifestPrepared({
+            manifest: makeManifest('turn-phase'),
+            turnExpectedVersion: turn.version,
+            leaseId,
+            fence: turn.fence,
+            idempotencyKey: 'submit-phase',
+        })
+        const duplicate = await store.createManifestPrepared({
+            manifest: makeManifest('turn-phase'),
+            turnExpectedVersion: turn.version,
+            leaseId,
+            fence: turn.fence,
+            idempotencyKey: 'submit-phase',
+        })
+        expect(duplicate).toEqual(prepared)
+        await expect(
+            store.advanceManifestPhase({
+                turnId: turn.turnId,
+                expectedVersion: prepared.version,
+                to: 'records_complete',
+            }),
+        ).rejects.toBeInstanceOf(IllustrationLedgerCorruptError)
+        await store.createJobsFromManifest({
+            turnId: turn.turnId,
+            expectedManifestVersion: prepared.version,
+        })
+        const complete = await store.advanceManifestPhase({
+            turnId: turn.turnId,
+            expectedVersion: prepared.version,
+            to: 'records_complete',
+        })
+        const durable = await store.advanceManifestPhase({
+            turnId: turn.turnId,
+            expectedVersion: complete.version,
+            to: 'projection_durable',
+        })
+        expect(durable).toMatchObject({ phase: 'projection_durable', version: 3 })
+        await expect(
+            store.advanceManifestPhase({
+                turnId: turn.turnId,
+                expectedVersion: durable.version,
+                to: 'records_complete',
+            }),
+        ).rejects.toBeInstanceOf(IllustrationLedgerValidationError)
+    })
+
+    test('creates manifest jobs idempotently without duplicating the index', async () => {
+        const turnId = 'turn-idempotent-jobs'
+        const { turn, leaseId } = await createClaimedTurn(turnId)
+        const manifest = await store.createManifestPrepared({
+            manifest: makeManifest(turnId, 3),
+            turnExpectedVersion: turn.version,
+            leaseId,
+            fence: turn.fence,
+            idempotencyKey: 'submit-idempotent-jobs',
+        })
+        const first = await store.createJobsFromManifest({
+            turnId,
+            expectedManifestVersion: manifest.version,
+        })
+        const second = await store.createJobsFromManifest({
+            turnId,
+            expectedManifestVersion: manifest.version,
+        })
+        expect(second).toEqual(first)
+        expect(second.every((job) => job.version === 1)).toBe(true)
+        expect(decodeStored<string[]>(illustrationTurnJobsKey(turnId))).toEqual(
+            manifest.jobs.map((job) => job.jobId),
+        )
+
+        const transitioned = await transition(first[0].jobId, 'awaiting_prompt')
+        const recoveredAfterTransition = await store.createJobsFromManifest({
+            turnId,
+            expectedManifestVersion: manifest.version,
+        })
+        expect(recoveredAfterTransition[0]).toEqual(transitioned)
+    })
+
+    test('returns an identical manifest replay after lease expiry without accepting a mismatch', async () => {
+        const turnId = 'manifest-replay-expired'
+        const manifestInput = makeManifest(turnId)
+        const { turn, leaseId } = await createClaimedTurn(turnId)
+        const stored = await store.createManifestPrepared({
+            manifest: manifestInput,
+            turnExpectedVersion: turn.version,
+            leaseId,
+            fence: turn.fence,
+            idempotencyKey: 'submit-expired-replay',
+        })
+
+        vi.advanceTimersByTime(TURN_LEASE_DURATION_MS + 1)
+        await expect(
+            store.createManifestPrepared({
+                manifest: manifestInput,
+                turnExpectedVersion: turn.version,
+                leaseId,
+                fence: turn.fence,
+                idempotencyKey: 'submit-expired-replay',
+            }),
+        ).resolves.toEqual(stored)
+        await expect(
+            store.createManifestPrepared({
+                manifest: { ...manifestInput, planHash: 'mismatching-plan' },
+                turnExpectedVersion: turn.version,
+                leaseId,
+                fence: turn.fence,
+                idempotencyKey: 'submit-expired-replay',
+            }),
+        ).rejects.toBeInstanceOf(IllustrationLedgerHolderMismatchError)
+    })
+
+    test('returns an identical manifest replay after the turn advances without accepting a mismatch', async () => {
+        const turnId = 'manifest-replay-advanced'
+        const manifestInput = makeManifest(turnId)
+        const { turn, leaseId } = await createClaimedTurn(turnId)
+        const stored = await store.createManifestPrepared({
+            manifest: manifestInput,
+            turnExpectedVersion: turn.version,
+            leaseId,
+            fence: turn.fence,
+            idempotencyKey: 'submit-advanced-replay',
+        })
+        const advancedTurn = await store.updateTurn({
+            turnId,
+            expectedVersion: turn.version,
+            mutate: (draft) => {
+                draft.state = 'awaiting_prompt'
+            },
+        })
+
+        await expect(
+            store.createManifestPrepared({
+                manifest: manifestInput,
+                turnExpectedVersion: turn.version,
+                leaseId,
+                fence: turn.fence,
+                idempotencyKey: 'submit-advanced-replay',
+            }),
+        ).resolves.toEqual(stored)
+        await expect(
+            store.createManifestPrepared({
+                manifest: { ...manifestInput, planHash: 'mismatching-plan' },
+                turnExpectedVersion: advancedTurn.version,
+                leaseId,
+                fence: turn.fence,
+                idempotencyKey: 'submit-advanced-replay',
+            }),
+        ).rejects.toBeInstanceOf(IllustrationLedgerValidationError)
+    })
+
+    test('allows only a fully durable job replay to bypass an advanced manifest version', async () => {
+        const turnId = 'jobs-replay-advanced-manifest'
+        const { turn, leaseId } = await createClaimedTurn(turnId)
+        const manifest = await store.createManifestPrepared({
+            manifest: makeManifest(turnId, 2),
+            turnExpectedVersion: turn.version,
+            leaseId,
+            fence: turn.fence,
+            idempotencyKey: 'submit-jobs-replay',
+        })
+        const created = await store.createJobsFromManifest({
+            turnId,
+            expectedManifestVersion: manifest.version,
+        })
+        await store.advanceManifestPhase({
+            turnId,
+            expectedVersion: manifest.version,
+            to: 'records_complete',
+        })
+
+        await expect(
+            store.createJobsFromManifest({
+                turnId,
+                expectedManifestVersion: manifest.version,
+            }),
+        ).resolves.toEqual(created)
+
+        storageMap.delete(illustrationTurnJobsKey(turnId))
+        await expect(
+            store.createJobsFromManifest({
+                turnId,
+                expectedManifestVersion: manifest.version,
+            }),
+        ).rejects.toBeInstanceOf(IllustrationLedgerVersionConflictError)
+        expect(storageMap.has(illustrationTurnJobsKey(turnId))).toBe(false)
+    })
+
+    test('recovers missing records and rebuilds the index after a partial storage failure', async () => {
+        const turnId = 'turn-partial-jobs'
+        const { turn, leaseId } = await createClaimedTurn(turnId)
+        const manifest = await store.createManifestPrepared({
+            manifest: makeManifest(turnId, 3),
+            turnExpectedVersion: turn.version,
+            leaseId,
+            fence: turn.fence,
+            idempotencyKey: 'submit-partial-jobs',
+        })
+        storageControl.failSetKey = illustrationJobKey(jobIdFor(turnId, 1))
+        storageControl.failSetCount = 1
+        await expect(
+            store.createJobsFromManifest({ turnId, expectedManifestVersion: manifest.version }),
+        ).rejects.toThrow('injected set failure')
+        expect(storageMap.has(illustrationJobKey(jobIdFor(turnId, 0)))).toBe(true)
+        expect(storageMap.has(illustrationJobKey(jobIdFor(turnId, 1)))).toBe(false)
+        expect(storageMap.has(illustrationTurnJobsKey(turnId))).toBe(false)
+
+        const recovered = await store.createJobsFromManifest({
+            turnId,
+            expectedManifestVersion: manifest.version,
+        })
+        expect(recovered).toHaveLength(3)
+        expect(decodeStored<string[]>(illustrationTurnJobsKey(turnId))).toEqual(
+            manifest.jobs.map((job) => job.jobId),
+        )
+    })
+})
+
+describe('lease lifecycle and holder writes', () => {
+    test('claims, renews, rejects an active rival, and fences an expired holder', async () => {
+        const created = await store.createTurn({ turnId: 'turn-lease', idempotencyKey: 'create-lease' })
+        const awaiting = await store.updateTurn({
+            turnId: created.turnId,
+            expectedVersion: created.version,
+            mutate: (draft) => {
+                draft.state = 'awaiting_plan'
+            },
+        })
+        const claimed = await store.claimTurn({
+            turnId: created.turnId,
+            expectedVersion: awaiting.version,
+            leaseId: 'holder-a',
+        })
+        expect(claimed).toMatchObject({ fence: 1, leaseId: 'holder-a' })
+        expect(claimed.leaseExpiresAt).toBe(BASE_TIME + TURN_LEASE_DURATION_MS)
+
+        vi.advanceTimersByTime(1_000)
+        const renewed = await store.claimTurn({
+            turnId: created.turnId,
+            expectedVersion: claimed.version,
+            leaseId: 'holder-a',
+        })
+        expect(renewed.fence).toBe(claimed.fence)
+        expect(renewed.leaseExpiresAt).toBe(BASE_TIME + 1_000 + TURN_LEASE_DURATION_MS)
+        await expect(
+            store.claimTurn({
+                turnId: created.turnId,
+                expectedVersion: renewed.version,
+                leaseId: 'holder-b',
+            }),
+        ).rejects.toBeInstanceOf(IllustrationLedgerLeaseConflictError)
+
+        vi.advanceTimersByTime(TURN_LEASE_DURATION_MS)
+        const reclaimed = await store.claimTurn({
+            turnId: created.turnId,
+            expectedVersion: renewed.version,
+            leaseId: 'holder-b',
+        })
+        expect(reclaimed).toMatchObject({ fence: 2, leaseId: 'holder-b' })
+        expect(() =>
+            validateHolderWrite(reclaimed, {
+                leaseId: reclaimed.leaseId!,
+                expectedVersion: reclaimed.version,
+                fence: renewed.fence,
+            }),
+        ).toThrow(IllustrationLedgerHolderMismatchError)
+        expect(() =>
+            validateHolderWrite(reclaimed, {
+                leaseId: 'holder-a',
+                expectedVersion: renewed.version,
+                fence: renewed.fence,
+            }),
+        ).toThrow(IllustrationLedgerVersionConflictError)
+        await expect(
+            store.createManifestPrepared({
+                manifest: makeManifest(created.turnId),
+                turnExpectedVersion: reclaimed.version,
+                leaseId: 'holder-a',
+                fence: renewed.fence,
+                idempotencyKey: 'late-plan-old-holder',
+            }),
+        ).rejects.toBeInstanceOf(IllustrationLedgerHolderMismatchError)
+        await expect(
+            store.createManifestPrepared({
+                manifest: makeManifest(created.turnId),
+                turnExpectedVersion: reclaimed.version,
+                leaseId: 'holder-b',
+                fence: renewed.fence,
+                idempotencyKey: 'late-plan-stale-fence',
+            }),
+        ).rejects.toBeInstanceOf(IllustrationLedgerHolderMismatchError)
+        expect(storageMap.has(illustrationManifestKey(created.turnId))).toBe(false)
+    })
+
+    test('accepts an exact holder lost-ACK replay after expiry but not changed provenance', async () => {
+        const [prepared] = await createPreparedJobs('holder-replay-expired')
+        const awaiting = await transition(prepared.jobId, 'awaiting_prompt')
+        const leaseId = 'tagger:holder-replay-expired'
+        const claimed = await store.claimJob({
+            jobId: prepared.jobId,
+            expectedVersion: awaiting.version,
+            leaseId,
+        })
+        const patch = {
+            idempotencyKey: 'supply:holder-replay-expired',
+            prompt: { positive: 'positive', negative: 'negative' },
+        }
+        const queued = await store.transitionJob({
+            jobId: prepared.jobId,
+            expectedVersion: claimed.version,
+            to: 'queued',
+            leaseId,
+            fence: claimed.fence,
+            patch,
+        })
+
+        vi.advanceTimersByTime(JOB_LEASE_DURATION_MS + 1)
+        await expect(
+            store.transitionJob({
+                jobId: prepared.jobId,
+                expectedVersion: claimed.version,
+                to: 'queued',
+                leaseId,
+                fence: claimed.fence,
+                patch,
+            }),
+        ).resolves.toEqual(queued)
+        await expect(
+            store.transitionJob({
+                jobId: prepared.jobId,
+                expectedVersion: claimed.version,
+                to: 'queued',
+                leaseId,
+                fence: claimed.fence,
+                patch: { idempotencyKey: patch.idempotencyKey },
+            }),
+        ).rejects.toBeInstanceOf(IllustrationLedgerCorruptError)
+        await expect(
+            store.transitionJob({
+                jobId: prepared.jobId,
+                expectedVersion: claimed.version,
+                to: 'queued',
+                leaseId,
+                fence: claimed.fence + 1,
+                patch,
+            }),
+        ).rejects.toBeInstanceOf(IllustrationLedgerHolderMismatchError)
+
+        await transition(prepared.jobId, 'generating', {
+            attemptId: 'attempt:holder-replay-expired',
+            assetId: 'asset:holder-replay-expired',
+        })
+        await expect(
+            store.transitionJob({
+                jobId: prepared.jobId,
+                expectedVersion: claimed.version,
+                to: 'queued',
+                leaseId,
+                fence: claimed.fence,
+                patch,
+            }),
+        ).rejects.toBeInstanceOf(IllustrationLedgerVersionConflictError)
+    })
+
+    test('renews an expired same bearer as a fenced reclaim', async () => {
+        const { turn, leaseId } = await createClaimedTurn('turn-same-bearer-reclaim')
+        vi.advanceTimersByTime(TURN_LEASE_DURATION_MS)
+        const reclaimed = await store.claimTurn({
+            turnId: turn.turnId,
+            expectedVersion: turn.version,
+            leaseId,
+        })
+        expect(reclaimed.fence).toBe(turn.fence + 1)
+        expect(() =>
+            validateHolderWrite(reclaimed, {
+                leaseId,
+                expectedVersion: reclaimed.version,
+                fence: turn.fence,
+            }),
+        ).toThrow(IllustrationLedgerHolderMismatchError)
+    })
+
+    test('deduplicates a lost-ACK Tagger write and rejects conflicting reuse', async () => {
+        const [prepared] = await createPreparedJobs('turn-holder-idempotency')
+        const awaiting = await transition(prepared.jobId, 'awaiting_prompt')
+        const leaseId = 'tagger-holder'
+        const claimed = await store.claimJob({
+            jobId: prepared.jobId,
+            expectedVersion: awaiting.version,
+            leaseId,
+        })
+        expect(claimed.leaseExpiresAt).toBe(BASE_TIME + JOB_LEASE_DURATION_MS)
+        const input = {
+            jobId: prepared.jobId,
+            expectedVersion: claimed.version,
+            to: 'queued' as const,
+            leaseId,
+            fence: claimed.fence,
+            patch: {
+                idempotencyKey: 'supply-once',
+                prompt: { positive: 'positive', negative: 'negative' },
+            },
+        }
+        const written = await store.transitionJob(input)
+        const duplicate = await store.transitionJob(input)
+        expect(duplicate).toEqual(written)
+        expect(duplicate.version).toBe(claimed.version + 1)
+        await expect(
+            store.transitionJob({
+                jobId: input.jobId,
+                expectedVersion: input.expectedVersion,
+                to: input.to,
+                patch: input.patch,
+            }),
+        ).rejects.toBeInstanceOf(IllustrationLedgerHolderMismatchError)
+
+        await expect(
+            store.transitionJob({
+                ...input,
+                patch: {
+                    ...input.patch,
+                    prompt: { positive: 'different', negative: 'negative' },
+                },
+            }),
+        ).rejects.toBeInstanceOf(IllustrationLedgerCorruptError)
+    })
+})
+
+describe('cancellation intent', () => {
+    test('maps all immediate states and keeps asset_writing as an intent-only write', async () => {
+        const prepared = await createJobAtState('cancel-prepared', 'prepared')
+        await expect(
+            store.transitionJob({
+                jobId: prepared.jobId,
+                expectedVersion: prepared.version,
+                to: 'cancelled',
+                patch: { idempotencyKey: 'bypass-request-cancel' },
+            }),
+        ).rejects.toBeInstanceOf(IllustrationLedgerValidationError)
+        await expect(
+            store.requestCancel({ jobId: prepared.jobId, expectedVersion: prepared.version }),
+        ).resolves.toMatchObject({ state: 'cancelled', cancelRequestedAt: BASE_TIME })
+
+        const awaiting = await createJobAtState('cancel-awaiting', 'awaiting_prompt')
+        await expect(
+            store.requestCancel({ jobId: awaiting.jobId, expectedVersion: awaiting.version }),
+        ).resolves.toMatchObject({ state: 'cancelled' })
+
+        const queued = await createJobAtState('cancel-queued', 'queued')
+        await expect(
+            store.requestCancel({ jobId: queued.jobId, expectedVersion: queued.version }),
+        ).resolves.toMatchObject({ state: 'cancelled' })
+
+        const blocked = await createJobAtState('cancel-blocked', 'blocked_config')
+        await expect(
+            store.requestCancel({ jobId: blocked.jobId, expectedVersion: blocked.version }),
+        ).resolves.toMatchObject({ state: 'cancelled' })
+
+        const writing = await createJobAtState('cancel-writing', 'asset_writing')
+        const intentOnly = await store.requestCancel({
+            jobId: writing.jobId,
+            expectedVersion: writing.version,
+        })
+        expect(intentOnly).toMatchObject({
+            state: 'asset_writing',
+            cancelRequestedAt: BASE_TIME,
+            version: writing.version + 1,
+        })
+
+        const ready = await createJobAtState('cancel-ready', 'asset_ready')
+        await expect(
+            store.requestCancel({ jobId: ready.jobId, expectedVersion: ready.version }),
+        ).resolves.toMatchObject({ state: 'cancelled' })
+
+        const committing = await createJobAtState('cancel-committing', 'committing')
+        await expect(
+            store.requestCancel({ jobId: committing.jobId, expectedVersion: committing.version }),
+        ).rejects.toBeInstanceOf(IllustrationLedgerValidationError)
+    })
+
+    test('persists one cancelRequestedAt through writing and refuses a cancelled commit', async () => {
+        const generating = await createJobAtState('cancel-generating', 'generating')
+        await expect(
+            store.transitionJob({
+                jobId: generating.jobId,
+                expectedVersion: generating.version,
+                to: 'cancel_requested',
+                patch: { idempotencyKey: 'bypass-generating-cancel' },
+            }),
+        ).rejects.toBeInstanceOf(IllustrationLedgerValidationError)
+        const requested = await store.requestCancel({
+            jobId: generating.jobId,
+            expectedVersion: generating.version,
+        })
+        expect(requested).toMatchObject({ state: 'cancel_requested', cancelRequestedAt: BASE_TIME })
+        const duplicate = await store.requestCancel({
+            jobId: generating.jobId,
+            expectedVersion: requested.version,
+        })
+        expect(duplicate).toEqual(requested)
+
+        const writing = await transition(generating.jobId, 'asset_writing')
+        const ready = await transition(generating.jobId, 'asset_ready')
+        expect(writing.cancelRequestedAt).toBe(BASE_TIME)
+        expect(ready.cancelRequestedAt).toBe(BASE_TIME)
+        await expect(
+            transition(generating.jobId, 'committing'),
+        ).rejects.toBeInstanceOf(IllustrationLedgerValidationError)
+        const cancelled = await store.requestCancel({
+            jobId: generating.jobId,
+            expectedVersion: ready.version,
+        })
+        expect(cancelled).toMatchObject({ state: 'cancelled', cancelRequestedAt: BASE_TIME })
+    })
+})
+
+describe('fail-closed Web Locks behavior', () => {
+    test('rejects every public store operation when Web Locks are unavailable', async () => {
+        setIllustrationLockManagerAccessorForTests(() => undefined)
+        const manifest = makeManifest('no-lock')
+        const operations: Array<() => Promise<unknown>> = [
+            () => store.createTurn({ turnId: 'no-lock', idempotencyKey: 'create' }),
+            () => store.getTurn('no-lock'),
+            () => store.listTurns(),
+            () =>
+                store.updateTurn({
+                    turnId: 'no-lock',
+                    expectedVersion: 1,
+                    mutate: () => undefined,
+                }),
+            () =>
+                store.createManifestPrepared({
+                    manifest,
+                    turnExpectedVersion: 1,
+                    leaseId: 'lease',
+                    fence: 1,
+                    idempotencyKey: 'submit',
+                }),
+            () => store.getManifest('no-lock'),
+            () =>
+                store.advanceManifestPhase({
+                    turnId: 'no-lock',
+                    expectedVersion: 1,
+                    to: 'records_complete',
+                }),
+            () =>
+                store.createJobsFromManifest({
+                    turnId: 'no-lock',
+                    expectedManifestVersion: 1,
+                }),
+            () => store.getJob(jobIdFor('no-lock')),
+            () => store.listJobs(),
+            () =>
+                store.transitionJob({
+                    jobId: jobIdFor('no-lock'),
+                    expectedVersion: 1,
+                    to: 'cancelled',
+                    patch: { idempotencyKey: 'cancel' },
+                }),
+            () => store.requestCancel({ jobId: jobIdFor('no-lock'), expectedVersion: 1 }),
+            () => store.claimTurn({ turnId: 'no-lock', expectedVersion: 1, leaseId: 'lease' }),
+            () => store.claimJob({ jobId: jobIdFor('no-lock'), expectedVersion: 1, leaseId: 'lease' }),
+            () => store.acquireWorkerEpoch(),
+            () =>
+                store.retryUncertainJob({
+                    jobId: jobIdFor('no-lock'),
+                    expectedVersion: 1,
+                    confirmNewCharge: true,
+                }),
+            () => store.pruneTerminalRecords(),
+        ]
+
+        for (const operation of operations) {
+            await expect(operation()).rejects.toBeInstanceOf(IllustrationLedgerUnavailableError)
+        }
+        expect(storageMap.size).toBe(0)
+    })
+})
+
+describe('manifest bounds', () => {
+    async function expectManifestRejectedWithoutWrite(
+        turnId: string,
+        manifest: Omit<PlanManifestV1, 'phase' | 'version'>,
+    ): Promise<void> {
+        const { turn, leaseId } = await createClaimedTurn(turnId)
+        const beforeKeys = [...storageMap.keys()].sort()
+        await expect(
+            store.createManifestPrepared({
+                manifest,
+                turnExpectedVersion: turn.version,
+                leaseId,
+                fence: turn.fence,
+                idempotencyKey: `submit:${turnId}`,
+            }),
+        ).rejects.toBeInstanceOf(IllustrationLedgerValidationError)
+        expect([...storageMap.keys()].sort()).toEqual(beforeKeys)
+        expect(storageMap.has(illustrationManifestKey(turnId))).toBe(false)
+    }
+
+    test('accepts 15 jobs and rejects the 16th before writing', async () => {
+        const acceptedTurnId = 'bounds-fifteen'
+        const { turn, leaseId } = await createClaimedTurn(acceptedTurnId)
+        const accepted = await store.createManifestPrepared({
+            manifest: makeManifest(acceptedTurnId, MAX_JOBS_PER_TURN),
+            turnExpectedVersion: turn.version,
+            leaseId,
+            fence: turn.fence,
+            idempotencyKey: 'submit-fifteen',
+        })
+        expect(accepted.jobs).toHaveLength(15)
+
+        await expectManifestRejectedWithoutWrite(
+            'bounds-sixteen',
+            makeManifest('bounds-sixteen', MAX_JOBS_PER_TURN + 1),
+        )
+    })
+
+    test('rejects an oversized scene payload before writing', async () => {
+        await expectManifestRejectedWithoutWrite(
+            'bounds-scene',
+            makeManifest('bounds-scene', 1, () => 'x'.repeat(17_000)),
+        )
+    })
+
+    test('rejects a plan over 192 KiB even when each scene is under 16 KiB', async () => {
+        await expectManifestRejectedWithoutWrite(
+            'bounds-plan',
+            makeManifest('bounds-plan', 15, () => 'x'.repeat(13_500)),
+        )
+    })
+
+    test('rejects non-JSON scene data with a typed error before writing', async () => {
+        const cycle: Record<string, unknown> = {}
+        cycle.self = cycle
+        const invalidValues: unknown[] = [
+            Number.NaN,
+            new Date(0),
+            undefined,
+            () => 'not-json',
+            1n,
+            cycle,
+        ]
+        for (let index = 0; index < invalidValues.length; index += 1) {
+            const turnId = `bounds-json-${index}`
+            await expectManifestRejectedWithoutWrite(
+                turnId,
+                makeManifest(turnId, 1, () => invalidValues[index]),
+            )
+        }
+    })
+
+    test('does not allow a transition patch to rewrite manifest scenePayload', async () => {
+        const [prepared] = await createPreparedJobs('immutable-scene-payload')
+        await expect(
+            store.transitionJob({
+                jobId: prepared.jobId,
+                expectedVersion: prepared.version,
+                to: 'awaiting_prompt',
+                patch: {
+                    idempotencyKey: 'rewrite-scene',
+                    scenePayload: { schemaVersion: 1, data: { changed: true } },
+                } as IllustrationJobTransitionPatch,
+            }),
+        ).rejects.toBeInstanceOf(IllustrationLedgerValidationError)
+    })
+})
+
+describe('retention pruning', () => {
+    test('deletes old prunable jobs within the bound and protects active and uncertain jobs', async () => {
+        const cancelledA = await createJobAtState('prune-cancelled-a', 'prepared')
+        await store.requestCancel({ jobId: cancelledA.jobId, expectedVersion: cancelledA.version })
+        const cancelledB = await createJobAtState('prune-cancelled-b', 'prepared')
+        await store.requestCancel({ jobId: cancelledB.jobId, expectedVersion: cancelledB.version })
+        const active = await createJobAtState('prune-active', 'prepared')
+        const uncertain = await createJobAtState('prune-uncertain', 'uncertain')
+
+        vi.advanceTimersByTime(TERMINAL_RECORD_TTL_MS + 1)
+        const first = await store.pruneTerminalRecords({ maxDeletes: 1 })
+        expect(first.deletedJobIds).toHaveLength(1)
+        expect([cancelledA.jobId, cancelledB.jobId]).toContain(first.deletedJobIds[0])
+        const deletedTurnId = first.deletedJobIds[0].split(':job:')[0]
+        expect(decodeStored<string[]>(illustrationTurnJobsKey(deletedTurnId))).toEqual([])
+        expect(await store.getJob(active.jobId)).not.toBeNull()
+        expect(await store.getJob(uncertain.jobId)).not.toBeNull()
+
+        const second = await store.pruneTerminalRecords({ maxDeletes: 10 })
+        expect(second.deletedJobIds).toHaveLength(1)
+        expect(await store.getJob(active.jobId)).not.toBeNull()
+        expect(await store.getJob(uncertain.jobId)).toMatchObject({ state: 'uncertain' })
+    })
+
+    test('keeps the latest 200 terminal turns and protects an older turn with an active job', async () => {
+        const makeTerminalTurn = (turnId: string, updatedAt: number): IllustrationTurnRecordV1 => ({
+            schemaVersion: 1,
+            turnId,
+            state: 'completed',
+            version: 1,
+            leaseId: null,
+            leaseExpiresAt: 0,
+            fence: 0,
+            workerEpoch: 0,
+            updatedAt,
+            idempotencyKey: `create:${turnId}`,
+        })
+        for (let index = 0; index <= 200; index += 1) {
+            const turnId = `summary-${index}`
+            encodeStored(illustrationTurnKey(turnId), makeTerminalTurn(turnId, BASE_TIME + index))
+        }
+
+        const guardedTurnId = 'summary-guarded-active'
+        const guardedJobId = jobIdFor(guardedTurnId)
+        encodeStored(
+            illustrationTurnKey(guardedTurnId),
+            makeTerminalTurn(guardedTurnId, BASE_TIME - 1),
+        )
+        encodeStored(illustrationJobKey(guardedJobId), {
+            schemaVersion: 1,
+            turnId: guardedTurnId,
+            jobId: guardedJobId,
+            slotToken: 'guarded-slot',
+            insertAfterUtf16: 0,
+            sceneId: 'guarded-scene',
+            scenePayload: { schemaVersion: 1, data: {} },
+            sourceRevisionHash: 'guarded-source',
+            state: 'prepared',
+            version: 1,
+            leaseId: null,
+            leaseExpiresAt: 0,
+            fence: 0,
+            workerEpoch: 0,
+            updatedAt: BASE_TIME - 1,
+            idempotencyKey: 'guarded-create',
+            creationIdempotencyKey: 'guarded-create',
+        } satisfies IllustrationJobRecordV1)
+        encodeStored(illustrationTurnJobsKey(guardedTurnId), [guardedJobId])
+
+        vi.advanceTimersByTime(TERMINAL_RECORD_TTL_MS + 1_000)
+        const result = await store.pruneTerminalRecords({ maxDeletes: 10 })
+        expect(result.deletedTurnIds).toEqual(['summary-0'])
+        expect(await store.getTurn('summary-0')).toBeNull()
+        expect(await store.getTurn('summary-1')).not.toBeNull()
+        expect(await store.getTurn('summary-200')).not.toBeNull()
+        expect(await store.getTurn(guardedTurnId)).not.toBeNull()
+        expect(await store.getJob(guardedJobId)).toMatchObject({ state: 'prepared' })
+    })
+
+    test('deletes a terminal turn with its manifest and index as one budgeted group', async () => {
+        const terminalTurn = (turnId: string, updatedAt: number): IllustrationTurnRecordV1 => ({
+            schemaVersion: 1,
+            turnId,
+            state: 'completed',
+            version: 1,
+            leaseId: null,
+            leaseExpiresAt: 0,
+            fence: 0,
+            workerEpoch: 0,
+            updatedAt,
+            idempotencyKey: `create:${turnId}`,
+        })
+        const targetTurnId = 'prune-group-target'
+        encodeStored(illustrationTurnKey(targetTurnId), terminalTurn(targetTurnId, BASE_TIME))
+        encodeStored(illustrationManifestKey(targetTurnId), {
+            ...makeManifest(targetTurnId),
+            phase: 'prepared',
+            version: 1,
+            updatedAt: BASE_TIME,
+            idempotencyKey: 'submit:prune-group-target',
+        })
+        encodeStored(illustrationTurnJobsKey(targetTurnId), null)
+        for (let index = 0; index < 200; index += 1) {
+            const turnId = `prune-group-protected-${index}`
+            encodeStored(illustrationTurnKey(turnId), terminalTurn(turnId, BASE_TIME + index + 1))
+        }
+
+        vi.advanceTimersByTime(TERMINAL_RECORD_TTL_MS + 1_000)
+        for (const maxDeletes of [1, 2]) {
+            const result = await store.pruneTerminalRecords({ maxDeletes })
+            expect(result.deletedTurnIds).toEqual([])
+            expect(storageMap.has(illustrationTurnKey(targetTurnId))).toBe(true)
+            expect(storageMap.has(illustrationManifestKey(targetTurnId))).toBe(true)
+            expect(storageMap.has(illustrationTurnJobsKey(targetTurnId))).toBe(true)
+        }
+
+        const removed = await store.pruneTerminalRecords({ maxDeletes: 3 })
+        expect(removed.deletedTurnIds).toEqual([targetTurnId])
+        expect(storageMap.has(illustrationTurnKey(targetTurnId))).toBe(false)
+        expect(storageMap.has(illustrationManifestKey(targetTurnId))).toBe(false)
+        expect(storageMap.has(illustrationTurnJobsKey(targetTurnId))).toBe(false)
+    })
+
+    test('sweeps orphan manifest and index keys within the physical delete budget', async () => {
+        const turnId = 'prune-orphan'
+        encodeStored(illustrationManifestKey(turnId), null)
+        encodeStored(illustrationTurnJobsKey(turnId), [])
+
+        await store.pruneTerminalRecords({ olderThanMs: 0, maxDeletes: 1 })
+        expect(
+            Number(storageMap.has(illustrationManifestKey(turnId))) +
+                Number(storageMap.has(illustrationTurnJobsKey(turnId))),
+        ).toBe(1)
+        await store.pruneTerminalRecords({ olderThanMs: 0, maxDeletes: 1 })
+        expect(storageMap.has(illustrationManifestKey(turnId))).toBe(false)
+        expect(storageMap.has(illustrationTurnJobsKey(turnId))).toBe(false)
+    })
+
+    test('never sweeps manifest or index keys belonging to a live turn', async () => {
+        const turnId = 'prune-live-dependencies'
+        await store.createTurn({ turnId, idempotencyKey: 'create:prune-live-dependencies' })
+        encodeStored(illustrationManifestKey(turnId), {
+            ...makeManifest(turnId),
+            phase: 'prepared',
+            version: 1,
+            updatedAt: BASE_TIME,
+            idempotencyKey: 'submit:prune-live-dependencies',
+        })
+        encodeStored(illustrationTurnJobsKey(turnId), [])
+
+        await store.pruneTerminalRecords({ olderThanMs: 0, maxDeletes: 10 })
+        expect(storageMap.has(illustrationManifestKey(turnId))).toBe(true)
+        expect(storageMap.has(illustrationTurnJobsKey(turnId))).toBe(true)
+    })
+})
+
+describe('manual uncertain retry', () => {
+    test('requires confirmation and creates fresh attempt, asset, and idempotency identifiers', async () => {
+        const uncertain = await createJobAtState('retry-uncertain', 'uncertain')
+        await expect(
+            store.retryUncertainJob({
+                jobId: uncertain.jobId,
+                expectedVersion: uncertain.version,
+                confirmNewCharge: false as true,
+            }),
+        ).rejects.toBeInstanceOf(IllustrationLedgerConfirmationRequiredError)
+
+        const retried = await store.retryUncertainJob({
+            jobId: uncertain.jobId,
+            expectedVersion: uncertain.version,
+            confirmNewCharge: true,
+        })
+        expect(retried).toMatchObject({ state: 'queued', version: uncertain.version + 1 })
+        expect(retried.attemptId).not.toBe(uncertain.attemptId)
+        expect(retried.assetId).not.toBe(uncertain.assetId)
+        expect(retried.idempotencyKey).not.toBe(uncertain.idempotencyKey)
+        await expect(
+            store.retryUncertainJob({
+                jobId: uncertain.jobId,
+                expectedVersion: uncertain.version,
+                confirmNewCharge: true,
+            }),
+        ).resolves.toEqual(retried)
+
+        const prepared = await createJobAtState('retry-prepared', 'prepared')
+        await expect(
+            store.retryUncertainJob({
+                jobId: prepared.jobId,
+                expectedVersion: prepared.version,
+                confirmNewCharge: true,
+            }),
+        ).rejects.toBeInstanceOf(IllustrationLedgerValidationError)
+    })
+
+    test('does not mistake an arbitrary retry-prefixed Tagger key for retry provenance', async () => {
+        const [prepared] = await createPreparedJobs('retry-prefix-spoof')
+        const awaiting = await transition(prepared.jobId, 'awaiting_prompt')
+        const leaseId = 'retry-prefix-tagger'
+        const claimed = await store.claimJob({
+            jobId: prepared.jobId,
+            expectedVersion: awaiting.version,
+            leaseId,
+        })
+        const queued = await store.transitionJob({
+            jobId: prepared.jobId,
+            expectedVersion: claimed.version,
+            to: 'queued',
+            leaseId,
+            fence: claimed.fence,
+            patch: {
+                idempotencyKey: 'retry:spoof',
+                prompt: { positive: 'positive', negative: 'negative' },
+            },
+        })
+        await expect(
+            store.retryUncertainJob({
+                jobId: queued.jobId,
+                expectedVersion: claimed.version,
+                confirmNewCharge: true,
+            }),
+        ).rejects.toBeInstanceOf(IllustrationLedgerVersionConflictError)
+    })
+
+    test('clears inherited cancellation intent before a fresh paid attempt', async () => {
+        const generating = await createJobAtState('retry-cancelled-uncertain', 'generating')
+        const cancelRequested = await store.requestCancel({
+            jobId: generating.jobId,
+            expectedVersion: generating.version,
+        })
+        const uncertain = await transition(generating.jobId, 'uncertain', {
+            error: { code: 'provider_timeout', certainty: 'uncertain' },
+        })
+        expect(cancelRequested.cancelRequestedAt).toBe(BASE_TIME)
+        expect(uncertain).toMatchObject({
+            state: 'uncertain',
+            cancelRequestedAt: BASE_TIME,
+        })
+
+        const retried = await store.retryUncertainJob({
+            jobId: generating.jobId,
+            expectedVersion: uncertain.version,
+            confirmNewCharge: true,
+        })
+        expect(retried.state).toBe('queued')
+        expect(retried.cancelRequestedAt).toBeUndefined()
+        await transition(generating.jobId, 'generating')
+        await transition(generating.jobId, 'asset_writing')
+        await transition(generating.jobId, 'asset_ready')
+        await expect(transition(generating.jobId, 'committing')).resolves.toMatchObject({
+            state: 'committing',
+        })
+    })
+})
+
+describe('index representation', () => {
+    test('stores a small per-turn string array instead of a whole queue record', async () => {
+        const turnId = 'index-shape'
+        await createPreparedJobs(turnId, makeManifest(turnId, 2))
+        const index = decodeStored<unknown>(illustrationTurnJobsKey(turnId))
+        expect(index).toEqual([jobIdFor(turnId, 0), jobIdFor(turnId, 1)])
+        expect(storageMap.has(illustrationTurnKey(turnId))).toBe(true)
+        expect(storageMap.has(illustrationJobKey(jobIdFor(turnId, 0)))).toBe(true)
+    })
+})
