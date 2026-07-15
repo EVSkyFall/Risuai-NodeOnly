@@ -8,6 +8,20 @@ import type { OpenAIChat } from "./index.svelte"
 import { processZip } from "./processzip"
 import random from "lodash/random"
 
+type ImageGenerationResult =
+    | { ok: true; bytesOrDataUrl: string; providerStatus: number }
+    | { ok: false; certainty: 'definite'; reason: string; providerStatus?: number }
+    | { ok: false; certainty: 'uncertain'; reason: string }
+
+type ImageGenerationPriority = 'interactive' | 'background'
+
+type ImageGenerationAttempt = {
+    result: ImageGenerationResult
+    compatibilityValue: string | false
+    shouldNotify?: boolean
+    notifyErrorValue?: unknown
+}
+
 export async function stableDiff(currentChar:character,prompt:string){
     let db = getDatabase()
 
@@ -60,7 +74,50 @@ export async function stableDiff(currentChar:character,prompt:string){
     return await generateAIImage(genPrompt, currentChar, neg, '')
 }
 
-export async function generateAIImage(genPrompt:string, currentChar:character, neg:string, returnSdData:string):Promise<string|false>{
+export async function generateAIImage(
+    genPrompt:string,
+    currentChar:character,
+    neg:string,
+    returnSdData:string,
+    priorityClass:ImageGenerationPriority = 'interactive',
+):Promise<string|false>{
+    const attempt = await generateAIImageTyped(genPrompt, currentChar, neg, returnSdData, priorityClass)
+    if (!attempt.result.ok && attempt.shouldNotify) {
+        notifyError(attempt.notifyErrorValue)
+    }
+    return attempt.compatibilityValue
+}
+
+async function generateAIImageTyped(
+    genPrompt:string,
+    currentChar:character,
+    neg:string,
+    returnSdData:string,
+    priorityClass:ImageGenerationPriority,
+):Promise<ImageGenerationAttempt>{
+    const result = await generateAIImageInternal(genPrompt, currentChar, neg, returnSdData, priorityClass)
+    if (typeof result === 'object') {
+        return result
+    }
+    if (result === false || (returnSdData === 'inlay' && result === '')) {
+        return {
+            result: { ok: false, certainty: 'definite', reason: 'Image generation failed' },
+            compatibilityValue: result,
+        }
+    }
+    return {
+        result: { ok: true, bytesOrDataUrl: result, providerStatus: 200 },
+        compatibilityValue: result,
+    }
+}
+
+async function generateAIImageInternal(
+    genPrompt:string,
+    currentChar:character,
+    neg:string,
+    returnSdData:string,
+    priorityClass:ImageGenerationPriority,
+):Promise<string|false|ImageGenerationAttempt>{
     const db = getDatabase()
     console.log(db.sdProvider)
     if(db.sdProvider === 'webui'){
@@ -343,47 +400,61 @@ export async function generateAIImage(genPrompt:string, currentChar:character, n
                 reqlist.body.parameters.noise = db.NAIImgConfig.noise || 0;
             }
             
-            console.log({img2img:reqlist});
         }else{
 
             reqlist = commonReq;
             reqlist.body.action = 'generate';
-
-            console.log({nothing:reqlist});
-           
         }
         try {
-            const da = await globalFetch(db.NAIImgUrl, reqlist)   
+            const da = await globalFetch(db.NAIImgUrl, {
+                ...reqlist,
+                plainFetchDeforce: true,
+                proxyRequestHeaders: {
+                    'risu-image-class': priorityClass,
+                },
+                redactRequestLog: true,
+            })
 
+            if(!da.ok){
+                const reason = Buffer.from(da.data).toString()
+                const brokerResult = da.headers?.['risu-image-result']
+                const result:ImageGenerationResult = brokerResult === 'provider-response'
+                    ? { ok: false, certainty: 'definite', reason, providerStatus: da.status }
+                    : brokerResult === 'validation-reject'
+                        ? { ok: false, certainty: 'definite', reason }
+                        : { ok: false, certainty: 'uncertain', reason }
+                return {
+                    result,
+                    compatibilityValue: returnSdData === 'inlay' ? '' : false,
+                    shouldNotify: true,
+                    notifyErrorValue: reason,
+                }
+            }
+
+            const img = await processZip(da.data);
             if(returnSdData === 'inlay'){
-                if(da.ok){
-                    const img = await processZip(da.data);
-                    return img
-                }
-                else{
-                    notifyError(Buffer.from(da.data).toString())
-                    return ''
+                return {
+                    result: { ok: true, bytesOrDataUrl: img, providerStatus: da.status },
+                    compatibilityValue: img,
                 }
             }
 
-            else if(da.ok){
-                let charemotions = get(CharEmotion)
-                const img = await processZip(da.data);
-                const emos:[string, string,number][] = [[img, img, Date.now()]]
-                charemotions[currentChar.chaId] = emos
-                CharEmotion.set(charemotions)
+            let charemotions = get(CharEmotion)
+            const emos:[string, string,number][] = [[img, img, Date.now()]]
+            charemotions[currentChar.chaId] = emos
+            CharEmotion.set(charemotions)
+            return {
+                result: { ok: true, bytesOrDataUrl: img, providerStatus: da.status },
+                compatibilityValue: returnSdData,
             }
-            else{
-                notifyError(Buffer.from(da.data).toString())
-                return false   
-            }
-
-            return returnSdData
-
 
         } catch (error) {
-            notifyError(error)
-            return false   
+            return {
+                result: { ok: false, certainty: 'uncertain', reason: String(error) },
+                compatibilityValue: false,
+                shouldNotify: true,
+                notifyErrorValue: error,
+            }
         }
     }
     if(db.sdProvider === 'dalle'){

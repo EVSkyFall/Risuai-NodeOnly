@@ -1197,6 +1197,8 @@ interface GlobalFetchArgs {
     plainFetchDeforce?: boolean;
     body?: any;
     headers?: { [key: string]: string };
+    proxyRequestHeaders?: { [key: string]: string };
+    redactRequestLog?: boolean;
     rawResponse?: boolean;
     method?: 'POST' | 'GET';
     abortSignal?: AbortSignal;
@@ -1323,11 +1325,21 @@ export async function globalFetch(url: string, arg: GlobalFetchArgs = {}): Promi
  * @param {string} url - The URL of the fetch request.
  * @param {GlobalFetchArgs} arg - The arguments for the fetch request.
  */
+function redactFetchLogHeaders(headers: { [key: string]: string } | undefined) {
+    const redacted: { [key: string]: string } = {}
+    for (const [key, value] of Object.entries(headers ?? {})) {
+        redacted[key] = /authorization|cookie|token|api[-_]?key/i.test(key) ? '[REDACTED]' : value
+    }
+    return redacted
+}
+
 function addFetchLogInGlobalFetch(response: any, success: boolean, url: string, arg: GlobalFetchArgs, status?: number) {
+    const loggedBody = arg.redactRequestLog ? '[REDACTED SENSITIVE REQUEST BODY]' : undefined
+    const loggedHeaders = arg.redactRequestLog ? redactFetchLogHeaders(arg.headers) : undefined
     try {
         fetchLog.unshift({
-            body: JSON.stringify(arg.body, null, 2),
-            header: JSON.stringify(arg.headers ?? {}, null, 2),
+            body: loggedBody ?? JSON.stringify(arg.body, null, 2),
+            header: JSON.stringify(loggedHeaders ?? arg.headers ?? {}, null, 2),
             response: JSON.stringify(response, null, 2),
             success: success,
             date: (new Date()).toLocaleTimeString(),
@@ -1338,8 +1350,8 @@ function addFetchLogInGlobalFetch(response: any, success: boolean, url: string, 
     }
     catch {
         fetchLog.unshift({
-            body: JSON.stringify(arg.body, null, 2),
-            header: JSON.stringify(arg.headers ?? {}, null, 2),
+            body: loggedBody ?? JSON.stringify(arg.body, null, 2),
+            header: JSON.stringify(loggedHeaders ?? arg.headers ?? {}, null, 2),
             response: `${response}`,
             success: success,
             date: (new Date()).toLocaleTimeString(),
@@ -1407,6 +1419,7 @@ async function fetchWithProxy(url: string, arg: GlobalFetchArgs): Promise<Global
         arg.headers["Content-Type"] ??= arg.body instanceof URLSearchParams ? "application/x-www-form-urlencoded" : "application/json";
         const turnId = getEffectiveTurnId()
         const headers = {
+            ...(arg.proxyRequestHeaders ?? {}),
             "risu-header": encodeURIComponent(JSON.stringify(arg.headers)),
             "risu-url": encodeURIComponent(url),
             "Content-Type": arg.body instanceof URLSearchParams ? "application/x-www-form-urlencoded" : "application/json",

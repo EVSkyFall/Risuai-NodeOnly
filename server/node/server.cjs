@@ -2941,6 +2941,346 @@ async function checkAuth(req, res, returnOnlyStatus = false, {allowExpired = fal
     }
 }
 
+const NAI_IMAGE_CLASS_HEADER = 'risu-image-class';
+const NAI_IMAGE_RESULT_HEADER = 'risu-image-result';
+const NAI_IMAGE_PATH_PATTERN = /\/ai\/generate-image(?:\/|$)/i;
+const DEFAULT_NAI_IMAGE_MAX_HOLD_MS = 8 * 60 * 1000;
+const configuredNaiImageMaxHoldMs = Number.parseInt(process.env.RISU_NAI_IMAGE_MAX_HOLD_MS || '', 10);
+const NAI_IMAGE_MAX_HOLD_MS = Number.isFinite(configuredNaiImageMaxHoldMs) && configuredNaiImageMaxHoldMs > 0
+    ? configuredNaiImageMaxHoldMs
+    : DEFAULT_NAI_IMAGE_MAX_HOLD_MS;
+
+const naiImageBrokerQueues = {
+    interactive: [],
+    background: [],
+};
+let naiImageBrokerActive = false;
+
+function pumpNaiImageBroker() {
+    if (naiImageBrokerActive) return;
+
+    let entry;
+    while (!entry) {
+        entry = naiImageBrokerQueues.interactive.shift() || naiImageBrokerQueues.background.shift();
+        if (!entry) return;
+        if (entry.cancelled) entry = null;
+    }
+
+    naiImageBrokerActive = true;
+    entry.started = true;
+    let released = false;
+    entry.resolve(() => {
+        if (released) return;
+        released = true;
+        naiImageBrokerActive = false;
+        pumpNaiImageBroker();
+    });
+}
+
+function enqueueNaiImagePermit(requestClass) {
+    let entry;
+    const promise = new Promise((resolve) => {
+        entry = { resolve, started: false, cancelled: false };
+        naiImageBrokerQueues[requestClass].push(entry);
+        pumpNaiImageBroker();
+    });
+
+    return {
+        promise,
+        cancel: () => {
+            if (!entry || entry.started || entry.cancelled) return false;
+            entry.cancelled = true;
+            const queue = naiImageBrokerQueues[requestClass];
+            const index = queue.indexOf(entry);
+            if (index !== -1) queue.splice(index, 1);
+            entry.resolve(null);
+            return true;
+        },
+    };
+}
+
+function stripHeaderCaseInsensitive(headers, headerName) {
+    for (const key of Object.keys(headers || {})) {
+        if (key.toLowerCase() === headerName) delete headers[key];
+    }
+}
+
+function getHeaderCaseInsensitive(headers, headerName) {
+    const key = Object.keys(headers || {}).find((candidate) => candidate.toLowerCase() === headerName);
+    return key ? headers[key] : undefined;
+}
+
+function isPlainObject(value) {
+    return value !== null && typeof value === 'object' && !Array.isArray(value) && !Buffer.isBuffer(value);
+}
+
+function isLoopbackHostname(hostname) {
+    return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1';
+}
+
+function allowInsecureNaiTestTarget() {
+    return process.env.NODE_ENV === 'test'
+        && process.env.RISU_NAI_BROKER_ALLOW_INSECURE_TEST_TARGET === 'true';
+}
+
+function classifyNaiImageRequest(req, urlParam) {
+    const rawClass = req.headers[NAI_IMAGE_CLASS_HEADER];
+    const hasClass = rawClass !== undefined;
+    const shouldInspect = hasClass
+        || (typeof urlParam === 'string' && /novelai\.net/i.test(urlParam))
+        || (allowInsecureNaiTestTarget() && typeof urlParam === 'string' && NAI_IMAGE_PATH_PATTERN.test(urlParam));
+    if (!shouldInspect) return null;
+
+    let target;
+    try {
+        target = new URL(urlParam);
+    } catch {
+        return hasClass ? { error: 'Invalid NAI image target URL' } : null;
+    }
+
+    const hostname = target.hostname.toLowerCase();
+    const officialHost = hostname === 'novelai.net' || hostname.endsWith('.novelai.net');
+    const pathMatches = NAI_IMAGE_PATH_PATTERN.test(target.pathname);
+    const insecureTestTarget = allowInsecureNaiTestTarget()
+        && target.protocol === 'http:'
+        && isLoopbackHostname(hostname)
+        && pathMatches;
+
+    if (hasClass) {
+        const requestClass = Array.isArray(rawClass) ? rawClass.join(',') : String(rawClass).trim();
+        if (requestClass !== 'interactive' && requestClass !== 'background') {
+            return { error: 'Invalid NAI image request class' };
+        }
+        const validTarget = pathMatches
+            && !target.username
+            && !target.password
+            && (target.protocol === 'https:' || insecureTestTarget);
+        if (!validTarget) return { error: 'Invalid NAI image target' };
+        return { target, requestClass };
+    }
+
+    if (officialHost && pathMatches) {
+        if (target.protocol !== 'https:' || target.username || target.password) {
+            return { error: 'Invalid NAI image target' };
+        }
+        return { target, requestClass: 'interactive' };
+    }
+    if (insecureTestTarget) return { target, requestClass: 'interactive' };
+    return null;
+}
+
+function rejectNaiImageRequest(res, error) {
+    res.setHeader(NAI_IMAGE_RESULT_HEADER, 'validation-reject');
+    res.status(400).send({ error });
+}
+
+function parseNaiImageBody(req) {
+    if (isPlainObject(req.body)) return req.body;
+    if (Buffer.isBuffer(req.body)) return JSON.parse(req.body.toString('utf8'));
+    if (typeof req.body === 'string') return JSON.parse(req.body);
+    return null;
+}
+
+function copyNaiProxyResponseHeaders(originalResponse, res) {
+    const head = new Headers(originalResponse.headers);
+    head.delete('content-security-policy');
+    head.delete('content-security-policy-report-only');
+    head.delete('clear-site-data');
+    head.delete('Cache-Control');
+    head.delete('Content-Encoding');
+    head.delete('Content-Length');
+    const headObj = {};
+    for (const [key, value] of head) headObj[key] = value;
+    res.header(headObj);
+    res.setHeader(NAI_IMAGE_RESULT_HEADER, 'provider-response');
+    res.status(originalResponse.status);
+}
+
+function sendNaiTransportError(res, status) {
+    if (res.destroyed) return;
+    if (!res.headersSent) {
+        res.setHeader(NAI_IMAGE_RESULT_HEADER, 'transport-error');
+        res.status(status).send({ error: status === 504 ? 'NAI image request timed out' : 'NAI image transport failed' });
+    } else {
+        res.end();
+    }
+}
+
+async function runNaiImageBrokerRequest({
+    req,
+    res,
+    target,
+    requestClass,
+    forwardedHeaders,
+    requestBody,
+}) {
+    const requestTimeoutMs = getRequestTimeoutMs(req.headers['risu-timeout-ms']);
+    const requestTimeout = createTimeoutController(requestTimeoutMs);
+    let queuedPermit;
+    let dispatchController;
+    let abortCause = null;
+    let downstreamDisconnected = res.destroyed;
+
+    const onDownstreamClose = () => {
+        if (res.writableFinished) return;
+        downstreamDisconnected = true;
+        abortCause = 'client-disconnect';
+        if (dispatchController) {
+            dispatchController.abort(new Error('Downstream client disconnected'));
+        } else {
+            queuedPermit?.cancel();
+        }
+    };
+    const onRequestTimeout = () => {
+        abortCause = 'request-timeout';
+        if (!dispatchController) queuedPermit?.cancel();
+    };
+
+    res.once('close', onDownstreamClose);
+    requestTimeout.signal?.addEventListener('abort', onRequestTimeout, { once: true });
+    queuedPermit = enqueueNaiImagePermit(requestClass);
+    if (downstreamDisconnected || requestTimeout.signal?.aborted) queuedPermit.cancel();
+
+    const release = await queuedPermit.promise;
+    if (!release) {
+        if (!downstreamDisconnected && requestTimeout.signal?.aborted) {
+            sendNaiTransportError(res, 504);
+        }
+        res.removeListener('close', onDownstreamClose);
+        requestTimeout.signal?.removeEventListener('abort', onRequestTimeout);
+        requestTimeout.cleanup();
+        return;
+    }
+
+    const startedAt = Date.now();
+    let byteCount = 0;
+    let providerStatus = null;
+    let maxHoldTimer;
+    try {
+        if (downstreamDisconnected) return;
+        if (requestTimeout.signal?.aborted) {
+            sendNaiTransportError(res, 504);
+            return;
+        }
+
+        dispatchController = new AbortController();
+        maxHoldTimer = setTimeout(() => {
+            abortCause = 'max-hold-timeout';
+            dispatchController.abort(new Error('NAI image max hold elapsed'));
+        }, NAI_IMAGE_MAX_HOLD_MS);
+        maxHoldTimer.unref?.();
+
+        const signals = [dispatchController.signal];
+        if (requestTimeout.signal) signals.push(requestTimeout.signal);
+        const signal = signals.length === 1 ? signals[0] : AbortSignal.any(signals);
+        const originalResponse = await fetch(target, {
+            method: req.method,
+            headers: forwardedHeaders,
+            body: requestBody,
+            signal,
+        });
+        providerStatus = originalResponse.status;
+        copyNaiProxyResponseHeaders(originalResponse, res);
+
+        if (!originalResponse.body) {
+            res.end();
+            return;
+        }
+
+        const counter = new Transform({
+            transform(chunk, encoding, callback) {
+                byteCount += Buffer.byteLength(chunk);
+                callback(null, chunk);
+            },
+        });
+        await pipeline(originalResponse.body, counter, res, { signal });
+    } catch {
+        if (dispatchController && !dispatchController.signal.aborted) {
+            dispatchController.abort(new Error('NAI image transport settled with an error'));
+        }
+        if (abortCause === 'max-hold-timeout' || abortCause === 'request-timeout') {
+            sendNaiTransportError(res, 504);
+        } else if (abortCause !== 'client-disconnect') {
+            sendNaiTransportError(res, 502);
+        }
+    } finally {
+        if (maxHoldTimer) clearTimeout(maxHoldTimer);
+        res.removeListener('close', onDownstreamClose);
+        requestTimeout.signal?.removeEventListener('abort', onRequestTimeout);
+        requestTimeout.cleanup();
+        const status = abortCause || providerStatus || 'transport-error';
+        logger.info(`[NAI Image Broker] class=${requestClass} host=${target.hostname} elapsedMs=${Date.now() - startedAt} status=${status} bytes=${byteCount}`);
+        release();
+    }
+}
+
+async function handleNaiImageProxy(req, res, classification) {
+    if (classification.error) {
+        rejectNaiImageRequest(res, classification.error);
+        return;
+    }
+
+    stripHeaderCaseInsensitive(req.headers, NAI_IMAGE_CLASS_HEADER);
+    if (req.method !== 'POST') {
+        rejectNaiImageRequest(res, 'NAI image requests must use POST');
+        return;
+    }
+    if (!String(req.headers['content-type'] || '').toLowerCase().startsWith('application/json')) {
+        rejectNaiImageRequest(res, 'NAI image requests must use JSON');
+        return;
+    }
+
+    let forwardedHeaders;
+    let parsedBody;
+    try {
+        const encodedHeaders = req.headers['risu-header'];
+        if (typeof encodedHeaders !== 'string') throw new Error('missing forwarded headers');
+        forwardedHeaders = JSON.parse(decodeURIComponent(encodedHeaders));
+        parsedBody = parseNaiImageBody(req);
+    } catch {
+        rejectNaiImageRequest(res, 'Invalid NAI image request shape');
+        return;
+    }
+
+    const authorization = getHeaderCaseInsensitive(forwardedHeaders, 'authorization');
+    const validBody = isPlainObject(parsedBody)
+        && typeof parsedBody.input === 'string'
+        && typeof parsedBody.model === 'string'
+        && (parsedBody.action === 'generate' || parsedBody.action === 'img2img')
+        && isPlainObject(parsedBody.parameters);
+    if (!isPlainObject(forwardedHeaders)
+        || typeof authorization !== 'string'
+        || !/^Bearer\s+\S+\s*$/i.test(authorization)
+        || !validBody) {
+        rejectNaiImageRequest(res, 'Invalid NAI image request shape');
+        return;
+    }
+
+    stripHeaderCaseInsensitive(forwardedHeaders, NAI_IMAGE_CLASS_HEADER);
+    stripHeaderCaseInsensitive(forwardedHeaders, 'risu-auth');
+    stripHeaderCaseInsensitive(forwardedHeaders, 'risu-url');
+    stripHeaderCaseInsensitive(forwardedHeaders, 'risu-header');
+    if (req.headers['x-risu-tk'] && !forwardedHeaders['x-risu-tk']) {
+        forwardedHeaders['x-risu-tk'] = req.headers['x-risu-tk'];
+    }
+    if (req.headers['risu-location'] && !forwardedHeaders['risu-location']) {
+        forwardedHeaders['risu-location'] = req.headers['risu-location'];
+    }
+    if (!forwardedHeaders['x-forwarded-for']) forwardedHeaders['x-forwarded-for'] = req.ip;
+
+    const requestBody = Buffer.isBuffer(req.body) || typeof req.body === 'string'
+        ? req.body
+        : JSON.stringify(req.body);
+    await runNaiImageBrokerRequest({
+        req,
+        res,
+        target: classification.target,
+        requestClass: classification.requestClass,
+        forwardedHeaders,
+        requestBody,
+    });
+}
+
 const reverseProxyFunc = async (req, res, next) => {
     if(!await checkAuth(req, res)){
         return;
@@ -2952,6 +3292,11 @@ const reverseProxyFunc = async (req, res, next) => {
         res.status(400).send({
             error:'URL has no param'
         });
+        return;
+    }
+    const naiImageRequest = classifyNaiImageRequest(req, urlParam);
+    if (naiImageRequest) {
+        await handleNaiImageProxy(req, res, naiImageRequest);
         return;
     }
     const timeoutMs = getRequestTimeoutMs(req.headers['risu-timeout-ms']);
@@ -3065,6 +3410,11 @@ const reverseProxyFunc_get = async (req, res, next) => {
         res.status(400).send({
             error:'URL has no param'
         });
+        return;
+    }
+    const naiImageRequest = classifyNaiImageRequest(req, urlParam);
+    if (naiImageRequest) {
+        await handleNaiImageProxy(req, res, naiImageRequest);
         return;
     }
     const timeoutMs = getRequestTimeoutMs(req.headers['risu-timeout-ms']);
