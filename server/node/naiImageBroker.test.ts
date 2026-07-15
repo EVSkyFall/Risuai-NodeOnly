@@ -1,9 +1,11 @@
 // @vitest-environment node
 
 import { afterEach, describe, expect, it } from 'vitest'
+import Database from 'better-sqlite3'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { spawnServer, type ServerHandle } from '../../test/compat/helpers/spawnServer.js'
+import path from 'node:path'
+import { spawnServer, type ServerHandle, type SpawnServerOptions } from '../../test/compat/helpers/spawnServer.js'
 import { createClient, type RisuClient } from '../../test/compat/helpers/client.js'
 
 interface TestContext {
@@ -15,6 +17,22 @@ interface MockUpstream {
     origin: string
     close: () => Promise<void>
 }
+
+interface ActiveLease {
+    leaseId: string
+    startedAt: number
+    host: string
+    requestClass: 'interactive' | 'background'
+    pid: number
+}
+
+interface BrokerStatus {
+    active: boolean
+    cooldownUntil: number | null
+    queueDepth: { interactive: number; background: number }
+}
+
+const ACTIVE_LEASE_KEY = 'nai_broker/active_lease'
 
 const servers: ServerHandle[] = []
 const upstreams: MockUpstream[] = []
@@ -43,6 +61,43 @@ async function within<T>(promise: Promise<T>, ms = 3_000): Promise<T> {
     }
 }
 
+async function waitFor(predicate: () => boolean, ms = 3_000): Promise<void> {
+    const deadline = Date.now() + ms
+    while (Date.now() < deadline) {
+        if (predicate()) return
+        await delay(25)
+    }
+    throw new Error(`Condition did not become true within ${ms}ms`)
+}
+
+function seedActiveLease(saveDir: string, lease: ActiveLease) {
+    const db = new Database(path.join(saveDir, 'risuai.db'))
+    try {
+        db.exec(`
+            CREATE TABLE IF NOT EXISTS kv (
+                key TEXT PRIMARY KEY,
+                value BLOB NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+        `)
+        db.prepare('INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)')
+            .run(ACTIVE_LEASE_KEY, Buffer.from(JSON.stringify(lease)), Date.now())
+    } finally {
+        db.close()
+    }
+}
+
+function readActiveLease(cwd: string): ActiveLease | null {
+    const db = new Database(path.join(cwd, 'save', 'risuai.db'), { readonly: true, fileMustExist: true })
+    try {
+        db.pragma('busy_timeout = 5000')
+        const row = db.prepare('SELECT value FROM kv WHERE key = ?').get(ACTIVE_LEASE_KEY) as { value: Buffer } | undefined
+        return row ? JSON.parse(Buffer.from(row.value).toString('utf-8')) as ActiveLease : null
+    } finally {
+        db.close()
+    }
+}
+
 async function startUpstream(
     handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>,
 ): Promise<MockUpstream> {
@@ -68,8 +123,12 @@ async function startUpstream(
     return mock
 }
 
-async function boot(extraEnv: Record<string, string> = {}): Promise<TestContext> {
+async function boot(
+    extraEnv: Record<string, string> = {},
+    options: Omit<SpawnServerOptions, 'env'> = {},
+): Promise<TestContext> {
     const server = await spawnServer({
+        ...options,
         env: {
             RISU_TUNNEL_DISABLED: 'true',
             RISU_UPDATE_CHECK: 'false',
@@ -79,6 +138,12 @@ async function boot(extraEnv: Record<string, string> = {}): Promise<TestContext>
     })
     servers.push(server)
     return { server, client: await createClient(server.port, server.password) }
+}
+
+async function readBrokerStatus(context: TestContext): Promise<BrokerStatus> {
+    const response = await context.client.fetch('/api/nai-broker/status')
+    expect(response.status).toBe(200)
+    return await response.json() as BrokerStatus
 }
 
 function validBody(id: string, parameters: Record<string, unknown> = {}) {
@@ -132,7 +197,7 @@ function proxyRequest(
 }
 
 afterEach(async () => {
-    await Promise.all(servers.splice(0).map((server) => server.cleanup()))
+    for (const server of servers.splice(0).reverse()) await server.cleanup()
     await Promise.all(upstreams.splice(0).map((upstream) => upstream.close()))
 })
 
@@ -448,6 +513,200 @@ describe('server-authoritative NAI image broker', { timeout: 30_000 }, () => {
         }
         const naiResponse = await nai
         await naiResponse.arrayBuffer()
+    })
+
+    it('makes zero upstream calls when the durable lease write fails and releases the permit', async () => {
+        let upstreamCalls = 0
+        const upstream = await startUpstream((_req, res) => {
+            upstreamCalls += 1
+            res.writeHead(200, { 'content-type': 'image/png' })
+            res.end(Buffer.from('image'))
+        })
+        const context = await boot()
+        const db = new Database(path.join(context.server.cwd, 'save', 'risuai.db'))
+        db.pragma('busy_timeout = 5000')
+        try {
+            db.exec(`
+                CREATE TRIGGER fail_nai_active_lease
+                BEFORE INSERT ON kv
+                WHEN NEW.key = '${ACTIVE_LEASE_KEY}'
+                BEGIN
+                    SELECT RAISE(FAIL, 'test lease write failure');
+                END
+            `)
+
+            const failed = await proxyRequest(context, `${upstream.origin}/ai/generate-image`, { id: 'blocked' })
+            await failed.arrayBuffer()
+            expect(failed.status).toBe(503)
+            expect(failed.headers.get('risu-image-result')).toBe('lease-write-failed')
+            expect(upstreamCalls).toBe(0)
+            expect(readActiveLease(context.server.cwd)).toBeNull()
+
+            db.exec('DROP TRIGGER fail_nai_active_lease')
+            const recovered = await proxyRequest(context, `${upstream.origin}/ai/generate-image`, { id: 'recovered' })
+            await recovered.arrayBuffer()
+            expect(recovered.status).toBe(200)
+            expect(upstreamCalls).toBe(1)
+        } finally {
+            db.exec('DROP TRIGGER IF EXISTS fail_nai_active_lease')
+            db.close()
+        }
+    })
+
+    it('persists the active lease before dispatch and clears it after the body settles', async () => {
+        const upstreamStarted = deferred()
+        const releaseBody = deferred()
+        const upstream = await startUpstream(async (_req, res) => {
+            res.writeHead(200, { 'content-type': 'image/png' })
+            res.write(Buffer.from('partial'))
+            upstreamStarted.resolve()
+            await releaseBody.promise
+            res.end(Buffer.from('complete'))
+        })
+        const context = await boot()
+        const responsePromise = proxyRequest(context, `${upstream.origin}/ai/generate-image`, {
+            id: 'lease-lifecycle',
+            requestClass: 'background',
+        })
+
+        await upstreamStarted.promise
+        const lease = readActiveLease(context.server.cwd)
+        expect(lease).not.toBeNull()
+        expect(lease?.leaseId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i)
+        expect(lease?.startedAt).toBeGreaterThan(0)
+        expect(lease?.host).toBe('127.0.0.1')
+        expect(lease?.requestClass).toBe('background')
+        expect(lease?.pid).toBe(context.server.pid)
+
+        releaseBody.resolve()
+        const response = await responsePromise
+        await response.arrayBuffer()
+        expect(response.status).toBe(200)
+        await waitFor(() => readActiveLease(context.server.cwd) === null)
+    })
+
+    it('holds queued requests during a fresh boot cooldown and exposes the hold state', async () => {
+        let upstreamCalls = 0
+        const upstream = await startUpstream((_req, res) => {
+            upstreamCalls += 1
+            res.writeHead(200, { 'content-type': 'image/png' })
+            res.end(Buffer.from('image'))
+        })
+        const seededLease: ActiveLease = {
+            leaseId: 'seeded-fresh-lease',
+            startedAt: Date.now() - 100,
+            host: 'image.novelai.net',
+            requestClass: 'background',
+            pid: 12345,
+        }
+        const context = await boot(
+            {
+                // Window must comfortably exceed worst-case server boot (spawnServer
+                // waits up to 10s) because startedAt is anchored BEFORE boot.
+                RISU_NAI_IMAGE_MAX_HOLD_MS: '8000',
+                RISU_NAI_BROKER_COOLDOWN_MARGIN_MS: '4000',
+            },
+            { seedSave: async (saveDir) => seedActiveLease(saveDir, seededLease) },
+        )
+
+        const initialStatus = await readBrokerStatus(context)
+        expect(initialStatus.active).toBe(false)
+        expect(initialStatus.cooldownUntil).toBe(seededLease.startedAt + 12_000)
+        expect(initialStatus.cooldownUntil).toBeGreaterThan(Date.now())
+
+        const request = proxyRequest(context, `${upstream.origin}/ai/generate-image`, {
+            id: 'after-cooldown',
+            requestClass: 'interactive',
+        })
+        await delay(150)
+        expect(upstreamCalls).toBe(0)
+        const queuedStatus = await readBrokerStatus(context)
+        expect(queuedStatus.cooldownUntil).toBe(initialStatus.cooldownUntil)
+        expect(queuedStatus.queueDepth).toEqual({ interactive: 1, background: 0 })
+
+        const response = await within(request, 20_000)
+        await response.arrayBuffer()
+        expect(response.status).toBe(200)
+        expect(upstreamCalls).toBe(1)
+        await waitFor(() => readActiveLease(context.server.cwd) === null)
+        const finalStatus = await readBrokerStatus(context)
+        expect(finalStatus.cooldownUntil).toBeNull()
+        expect(finalStatus.queueDepth).toEqual({ interactive: 0, background: 0 })
+        const output = context.server.getOutput()
+        expect(output.stdout + output.stderr).toContain('previous upstream outcome UNKNOWN')
+    })
+
+    it('clears an expired boot lease and proceeds without a cooldown', async () => {
+        let upstreamCalls = 0
+        const upstream = await startUpstream((_req, res) => {
+            upstreamCalls += 1
+            res.writeHead(200, { 'content-type': 'image/png' })
+            res.end(Buffer.from('image'))
+        })
+        const seededLease: ActiveLease = {
+            leaseId: 'seeded-expired-lease',
+            startedAt: Date.now() - 60_000,
+            host: 'image.novelai.net',
+            requestClass: 'interactive',
+            pid: 12345,
+        }
+        const context = await boot(
+            {
+                RISU_NAI_IMAGE_MAX_HOLD_MS: '500',
+                RISU_NAI_BROKER_COOLDOWN_MARGIN_MS: '100',
+            },
+            { seedSave: async (saveDir) => seedActiveLease(saveDir, seededLease) },
+        )
+
+        expect(readActiveLease(context.server.cwd)).toBeNull()
+        const status = await readBrokerStatus(context)
+        expect(status.cooldownUntil).toBeNull()
+        const response = await within(proxyRequest(
+            context,
+            `${upstream.origin}/ai/generate-image`,
+            { id: 'expired-fast-path' },
+        ), 2_000)
+        await response.arrayBuffer()
+        expect(response.status).toBe(200)
+        expect(upstreamCalls).toBe(1)
+        await waitFor(() => readActiveLease(context.server.cwd) === null)
+    })
+
+    it('enters cooldown after SIGKILL leaves an acknowledged active lease', async () => {
+        const upstreamStarted = deferred()
+        const upstream = await startUpstream((_req, res) => {
+            res.writeHead(200, { 'content-type': 'image/png' })
+            res.write(Buffer.from('partial'))
+            upstreamStarted.resolve()
+            const timer = setInterval(() => res.write(Buffer.from('more')), 50)
+            res.once('close', () => clearInterval(timer))
+        })
+        const cooldownEnv = {
+            RISU_NAI_IMAGE_MAX_HOLD_MS: '5000',
+            RISU_NAI_BROKER_COOLDOWN_MARGIN_MS: '2000',
+        }
+        const first = await boot(cooldownEnv)
+        const firstResponse = await proxyRequest(first, `${upstream.origin}/ai/generate-image`, {
+            id: 'crash-orphan',
+            requestClass: 'background',
+        })
+        const firstBody = firstResponse.arrayBuffer().catch(() => new ArrayBuffer(0))
+        await upstreamStarted.promise
+
+        const acknowledgedLease = readActiveLease(first.server.cwd)
+        expect(acknowledgedLease).not.toBeNull()
+        expect(acknowledgedLease?.pid).toBe(first.server.pid)
+        await first.server.stop('SIGKILL')
+        await within(firstBody)
+
+        const restarted = await boot(cooldownEnv, { cwd: first.server.cwd })
+        const status = await readBrokerStatus(restarted)
+        expect(status.active).toBe(false)
+        expect(status.cooldownUntil).toBe(acknowledgedLease!.startedAt + 7000)
+        expect(status.cooldownUntil).toBeGreaterThan(Date.now())
+        expect(readActiveLease(restarted.server.cwd)?.leaseId).toBe(acknowledgedLease?.leaseId)
+        const output = restarted.server.getOutput()
+        expect(output.stdout + output.stderr).toContain('previous upstream outcome UNKNOWN')
     })
 
     it('rejects invalid marked request shapes before any queue slot or upstream call', async () => {

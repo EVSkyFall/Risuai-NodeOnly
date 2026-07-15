@@ -2944,20 +2944,149 @@ async function checkAuth(req, res, returnOnlyStatus = false, {allowExpired = fal
 const NAI_IMAGE_CLASS_HEADER = 'risu-image-class';
 const NAI_IMAGE_RESULT_HEADER = 'risu-image-result';
 const NAI_IMAGE_PATH_PATTERN = /\/ai\/generate-image(?:\/|$)/i;
+const NAI_BROKER_ACTIVE_LEASE_KEY = 'nai_broker/active_lease';
 const DEFAULT_NAI_IMAGE_MAX_HOLD_MS = 8 * 60 * 1000;
+const DEFAULT_NAI_BROKER_COOLDOWN_MARGIN_MS = 60 * 1000;
+const NAI_BROKER_COOLDOWN_CLEAR_RETRY_MS = 1000;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+const MAX_DATE_TIMESTAMP_MS = 8_640_000_000_000_000;
 const configuredNaiImageMaxHoldMs = Number.parseInt(process.env.RISU_NAI_IMAGE_MAX_HOLD_MS || '', 10);
 const NAI_IMAGE_MAX_HOLD_MS = Number.isFinite(configuredNaiImageMaxHoldMs) && configuredNaiImageMaxHoldMs > 0
     ? configuredNaiImageMaxHoldMs
     : DEFAULT_NAI_IMAGE_MAX_HOLD_MS;
+const configuredNaiBrokerCooldownMarginMs = Number.parseInt(process.env.RISU_NAI_BROKER_COOLDOWN_MARGIN_MS || '', 10);
+const NAI_BROKER_COOLDOWN_MARGIN_MS = Number.isFinite(configuredNaiBrokerCooldownMarginMs)
+    && configuredNaiBrokerCooldownMarginMs >= 0
+    ? configuredNaiBrokerCooldownMarginMs
+    : DEFAULT_NAI_BROKER_COOLDOWN_MARGIN_MS;
 
 const naiImageBrokerQueues = {
     interactive: [],
     background: [],
 };
 let naiImageBrokerActive = false;
+let naiBrokerCooldownUntil = null;
+let naiBrokerCooldownTimer = null;
+let naiBrokerCooldownLeaseStartedAt = null;
+let naiBrokerCooldownClearFailureLogged = false;
+
+function calculateNaiBrokerCooldownUntil(startedAt) {
+    const cooldownUntil = startedAt + NAI_IMAGE_MAX_HOLD_MS + NAI_BROKER_COOLDOWN_MARGIN_MS;
+    return Number.isFinite(cooldownUntil) && cooldownUntil <= MAX_DATE_TIMESTAMP_MS
+        ? cooldownUntil
+        : MAX_DATE_TIMESTAMP_MS;
+}
+
+function scheduleNaiBrokerCooldownPump(delayMs) {
+    if (naiBrokerCooldownTimer) return;
+    const boundedDelay = Math.max(1, Math.min(delayMs, MAX_TIMER_DELAY_MS));
+    naiBrokerCooldownTimer = setTimeout(() => {
+        naiBrokerCooldownTimer = null;
+        pumpNaiImageBroker();
+    }, boundedDelay);
+    naiBrokerCooldownTimer.unref?.();
+}
+
+function enterNaiBrokerCooldown(cooldownUntil, leaseStartedAt, reason) {
+    naiBrokerCooldownUntil = cooldownUntil;
+    naiBrokerCooldownLeaseStartedAt = leaseStartedAt;
+    naiBrokerCooldownClearFailureLogged = false;
+    logger.warn(`[NAI Image Broker] previous upstream outcome UNKNOWN; precautionary hold reason=${reason} until=${new Date(cooldownUntil).toISOString()}`);
+    const remaining = cooldownUntil - Date.now();
+    scheduleNaiBrokerCooldownPump(remaining > 0 ? remaining : NAI_BROKER_COOLDOWN_CLEAR_RETRY_MS);
+}
+
+function clearNaiBrokerCooldownLease() {
+    try {
+        kvDel(NAI_BROKER_ACTIVE_LEASE_KEY);
+    } catch {
+        if (!naiBrokerCooldownClearFailureLogged) {
+            logger.warn('[NAI Image Broker] precautionary hold remains active because durable lease clear failed');
+            naiBrokerCooldownClearFailureLogged = true;
+        }
+        scheduleNaiBrokerCooldownPump(NAI_BROKER_COOLDOWN_CLEAR_RETRY_MS);
+        return false;
+    }
+
+    const leaseStartedAt = naiBrokerCooldownLeaseStartedAt;
+    naiBrokerCooldownUntil = null;
+    naiBrokerCooldownLeaseStartedAt = null;
+    naiBrokerCooldownClearFailureLogged = false;
+    const leaseTime = Number.isFinite(leaseStartedAt) ? ` leaseStartedAt=${new Date(leaseStartedAt).toISOString()}` : '';
+    logger.info(`[NAI Image Broker] precautionary hold ended; previous upstream outcome remains UNKNOWN${leaseTime}`);
+    return true;
+}
+
+function parseNaiBrokerActiveLease(rawLease) {
+    try {
+        const lease = JSON.parse(Buffer.from(rawLease).toString('utf-8'));
+        if (!isPlainObject(lease)
+            || typeof lease.leaseId !== 'string'
+            || lease.leaseId.length === 0
+            || !Number.isSafeInteger(lease.startedAt)
+            || lease.startedAt < 0
+            || lease.startedAt > MAX_DATE_TIMESTAMP_MS
+            || typeof lease.host !== 'string'
+            || (lease.requestClass !== 'interactive' && lease.requestClass !== 'background')
+            || !Number.isInteger(lease.pid)) {
+            return null;
+        }
+        return lease;
+    } catch {
+        return null;
+    }
+}
+
+function initializeNaiBrokerRestartHardening() {
+    const now = Date.now();
+    let rawLease;
+    try {
+        rawLease = kvGet(NAI_BROKER_ACTIVE_LEASE_KEY);
+    } catch {
+        enterNaiBrokerCooldown(
+            calculateNaiBrokerCooldownUntil(now),
+            null,
+            'lease-read-failed',
+        );
+        return;
+    }
+    if (rawLease === null) return;
+
+    const lease = parseNaiBrokerActiveLease(rawLease);
+    if (!lease) {
+        enterNaiBrokerCooldown(
+            calculateNaiBrokerCooldownUntil(now),
+            null,
+            'lease-invalid',
+        );
+        return;
+    }
+
+    const cooldownUntil = calculateNaiBrokerCooldownUntil(lease.startedAt);
+    if (cooldownUntil > now) {
+        enterNaiBrokerCooldown(cooldownUntil, lease.startedAt, 'orphaned-active-lease');
+        return;
+    }
+
+    try {
+        kvDel(NAI_BROKER_ACTIVE_LEASE_KEY);
+        logger.info(`[NAI Image Broker] cleared stale lease from ${new Date(lease.startedAt).toISOString()}; previous upstream outcome remains UNKNOWN`);
+    } catch {
+        enterNaiBrokerCooldown(cooldownUntil, lease.startedAt, 'stale-lease-clear-failed');
+    }
+}
 
 function pumpNaiImageBroker() {
     if (naiImageBrokerActive) return;
+    if (naiBrokerCooldownUntil !== null) {
+        const remaining = naiBrokerCooldownUntil - Date.now();
+        if (remaining > 0) {
+            scheduleNaiBrokerCooldownPump(remaining);
+            return;
+        }
+        if (naiBrokerCooldownTimer) return;
+        if (!clearNaiBrokerCooldownLease()) return;
+    }
 
     let entry;
     while (!entry) {
@@ -2998,6 +3127,18 @@ function enqueueNaiImagePermit(requestClass) {
         },
     };
 }
+
+app.get('/api/nai-broker/status', async (req, res) => {
+    if (!await checkAuth(req, res)) return;
+    res.json({
+        active: naiImageBrokerActive,
+        cooldownUntil: naiBrokerCooldownUntil,
+        queueDepth: {
+            interactive: naiImageBrokerQueues.interactive.length,
+            background: naiImageBrokerQueues.background.length,
+        },
+    });
+});
 
 function stripHeaderCaseInsensitive(headers, headerName) {
     for (const key of Object.keys(headers || {})) {
@@ -3106,6 +3247,16 @@ function sendNaiTransportError(res, status) {
     }
 }
 
+function sendNaiLeaseWriteError(res) {
+    if (res.destroyed) return;
+    if (!res.headersSent) {
+        res.setHeader(NAI_IMAGE_RESULT_HEADER, 'lease-write-failed');
+        res.status(503).send({ error: 'NAI image broker lease unavailable' });
+    } else {
+        res.end();
+    }
+}
+
 async function runNaiImageBrokerRequest({
     req,
     res,
@@ -3156,10 +3307,29 @@ async function runNaiImageBrokerRequest({
     let byteCount = 0;
     let providerStatus = null;
     let maxHoldTimer;
+    let leaseWritten = false;
     try {
         if (downstreamDisconnected) return;
         if (requestTimeout.signal?.aborted) {
             sendNaiTransportError(res, 504);
+            return;
+        }
+
+        const activeLease = {
+            leaseId: nodeCrypto.randomUUID(),
+            startedAt,
+            host: target.hostname,
+            requestClass,
+            pid: process.pid,
+        };
+        try {
+            // This synchronous return is the accepted process-crash durability
+            // ACK boundary, matching Gate 1's SQLite WAL + synchronous=NORMAL use.
+            kvSet(NAI_BROKER_ACTIVE_LEASE_KEY, Buffer.from(JSON.stringify(activeLease), 'utf-8'));
+            leaseWritten = true;
+        } catch {
+            abortCause = 'lease-write-failed';
+            sendNaiLeaseWriteError(res);
             return;
         }
 
@@ -3208,6 +3378,13 @@ async function runNaiImageBrokerRequest({
         res.removeListener('close', onDownstreamClose);
         requestTimeout.signal?.removeEventListener('abort', onRequestTimeout);
         requestTimeout.cleanup();
+        if (leaseWritten) {
+            try {
+                kvDel(NAI_BROKER_ACTIVE_LEASE_KEY);
+            } catch {
+                logger.warn(`[NAI Image Broker] lease clear failed class=${requestClass} host=${target.hostname}`);
+            }
+        }
         const status = abortCause || providerStatus || 'transport-error';
         logger.info(`[NAI Image Broker] class=${requestClass} host=${target.hostname} elapsedMs=${Date.now() - startedAt} status=${status} bytes=${byteCount}`);
         release();
@@ -8198,6 +8375,7 @@ async function startServer() {
     try {
         await migrateInlaysToFilesystem();
         await migrateRemoteBlocksIfNeeded();
+        initializeNaiBrokerRestartHardening();
         const port = process.env.PORT || 6001;
         const httpsOptions = await getHttpsOptions();
         let server;

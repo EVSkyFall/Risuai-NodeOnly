@@ -19,7 +19,10 @@ export interface ServerHandle {
   port: number
   password: string
   cwd: string
+  pid: number
   getOutput: () => { stdout: string; stderr: string }
+  /** Stop the child without deleting its working directory. */
+  stop: (signal?: NodeJS.Signals) => Promise<void>
   /** Kill the server and clean up the temp directory. */
   cleanup: () => Promise<void>
 }
@@ -45,6 +48,8 @@ async function getFreePort(): Promise<number> {
 export interface SpawnServerOptions {
   /** Extra env vars to pass to the spawned server process. */
   env?: Record<string, string>
+  /** Reuse an existing isolated working directory, e.g. for restart tests. */
+  cwd?: string
   /**
    * Seed files into the temp `save/` directory BEFORE the server boots — e.g.
    * to plant an old hex-named save folder and exercise migrateFromSaveDir.
@@ -54,7 +59,9 @@ export interface SpawnServerOptions {
 }
 
 export async function spawnServer(opts: SpawnServerOptions = {}): Promise<ServerHandle> {
-  const tempDir = await mkdtemp(path.join(tmpdir(), 'risu-compat-'))
+  const ownsCwd = opts.cwd === undefined
+  const tempDir = opts.cwd ?? await mkdtemp(path.join(tmpdir(), 'risu-compat-'))
+  await mkdir(tempDir, { recursive: true })
   await mkdir(path.join(tempDir, 'save'), { recursive: true })
   await mkdir(path.join(tempDir, 'backups'), { recursive: true })
   await writeFile(path.join(tempDir, 'save', '__password'), TEST_PASSWORD, 'utf-8')
@@ -71,6 +78,10 @@ export async function spawnServer(opts: SpawnServerOptions = {}): Promise<Server
       stdio: ['ignore', 'pipe', 'pipe'],
     },
   )
+  if (child.pid === undefined) throw new Error('Spawned server has no process id')
+
+  let exited = child.exitCode !== null
+  child.on('exit', () => { exited = true })
 
   // Collect process output for diagnostics and log-redaction assertions.
   let stdoutBuf = ''
@@ -98,24 +109,36 @@ export async function spawnServer(opts: SpawnServerOptions = {}): Promise<Server
     })
   })
 
-  // Track exit state via event listener (set up once, before any cleanup call)
-  let exited = child.exitCode !== null
-  child.on('exit', () => { exited = true })
+  const stop = async (signal: NodeJS.Signals = 'SIGTERM') => {
+    if (exited) return
+    const exitPromise = new Promise<void>((resolve) => child.once('exit', () => resolve()))
+    child.kill(signal)
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        exitPromise,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`Server did not exit after ${signal}`)), 5000)
+        }),
+      ])
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+  }
 
   const cleanup = async () => {
     if (!exited) {
-      child.kill('SIGTERM')
-      await new Promise<void>(resolve => {
-        const timeout = setTimeout(() => {
-          if (!exited) child.kill('SIGKILL')
-          resolve()
-        }, 3000)
-        child.on('exit', () => { clearTimeout(timeout); resolve() })
-      })
+      try {
+        await stop('SIGTERM')
+      } catch {
+        if (!exited) await stop('SIGKILL')
+      }
     }
-    await rm(tempDir, { recursive: true, force: true })
+    if (ownsCwd) {
+      await rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+    }
   }
 
   const getOutput = () => ({ stdout: stdoutBuf, stderr: stderrBuf })
-  return { port, password: TEST_PASSWORD, cwd: tempDir, getOutput, cleanup }
+  return { port, password: TEST_PASSWORD, cwd: tempDir, pid: child.pid, getOutput, stop, cleanup }
 }
