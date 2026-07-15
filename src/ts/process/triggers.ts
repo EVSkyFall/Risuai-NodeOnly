@@ -13,7 +13,7 @@ import { HypaProcesser } from "./memory/hypamemory";
 import { requestChatData } from "./request/request";
 import { collectStreamingText } from "./request/shared";
 import { generateAIImage } from "./stableDiff";
-import { writeInlayImage } from "./files/inlays";
+import { InlayImageWriteError, writeInlayImage } from "./files/inlays";
 import { runScripted } from "./scriptings";
 import { calcString } from "./infunctions";
 
@@ -1518,9 +1518,18 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                     }
                     const imgHTML = new Image()
                     imgHTML.src = gen
-                    const inlay = await writeInlayImage(imgHTML)
-                    const res = `{{inlay::${inlay}}}`
-                    setVar(effect.inputVar, res)
+                    try {
+                        const inlay = await writeInlayImage(imgHTML)
+                        const res = `{{inlay::${inlay}}}`
+                        setVar(effect.inputVar, res)
+                    } catch (error) {
+                        if (error instanceof InlayImageWriteError) {
+                            console.warn('Failed to decode trigger-generated inlay image:', error)
+                            setVar(effect.inputVar, 'Error: Image generation failed')
+                            break
+                        }
+                        throw error
+                    }
                     break
                 }
 
@@ -1856,9 +1865,18 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                     }
                     let imgHTML = new Image()
                     imgHTML.src = gen
-                    let inlay = await writeInlayImage(imgHTML)
-                    let res = `{{inlay::${inlay}}}`
-                    setVar(risuChatParser(effect.outputVar, {chara:char}), res)
+                    try {
+                        let inlay = await writeInlayImage(imgHTML)
+                        let res = `{{inlay::${inlay}}}`
+                        setVar(risuChatParser(effect.outputVar, {chara:char}), res)
+                    } catch (error) {
+                        if (error instanceof InlayImageWriteError) {
+                            console.warn('Failed to decode V2 trigger-generated inlay image:', error)
+                            setVar(risuChatParser(effect.outputVar, {chara:char}), 'null')
+                            break
+                        }
+                        throw error
+                    }
                     break
 
                 }

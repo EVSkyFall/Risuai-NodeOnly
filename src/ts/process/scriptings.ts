@@ -8,7 +8,7 @@ import { ReloadChatPointer, ReloadGUIPointer, selectedCharID } from "../stores.s
 import { alertSelect, alertError, alertInput, alertNormal, alertConfirm } from "../alert";
 import { HypaProcesser } from "./memory/hypamemory";
 import { generateAIImage } from "./stableDiff";
-import { writeInlayImage, getInlayAsset } from "./files/inlays";
+import { InlayImageWriteError, writeInlayImage, getInlayAsset } from "./files/inlays";
 import type { OpenAIChat, MultiModal } from "./index.svelte";
 import { requestChatData, type StreamResponseChunk } from "./request/request";
 import { v4 } from "uuid";
@@ -453,8 +453,16 @@ export async function runScripted(code:string, arg:{
                 }
                 const imgHTML = new Image()
                 imgHTML.src = gen
-                const inlay = await writeInlayImage(imgHTML)
-                return `{{inlay::${inlay}}}`
+                try {
+                    const inlay = await writeInlayImage(imgHTML)
+                    return `{{inlay::${inlay}}}`
+                } catch (error) {
+                    if (error instanceof InlayImageWriteError) {
+                        console.warn('Failed to decode Lua-generated inlay image:', error)
+                        return 'Error: Image generation failed'
+                    }
+                    throw error
+                }
             })
 
             declareAPI('getCharacterImageMain', async (id:string) => {

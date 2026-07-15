@@ -5,9 +5,13 @@ import {
     getInlayAsset,
     getInlayAssetBlob,
     getCharacterChatIndex,
+    getInlayInfosBatch,
+    getInlayMeta,
+    inspectInlayAssetIntegrity,
     listInlayAssets,
     listInlayExplorerItems,
     postInlayAsset,
+    repairInlayAssetRecords,
     removeInlayAsset,
     setInlayAsset,
     writeInlayImage,
@@ -20,21 +24,27 @@ import {
 const fakeCtx = {
     drawImage: vi.fn(),
 }
+const canvasMockState: {
+    blob: Blob | null
+    context: typeof fakeCtx | null
+} = {
+    blob: new Blob(['fake-image'], { type: 'image/png' }),
+    context: fakeCtx,
+}
 const origCreateElement = document.createElement.bind(document)
 vi.spyOn(document, 'createElement').mockImplementation((tag: string, options?: any) => {
     const el = origCreateElement(tag, options)
     if (tag === 'canvas') {
-        ;(el as HTMLCanvasElement).getContext = (() => fakeCtx) as any
+        ;(el as HTMLCanvasElement).getContext = (() => canvasMockState.context) as any
         ;(el as HTMLCanvasElement).toBlob = ((cb: BlobCallback, type?: string) => {
-            cb(new Blob(['fake-image'], { type: type || 'image/png' }))
+            cb(canvasMockState.blob && new Blob([canvasMockState.blob], { type: type || 'image/png' }))
         }) as any
     }
     return el
 })
 
-const { nodeStorageMap, inlayMetaMap } = vi.hoisted(() => ({
+const { nodeStorageMap } = vi.hoisted(() => ({
     nodeStorageMap: new Map<string, Uint8Array>(),
-    inlayMetaMap: new Map<string, any>(),
 }))
 
 vi.mock('src/ts/storage/nodeStorage', () => {
@@ -68,33 +78,18 @@ vi.mock('src/ts/storage/nodeStorage', () => {
     return { NodeStorage: MockNodeStorage }
 })
 
-vi.mock('src/ts/process/files/inlayMeta', () => ({
-    getInlayMeta: vi.fn(async (id: string) => inlayMetaMap.get(id) ?? null),
-    getInlayMetasBatch: vi.fn(async (ids: string[]) => Object.fromEntries(
-        ids
-            .filter((id) => inlayMetaMap.has(id))
-            .map((id) => [id, inlayMetaMap.get(id)])
-    )),
-    setInlayMeta: vi.fn(async (id: string, meta: any) => { inlayMetaMap.set(id, meta) }),
-    removeInlayMeta: vi.fn(async (id: string) => { inlayMetaMap.delete(id) }),
-    buildInlayMeta: vi.fn((existing: any) => ({
-        createdAt: existing?.createdAt ?? Date.now(),
-        updatedAt: Date.now(),
-    })),
-    listInlayMetaEntries: vi.fn(async () => [...inlayMetaMap.entries()]),
-}))
-
 vi.mock('uuid', () => ({
     v4: vi.fn(() => 'test-uuid-1234'),
 }))
 
-const { getDatabaseMock } = vi.hoisted(() => ({
+const { getCurrentCharacterMock, getDatabaseMock } = vi.hoisted(() => ({
+    getCurrentCharacterMock: vi.fn<() => any>(() => null),
     getDatabaseMock: vi.fn<() => any>(() => ({ characters: [] })),
 }))
 
 vi.mock(import('src/ts/storage/database.svelte'), () => ({
     getDatabase: getDatabaseMock,
-    getCurrentCharacter: vi.fn(() => null),
+    getCurrentCharacter: getCurrentCharacterMock,
     getCurrentChat: vi.fn(() => null),
 }))
 
@@ -119,21 +114,28 @@ function makeImage(w: number, h: number): HTMLImageElement {
     const img = new Image()
     Object.defineProperty(img, 'width', { get: () => w })
     Object.defineProperty(img, 'height', { get: () => h })
-    Object.defineProperty(img, 'onload', {
-        set(fn: () => void) {
-            fn?.()
-        },
-        get() {
-            return null
-        },
-    })
+    Object.defineProperty(img, 'naturalWidth', { get: () => w })
+    Object.defineProperty(img, 'naturalHeight', { get: () => h })
+    Object.defineProperty(img, 'complete', { get: () => true })
+    return img
+}
+
+function makePendingImage(w = 1, h = 1): HTMLImageElement {
+    const img = new Image()
+    Object.defineProperty(img, 'width', { get: () => w })
+    Object.defineProperty(img, 'height', { get: () => h })
+    Object.defineProperty(img, 'naturalWidth', { get: () => 0 })
+    Object.defineProperty(img, 'naturalHeight', { get: () => 0 })
+    Object.defineProperty(img, 'complete', { get: () => false })
     return img
 }
 
 beforeEach(() => {
     vi.clearAllMocks()
     nodeStorageMap.clear()
-    inlayMetaMap.clear()
+    canvasMockState.blob = new Blob(['fake-image'], { type: 'image/png' })
+    canvasMockState.context = fakeCtx
+    getCurrentCharacterMock.mockReturnValue(null)
     getDatabaseMock.mockReturnValue({ characters: [] })
     __resetInlayStorageForTest()
 })
@@ -350,12 +352,12 @@ describe('getCharacterChatIndex', () => {
 
 describe('listInlayExplorerItems', () => {
     test('returns lightweight explorer items without loading full asset body', async () => {
-        inlayMetaMap.set('img-1', {
+        nodeStorageMap.set('inlay_meta/img-1', new TextEncoder().encode(JSON.stringify({
             charId: 'char-1',
             chatId: 'chat-1',
             createdAt: 10,
             updatedAt: 20,
-        })
+        })))
 
         await setInlayAsset('img-1', {
             data: new Blob(['img-data'], { type: 'image/png' }),
@@ -405,6 +407,15 @@ describe('removeInlayAsset', () => {
 })
 
 describe('postInlayAsset', () => {
+    test('returns null when an uploaded image cannot be decoded', async () => {
+        canvasMockState.context = null
+
+        await expect(postInlayAsset({
+            name: 'broken.png',
+            data: new Uint8Array([0x00]),
+        })).resolves.toBeNull()
+    })
+
     test('stores audio asset and returns id', async () => {
         const data = new Uint8Array([0xff, 0xfb, 0x90, 0x00])
         const result = await postInlayAsset({
@@ -445,7 +456,6 @@ describe('postInlayAsset', () => {
                 fc.string({ minLength: 1, maxLength: 10 }).filter((ext) => !allSupportedExts.includes(ext as any)),
                 async (ext) => {
                     nodeStorageMap.clear()
-                    inlayMetaMap.clear()
                     __resetInlayStorageForTest()
                     const result = await postInlayAsset({
                         name: `file.${ext}`,
@@ -461,7 +471,6 @@ describe('postInlayAsset', () => {
         await fc.assert(
             fc.asyncProperty(fc.constantFrom(...supportedAudioExts), async (ext) => {
                 nodeStorageMap.clear()
-                inlayMetaMap.clear()
                 __resetInlayStorageForTest()
                 const result = await postInlayAsset({
                     name: `sound.${ext}`,
@@ -479,7 +488,6 @@ describe('postInlayAsset', () => {
         await fc.assert(
             fc.asyncProperty(fc.constantFrom(...supportedVideoExts), async (ext) => {
                 nodeStorageMap.clear()
-                inlayMetaMap.clear()
                 __resetInlayStorageForTest()
                 const result = await postInlayAsset({
                     name: `clip.${ext}`,
@@ -495,6 +503,105 @@ describe('postInlayAsset', () => {
 })
 
 describe('writeInlayImage', () => {
+    test('rejects with a typed error when image loading fails and clears its timer', async () => {
+        vi.useFakeTimers()
+        try {
+            const imgObj = makePendingImage()
+            const result = writeInlayImage(imgObj, { decodeTimeoutMs: 60_000 })
+            const rejection = expect(result).rejects.toMatchObject({
+                code: 'INLAY_IMAGE_LOAD_ERROR',
+                name: 'InlayImageWriteError',
+            })
+
+            imgObj.dispatchEvent(new Event('error'))
+
+            await rejection
+            expect(vi.getTimerCount()).toBe(0)
+        } finally {
+            vi.useRealTimers()
+        }
+    })
+
+    test('rejects with a typed error after the decode timeout without leaving a timer', async () => {
+        vi.useFakeTimers()
+        try {
+            const result = writeInlayImage(makePendingImage(), { decodeTimeoutMs: 250 })
+            const rejection = expect(result).rejects.toMatchObject({
+                code: 'INLAY_IMAGE_DECODE_TIMEOUT',
+                name: 'InlayImageWriteError',
+            })
+
+            await vi.advanceTimersByTimeAsync(250)
+
+            await rejection
+            expect(vi.getTimerCount()).toBe(0)
+        } finally {
+            vi.useRealTimers()
+        }
+    })
+
+    test('rejects with a typed error when a completed image failed to load', async () => {
+        await expect(writeInlayImage(makeImage(0, 0))).rejects.toMatchObject({
+            code: 'INLAY_IMAGE_LOAD_ERROR',
+            name: 'InlayImageWriteError',
+        })
+    })
+
+    test('rejects with a typed error when no canvas context is available', async () => {
+        canvasMockState.context = null
+
+        await expect(writeInlayImage(makeImage(10, 10))).rejects.toMatchObject({
+            code: 'INLAY_CANVAS_CONTEXT_UNAVAILABLE',
+            name: 'InlayImageWriteError',
+        })
+    })
+
+    test('rejects with a typed error when canvas encoding returns null', async () => {
+        canvasMockState.blob = null
+
+        await expect(writeInlayImage(makeImage(10, 10))).rejects.toMatchObject({
+            code: 'INLAY_CANVAS_ENCODE_FAILED',
+            name: 'InlayImageWriteError',
+        })
+    })
+
+    test('handles an image that completed before handlers were attached', async () => {
+        const result = await writeInlayImage(makeImage(80, 40), { id: 'already-loaded' })
+
+        expect(result).toBe('already-loaded')
+        expect(await getInlayAssetBlob('already-loaded')).toMatchObject({
+            height: 40,
+            width: 80,
+        })
+    })
+
+    test('uses an explicit target and preserves active-chat inference when target is absent', async () => {
+        getCurrentCharacterMock.mockReturnValue({
+            chaId: 'active-char',
+            chatPage: 0,
+            chats: [{ id: 'active-chat' }],
+        })
+
+        await writeInlayImage(makeImage(20, 10), {
+            id: 'explicit-target',
+            target: { charId: 'original-char', chatId: 'original-chat' },
+        })
+        await writeInlayImage(makeImage(20, 10), {
+            id: 'explicit-target',
+            target: { charId: 'final-char', chatId: 'final-chat' },
+        })
+        await writeInlayImage(makeImage(20, 10), { id: 'implicit-target' })
+
+        expect(await getInlayMeta('explicit-target')).toMatchObject({
+            charId: 'final-char',
+            chatId: 'final-chat',
+        })
+        expect(await getInlayMeta('implicit-target')).toMatchObject({
+            charId: 'active-char',
+            chatId: 'active-chat',
+        })
+    })
+
     test('stores image asset with correct metadata and returns id', async () => {
         const imgObj = makeImage(200, 100)
 
@@ -547,14 +654,22 @@ describe('writeInlayImage', () => {
         expect(result).toBe('test-uuid-1234')
 
         const stored = await getInlayAssetBlob('test-uuid-1234')
-        expect(stored!.name).toBe('test-uuid-1234')
+        expect(stored).toMatchObject({
+            ext: 'webp',
+            height: 50,
+            name: 'test-uuid-1234',
+            type: 'image',
+            width: 50,
+        })
+        expect(nodeStorageMap.has('inlay/test-uuid-1234')).toBe(true)
+        expect(nodeStorageMap.has('inlay_info/test-uuid-1234')).toBe(true)
+        expect(nodeStorageMap.has('inlay_meta/test-uuid-1234')).toBe(true)
     })
 
     test('output pixels never exceed 1024 * 1024', async () => {
         await fc.assert(
             fc.asyncProperty(fc.integer({ min: 1, max: 10000 }), fc.integer({ min: 1, max: 10000 }), async (w, h) => {
                 nodeStorageMap.clear()
-                inlayMetaMap.clear()
                 __resetInlayStorageForTest()
                 const img = makeImage(w, h)
                 await writeInlayImage(img, { id: 'prop-img' })
@@ -574,7 +689,6 @@ describe('writeInlayImage', () => {
                 fc.integer({ min: 1025, max: 10000 }),
                 async (w, h) => {
                     nodeStorageMap.clear()
-                    inlayMetaMap.clear()
                     __resetInlayStorageForTest()
                     const img = makeImage(w, h)
                     await writeInlayImage(img, { id: 'ratio-img' })
@@ -592,7 +706,6 @@ describe('writeInlayImage', () => {
         await fc.assert(
             fc.asyncProperty(fc.integer({ min: 1, max: 1024 }), fc.integer({ min: 1, max: 1024 }), async (w, h) => {
                 nodeStorageMap.clear()
-                inlayMetaMap.clear()
                 __resetInlayStorageForTest()
                 const img = makeImage(w, h)
                 await writeInlayImage(img, { id: 'small-img' })
@@ -607,6 +720,182 @@ describe('writeInlayImage', () => {
     })
 })
 
+describe('inlay asset integrity', () => {
+    const integrityAsset: InlayAsset = {
+        data: new Blob(['integrity-data'], { type: 'image/png' }),
+        ext: 'png',
+        height: 64,
+        name: 'integrity.png',
+        type: 'image',
+        width: 128,
+    }
+
+    test('classifies all usable records as complete', async () => {
+        await setInlayAsset('complete-id', integrityAsset, {
+            charId: 'char-complete',
+            chatId: 'chat-complete',
+        })
+
+        await expect(inspectInlayAssetIntegrity('complete-id')).resolves.toEqual({
+            hasAsset: true,
+            hasInfo: true,
+            hasMeta: true,
+            status: 'complete',
+        })
+    })
+
+    test('repairs missing info and meta from actual storage with the expected target', async () => {
+        await setInlayAsset('repair-id', integrityAsset, {
+            charId: 'old-char',
+            chatId: 'old-chat',
+        })
+        nodeStorageMap.delete('inlay_info/repair-id')
+        nodeStorageMap.delete('inlay_meta/repair-id')
+
+        await expect(inspectInlayAssetIntegrity('repair-id')).resolves.toEqual({
+            hasAsset: true,
+            hasInfo: false,
+            hasMeta: false,
+            status: 'repairable',
+        })
+
+        await repairInlayAssetRecords(
+            'repair-id',
+            { charId: 'expected-char', chatId: 'expected-chat' },
+            { name: 'repaired-name.png', ext: 'repaired-ext' },
+        )
+
+        await expect(inspectInlayAssetIntegrity('repair-id')).resolves.toEqual({
+            hasAsset: true,
+            hasInfo: true,
+            hasMeta: true,
+            status: 'complete',
+        })
+        expect((await getInlayInfosBatch(['repair-id']))['repair-id']).toMatchObject({
+            ext: 'repaired-ext',
+            height: 64,
+            name: 'repaired-name.png',
+            type: 'image',
+            width: 128,
+        })
+        expect(await getInlayMeta('repair-id')).toMatchObject({
+            charId: 'expected-char',
+            chatId: 'expected-chat',
+        })
+    })
+
+    test('classifies parseable but incomplete records as repairable', async () => {
+        await setInlayAsset('partial-id', integrityAsset, {
+            charId: 'old-char',
+            chatId: 'old-chat',
+        })
+        nodeStorageMap.set('inlay_info/partial-id', new TextEncoder().encode('{}'))
+        nodeStorageMap.set('inlay_meta/partial-id', new TextEncoder().encode('{}'))
+
+        await expect(inspectInlayAssetIntegrity('partial-id')).resolves.toEqual({
+            hasAsset: true,
+            hasInfo: false,
+            hasMeta: false,
+            status: 'repairable',
+        })
+
+        await repairInlayAssetRecords('partial-id', {
+            charId: 'expected-char',
+            chatId: 'expected-chat',
+        })
+
+        await expect(inspectInlayAssetIntegrity('partial-id')).resolves.toMatchObject({
+            hasAsset: true,
+            hasInfo: true,
+            hasMeta: true,
+            status: 'complete',
+        })
+    })
+
+    test('classifies a stored record with no asset payload as missing', async () => {
+        await setInlayAsset('empty-data-id', integrityAsset, {
+            charId: 'existing-char',
+            chatId: 'existing-chat',
+        })
+        nodeStorageMap.set('inlay/empty-data-id', new TextEncoder().encode(JSON.stringify({
+            data: '',
+            ext: 'png',
+            height: 64,
+            name: 'empty.png',
+            type: 'image',
+            width: 128,
+        })))
+
+        await expect(inspectInlayAssetIntegrity('empty-data-id')).resolves.toEqual({
+            hasAsset: false,
+            hasInfo: true,
+            hasMeta: true,
+            status: 'missing',
+        })
+    })
+
+    test('classifies a malformed media string as missing and refuses repair without mutation', async () => {
+        await setInlayAsset('malformed-data-id', integrityAsset, {
+            charId: 'existing-char',
+            chatId: 'existing-chat',
+        })
+        nodeStorageMap.set('inlay/malformed-data-id', new TextEncoder().encode(JSON.stringify({
+            data: 'garbage',
+            ext: 'png',
+            height: 64,
+            name: 'malformed.png',
+            type: 'image',
+            width: 128,
+        })))
+        const recordsBeforeRepair = [...nodeStorageMap.entries()]
+
+        await expect(inspectInlayAssetIntegrity('malformed-data-id')).resolves.toEqual({
+            hasAsset: false,
+            hasInfo: true,
+            hasMeta: true,
+            status: 'missing',
+        })
+        await expect(repairInlayAssetRecords('malformed-data-id', {
+            charId: 'expected-char',
+            chatId: 'expected-chat',
+        })).rejects.toMatchObject({
+            code: 'INLAY_ASSET_MISSING',
+            name: 'InlayAssetIntegrityError',
+        })
+
+        expect([...nodeStorageMap.entries()]).toEqual(recordsBeforeRepair)
+        await expect(getInlayAssetBlob('malformed-data-id')).rejects.toThrow()
+    })
+
+    test('treats an absent actual record as missing despite a stale LRU and refuses repair without mutation', async () => {
+        await setInlayAsset('missing-id', integrityAsset, {
+            charId: 'existing-char',
+            chatId: 'existing-chat',
+        })
+        nodeStorageMap.delete('inlay/missing-id')
+        const recordsBeforeRepair = [...nodeStorageMap.entries()]
+
+        await expect(inspectInlayAssetIntegrity('missing-id')).resolves.toEqual({
+            hasAsset: false,
+            hasInfo: true,
+            hasMeta: true,
+            status: 'missing',
+        })
+        await expect(repairInlayAssetRecords('missing-id', {
+            charId: 'expected-char',
+            chatId: 'expected-chat',
+        })).rejects.toMatchObject({
+            code: 'INLAY_ASSET_MISSING',
+            name: 'InlayAssetIntegrityError',
+        })
+
+        expect([...nodeStorageMap.entries()]).toEqual(recordsBeforeRepair)
+        expect(await getInlayAssetBlob('missing-id')).toBeNull()
+        expect(nodeStorageMap.has('inlay_info/missing-id')).toBe(true)
+        expect(nodeStorageMap.has('inlay_meta/missing-id')).toBe(true)
+    })
+})
+
 describe('set -> get round-trip', () => {
     test('preserves metadata through setInlayAsset -> getInlayAsset', async () => {
         await fc.assert(
@@ -618,7 +907,6 @@ describe('set -> get round-trip', () => {
                 fc.nat({ max: 5000 }),
                 async (id, name, ext, width, height) => {
                     nodeStorageMap.clear()
-                    inlayMetaMap.clear()
                     __resetInlayStorageForTest()
                     const blob = new Blob(['data'], { type: 'application/octet-stream' })
                     const asset: InlayAsset = {
@@ -652,7 +940,6 @@ describe('set -> remove -> get', () => {
         await fc.assert(
             fc.asyncProperty(fc.string({ minLength: 1, maxLength: 20 }), async (id) => {
                 nodeStorageMap.clear()
-                inlayMetaMap.clear()
                 __resetInlayStorageForTest()
                 const asset: InlayAsset = {
                     data: new Blob(['x']),

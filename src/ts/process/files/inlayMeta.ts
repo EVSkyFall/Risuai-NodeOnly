@@ -10,6 +10,11 @@ export type InlayAssetMeta = {
     chatId?: string
 }
 
+export type InlayTarget = {
+    charId: string
+    chatId: string
+}
+
 class NodeInlayMetaStorage {
     private nodeStorage = new NodeStorage()
 
@@ -103,9 +108,9 @@ export async function getInlayMetasBatch(ids: string[]): Promise<Record<string, 
     return await getStorage().getItems(ids)
 }
 
-export function buildInlayMeta(existingMeta?: InlayAssetMeta | null): InlayAssetMeta {
+export function buildInlayMeta(existingMeta?: InlayAssetMeta | null, target?: InlayTarget): InlayAssetMeta {
     const now = Date.now()
-    const currentChar = getCurrentCharacter()
+    const currentChar = target ? null : getCurrentCharacter()
     const currentCharId = typeof currentChar?.chaId === 'string' ? currentChar.chaId : undefined
     const currentChat = currentChar?.chats?.[currentChar?.chatPage ?? 0]
     const currentChatId = typeof currentChat?.id === 'string' ? currentChat.id : undefined
@@ -113,7 +118,7 @@ export function buildInlayMeta(existingMeta?: InlayAssetMeta | null): InlayAsset
     return {
         createdAt: (existingMeta?.createdAt && existingMeta.createdAt > 0) ? existingMeta.createdAt : now,
         updatedAt: now,
-        charId: (existingMeta?.charId && existingMeta.charId.length > 0) ? existingMeta.charId : currentCharId,
-        chatId: (existingMeta?.chatId && existingMeta.chatId.length > 0) ? existingMeta.chatId : currentChatId,
+        charId: target?.charId ?? ((existingMeta?.charId && existingMeta.charId.length > 0) ? existingMeta.charId : currentCharId),
+        chatId: target?.chatId ?? ((existingMeta?.chatId && existingMeta.chatId.length > 0) ? existingMeta.chatId : currentChatId),
     }
 }

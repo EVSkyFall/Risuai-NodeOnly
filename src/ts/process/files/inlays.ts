@@ -6,6 +6,7 @@ import { asBuffer } from "../../util";
 import { NodeStorage } from "../../storage/nodeStorage";
 import {
     type InlayAssetMeta,
+    type InlayTarget,
     buildInlayMeta,
     getInlayMeta,
     getInlayMetasBatch,
@@ -61,6 +62,49 @@ export type CharacterChatIndexItem = {
     name: string
 }
 
+export type InlayImageWriteOptions = {
+    name?: string
+    ext?: string
+    id?: string
+    target?: InlayTarget
+    decodeTimeoutMs?: number
+}
+
+export type InlayAssetIntegrity = {
+    status: 'complete' | 'repairable' | 'missing'
+    hasAsset: boolean
+    hasInfo: boolean
+    hasMeta: boolean
+}
+
+export type InlayImageWriteErrorCode =
+    | 'INLAY_IMAGE_LOAD_ERROR'
+    | 'INLAY_IMAGE_DECODE_TIMEOUT'
+    | 'INLAY_CANVAS_CONTEXT_UNAVAILABLE'
+    | 'INLAY_CANVAS_DRAW_FAILED'
+    | 'INLAY_CANVAS_ENCODE_FAILED'
+
+export class InlayImageWriteError extends Error {
+    readonly code: InlayImageWriteErrorCode
+    readonly cause?: unknown
+
+    constructor(code: InlayImageWriteErrorCode, message: string, cause?: unknown) {
+        super(message)
+        this.name = 'InlayImageWriteError'
+        this.code = code
+        this.cause = cause
+    }
+}
+
+export class InlayAssetIntegrityError extends Error {
+    readonly code = 'INLAY_ASSET_MISSING'
+
+    constructor(id: string) {
+        super(`Inlay asset is missing or unreadable: ${id}`)
+        this.name = 'InlayAssetIntegrityError'
+    }
+}
+
 const inlayImageExts = [
     'jpg', 'jpeg', 'png', 'gif', 'webp', 'avif'
 ]
@@ -75,6 +119,7 @@ const inlayVideoExts = [
 
 const INLAY_PREFIX = 'inlay/'
 const INLAY_INFO_PREFIX = 'inlay_info/'
+const DEFAULT_INLAY_DECODE_TIMEOUT_MS = 15_000
 
 // ── Memory LRU cache ──
 type LRUEntry = {
@@ -213,21 +258,26 @@ class NodeInlayStorage {
         lruSet(id, toCoreInlayAsset(asset))
     }
 
+    async getItemFromStorage<T>(id: string): Promise<T | null> {
+        try {
+            const buf = await this.nodeStorage.getItem(this.serverKey(id))
+            if (!buf || buf.length === 0) return null
+            return this.deserializeAsset(buf) as unknown as T
+        } catch {
+            return null
+        }
+    }
+
     async getItem<T>(id: string): Promise<T | null> {
         // 1. Try memory LRU cache
         const cached = lruGet(id)
         if (cached) return cached as unknown as T
 
         // 2. Fetch from server
-        try {
-            const buf = await this.nodeStorage.getItem(this.serverKey(id))
-            if (!buf || buf.length === 0) return null
-            const asset = this.deserializeAsset(buf)
-            lruSet(id, toCoreInlayAsset(asset))
-            return asset as unknown as T
-        } catch {
-            return null
-        }
+        const asset = await this.getItemFromStorage<InlayAsset>(id)
+        if (!asset) return null
+        lruSet(id, toCoreInlayAsset(asset))
+        return asset as unknown as T
     }
 
     async removeItem(id: string): Promise<void> {
@@ -328,6 +378,49 @@ function toCoreInlayAsset(asset: any): InlayAsset {
     }
 }
 
+function isKnownInlayType(type: unknown): type is InlayAsset['type'] {
+    return type === 'image' || type === 'video' || type === 'audio' || type === 'signature'
+}
+
+function isUsableInlayAsset(asset: InlayAsset | null): asset is InlayAsset {
+    if (!asset || !isKnownInlayType(asset.type)) return false
+    if (typeof asset.name !== 'string' || asset.name.length === 0) return false
+    if (typeof asset.ext !== 'string' || asset.ext.length === 0) return false
+    if (asset.type === 'signature') return typeof asset.data === 'string' && asset.data.length > 0
+    return asset.data instanceof Blob && asset.data.size > 0
+}
+
+function isUsableInlayExplorerInfo(info: InlayExplorerInfo | null): info is InlayExplorerInfo {
+    if (!info || !isKnownInlayType(info.type)) return false
+    if (typeof info.name !== 'string' || info.name.length === 0) return false
+    if (typeof info.ext !== 'string' || info.ext.length === 0) return false
+    if (info.width !== undefined && (typeof info.width !== 'number' || !Number.isFinite(info.width))) return false
+    if (info.height !== undefined && (typeof info.height !== 'number' || !Number.isFinite(info.height))) return false
+    return true
+}
+
+function isUsableInlayMeta(meta: InlayAssetMeta | null): meta is InlayAssetMeta {
+    return !!meta
+        && typeof meta.createdAt === 'number'
+        && meta.createdAt > 0
+        && typeof meta.updatedAt === 'number'
+        && meta.updatedAt > 0
+        && typeof meta.charId === 'string'
+        && meta.charId.length > 0
+        && typeof meta.chatId === 'string'
+        && meta.chatId.length > 0
+}
+
+async function readInlayAssetForIntegrity(id: string): Promise<InlayAsset | null> {
+    const asset = await getInlayStorage().getItemFromStorage<InlayAsset>(id)
+    if (!isUsableInlayAsset(asset)) {
+        lruDelete(id)
+        return null
+    }
+    lruSet(id, toCoreInlayAsset(asset))
+    return asset
+}
+
 // ── Storage instance singletons ──
 
 let _nodeInlayStorage: NodeInlayStorage | null = null
@@ -415,7 +508,15 @@ export async function postInlayAsset(img: { name: string, data: Uint8Array }) {
 
     if (inlayImageExts.includes(extention)) {
         imgObj.src = URL.createObjectURL(new Blob([asBuffer(img.data)], { type: `image/${extention}` }))
-        return await writeInlayImage(imgObj, { name: img.name, ext: extention })
+        try {
+            return await writeInlayImage(imgObj, { name: img.name, ext: extention })
+        } catch (error) {
+            if (error instanceof InlayImageWriteError) {
+                console.warn('Failed to decode uploaded inlay image:', error)
+                return null
+            }
+            throw error
+        }
     }
 
     if (inlayAudioExts.includes(extention)) {
@@ -435,35 +536,125 @@ export async function postInlayAsset(img: { name: string, data: Uint8Array }) {
     return null
 }
 
-export async function writeInlayImage(imgObj: HTMLImageElement, arg: { name?: string, ext?: string, id?: string } = {}) {
+export async function writeInlayImage(imgObj: HTMLImageElement, arg: InlayImageWriteOptions = {}) {
     let drawHeight = 0
     let drawWidth = 0
     const canvas = document.createElement('canvas')
     const ctx = canvas.getContext('2d')
-    await new Promise((resolve) => {
-        imgObj.onload = () => {
-            drawHeight = imgObj.height
-            drawWidth = imgObj.width
-            const maxPixels = 1024 * 1024
-            const currentPixels = drawHeight * drawWidth
-            if (currentPixels > maxPixels) {
-                const scaleFactor = Math.sqrt(maxPixels / currentPixels)
-                drawWidth = Math.floor(drawWidth * scaleFactor)
-                drawHeight = Math.floor(drawHeight * scaleFactor)
+
+    if (!ctx) {
+        throw new InlayImageWriteError(
+            'INLAY_CANVAS_CONTEXT_UNAVAILABLE',
+            'Unable to acquire a 2D canvas context for the inlay image.',
+        )
+    }
+
+    await new Promise<void>((resolve, reject) => {
+        let settled = false
+        let timeout: ReturnType<typeof setTimeout> | null = null
+
+        const cleanup = () => {
+            if (timeout !== null) {
+                clearTimeout(timeout)
+                timeout = null
             }
-            canvas.width = drawWidth
-            canvas.height = drawHeight
-            ctx.drawImage(imgObj, 0, 0, drawWidth, drawHeight)
-            resolve(null)
+            imgObj.removeEventListener('load', handleLoad)
+            imgObj.removeEventListener('error', handleError)
+        }
+        const resolveOnce = () => {
+            if (settled) return
+            settled = true
+            cleanup()
+            resolve()
+        }
+        const rejectOnce = (error: InlayImageWriteError) => {
+            if (settled) return
+            settled = true
+            cleanup()
+            reject(error)
+        }
+        const handleLoad = () => {
+            if (settled) return
+            try {
+                drawHeight = imgObj.height
+                drawWidth = imgObj.width
+                const maxPixels = 1024 * 1024
+                const currentPixels = drawHeight * drawWidth
+                if (currentPixels > maxPixels) {
+                    const scaleFactor = Math.sqrt(maxPixels / currentPixels)
+                    drawWidth = Math.floor(drawWidth * scaleFactor)
+                    drawHeight = Math.floor(drawHeight * scaleFactor)
+                }
+                canvas.width = drawWidth
+                canvas.height = drawHeight
+                ctx.drawImage(imgObj, 0, 0, drawWidth, drawHeight)
+                resolveOnce()
+            } catch (cause) {
+                rejectOnce(new InlayImageWriteError(
+                    'INLAY_CANVAS_DRAW_FAILED',
+                    'Failed to draw the decoded inlay image onto the canvas.',
+                    cause,
+                ))
+            }
+        }
+        const handleError = (event?: Event) => {
+            rejectOnce(new InlayImageWriteError(
+                'INLAY_IMAGE_LOAD_ERROR',
+                'Failed to load or decode the inlay image.',
+                event,
+            ))
+        }
+
+        imgObj.addEventListener('load', handleLoad)
+        imgObj.addEventListener('error', handleError)
+
+        if (!settled) {
+            timeout = setTimeout(() => {
+                rejectOnce(new InlayImageWriteError(
+                    'INLAY_IMAGE_DECODE_TIMEOUT',
+                    `Inlay image decode timed out after ${arg.decodeTimeoutMs ?? DEFAULT_INLAY_DECODE_TIMEOUT_MS}ms.`,
+                ))
+            }, arg.decodeTimeoutMs ?? DEFAULT_INLAY_DECODE_TIMEOUT_MS)
+        }
+
+        if (!settled && imgObj.complete) {
+            if (imgObj.naturalWidth > 0) {
+                handleLoad()
+            } else {
+                handleError()
+            }
         }
     })
     const db = getDatabase()
     const [mimeType, ext, quality]: [string, string, number?] = db.inlayImageLossless
         ? ['image/png', 'png', undefined]
         : ['image/webp', 'webp', 0.85]
-    const imageBlob = await new Promise<Blob>(resolve => canvas.toBlob(resolve, mimeType, quality))
+    const imageBlob = await new Promise<Blob>((resolve, reject) => {
+        try {
+            canvas.toBlob((blob) => {
+                if (!blob) {
+                    reject(new InlayImageWriteError(
+                        'INLAY_CANVAS_ENCODE_FAILED',
+                        'Canvas encoding returned no inlay image data.',
+                    ))
+                    return
+                }
+                resolve(blob)
+            }, mimeType, quality)
+        } catch (cause) {
+            reject(new InlayImageWriteError(
+                'INLAY_CANVAS_ENCODE_FAILED',
+                'Canvas encoding failed for the inlay image.',
+                cause,
+            ))
+        }
+    })
     const imgid = arg.id ?? v4()
-    await setInlayAsset(imgid, { name: arg.name ?? imgid, data: imageBlob, ext, height: drawHeight, width: drawWidth, type: 'image' })
+    await setInlayAsset(
+        imgid,
+        { name: arg.name ?? imgid, data: imageBlob, ext, height: drawHeight, width: drawWidth, type: 'image' },
+        arg.target,
+    )
     return `${imgid}`
 }
 
@@ -597,13 +788,63 @@ export async function listInlayExplorerItems(forceRefresh = false): Promise<Inla
     return items
 }
 
-export async function setInlayAsset(id: string, img: InlayAsset) {
+export async function setInlayAsset(id: string, img: InlayAsset, target?: InlayTarget) {
     const existingMeta = await getInlayMeta(id)
-    const nextMeta = buildInlayMeta(existingMeta)
+    const nextMeta = buildInlayMeta(existingMeta, target)
     await getInlayStorage().setItem(id, toCoreInlayAsset(img))
     await getInlayInfoStorage().setItem(id, buildInlayExplorerInfo(toCoreInlayAsset(img)))
     await setInlayMeta(id, nextMeta)
     _explorerItemsCache = null // invalidate gallery cache
+}
+
+export async function inspectInlayAssetIntegrity(id: string): Promise<InlayAssetIntegrity> {
+    const [asset, info, meta] = await Promise.all([
+        readInlayAssetForIntegrity(id),
+        getInlayInfoStorage().getItem<InlayExplorerInfo>(id),
+        getInlayMeta(id),
+    ])
+    const hasAsset = asset !== null
+    const hasInfo = isUsableInlayExplorerInfo(info)
+    const hasMeta = isUsableInlayMeta(meta)
+
+    return {
+        status: !hasAsset ? 'missing' : (hasInfo && hasMeta ? 'complete' : 'repairable'),
+        hasAsset,
+        hasInfo,
+        hasMeta,
+    }
+}
+
+export async function repairInlayAssetRecords(
+    id: string,
+    expectedTarget: InlayTarget,
+    opts: { name?: string, ext?: string } = {},
+): Promise<void> {
+    const asset = await readInlayAssetForIntegrity(id)
+    if (!asset) {
+        throw new InlayAssetIntegrityError(id)
+    }
+
+    const [info, meta] = await Promise.all([
+        getInlayInfoStorage().getItem<InlayExplorerInfo>(id),
+        getInlayMeta(id),
+    ])
+
+    if (!isUsableInlayExplorerInfo(info)) {
+        await getInlayInfoStorage().setItem(id, buildInlayExplorerInfo({
+            ...asset,
+            name: opts.name ?? asset.name,
+            ext: opts.ext ?? asset.ext,
+        }))
+        _explorerItemsCache = null
+    }
+
+    if (!isUsableInlayMeta(meta)
+        || meta.charId !== expectedTarget.charId
+        || meta.chatId !== expectedTarget.chatId) {
+        await setInlayMetaFields(id, expectedTarget)
+        _explorerItemsCache = null
+    }
 }
 
 export async function removeInlayAsset(id: string) {
