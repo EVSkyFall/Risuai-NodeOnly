@@ -8,6 +8,7 @@ const harness = vi.hoisted(() => ({
     database: null as any,
     strictFailure: null as Error | null,
     storageHook: null as ((key: string) => void) | null,
+    mutationHook: null as (() => void) | null,
     strictSave: vi.fn(),
 }))
 
@@ -45,6 +46,7 @@ vi.mock('src/ts/storage/chatStorage', () => ({
 }))
 
 const coordinatorModule = await import('../coordinator')
+const coordinatorRecordModule = await import('../coordinatorRecord')
 const featureModule = await import('../featureFlag')
 const lockModule = await import('../locks')
 const operationLockModule = await import('../operationLock')
@@ -52,10 +54,12 @@ const storeModule = await import('../store')
 
 const {
     cancelLedger,
+    cancelTurnLedger,
     registerTrustedTurn,
     submitPlanLedger,
     supplyPromptLedger,
 } = coordinatorModule
+const { claimCoordinator } = coordinatorRecordModule
 const { IllustrationFeatureDisabledError, setIllustrationFeatureEnabled } = featureModule
 const { resetIllustrationLockManagerAccessorForTests, setIllustrationLockManagerAccessorForTests } = lockModule
 const {
@@ -72,6 +76,19 @@ const {
 const BASE_TIME = Date.UTC(2026, 0, 2)
 let mutationEvents: string[]
 let lockManager: InMemoryLockManager
+let coordinatorProof: { coordinatorLeaseId: string; coordinatorFence: number }
+
+async function refreshCoordinatorProof(): Promise<void> {
+    const snapshot = await claimCoordinator({
+        protocolVersion: 1,
+        leaseId: 'test-coordinator',
+        holderRuntimeId: 'test-runtime',
+    })
+    coordinatorProof = {
+        coordinatorLeaseId: 'test-coordinator',
+        coordinatorFence: snapshot.fence,
+    }
+}
 
 function makeMessage(source: string): Message {
     let data = source
@@ -85,6 +102,7 @@ function makeMessage(source: string): Message {
         get: () => data,
         set: (value: string) => {
             mutationEvents.push('marker')
+            harness.mutationHook?.()
             data = value
         },
     })
@@ -130,6 +148,7 @@ async function registerAndClaim(source = 'A quiet scene.') {
     installDatabase(source)
     const registered = await registerTrustedTurn(registerInput(source))
     const claimed = await illustrationJobStore.claimTurn({
+        ...coordinatorProof,
         turnId: registered.turnId,
         expectedVersion: registered.version,
         leaseId: 'planner-lease',
@@ -142,6 +161,7 @@ function submitInput(
     offsets: number[],
 ) {
     return {
+        ...coordinatorProof,
         turnId: claimed.turnId,
         expectedVersion: claimed.version,
         leaseId: 'planner-lease',
@@ -163,12 +183,14 @@ beforeEach(async () => {
     harness.storageEvents.length = 0
     harness.strictFailure = null
     harness.storageHook = null
+    harness.mutationHook = null
     harness.strictSave.mockReset()
     mutationEvents = []
     installDatabase()
     lockManager = new InMemoryLockManager()
     setIllustrationLockManagerAccessorForTests(() => lockManager)
     setIllustrationOperationLockManagerAccessorForTests(() => lockManager)
+    await refreshCoordinatorProof()
     await setIllustrationFeatureEnabled(true)
     harness.storageEvents.length = 0
     harness.strictSave.mockImplementation(async () => {
@@ -339,6 +361,7 @@ describe('prompt handoff and cancellation', () => {
         const { claimed } = await registerAndClaim(source)
         const [projected] = await submitPlanLedger(submitInput(claimed, [source.length]))
         const job = await illustrationJobStore.claimJob({
+            ...coordinatorProof,
             jobId: projected.jobId,
             expectedVersion: projected.version,
             leaseId: 'tagger-lease',
@@ -348,6 +371,7 @@ describe('prompt handoff and cancellation', () => {
 
     function promptInput(job: Awaited<ReturnType<typeof illustrationJobStore.claimJob>>) {
         return {
+            ...coordinatorProof,
             jobId: job.jobId,
             expectedVersion: job.version,
             leaseId: 'tagger-lease',
@@ -357,6 +381,42 @@ describe('prompt handoff and cancellation', () => {
             negative: '',
         }
     }
+
+    test('persists turn cancellation before best-effort strict marker removal', async () => {
+        const { claimed } = await registerAndClaim('Cancelled source')
+        const order: string[] = []
+        harness.storageHook = (key) => {
+            if (key === illustrationTurnKey(claimed.turnId)) order.push('ledger')
+        }
+        harness.mutationHook = () => order.push('marker')
+        harness.strictSave.mockImplementation(async () => {
+            order.push('strict')
+            return { success: true, durable: true }
+        })
+
+        const cancelled = await cancelTurnLedger({
+            turnId: claimed.turnId,
+            expectedVersion: claimed.version,
+        })
+        expect(cancelled).toMatchObject({ state: 'cancelled' })
+        expect(order).toEqual(['ledger', 'marker', 'strict'])
+        expect((await illustrationJobStore.getTurn(claimed.turnId))?.leaseId).toBeNull()
+        expect(harness.database.characters[0].chats[0].message[0].data)
+            .not.toContain('risu-illustration-request')
+    })
+
+    test('does not roll back cancelled when strict marker removal fails', async () => {
+        const { claimed } = await registerAndClaim('Cancelled flush failure')
+        harness.strictSave.mockClear()
+        harness.strictFailure = new Error('strict removal failed')
+        const cancelled = await cancelTurnLedger({
+            turnId: claimed.turnId,
+            expectedVersion: claimed.version,
+        })
+        expect(cancelled.state).toBe('cancelled')
+        expect((await illustrationJobStore.getTurn(claimed.turnId))?.state).toBe('cancelled')
+        expect(harness.strictSave).toHaveBeenCalledTimes(1)
+    })
 
     // §10.1 / §14: final prompts are validated and durable before queued.
     test('queues a durable positive prompt while allowing an empty negative prompt', async () => {
@@ -407,6 +467,44 @@ describe('prompt handoff and cancellation', () => {
         const stale = await illustrationJobStore.getJob(job.jobId)
         expect(stale?.state).toBe('stale')
         expect(stale?.prompt).toBeUndefined()
+    })
+
+    test('preserves cumulative Agent attempts when a retried prompt handoff closes stale', async () => {
+        const job = await createClaimedPromptJob('Retry then edit source')
+        const blocked = await illustrationJobStore.reportAgentFailure({
+            protocolVersion: 1,
+            kind: 'job',
+            id: job.jobId,
+            expectedVersion: job.version,
+            leaseId: 'tagger-lease',
+            fence: job.fence,
+            ...coordinatorProof,
+            idempotencyKey: 'failure:retry-then-edit',
+            code: 'tagger_failed',
+            retryable: true,
+        })
+        const retried = await illustrationJobStore.retryAgentFailure({
+            protocolVersion: 1,
+            kind: 'job',
+            id: job.jobId,
+            expectedVersion: blocked.version,
+            confirmNewLlmCharge: true,
+            ...coordinatorProof,
+        })
+        const reclaimed = await illustrationJobStore.claimJob({
+            ...coordinatorProof,
+            jobId: job.jobId,
+            expectedVersion: retried.version,
+            leaseId: 'tagger-lease',
+        })
+        const message = harness.database.characters[0].chats[0].message[0]
+        message.data = message.data.replace('Retry then edit source', 'Edited after retry')
+
+        await expect(supplyPromptLedger(promptInput(reclaimed))).rejects.toThrow('stale')
+        expect(await illustrationJobStore.getJob(job.jobId)).toMatchObject({
+            state: 'stale',
+            agentAttemptCount: 1,
+        })
     })
 
     // §10.3 queued cancel is immediate and needs no provider participation.

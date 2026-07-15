@@ -16,8 +16,18 @@ const allowedJobEdges: Array<[IllustrationJobState, IllustrationJobState]> = [
     ['prepared', 'stale'],
     ['prepared', 'corrupt'],
     ['awaiting_prompt', 'queued'],
+    ['awaiting_prompt', 'agent_blocked_retryable'], // Report §8: retryable Tagger failure.
+    ['awaiting_prompt', 'agent_blocked'], // Report §8: hard/exhausted Tagger failure.
     ['awaiting_prompt', 'stale'],
     ['awaiting_prompt', 'corrupt'],
+    ['agent_blocked_retryable', 'awaiting_prompt'], // Report §8: retryAgentFailure only.
+    ['agent_blocked_retryable', 'cancelled'], // Report §8: blocked work is cancellable.
+    ['agent_blocked_retryable', 'stale'], // Report §8: edit-staleness closure.
+    ['agent_blocked_retryable', 'corrupt'], // Report §8: corrupt closure.
+    ['agent_blocked', 'awaiting_prompt'], // Report §8: confirmed manual retry only.
+    ['agent_blocked', 'cancelled'], // Report §8: blocked work is cancellable.
+    ['agent_blocked', 'stale'], // Report §8: edit-staleness closure.
+    ['agent_blocked', 'corrupt'], // Report §8: corrupt closure.
     ['queued', 'generating'],
     ['queued', 'blocked_config'],
     ['queued', 'corrupt'],
@@ -70,10 +80,10 @@ describe('illustration job transition matrix', () => {
         expect(() => assertTransition('job', from, to)).toThrow(IllustrationLedgerTransitionError)
     })
 
-    test('pins the complete set of 36 allowed general transitions', () => {
+    test('pins the complete set of 46 allowed general transitions', () => {
         const allStates = Object.keys(JOB_TRANSITIONS) as IllustrationJobState[]
         const expected = new Set(allowedJobEdges.map(([from, to]) => `${from}->${to}`))
-        expect(expected.size).toBe(36)
+        expect(expected.size).toBe(46)
 
         for (const from of allStates) {
             for (const to of allStates) {
@@ -109,6 +119,37 @@ describe('illustration job transition matrix', () => {
 })
 
 describe('illustration turn transition extension', () => {
+    const allowedTurnEdges: Array<[IllustrationTurnState, IllustrationTurnState]> = [
+        ['prepared', 'awaiting_plan'],
+        ['prepared', 'blocked_capture'],
+        ['prepared', 'cancelled'],
+        ['prepared', 'stale'],
+        ['prepared', 'corrupt'],
+        ['blocked_capture', 'awaiting_plan'],
+        ['blocked_capture', 'cancelled'],
+        ['blocked_capture', 'stale'],
+        ['blocked_capture', 'corrupt'],
+        ['awaiting_plan', 'awaiting_prompt'],
+        ['awaiting_plan', 'agent_blocked_retryable'], // Report §8: retryable Planner failure.
+        ['awaiting_plan', 'agent_blocked'], // Report §8: hard/exhausted Planner failure.
+        ['awaiting_plan', 'blocked_manifest'],
+        ['awaiting_plan', 'no_scenes'],
+        ['awaiting_plan', 'cancelled'],
+        ['awaiting_plan', 'stale'],
+        ['awaiting_plan', 'corrupt'],
+        ['agent_blocked_retryable', 'awaiting_plan'], // Report §8: retryAgentFailure only.
+        ['agent_blocked_retryable', 'cancelled'], // Decision 1A: blocked turn cancellation.
+        ['agent_blocked_retryable', 'stale'], // Report §8: edit-staleness closure.
+        ['agent_blocked_retryable', 'corrupt'], // Report §8: corrupt closure.
+        ['agent_blocked', 'awaiting_plan'], // Report §8: confirmed manual retry only.
+        ['agent_blocked', 'cancelled'], // Decision 1A: blocked turn cancellation.
+        ['agent_blocked', 'stale'], // Report §8: edit-staleness closure.
+        ['agent_blocked', 'corrupt'], // Report §8: corrupt closure.
+        ['awaiting_prompt', 'completed'],
+        ['awaiting_prompt', 'stale'],
+        ['awaiting_prompt', 'corrupt'],
+    ]
+
     test('models capture retry and a single normal completion state', () => {
         expect(canTransition('turn', 'prepared', 'blocked_capture')).toBe(true)
         expect(canTransition('turn', 'blocked_capture', 'awaiting_plan')).toBe(true)
@@ -124,12 +165,25 @@ describe('illustration turn transition extension', () => {
             'blocked_manifest',
             'no_scenes',
             'completed',
+            'cancelled',
             'stale',
             'corrupt',
         ])
         for (const from of terminalStates) {
             for (const to of allStates) {
                 expect(canTransition('turn', from, to), `${from} -> ${to}`).toBe(false)
+            }
+        }
+    })
+
+    test('pins the complete set of 28 allowed turn transitions', () => {
+        const allStates = Object.keys(TURN_TRANSITIONS) as IllustrationTurnState[]
+        const expected = new Set(allowedTurnEdges.map(([from, to]) => `${from}->${to}`))
+        expect(expected.size).toBe(28)
+        for (const from of allStates) {
+            for (const to of allStates) {
+                expect(canTransition('turn', from, to), `${from} -> ${to}`)
+                    .toBe(expected.has(`${from}->${to}`))
             }
         }
     })

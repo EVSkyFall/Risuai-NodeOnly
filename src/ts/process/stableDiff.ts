@@ -94,8 +94,16 @@ export async function generateAIImageTyped(
     neg:string,
     returnSdData:string,
     priorityClass:ImageGenerationPriority,
+    options: { preservePromptText?: boolean } = {},
 ):Promise<ImageGenerationAttempt>{
-    const result = await generateAIImageInternal(genPrompt, currentChar, neg, returnSdData, priorityClass)
+    const result = await generateAIImageInternal(
+        genPrompt,
+        currentChar,
+        neg,
+        returnSdData,
+        priorityClass,
+        options,
+    )
     if (typeof result === 'object') {
         return result
     }
@@ -117,6 +125,7 @@ async function generateAIImageInternal(
     neg:string,
     returnSdData:string,
     priorityClass:ImageGenerationPriority,
+    options: { preservePromptText?: boolean },
 ):Promise<string|false|ImageGenerationAttempt>{
     const db = getDatabase()
     console.log(db.sdProvider)
@@ -177,13 +186,15 @@ async function generateAIImageInternal(
         }
     }
     if(db.sdProvider === 'novelai'){
-        genPrompt = genPrompt
-            .replaceAll('\\(', "♧")
-            .replaceAll('\\)', "♤")
-            .replaceAll('(','{')
-            .replaceAll(')','}')
-            .replaceAll('♧','(')
-            .replaceAll('♤',')')
+        if(options.preservePromptText !== true){
+            genPrompt = genPrompt
+                .replaceAll('\\(', "♧")
+                .replaceAll('\\)', "♤")
+                .replaceAll('(','{')
+                .replaceAll(')','}')
+                .replaceAll('♧','(')
+                .replaceAll('♤',')')
+        }
 
         let reqlist:any = {}
 

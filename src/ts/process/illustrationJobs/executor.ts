@@ -276,7 +276,7 @@ async function reconcileDurableAssetReference(
         return 'settled'
     }
 
-    const siblings = await illustrationJobStore.listJobs({ turnId: job.turnId })
+    const siblings = await illustrationJobStore.listJobRecords({ turnId: job.turnId })
     const hash = await computeSourceRevisionHash(matches[0].text, {
         requestNonce: job.target.requestNonce,
         slotTokens: siblings.map((candidate) => candidate.slotToken),
@@ -518,6 +518,7 @@ async function processQueuedJob(job: IllustrationJobRecordV1, epoch: number): Pr
         generating.prompt!.negative,
         'inlay',
         'background',
+        { preservePromptText: true },
     )
     if (attempt.result.ok === false) {
         await transitionProviderFailure(job.jobId, epoch, attempt.result.certainty)
@@ -660,7 +661,7 @@ async function resumeBlockedConfig(job: IllustrationJobRecordV1, epoch: number):
 }
 
 async function processNextJob(epoch: number): Promise<boolean> {
-    const jobs = await illustrationJobStore.listJobs()
+    const jobs = await illustrationJobStore.listJobRecords()
     const queued = jobs.find((job) => job.state === 'queued')
     if (queued) {
         await processQueuedJob(queued, epoch)
@@ -698,7 +699,7 @@ function clearPollTimer(): void {
 async function schedulePollIfNeeded(): Promise<void> {
     if (!leaderActive || stopRequested || pollTimer !== null) return
     if (!(await isIllustrationFeatureEnabled())) return
-    const jobs = await illustrationJobStore.listJobs()
+    const jobs = await illustrationJobStore.listJobRecords()
     if (!jobs.some((job) => !isTerminalJobState(job.state))) return
     pollTimer = setTimeout(() => {
         pollTimer = null

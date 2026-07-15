@@ -36,6 +36,8 @@ export type IllustrationTargetV1 = {
 export type IllustrationJobState =
     | 'prepared'
     | 'awaiting_prompt'
+    | 'agent_blocked_retryable'
+    | 'agent_blocked'
     | 'queued'
     | 'generating'
     | 'cancel_requested'
@@ -56,10 +58,13 @@ export type IllustrationTurnState =
     | 'prepared'
     | 'blocked_capture'
     | 'awaiting_plan'
+    | 'agent_blocked_retryable'
+    | 'agent_blocked'
     | 'awaiting_prompt'
     | 'blocked_manifest'
     | 'no_scenes'
     | 'completed'
+    | 'cancelled'
     | 'stale'
     | 'corrupt'
 
@@ -72,6 +77,29 @@ export type IllustrationRecordErrorV1 = {
     code: string
     certainty?: 'definite' | 'uncertain'
     message?: string
+    retryable?: boolean
+}
+
+export type IllustrationAgentFailureReceiptV1 = {
+    idempotencyKey: string
+    previousVersion: number
+    resultVersion: number
+    leaseId: string
+    fence: number
+    code: string
+    retryable: boolean
+    outcomeState: 'agent_blocked_retryable' | 'agent_blocked'
+    agentAttemptCount: number
+}
+
+export type IllustrationPlanClosureReceiptV1 = {
+    idempotencyKey: string
+    previousVersion: number
+    resultVersion: number
+    leaseId: string
+    fence: number
+    state: 'stale' | 'corrupt'
+    code: string
 }
 
 export type IllustrationLeaseRecordFields = {
@@ -82,6 +110,10 @@ export type IllustrationLeaseRecordFields = {
     workerEpoch: number
     updatedAt: number
     idempotencyKey: string
+    agentAttemptCount: number
+    agentHardRetryPending?: boolean
+    lastAgentFailureWrite?: IllustrationAgentFailureReceiptV1
+    agentFailureWrites?: IllustrationAgentFailureReceiptV1[]
 }
 
 export type IllustrationTurnRecordV1 = IllustrationLeaseRecordFields & {
@@ -93,6 +125,7 @@ export type IllustrationTurnRecordV1 = IllustrationLeaseRecordFields & {
     sourceRevisionHash?: string
     settingsFingerprint?: string
     error?: IllustrationRecordErrorV1
+    lastPlanClosureWrite?: IllustrationPlanClosureReceiptV1
 }
 
 export type IllustrationJobPromptV1 = {
@@ -109,6 +142,8 @@ export type IllustrationJobRecordV1 = IllustrationLeaseRecordFields & {
     sceneId: string
     scenePayload: ScenePayloadV1
     sourceRevisionHash: string
+    slotOrdinal: number
+    createdAt: number
     state: IllustrationJobState
     creationIdempotencyKey: string
     lastHolderWrite?: {
@@ -133,6 +168,11 @@ export type IllustrationJobRecordV1 = IllustrationLeaseRecordFields & {
 export type StoredPlanManifestV1 = PlanManifestV1 & {
     updatedAt: number
     idempotencyKey: string
+    holderWrite?: {
+        turnExpectedVersion: number
+        leaseId: string
+        fence: number
+    }
 }
 
 export type IllustrationWorkerEpochRecordV1 = {
@@ -158,3 +198,91 @@ export type IllustrationHolderWrite = {
     expectedVersion: number
     fence: number
 }
+
+export type IllustrationCoordinatorProof = {
+    coordinatorLeaseId: string
+    coordinatorFence: number
+}
+
+export type IllustrationCoordinatorRecordV1 = {
+    version: number
+    fence: number
+    leaseId: string | null
+    holderRuntimeId: string | null
+    expiresAt: number
+    draining: boolean
+    updatedAt: number
+}
+
+export type IllustrationCoordinatorSnapshotV1 = {
+    protocolVersion: 1
+    version: number
+    fence: number
+    expiresAt: number
+    ownedByCaller: boolean
+    draining: boolean
+}
+
+export type IllustrationLeaseViewV1 = {
+    expiresAt: number
+    fence: number
+    ownedByCaller: boolean
+}
+
+export type IllustrationTurnSnapshotV1 = {
+    protocolVersion: 1
+    turnId: string
+    version: number
+    state: IllustrationTurnState
+    lease?: IllustrationLeaseViewV1
+    target?: IllustrationTurnTargetV1
+    sourceTextUtf16?: string
+    sourceRevisionHash?: string
+    offsetEncoding: 'utf-16'
+    settingsFingerprint?: string
+    agentAttemptCount: number
+    updatedAt: number
+    error?: IllustrationRecordErrorV1
+}
+
+export type IllustrationJobFullSnapshotV1 = {
+    protocolVersion: 1
+    turnId: string
+    jobId: string
+    slotOrdinal: number
+    version: number
+    state: IllustrationJobState
+    lease?: IllustrationLeaseViewV1
+    workerEpoch: number
+    target?: IllustrationTargetV1
+    sceneId: string
+    scenePayload: ScenePayloadV1
+    hasDurablePrompt: boolean
+    attemptId?: string
+    assetId?: string
+    createdAt: number
+    updatedAt: number
+    agentAttemptCount: number
+    error?: IllustrationRecordErrorV1
+}
+
+export type IllustrationJobTerminalSummaryV1 = {
+    protocolVersion: 1
+    turnId: string
+    jobId: string
+    slotOrdinal: number
+    version: number
+    state: 'committed' | 'failed' | 'stale' | 'cancelled' | 'corrupt'
+    target?: Pick<
+        IllustrationTargetV1,
+        'chaId' | 'conversationId' | 'expectedMessageId' | 'rootTurnId'
+    >
+    sceneId: string
+    createdAt: number
+    updatedAt: number
+    error?: Pick<IllustrationRecordErrorV1, 'code'>
+}
+
+export type IllustrationJobSnapshotV1 =
+    | IllustrationJobFullSnapshotV1
+    | IllustrationJobTerminalSummaryV1

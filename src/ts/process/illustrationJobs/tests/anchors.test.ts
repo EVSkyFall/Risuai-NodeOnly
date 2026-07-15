@@ -241,8 +241,8 @@ describe('validatePlacementOffsets', () => {
         expectOffsetError('abc', [offset], 'out_of_range')
     })
 
-    test('rejects duplicate offsets', () => {
-        expectOffsetError('abc', [1, 1], 'duplicate')
+    test('allows duplicate offsets for manifest-order tie breaking', () => {
+        expect(validatePlacementOffsets('abc', [1, 1])).toEqual([1, 1])
     })
 
     test('rejects offsets that split a UTF-16 surrogate pair', () => {

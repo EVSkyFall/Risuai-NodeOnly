@@ -206,7 +206,7 @@ async function recoverJob(job: IllustrationJobRecordV1, epoch: number): Promise<
 async function updateTurnAfterJobs(turn: IllustrationTurnRecordV1): Promise<void> {
     const latest = await illustrationJobStore.getTurn(turn.turnId)
     if (!latest || latest.state !== 'awaiting_prompt') return
-    const jobs = await illustrationJobStore.listJobs({ turnId: latest.turnId })
+    const jobs = await illustrationJobStore.listJobRecords({ turnId: latest.turnId })
     if (jobs.length === 0 || !jobs.every((job) => isTerminalJobState(job.state))) return
 
     // A turn with any committed sibling completed its user-visible work; per-job
@@ -249,7 +249,7 @@ export async function runIllustrationRecovery(): Promise<IllustrationRecoverySum
             }
         }
 
-        const jobs = (await illustrationJobStore.listJobs())
+        const jobs = (await illustrationJobStore.listJobRecords())
             .filter((job) => !isTerminalJobState(job.state))
         for (const job of jobs) {
             try {

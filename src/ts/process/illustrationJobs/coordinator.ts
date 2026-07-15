@@ -15,6 +15,15 @@ import {
     IllustrationLedgerCorruptError,
     IllustrationLedgerValidationError,
 } from './errors'
+import {
+    claimCoordinator as claimCoordinatorRecord,
+    markCoordinatorDraining as markCoordinatorDrainingRecord,
+    releaseCoordinator as releaseCoordinatorRecord,
+    releaseCoordinatorFinal as releaseCoordinatorFinalRecord,
+    type ClaimCoordinatorInput,
+    type CoordinatorReleaseProof,
+    type ReleaseCoordinatorInput,
+} from './coordinatorRecord'
 import { requireIllustrationFeatureEnabled } from './featureFlag'
 import { signalIllustrationExecutor } from './executorSignal'
 import { withIllustrationOperationLock } from './operationLock'
@@ -24,17 +33,91 @@ import { canTransition } from './stateMachine'
 import {
     MAX_JOBS_PER_TURN,
     illustrationJobStore,
+    projectFullJobSnapshot,
+    projectTurnSnapshot,
+    type ReportAgentFailureInput,
+    type RetryAgentFailureInput,
     validateHolderWrite,
 } from './store'
 import type {
+    IllustrationCoordinatorProof,
+    IllustrationCoordinatorRecordV1,
+    IllustrationCoordinatorSnapshotV1,
     IllustrationHolderWrite,
+    IllustrationJobFullSnapshotV1,
     IllustrationJobRecordV1,
+    IllustrationJobSnapshotV1,
     IllustrationTurnRecordV1,
+    IllustrationTurnSnapshotV1,
     ScenePayloadV1,
     StoredPlanManifestV1,
 } from './types'
 
 export const ILLUSTRATION_PROTOCOL_VERSION = 1
+
+export async function claimCoordinatorLedger(
+    input: ClaimCoordinatorInput,
+): Promise<IllustrationCoordinatorSnapshotV1> {
+    // Gate 4b injects a host-generated, non-forgeable runtime ID. This ledger
+    // layer only stores and binds the verbatim value; it is not an auth boundary.
+    return await claimCoordinatorRecord(input)
+}
+
+export async function releaseCoordinatorLedger(input: ReleaseCoordinatorInput): Promise<void> {
+    await releaseCoordinatorRecord(input)
+}
+
+export async function markCoordinatorDrainingLedger(
+    input: CoordinatorReleaseProof,
+): Promise<IllustrationCoordinatorRecordV1> {
+    return await markCoordinatorDrainingRecord(input)
+}
+
+export async function releaseCoordinatorFinalLedger(
+    input: CoordinatorReleaseProof,
+): Promise<void> {
+    await releaseCoordinatorFinalRecord(input)
+}
+
+export async function listPendingTurnsLedger(): Promise<IllustrationTurnSnapshotV1[]> {
+    return await illustrationJobStore.listPendingTurns()
+}
+
+export async function listJobsLedger(
+    input: { turnId?: string } = {},
+): Promise<IllustrationJobSnapshotV1[]> {
+    return await illustrationJobStore.listJobs(input)
+}
+
+export async function claimTurnLedger(
+    input: Parameters<typeof illustrationJobStore.claimTurnSnapshot>[0],
+): Promise<IllustrationTurnSnapshotV1> {
+    return await illustrationJobStore.claimTurnSnapshot(input)
+}
+
+export async function claimJobLedger(
+    input: Parameters<typeof illustrationJobStore.claimJobSnapshot>[0],
+): Promise<IllustrationJobFullSnapshotV1> {
+    return await illustrationJobStore.claimJobSnapshot(input)
+}
+
+export async function reportAgentFailureLedger(
+    input: ReportAgentFailureInput,
+): Promise<IllustrationTurnSnapshotV1 | IllustrationJobSnapshotV1> {
+    const record = await illustrationJobStore.reportAgentFailure(input)
+    return input.kind === 'turn'
+        ? projectTurnSnapshot(record as IllustrationTurnRecordV1)
+        : projectFullJobSnapshot(record as IllustrationJobRecordV1)
+}
+
+export async function retryAgentFailureLedger(
+    input: RetryAgentFailureInput,
+): Promise<IllustrationTurnSnapshotV1 | IllustrationJobSnapshotV1> {
+    const record = await illustrationJobStore.retryAgentFailure(input)
+    return input.kind === 'turn'
+        ? projectTurnSnapshot(record as IllustrationTurnRecordV1)
+        : projectFullJobSnapshot(record as IllustrationJobRecordV1)
+}
 
 export type RegisterTrustedTurnInput = {
     chaId: string
@@ -142,7 +225,7 @@ function resolveCaptureVariant(
     }
 }
 
-export type SubmitPlanLedgerInput = IllustrationHolderWrite & {
+export type SubmitPlanLedgerInput = IllustrationHolderWrite & IllustrationCoordinatorProof & {
     turnId: string
     idempotencyKey: string
     sourceRevisionHash: string
@@ -249,10 +332,29 @@ async function closeTurnBeforeProjection(
     turn: IllustrationTurnRecordV1,
     state: 'stale' | 'corrupt',
     code: string,
+    input: SubmitPlanLedgerInput,
 ): Promise<never> {
-    const jobs = await illustrationJobStore.listJobs({ turnId: turn.turnId })
+    await illustrationJobStore.closeTurnFromPlan({
+        turnId: turn.turnId,
+        expectedVersion: turn.version,
+        leaseId: input.leaseId,
+        fence: input.fence,
+        coordinatorLeaseId: input.coordinatorLeaseId,
+        coordinatorFence: input.coordinatorFence,
+        to: state,
+        code,
+        idempotencyKey: `plan-close:${input.idempotencyKey}:${state}:${code}`,
+    })
+    const jobs = await illustrationJobStore.listJobRecords({ turnId: turn.turnId })
     for (const job of jobs) {
-        if (!['prepared', 'awaiting_prompt', 'queued', 'blocked_config'].includes(job.state)) continue
+        if (![
+            'prepared',
+            'awaiting_prompt',
+            'agent_blocked_retryable',
+            'agent_blocked',
+            'queued',
+            'blocked_config',
+        ].includes(job.state)) continue
         await illustrationJobStore.transitionJob({
             jobId: job.jobId,
             expectedVersion: job.version,
@@ -263,14 +365,6 @@ async function closeTurnBeforeProjection(
             },
         })
     }
-    await illustrationJobStore.updateTurn({
-        turnId: turn.turnId,
-        expectedVersion: turn.version,
-        mutate: (draft) => {
-            draft.state = state
-            draft.error = { code }
-        },
-    })
     throw new IllustrationLedgerValidationError(`Illustration turn is ${state}: ${code}`)
 }
 
@@ -286,10 +380,12 @@ function materializedText(
     manifest: StoredPlanManifestV1,
 ): string {
     let text = sourceTextUtf16
-    const entries = [...manifest.jobs].sort(
-        (left, right) => right.insertAfterUtf16 - left.insertAfterUtf16,
-    )
-    for (const entry of entries) {
+    const entries = manifest.jobs
+        .map((entry, manifestIndex) => ({ entry, manifestIndex }))
+        .sort((left, right) =>
+            right.entry.insertAfterUtf16 - left.entry.insertAfterUtf16
+            || right.manifestIndex - left.manifestIndex)
+    for (const { entry } of entries) {
         text = text.slice(0, entry.insertAfterUtf16)
             + buildSlotNode(entry.jobId, entry.slotToken)
             + text.slice(entry.insertAfterUtf16)
@@ -344,7 +440,7 @@ async function submitPlanLedgerLocked(
         throw new IllustrationLedgerValidationError(`A turn may contain at most ${MAX_JOBS_PER_TURN} jobs`)
     }
 
-    const turn = await illustrationJobStore.getTurn(input.turnId)
+    let turn = await illustrationJobStore.getTurn(input.turnId)
     if (!turn || !turn.target || turn.sourceTextUtf16 === undefined
         || !turn.sourceRevisionHash || !turn.settingsFingerprint) {
         throw new IllustrationLedgerValidationError('Illustration turn capture is incomplete')
@@ -367,9 +463,24 @@ async function submitPlanLedgerLocked(
         throw new IllustrationLedgerCorruptError('A conflicting plan already exists for this turn')
     }
     if (manifest) {
+        manifest = await illustrationJobStore.createManifestPrepared({
+            manifest: {
+                turnId: manifest.turnId,
+                planHash: manifest.planHash,
+                expectedCount: manifest.expectedCount,
+                sourceRevisionHash: manifest.sourceRevisionHash,
+                jobs: manifest.jobs,
+            },
+            turnExpectedVersion: input.expectedVersion,
+            leaseId: input.leaseId,
+            fence: input.fence,
+            coordinatorLeaseId: input.coordinatorLeaseId,
+            coordinatorFence: input.coordinatorFence,
+            idempotencyKey: input.idempotencyKey,
+        })
         await recoverIllustrationProjectionLocked(turn.turnId, 0)
         manifest = await illustrationJobStore.getManifest(turn.turnId)
-        const replayJobs = await illustrationJobStore.listJobs({ turnId: turn.turnId })
+        const replayJobs = await illustrationJobStore.listJobRecords({ turnId: turn.turnId })
         if (
             manifest?.phase === 'projection_durable'
             && replayJobs.length === manifest.expectedCount
@@ -389,10 +500,10 @@ async function submitPlanLedgerLocked(
         turn.target.requestNonce,
     )
     if (marker.kind === 'stale') {
-        return await closeTurnBeforeProjection(turn, 'stale', marker.reason)
+        return await closeTurnBeforeProjection(turn, 'stale', marker.reason, input)
     }
     if (marker.kind === 'corrupt') {
-        return await closeTurnBeforeProjection(turn, 'corrupt', marker.reason)
+        return await closeTurnBeforeProjection(turn, 'corrupt', marker.reason, input)
     }
 
     const liveHash = await computeSourceRevisionHash(marker.location.getText(), {
@@ -401,12 +512,12 @@ async function submitPlanLedgerLocked(
         committedAssetIds: [],
     })
     if (!hashesMatch(liveHash, turn.sourceRevisionHash)) {
-        return await closeTurnBeforeProjection(turn, 'stale', 'source_hash_mismatch')
+        return await closeTurnBeforeProjection(turn, 'stale', 'source_hash_mismatch', input)
     }
     const markerless = marker.location.getText().slice(0, marker.start)
         + marker.location.getText().slice(marker.end)
     if (markerless !== turn.sourceTextUtf16) {
-        return await closeTurnBeforeProjection(turn, 'stale', 'source_text_mismatch')
+        return await closeTurnBeforeProjection(turn, 'stale', 'source_text_mismatch', input)
     }
 
     if (!manifest) {
@@ -427,8 +538,12 @@ async function submitPlanLedgerLocked(
             turnExpectedVersion: input.expectedVersion,
             leaseId: input.leaseId,
             fence: input.fence,
+            coordinatorLeaseId: input.coordinatorLeaseId,
+            coordinatorFence: input.coordinatorFence,
             idempotencyKey: input.idempotencyKey,
         })
+        turn = await illustrationJobStore.getTurn(input.turnId)
+        if (!turn) throw new IllustrationLedgerValidationError('Illustration turn disappeared')
     }
 
     let jobs = await illustrationJobStore.createJobsFromManifest({
@@ -449,10 +564,10 @@ async function submitPlanLedgerLocked(
         turn.target.requestNonce,
     )
     if (currentMarker.kind === 'stale') {
-        return await closeTurnBeforeProjection(turn, 'stale', currentMarker.reason)
+        return await closeTurnBeforeProjection(turn, 'stale', currentMarker.reason, input)
     }
     if (currentMarker.kind === 'corrupt') {
-        return await closeTurnBeforeProjection(turn, 'corrupt', currentMarker.reason)
+        return await closeTurnBeforeProjection(turn, 'corrupt', currentMarker.reason, input)
     }
     const currentHash = await computeSourceRevisionHash(currentMarker.location.getText(), {
         requestNonce: turn.target.requestNonce,
@@ -465,7 +580,12 @@ async function submitPlanLedgerLocked(
         !hashesMatch(currentHash, turn.sourceRevisionHash)
         || currentMarkerless !== turn.sourceTextUtf16
     ) {
-        return await closeTurnBeforeProjection(turn, 'stale', 'source_changed_before_projection')
+        return await closeTurnBeforeProjection(
+            turn,
+            'stale',
+            'source_changed_before_projection',
+            input,
+        )
     }
 
     const nextText = input.slots.length === 0
@@ -604,7 +724,7 @@ async function settleProjectionFailure(
     code: string,
     workerEpoch: number,
 ): Promise<void> {
-    const jobs = await illustrationJobStore.listJobs({ turnId: turn.turnId })
+    const jobs = await illustrationJobStore.listJobRecords({ turnId: turn.turnId })
     for (const job of jobs) {
         if (!canTransition('job', job.state, state)) continue
         await illustrationJobStore.transitionJob({
@@ -711,7 +831,7 @@ async function recoverIllustrationProjectionLocked(
     let manifest = await illustrationJobStore.getManifest(turn.turnId)
     if (!manifest) return
     if (turn.state === 'awaiting_prompt' && manifest.phase === 'projection_durable') {
-        const existingJobs = await illustrationJobStore.listJobs({ turnId: turn.turnId })
+        const existingJobs = await illustrationJobStore.listJobRecords({ turnId: turn.turnId })
         if (
             existingJobs.length === manifest.expectedCount
             && existingJobs.every((job) => job.state !== 'prepared')
@@ -904,7 +1024,7 @@ export async function recoverIllustrationProjection(
 
 export const MAX_ILLUSTRATION_PROMPT_BYTES = 16 * 1024
 
-export type SupplyPromptLedgerInput = IllustrationHolderWrite & {
+export type SupplyPromptLedgerInput = IllustrationHolderWrite & IllustrationCoordinatorProof & {
     jobId: string
     idempotencyKey: string
     positive: string
@@ -950,7 +1070,7 @@ export async function resolveIllustrationJobContext(
     const resolution = resolveSlotAnchor(loaded.chat, job.target)
     if (resolution.kind !== 'found') return resolution
 
-    const siblings = await illustrationJobStore.listJobs({ turnId: job.turnId })
+    const siblings = await illustrationJobStore.listJobRecords({ turnId: job.turnId })
     const variantText = resolvedVariantText(loaded.chat, resolution)
     const liveHash = await computeSourceRevisionHash(variantText, {
         requestNonce: job.target.requestNonce,
@@ -1001,6 +1121,8 @@ export async function supplyPromptLedger(
             to: 'queued',
             leaseId: input.leaseId,
             fence: input.fence,
+            coordinatorLeaseId: input.coordinatorLeaseId,
+            coordinatorFence: input.coordinatorFence,
             patch: {
                 idempotencyKey: input.idempotencyKey,
                 prompt: { positive: input.positive, negative: input.negative },
@@ -1017,6 +1139,10 @@ export async function supplyPromptLedger(
             jobId: job.jobId,
             expectedVersion: input.expectedVersion,
             to: context.kind,
+            leaseId: input.leaseId,
+            fence: input.fence,
+            coordinatorLeaseId: input.coordinatorLeaseId,
+            coordinatorFence: input.coordinatorFence,
             patch: {
                 idempotencyKey: `prompt-target:${input.idempotencyKey}:${context.kind}`,
                 error: { code: context.reason },
@@ -1033,6 +1159,8 @@ export async function supplyPromptLedger(
         to: 'queued',
         leaseId: input.leaseId,
         fence: input.fence,
+        coordinatorLeaseId: input.coordinatorLeaseId,
+        coordinatorFence: input.coordinatorFence,
         patch: {
             idempotencyKey: input.idempotencyKey,
             prompt: { positive: input.positive, negative: input.negative },
@@ -1049,6 +1177,37 @@ export async function cancelLedger(input: {
     const cancelled = await illustrationJobStore.requestCancel(input)
     signalIllustrationExecutor()
     return cancelled
+}
+
+async function removeCancelledTurnMarkerBestEffort(
+    turn: IllustrationTurnRecordV1,
+): Promise<void> {
+    if (!turn.target) return
+    try {
+        const loaded = await loadChat(turn.target.chaId, turn.target.conversationId)
+        const marker = resolveRequestMarker(
+            loaded.chat,
+            turn.target.expectedMessageId,
+            turn.target.requestNonce,
+        )
+        if (marker.kind !== 'found') return
+        const text = marker.location.getText()
+        marker.location.setText(text.slice(0, marker.start) + text.slice(marker.end))
+        await saveLoadedChatStrict(turn, loaded)
+    } catch {
+        // The ledger transition is the authority and has already ACKed. A marker
+        // left by a failed strict flush is inert: cancelled turns cannot claim
+        // work, and prompt/render boundaries strip or hide control nodes.
+    }
+}
+
+export async function cancelTurnLedger(input: {
+    turnId: string
+    expectedVersion: number
+}): Promise<IllustrationTurnSnapshotV1> {
+    const cancelled = await illustrationJobStore.requestCancelTurn(input)
+    await removeCancelledTurnMarkerBestEffort(cancelled)
+    return projectTurnSnapshot(cancelled)
 }
 
 export async function retryUncertainLedger(input: {

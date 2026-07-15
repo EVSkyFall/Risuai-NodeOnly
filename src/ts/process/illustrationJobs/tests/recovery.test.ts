@@ -57,6 +57,7 @@ vi.mock('src/ts/process/files/inlays', () => ({
 }))
 
 const coordinatorModule = await import('../coordinator')
+const coordinatorRecordModule = await import('../coordinatorRecord')
 const executorModule = await import('../executor')
 const featureModule = await import('../featureFlag')
 const lockModule = await import('../locks')
@@ -65,6 +66,7 @@ const recoveryModule = await import('../recovery')
 const storeModule = await import('../store')
 
 const { registerTrustedTurn, submitPlanLedger, supplyPromptLedger } = coordinatorModule
+const { claimCoordinator } = coordinatorRecordModule
 const {
     resetIllustrationWorkerLockManagerAccessorForTests,
     setIllustrationWorkerLockManagerAccessorForTests,
@@ -80,6 +82,19 @@ const { illustrationJobKey, illustrationJobStore } = storeModule
 
 const BASE_TIME = Date.UTC(2026, 0, 4)
 let lockManager: InMemoryLockManager
+let coordinatorProof: { coordinatorLeaseId: string; coordinatorFence: number }
+
+async function refreshCoordinatorProof(): Promise<void> {
+    const snapshot = await claimCoordinator({
+        protocolVersion: 1,
+        leaseId: 'test-coordinator',
+        holderRuntimeId: 'test-runtime',
+    })
+    coordinatorProof = {
+        coordinatorLeaseId: 'test-coordinator',
+        coordinatorFence: snapshot.fence,
+    }
+}
 
 function installDatabase(source = 'Recovery source') {
     const message: any = { role: 'char', chatId: 'message-1', data: source }
@@ -118,6 +133,7 @@ async function createClaimedTurn(source = 'Recovery source') {
         sourceVariantText: source,
     })
     const claimed = await illustrationJobStore.claimTurn({
+        ...coordinatorProof,
         turnId: turn.turnId,
         expectedVersion: turn.version,
         leaseId: 'planner',
@@ -128,6 +144,7 @@ async function createClaimedTurn(source = 'Recovery source') {
 async function createQueuedJob(source = 'Recovery source') {
     const target = await createClaimedTurn(source)
     const [projected] = await submitPlanLedger({
+        ...coordinatorProof,
         turnId: target.turn.turnId,
         expectedVersion: target.claimed.version,
         leaseId: 'planner',
@@ -141,11 +158,13 @@ async function createQueuedJob(source = 'Recovery source') {
         }],
     })
     const claimedJob = await illustrationJobStore.claimJob({
+        ...coordinatorProof,
         jobId: projected.jobId,
         expectedVersion: projected.version,
         leaseId: 'tagger',
     })
     const queued = await supplyPromptLedger({
+        ...coordinatorProof,
         jobId: projected.jobId,
         expectedVersion: claimedJob.version,
         leaseId: 'tagger',
@@ -161,6 +180,7 @@ async function createQueuedJob(source = 'Recovery source') {
 async function createTwoQueuedJobs(source = 'Two recovery scenes') {
     const target = await createClaimedTurn(source)
     const projected = await submitPlanLedger({
+        ...coordinatorProof,
         turnId: target.turn.turnId,
         expectedVersion: target.claimed.version,
         leaseId: 'planner',
@@ -184,11 +204,13 @@ async function createTwoQueuedJobs(source = 'Two recovery scenes') {
     for (const [index, job] of projected.entries()) {
         const leaseId = `tagger-${index}`
         const claimedJob = await illustrationJobStore.claimJob({
+            ...coordinatorProof,
             jobId: job.jobId,
             expectedVersion: job.version,
             leaseId,
         })
         queued.push(await supplyPromptLedger({
+            ...coordinatorProof,
             jobId: job.jobId,
             expectedVersion: claimedJob.version,
             leaseId,
@@ -207,6 +229,7 @@ function planInput(
     offsets: number[],
 ) {
     return {
+        ...coordinatorProof,
         turnId: target.turn.turnId,
         expectedVersion: target.claimed.version,
         leaseId: 'planner',
@@ -276,6 +299,7 @@ beforeEach(async () => {
     setIllustrationLockManagerAccessorForTests(() => lockManager)
     setIllustrationOperationLockManagerAccessorForTests(() => lockManager)
     setIllustrationWorkerLockManagerAccessorForTests(() => lockManager)
+    await refreshCoordinatorProof()
     await setIllustrationFeatureEnabled(true)
     harness.inspectInlay.mockImplementation(async (id: string) => {
         const status = harness.integrity.get(id) ?? 'missing'
@@ -624,6 +648,7 @@ describe('illustration recovery', () => {
         expect((await illustrationJobStore.getTurn(blocked.turnId))?.state).toBe('awaiting_plan')
 
         harness.storageMap.clear()
+        await refreshCoordinatorProof()
         await setIllustrationFeatureEnabled(true)
         installDatabase('Changed target')
         harness.strictFailure = new Error('capture failed')
@@ -640,6 +665,36 @@ describe('illustration recovery', () => {
 
         await runIllustrationRecovery()
         expect((await illustrationJobStore.getTurn(second.turnId))?.state).toBe('blocked_capture')
+    })
+
+    test('keeps Agent-blocked jobs live when updating the parent turn', async () => {
+        const target = await createClaimedTurn('Agent blocked recovery')
+        const [projected] = await submitPlanLedger(planInput(target, [5]))
+        const leaseId = 'tagger:agent-blocked-recovery'
+        const claimed = await illustrationJobStore.claimJob({
+            ...coordinatorProof,
+            jobId: projected.jobId,
+            expectedVersion: projected.version,
+            leaseId,
+        })
+        const blocked = await illustrationJobStore.reportAgentFailure({
+            protocolVersion: 1,
+            kind: 'job',
+            id: claimed.jobId,
+            expectedVersion: claimed.version,
+            leaseId,
+            fence: claimed.fence,
+            ...coordinatorProof,
+            idempotencyKey: 'failure:agent-blocked-recovery',
+            code: 'tagger_failed',
+            retryable: true,
+        })
+
+        await runIllustrationRecovery()
+
+        expect(await illustrationJobStore.getJob(claimed.jobId)).toEqual(blocked)
+        expect((await illustrationJobStore.getTurn(target.turn.turnId))?.state)
+            .toBe('awaiting_prompt')
     })
 
     // §22 feature flag: recovery is a no-op while disabled.

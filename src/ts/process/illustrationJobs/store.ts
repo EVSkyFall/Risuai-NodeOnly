@@ -8,11 +8,13 @@ import {
     IllustrationLedgerConfirmationRequiredError,
     IllustrationLedgerCorruptError,
     IllustrationLedgerHolderMismatchError,
+    IllustrationLedgerIdempotencyConflictError,
     IllustrationLedgerLeaseConflictError,
     IllustrationLedgerNotFoundError,
     IllustrationLedgerValidationError,
     IllustrationLedgerVersionConflictError,
 } from './errors'
+import { validateCoordinatorProofUnlocked } from './coordinatorRecord'
 import { withIllustrationLedgerLock } from './locks'
 import {
     assertTransition,
@@ -22,12 +24,18 @@ import {
 } from './stateMachine'
 import type {
     IllustrationHolderWrite,
+    IllustrationCoordinatorProof,
+    IllustrationJobFullSnapshotV1,
+    IllustrationJobSnapshotV1,
     IllustrationJobRecordV1,
     IllustrationJobState,
+    IllustrationJobTerminalSummaryV1,
     IllustrationJobTransitionPatch,
     IllustrationLeaseRecordFields,
     IllustrationTargetV1,
     IllustrationTurnRecordV1,
+    IllustrationTurnState,
+    IllustrationTurnSnapshotV1,
     IllustrationTurnTargetV1,
     IllustrationWorkerEpochRecordV1,
     PlanManifestV1,
@@ -48,6 +56,8 @@ export const JOB_LEASE_DURATION_MS = 120_000
 export const TERMINAL_RECORD_TTL_MS = 30 * 24 * 60 * 60 * 1000
 export const TURN_SUMMARY_RETENTION = 200
 export const DEFAULT_PRUNE_MAX_DELETES = 100
+export const MAX_AGENT_ATTEMPTS = 3
+export const TERMINAL_SUMMARY_LIMIT = 50
 
 const encoder = new TextEncoder()
 
@@ -83,7 +93,7 @@ export type CreateManifestPreparedInput = {
     leaseId: string
     fence: number
     idempotencyKey: string
-}
+} & IllustrationCoordinatorProof
 
 export type AdvanceManifestPhaseInput = {
     turnId: string
@@ -104,11 +114,37 @@ export type TransitionJobInput = {
     patch?: IllustrationJobTransitionPatch
     leaseId?: string
     fence?: number
+    coordinatorLeaseId?: string
+    coordinatorFence?: number
 }
 
 export type ClaimLeaseInput = {
     expectedVersion: number
     leaseId: string
+} & IllustrationCoordinatorProof
+
+export type ReportAgentFailureInput = IllustrationHolderWrite & IllustrationCoordinatorProof & {
+    protocolVersion: 1
+    kind: 'turn' | 'job'
+    id: string
+    idempotencyKey: string
+    code: string
+    retryable: boolean
+}
+
+export type RetryAgentFailureInput = IllustrationCoordinatorProof & {
+    protocolVersion: 1
+    kind: 'turn' | 'job'
+    id: string
+    expectedVersion: number
+    confirmNewLlmCharge: true
+}
+
+export type CloseTurnFromPlanInput = IllustrationHolderWrite & IllustrationCoordinatorProof & {
+    turnId: string
+    to: 'stale' | 'corrupt'
+    code: string
+    idempotencyKey: string
 }
 
 export type RetryUncertainJobInput = {
@@ -262,7 +298,6 @@ function validateManifest(manifest: PlanManifestV1): void {
     const jobIds = new Set<string>()
     const slotTokens = new Set<string>()
     const sceneIds = new Set<string>()
-    const insertionOffsets = new Set<number>()
     manifest.jobs.forEach((job, index) => {
         const label = `manifest.jobs[${index}]`
         assertNonEmptyString(job.jobId, `${label}.jobId`)
@@ -275,13 +310,9 @@ function validateManifest(manifest: PlanManifestV1): void {
             throw new IllustrationLedgerValidationError('Duplicate slotToken in manifest')
         }
         if (sceneIds.has(job.sceneId)) throw new IllustrationLedgerValidationError('Duplicate sceneId in manifest')
-        if (insertionOffsets.has(job.insertAfterUtf16)) {
-            throw new IllustrationLedgerValidationError('Duplicate insertAfterUtf16 in manifest')
-        }
         jobIds.add(job.jobId)
         slotTokens.add(job.slotToken)
         sceneIds.add(job.sceneId)
-        insertionOffsets.add(job.insertAfterUtf16)
     })
 
     const canonicalManifest: PlanManifestV1 = {
@@ -312,11 +343,169 @@ function validateRecordBasics(record: IllustrationLeaseRecordFields): void {
     validateWorkerEpoch(record.workerEpoch)
     assertNonNegativeInteger(record.updatedAt, 'record.updatedAt')
     assertNonEmptyString(record.idempotencyKey, 'record.idempotencyKey')
+    assertNonNegativeInteger(record.agentAttemptCount ?? 0, 'record.agentAttemptCount')
+    if (
+        record.agentHardRetryPending !== undefined
+        && typeof record.agentHardRetryPending !== 'boolean'
+    ) {
+        throw new IllustrationLedgerValidationError('record.agentHardRetryPending must be a boolean')
+    }
     if (record.leaseId !== null) assertNonEmptyString(record.leaseId, 'record.leaseId')
+}
+
+function coordinatorProofFrom(input: {
+    coordinatorLeaseId?: string
+    coordinatorFence?: number
+}): IllustrationCoordinatorProof {
+    return {
+        coordinatorLeaseId: input.coordinatorLeaseId as string,
+        coordinatorFence: input.coordinatorFence as number,
+    }
+}
+
+export function projectTurnSnapshot(
+    record: IllustrationTurnRecordV1,
+    callerLeaseId?: string,
+): IllustrationTurnSnapshotV1 {
+    return {
+        protocolVersion: 1,
+        turnId: record.turnId,
+        version: record.version,
+        state: record.state,
+        ...(record.leaseId === null ? {} : {
+            lease: {
+                expiresAt: record.leaseExpiresAt,
+                fence: record.fence,
+                ownedByCaller: callerLeaseId !== undefined && record.leaseId === callerLeaseId,
+            },
+        }),
+        ...(record.target ? { target: cloneJson(record.target) } : {}),
+        ...(record.sourceTextUtf16 === undefined ? {} : { sourceTextUtf16: record.sourceTextUtf16 }),
+        ...(record.sourceRevisionHash === undefined ? {} : {
+            sourceRevisionHash: record.sourceRevisionHash,
+        }),
+        offsetEncoding: 'utf-16',
+        ...(record.settingsFingerprint === undefined ? {} : {
+            settingsFingerprint: record.settingsFingerprint,
+        }),
+        agentAttemptCount: record.agentAttemptCount ?? 0,
+        updatedAt: record.updatedAt,
+        ...(record.error ? { error: cloneJson(record.error) } : {}),
+    }
+}
+
+export function projectFullJobSnapshot(
+    record: IllustrationJobRecordV1,
+    callerLeaseId?: string,
+): IllustrationJobFullSnapshotV1 {
+    return {
+        protocolVersion: 1,
+        turnId: record.turnId,
+        jobId: record.jobId,
+        slotOrdinal: record.slotOrdinal ?? 0,
+        version: record.version,
+        state: record.state,
+        ...(record.leaseId === null ? {} : {
+            lease: {
+                expiresAt: record.leaseExpiresAt,
+                fence: record.fence,
+                ownedByCaller: callerLeaseId !== undefined && record.leaseId === callerLeaseId,
+            },
+        }),
+        workerEpoch: record.workerEpoch,
+        ...(record.target ? { target: cloneJson(record.target) } : {}),
+        sceneId: record.sceneId,
+        scenePayload: cloneJson(record.scenePayload),
+        hasDurablePrompt: record.prompt !== undefined,
+        ...(record.attemptId === undefined ? {} : { attemptId: record.attemptId }),
+        ...(record.assetId === undefined ? {} : { assetId: record.assetId }),
+        createdAt: record.createdAt ?? record.updatedAt,
+        updatedAt: record.updatedAt,
+        agentAttemptCount: record.agentAttemptCount ?? 0,
+        ...(record.error ? { error: cloneJson(record.error) } : {}),
+    }
+}
+
+function toTerminalJobSummary(record: IllustrationJobRecordV1): IllustrationJobTerminalSummaryV1 {
+    if (!isPrunableJobState(record.state)) {
+        throw new IllustrationLedgerCorruptError(`Job ${record.jobId} is not terminal-summary eligible`)
+    }
+    return {
+        protocolVersion: 1,
+        turnId: record.turnId,
+        jobId: record.jobId,
+        slotOrdinal: record.slotOrdinal ?? 0,
+        version: record.version,
+        state: record.state as IllustrationJobTerminalSummaryV1['state'],
+        ...(record.target ? {
+            target: {
+                chaId: record.target.chaId,
+                conversationId: record.target.conversationId,
+                expectedMessageId: record.target.expectedMessageId,
+                rootTurnId: record.target.rootTurnId,
+            },
+        } : {}),
+        sceneId: record.sceneId,
+        createdAt: record.createdAt ?? record.updatedAt,
+        updatedAt: record.updatedAt,
+        ...(record.error ? { error: { code: record.error.code } } : {}),
+    }
+}
+
+function compareJobSnapshotOrder(
+    left: IllustrationJobSnapshotV1,
+    right: IllustrationJobSnapshotV1,
+): number {
+    return left.slotOrdinal - right.slotOrdinal
+        || left.createdAt - right.createdAt
+        || left.jobId.localeCompare(right.jobId)
+}
+
+function replayedAgentFailure<T extends IllustrationTurnRecordV1 | IllustrationJobRecordV1>(
+    current: T,
+    input: ReportAgentFailureInput,
+): T | null {
+    const history = current.agentFailureWrites
+        ?? (current.lastAgentFailureWrite ? [current.lastAgentFailureWrite] : [])
+    const receipt = history.find((candidate) => candidate.idempotencyKey === input.idempotencyKey)
+    if (!receipt) return null
+    if (receipt.leaseId !== input.leaseId || receipt.fence !== input.fence) {
+        throw new IllustrationLedgerHolderMismatchError(
+            'Repeated Agent failure report must use the original holder lease and fence',
+        )
+    }
+    if (
+        receipt.previousVersion !== input.expectedVersion
+        || receipt.code !== input.code
+        || receipt.retryable !== input.retryable
+    ) {
+        throw new IllustrationLedgerIdempotencyConflictError(
+            'Agent failure idempotencyKey is bound to different report data',
+        )
+    }
+    if (
+        current.version !== receipt.resultVersion
+        || current.state !== receipt.outcomeState
+        || (current.agentAttemptCount ?? 0) !== receipt.agentAttemptCount
+    ) {
+        throw new IllustrationLedgerIdempotencyConflictError(
+            'Agent failure idempotencyKey is stale after the blocked outcome changed',
+        )
+    }
+    return cloneJson(current)
 }
 
 function jobIdempotencyKey(manifest: PlanManifestV1, jobId: string): string {
     return `manifest:${manifest.planHash}:job:${jobId}`
+}
+
+function slotOrdinalsForManifest(manifest: PlanManifestV1): Map<string, number> {
+    const ordered = manifest.jobs
+        .map((job, manifestIndex) => ({ job, manifestIndex }))
+        .sort((left, right) =>
+            left.job.insertAfterUtf16 - right.job.insertAfterUtf16
+            || left.manifestIndex - right.manifestIndex)
+    return new Map(ordered.map(({ job }, slotOrdinal) => [job.jobId, slotOrdinal]))
 }
 
 function manifestBodyMatches(
@@ -339,6 +528,7 @@ function jobMatchesManifest(
     manifest: PlanManifestV1,
     job: PlanManifestV1['jobs'][number],
 ): boolean {
+    const slotOrdinal = slotOrdinalsForManifest(manifest).get(job.jobId)
     return (
         record.jobId === job.jobId &&
         record.turnId === manifest.turnId &&
@@ -347,6 +537,7 @@ function jobMatchesManifest(
         record.insertAfterUtf16 === job.insertAfterUtf16 &&
         record.sceneId === job.sceneId &&
         record.sourceRevisionHash === manifest.sourceRevisionHash &&
+        record.slotOrdinal === slotOrdinal &&
         jsonValuesEqual(record.scenePayload, job.scenePayload)
     )
 }
@@ -559,6 +750,7 @@ export class IllustrationJobStore {
                 workerEpoch,
                 updatedAt: now,
                 idempotencyKey: input.idempotencyKey,
+                agentAttemptCount: 0,
                 ...(input.target ? { target: cloneJson(input.target) } : {}),
                 ...(input.sourceTextUtf16 !== undefined ? { sourceTextUtf16: input.sourceTextUtf16 } : {}),
                 ...(input.sourceRevisionHash !== undefined
@@ -614,6 +806,38 @@ export class IllustrationJobStore {
             ) {
                 throw new IllustrationLedgerValidationError('Turn lease fields may only change through claimTurn')
             }
+            if (
+                candidate.agentAttemptCount !== current.agentAttemptCount
+                || candidate.agentHardRetryPending !== current.agentHardRetryPending
+                || !jsonValuesEqual(candidate.lastAgentFailureWrite, current.lastAgentFailureWrite)
+                || !jsonValuesEqual(candidate.agentFailureWrites, current.agentFailureWrites)
+                || !jsonValuesEqual(candidate.lastPlanClosureWrite, current.lastPlanClosureWrite)
+            ) {
+                throw new IllustrationLedgerValidationError(
+                    'Turn failure counters and closure receipts may only change through their dedicated ledger operations',
+                )
+            }
+            if (
+                (current.state === 'agent_blocked_retryable' || current.state === 'agent_blocked')
+                && candidate.state === 'awaiting_plan'
+            ) {
+                throw new IllustrationLedgerValidationError(
+                    'Agent-blocked turns may only be reopened through retryAgentFailure',
+                )
+            }
+            if (
+                current.state === 'awaiting_plan'
+                && (candidate.state === 'agent_blocked_retryable' || candidate.state === 'agent_blocked')
+            ) {
+                throw new IllustrationLedgerValidationError(
+                    'Agent failure states may only be entered through reportAgentFailure',
+                )
+            }
+            if (candidate.state === 'cancelled' && current.state !== 'cancelled') {
+                throw new IllustrationLedgerValidationError(
+                    'Turn cancellation must use requestCancelTurn',
+                )
+            }
             if (candidate.state !== current.state) {
                 assertTransition('turn', current.state, candidate.state)
             }
@@ -634,11 +858,41 @@ export class IllustrationJobStore {
             assertNonEmptyString(input.manifest.turnId, 'manifest.turnId')
             assertJsonSerializable(input.manifest, 'plan manifest')
 
+            const now = Date.now()
+            await validateCoordinatorProofUnlocked(input, { now })
             const existing = await this.readManifestUnlocked(input.manifest.turnId)
             if (
                 existing &&
                 manifestBodyMatches(existing, input.manifest, input.idempotencyKey)
             ) {
+                const turn = await this.requireTurnUnlocked(input.manifest.turnId)
+                if (existing.holderWrite) {
+                    if (
+                        existing.holderWrite.turnExpectedVersion !== input.turnExpectedVersion
+                        || existing.holderWrite.leaseId !== input.leaseId
+                        || existing.holderWrite.fence !== input.fence
+                    ) {
+                        throw new IllustrationLedgerHolderMismatchError(
+                            'Repeated plan submission must use the original turn version, lease, and fence',
+                        )
+                    }
+                } else {
+                    validateHolderWrite(turn, {
+                        leaseId: input.leaseId,
+                        expectedVersion: input.turnExpectedVersion,
+                        fence: input.fence,
+                    }, now)
+                }
+                if ((turn.agentAttemptCount ?? 0) !== 0 || turn.agentHardRetryPending === true) {
+                    const reset: IllustrationTurnRecordV1 = {
+                        ...turn,
+                        agentAttemptCount: 0,
+                        version: turn.version + 1,
+                        updatedAt: now,
+                    }
+                    delete reset.agentHardRetryPending
+                    await writePersistentJson(illustrationTurnKey(turn.turnId), reset)
+                }
                 return cloneJson(existing)
             }
 
@@ -668,10 +922,25 @@ export class IllustrationJobStore {
 
             const stored: StoredPlanManifestV1 = {
                 ...manifest,
-                updatedAt: Date.now(),
+                updatedAt: now,
                 idempotencyKey: input.idempotencyKey,
+                holderWrite: {
+                    turnExpectedVersion: input.turnExpectedVersion,
+                    leaseId: input.leaseId,
+                    fence: input.fence,
+                },
             }
             await writePersistentJson(illustrationManifestKey(manifest.turnId), stored)
+            if ((turn.agentAttemptCount ?? 0) !== 0 || turn.agentHardRetryPending === true) {
+                const reset: IllustrationTurnRecordV1 = {
+                    ...turn,
+                    agentAttemptCount: 0,
+                    version: turn.version + 1,
+                    updatedAt: now,
+                }
+                delete reset.agentHardRetryPending
+                await writePersistentJson(illustrationTurnKey(turn.turnId), reset)
+            }
             return cloneJson(stored)
         })
     }
@@ -756,6 +1025,7 @@ export class IllustrationJobStore {
             })
 
             const now = Date.now()
+            const slotOrdinals = slotOrdinalsForManifest(manifest)
             const result: IllustrationJobRecordV1[] = []
             for (let index = 0; index < manifest.jobs.length; index += 1) {
                 const prior = existing[index]
@@ -773,6 +1043,8 @@ export class IllustrationJobStore {
                     sceneId: job.sceneId,
                     scenePayload: cloneJson(job.scenePayload),
                     sourceRevisionHash: manifest.sourceRevisionHash,
+                    slotOrdinal: slotOrdinals.get(job.jobId)!,
+                    createdAt: now,
                     state: 'prepared',
                     version: 1,
                     leaseId: null,
@@ -781,6 +1053,7 @@ export class IllustrationJobStore {
                     workerEpoch,
                     updatedAt: now,
                     idempotencyKey: jobIdempotencyKey(manifest, job.jobId),
+                    agentAttemptCount: 0,
                     creationIdempotencyKey: jobIdempotencyKey(manifest, job.jobId),
                 }
                 await writePersistentJson(illustrationJobKey(job.jobId), record)
@@ -804,7 +1077,7 @@ export class IllustrationJobStore {
         })
     }
 
-    async listJobs(input: { turnId?: string } = {}): Promise<IllustrationJobRecordV1[]> {
+    async listJobRecords(input: { turnId?: string } = {}): Promise<IllustrationJobRecordV1[]> {
         return await withIllustrationLedgerLock(async () => {
             if (input.turnId !== undefined) {
                 assertNonEmptyString(input.turnId, 'turnId')
@@ -833,6 +1106,65 @@ export class IllustrationJobStore {
         })
     }
 
+    async listJobs(input: { turnId?: string } = {}): Promise<IllustrationJobSnapshotV1[]> {
+        return await withIllustrationLedgerLock(async () => {
+            let records: IllustrationJobRecordV1[]
+            if (input.turnId !== undefined) {
+                assertNonEmptyString(input.turnId, 'turnId')
+                const jobIds =
+                    (await readPersistentJson<string[]>(illustrationTurnJobsKey(input.turnId))) ?? []
+                const read = await Promise.all(jobIds.map((jobId) => this.readJobUnlocked(jobId)))
+                records = read
+                    .filter((record): record is IllustrationJobRecordV1 => record !== null)
+                    .map((record) => {
+                        if (record.turnId !== input.turnId) {
+                            throw new IllustrationLedgerCorruptError(
+                                `Turn-job index points to job ${record.jobId} from another turn`,
+                            )
+                        }
+                        return record
+                    })
+            } else {
+                const keys = await listPersistentKeys(ILLUSTRATION_JOB_PREFIX)
+                const read = await Promise.all(
+                    keys.map((key) => readPersistentJson<IllustrationJobRecordV1>(key)),
+                )
+                records = read.filter((record): record is IllustrationJobRecordV1 => record !== null)
+            }
+
+            const full = records.filter((record) =>
+                !isTerminalJobState(record.state) || record.state === 'uncertain')
+            const summaries = records
+                .filter((record) => isPrunableJobState(record.state))
+                .sort((left, right) =>
+                    right.updatedAt - left.updatedAt || left.jobId.localeCompare(right.jobId))
+                .slice(0, TERMINAL_SUMMARY_LIMIT)
+            return [
+                ...full.map((record) => projectFullJobSnapshot(record)),
+                ...summaries.map((record) => toTerminalJobSummary(record)),
+            ].sort(compareJobSnapshotOrder)
+        })
+    }
+
+    async listPendingTurns(): Promise<IllustrationTurnSnapshotV1[]> {
+        return await withIllustrationLedgerLock(async () => {
+            const keys = await listPersistentKeys(ILLUSTRATION_TURN_PREFIX)
+            const records = await Promise.all(
+                keys.map((key) => readPersistentJson<IllustrationTurnRecordV1>(key)),
+            )
+            return records
+                .filter((record): record is IllustrationTurnRecordV1 => record !== null)
+                .filter((record) => [
+                    'awaiting_plan',
+                    'agent_blocked_retryable',
+                    'agent_blocked',
+                ].includes(record.state))
+                .sort((left, right) =>
+                    left.updatedAt - right.updatedAt || left.turnId.localeCompare(right.turnId))
+                .map((record) => projectTurnSnapshot(record))
+        })
+    }
+
     async transitionJob(input: TransitionJobInput): Promise<IllustrationJobRecordV1> {
         return await withIllustrationLedgerLock(async () => {
             const current = await this.requireJobUnlocked(input.jobId)
@@ -844,22 +1176,55 @@ export class IllustrationJobStore {
             }
 
             const now = Date.now()
+            // Holder/coordinator fields identify Plugin Agent pipeline writes.
+            // Executor-owned NAI/asset transitions intentionally omit them: the
+            // coordinator governs Agent LLM work, not Core's NAI worker.
+            const promptSupply = current.state === 'awaiting_prompt' && input.to === 'queued'
+            const pluginAgentWrite = promptSupply
+                || input.leaseId !== undefined
+                || input.fence !== undefined
+                || input.coordinatorLeaseId !== undefined
+                || input.coordinatorFence !== undefined
+            if (pluginAgentWrite) {
+                if (
+                    input.leaseId === undefined
+                    || input.fence === undefined
+                    || input.coordinatorLeaseId === undefined
+                    || input.coordinatorFence === undefined
+                ) {
+                    throw new IllustrationLedgerHolderMismatchError(
+                        'Plugin Agent writes require holder and coordinator proof',
+                    )
+                }
+                await validateCoordinatorProofUnlocked(coordinatorProofFrom(input), { now })
+            }
             if (current.version !== input.expectedVersion) {
                 if (isLostAckTransition(current, input, patch, now)) return cloneJson(current)
                 throw new IllustrationLedgerVersionConflictError(input.expectedVersion, current.version)
             }
             assertTransition('job', current.state, input.to)
-            if (current.state === 'awaiting_prompt' && input.to === 'queued') {
-                if (input.leaseId === undefined || input.fence === undefined) {
-                    throw new IllustrationLedgerHolderMismatchError(
-                        'Tagger result writes require leaseId, expectedVersion, and fence',
-                    )
-                }
+            if (
+                (current.state === 'agent_blocked_retryable' || current.state === 'agent_blocked')
+                && input.to === 'awaiting_prompt'
+            ) {
+                throw new IllustrationLedgerValidationError(
+                    'Agent-blocked jobs may only be reopened through retryAgentFailure',
+                )
+            }
+            if (
+                current.state === 'awaiting_prompt'
+                && (input.to === 'agent_blocked_retryable' || input.to === 'agent_blocked')
+            ) {
+                throw new IllustrationLedgerValidationError(
+                    'Agent failure states may only be entered through reportAgentFailure',
+                )
+            }
+            if (pluginAgentWrite) {
                 validateHolderWrite(current, {
-                    leaseId: input.leaseId,
+                    leaseId: input.leaseId!,
                     expectedVersion: input.expectedVersion,
-                    fence: input.fence,
-                })
+                    fence: input.fence!,
+                }, now)
             }
 
             assertNonEmptyString(patch.idempotencyKey, 'patch.idempotencyKey')
@@ -869,7 +1234,7 @@ export class IllustrationJobStore {
             const next = cloneJson(current)
             next.state = input.to
             next.idempotencyKey = patch.idempotencyKey
-            if (current.state === 'awaiting_prompt' && input.to === 'queued') {
+            if (pluginAgentWrite) {
                 next.lastHolderWrite = {
                     leaseId: input.leaseId!,
                     fence: input.fence!,
@@ -877,6 +1242,12 @@ export class IllustrationJobStore {
                 }
             } else {
                 delete next.lastHolderWrite
+            }
+            if (current.state === 'awaiting_prompt' && input.to === 'queued') {
+                // Gate 4a decision 2A: a durable prompt is the Tagger success
+                // boundary that resets the cumulative Agent failure count.
+                next.agentAttemptCount = 0
+                delete next.agentHardRetryPending
             }
             delete next.lastRetryWrite
 
@@ -997,6 +1368,8 @@ export class IllustrationJobStore {
             switch (current.state) {
                 case 'prepared':
                 case 'awaiting_prompt':
+                case 'agent_blocked_retryable':
+                case 'agent_blocked':
                 case 'queued':
                 case 'blocked_config':
                 case 'asset_ready':
@@ -1031,6 +1404,99 @@ export class IllustrationJobStore {
         })
     }
 
+    async closeTurnFromPlan(input: CloseTurnFromPlanInput): Promise<IllustrationTurnRecordV1> {
+        return await withIllustrationLedgerLock(async () => {
+            assertNonEmptyString(input.code, 'code')
+            assertNonEmptyString(input.idempotencyKey, 'idempotencyKey')
+            const now = Date.now()
+            await validateCoordinatorProofUnlocked(input, { now })
+            const current = await this.requireTurnUnlocked(input.turnId)
+            const receipt = current.lastPlanClosureWrite
+            if (receipt?.idempotencyKey === input.idempotencyKey) {
+                if (
+                    receipt.previousVersion !== input.expectedVersion
+                    || receipt.leaseId !== input.leaseId
+                    || receipt.fence !== input.fence
+                    || receipt.state !== input.to
+                    || receipt.code !== input.code
+                    || current.version !== receipt.resultVersion
+                    || current.state !== receipt.state
+                ) {
+                    throw new IllustrationLedgerIdempotencyConflictError(
+                        'Plan closure idempotencyKey is bound to a different write',
+                    )
+                }
+                return cloneJson(current)
+            }
+            validateHolderWrite(current, input, now)
+            if (current.state !== 'awaiting_plan') {
+                throw new IllustrationLedgerValidationError(
+                    'Only an awaiting_plan turn may be closed by submitPlan',
+                )
+            }
+            assertTransition('turn', current.state, input.to)
+            const next: IllustrationTurnRecordV1 = {
+                ...current,
+                state: input.to,
+                leaseId: null,
+                leaseExpiresAt: 0,
+                error: { code: input.code },
+                version: current.version + 1,
+                updatedAt: now,
+                lastPlanClosureWrite: {
+                    idempotencyKey: input.idempotencyKey,
+                    previousVersion: current.version,
+                    resultVersion: current.version + 1,
+                    leaseId: input.leaseId,
+                    fence: input.fence,
+                    state: input.to,
+                    code: input.code,
+                },
+            }
+            await writePersistentJson(illustrationTurnKey(current.turnId), next)
+            return cloneJson(next)
+        })
+    }
+
+    async requestCancelTurn(input: {
+        turnId: string
+        expectedVersion: number
+    }): Promise<IllustrationTurnRecordV1> {
+        return await withIllustrationLedgerLock(async () => {
+            const current = await this.requireTurnUnlocked(input.turnId)
+            if (current.version !== input.expectedVersion) {
+                if (
+                    current.version === input.expectedVersion + 1
+                    && current.state === 'cancelled'
+                ) return cloneJson(current)
+                throw new IllustrationLedgerVersionConflictError(input.expectedVersion, current.version)
+            }
+            if (![
+                'prepared',
+                'blocked_capture',
+                'awaiting_plan',
+                'agent_blocked_retryable',
+                'agent_blocked',
+            ].includes(current.state)) {
+                throw new IllustrationLedgerValidationError(
+                    `Turn cancellation is not accepted from ${current.state}`,
+                )
+            }
+            assertTransition('turn', current.state, 'cancelled')
+            const now = Date.now()
+            const next: IllustrationTurnRecordV1 = {
+                ...current,
+                state: 'cancelled',
+                leaseId: null,
+                leaseExpiresAt: 0,
+                version: current.version + 1,
+                updatedAt: now,
+            }
+            await writePersistentJson(illustrationTurnKey(current.turnId), next)
+            return cloneJson(next)
+        })
+    }
+
     private claimLeaseRecord<T extends IllustrationTurnRecordV1 | IllustrationJobRecordV1>(
         current: T,
         input: ClaimLeaseInput,
@@ -1057,10 +1523,12 @@ export class IllustrationJobStore {
     async claimTurn(input: ClaimLeaseInput & { turnId: string }): Promise<IllustrationTurnRecordV1> {
         return await withIllustrationLedgerLock(async () => {
             const current = await this.requireTurnUnlocked(input.turnId)
+            const now = Date.now()
+            await validateCoordinatorProofUnlocked(input, { now })
             if (current.state !== 'awaiting_plan') {
                 throw new IllustrationLedgerValidationError('Only awaiting_plan turns may be claimed')
             }
-            const next = this.claimLeaseRecord(current, input, TURN_LEASE_DURATION_MS, Date.now())
+            const next = this.claimLeaseRecord(current, input, TURN_LEASE_DURATION_MS, now)
             await writePersistentJson(illustrationTurnKey(current.turnId), next)
             return cloneJson(next)
         })
@@ -1069,11 +1537,169 @@ export class IllustrationJobStore {
     async claimJob(input: ClaimLeaseInput & { jobId: string }): Promise<IllustrationJobRecordV1> {
         return await withIllustrationLedgerLock(async () => {
             const current = await this.requireJobUnlocked(input.jobId)
+            const now = Date.now()
+            await validateCoordinatorProofUnlocked(input, { now })
             if (current.state !== 'awaiting_prompt') {
                 throw new IllustrationLedgerValidationError('Only awaiting_prompt jobs may be claimed')
             }
-            const next = this.claimLeaseRecord(current, input, JOB_LEASE_DURATION_MS, Date.now())
+            const next = this.claimLeaseRecord(current, input, JOB_LEASE_DURATION_MS, now)
             await writePersistentJson(illustrationJobKey(current.jobId), next)
+            return cloneJson(next)
+        })
+    }
+
+    async claimTurnSnapshot(
+        input: ClaimLeaseInput & { turnId: string },
+    ): Promise<IllustrationTurnSnapshotV1> {
+        return projectTurnSnapshot(await this.claimTurn(input), input.leaseId)
+    }
+
+    async claimJobSnapshot(
+        input: ClaimLeaseInput & { jobId: string },
+    ): Promise<IllustrationJobFullSnapshotV1> {
+        return projectFullJobSnapshot(await this.claimJob(input), input.leaseId)
+    }
+
+    async reportAgentFailure(
+        input: ReportAgentFailureInput,
+    ): Promise<IllustrationTurnRecordV1 | IllustrationJobRecordV1> {
+        return await withIllustrationLedgerLock(async () => {
+            if (input.protocolVersion !== 1) {
+                throw new IllustrationLedgerValidationError('protocolVersion must be 1')
+            }
+            if (input.kind !== 'turn' && input.kind !== 'job') {
+                throw new IllustrationLedgerValidationError('kind must be turn or job')
+            }
+            assertNonEmptyString(input.id, 'id')
+            assertNonEmptyString(input.idempotencyKey, 'idempotencyKey')
+            assertNonEmptyString(input.code, 'code')
+            if (typeof input.retryable !== 'boolean') {
+                throw new IllustrationLedgerValidationError('retryable must be a boolean')
+            }
+            const now = Date.now()
+            await validateCoordinatorProofUnlocked(input, { allowDraining: true, now })
+            const current = input.kind === 'turn'
+                ? await this.requireTurnUnlocked(input.id)
+                : await this.requireJobUnlocked(input.id)
+            const replay = replayedAgentFailure(current, input)
+            if (replay) return replay
+            validateHolderWrite(current, input, now)
+
+            const expectedState = input.kind === 'turn' ? 'awaiting_plan' : 'awaiting_prompt'
+            if (current.state !== expectedState) {
+                throw new IllustrationLedgerValidationError(
+                    `Only ${expectedState} records may report an Agent failure`,
+                )
+            }
+            const priorAttemptCount = current.agentAttemptCount ?? 0
+            const agentAttemptCount = input.retryable
+                ? priorAttemptCount + 1
+                : priorAttemptCount
+            const outcomeState = input.retryable
+                && agentAttemptCount < MAX_AGENT_ATTEMPTS
+                && current.agentHardRetryPending !== true
+                ? 'agent_blocked_retryable'
+                : 'agent_blocked'
+            if (input.kind === 'turn') {
+                assertTransition(
+                    'turn',
+                    current.state as IllustrationTurnState,
+                    outcomeState,
+                )
+            } else {
+                assertTransition('job', current.state as IllustrationJobState, outcomeState)
+            }
+            const receipt = {
+                idempotencyKey: input.idempotencyKey,
+                previousVersion: current.version,
+                resultVersion: current.version + 1,
+                leaseId: input.leaseId,
+                fence: input.fence,
+                code: input.code,
+                retryable: input.retryable,
+                outcomeState,
+                agentAttemptCount,
+            }
+            const priorHistory = current.agentFailureWrites
+                ?? (current.lastAgentFailureWrite ? [current.lastAgentFailureWrite] : [])
+            const next = {
+                ...current,
+                state: outcomeState,
+                leaseId: null,
+                leaseExpiresAt: 0,
+                agentAttemptCount,
+                error: { code: input.code, retryable: input.retryable },
+                version: current.version + 1,
+                updatedAt: now,
+                lastAgentFailureWrite: receipt,
+                agentFailureWrites: [...priorHistory, receipt],
+            } as IllustrationTurnRecordV1 | IllustrationJobRecordV1
+            delete next.agentHardRetryPending
+            if (input.kind === 'job') {
+                delete (next as IllustrationJobRecordV1).lastHolderWrite
+                delete (next as IllustrationJobRecordV1).lastRetryWrite
+                await writePersistentJson(illustrationJobKey(input.id), next)
+            } else {
+                await writePersistentJson(illustrationTurnKey(input.id), next)
+            }
+            return cloneJson(next)
+        })
+    }
+
+    async retryAgentFailure(
+        input: RetryAgentFailureInput,
+    ): Promise<IllustrationTurnRecordV1 | IllustrationJobRecordV1> {
+        return await withIllustrationLedgerLock(async () => {
+            if (input.protocolVersion !== 1) {
+                throw new IllustrationLedgerValidationError('protocolVersion must be 1')
+            }
+            if (input.confirmNewLlmCharge !== true) {
+                throw new IllustrationLedgerConfirmationRequiredError(
+                    'Retrying blocked Agent work requires confirmNewLlmCharge: true',
+                )
+            }
+            if (input.kind !== 'turn' && input.kind !== 'job') {
+                throw new IllustrationLedgerValidationError('kind must be turn or job')
+            }
+            assertNonEmptyString(input.id, 'id')
+            const now = Date.now()
+            await validateCoordinatorProofUnlocked(input, { now })
+            const current = input.kind === 'turn'
+                ? await this.requireTurnUnlocked(input.id)
+                : await this.requireJobUnlocked(input.id)
+            assertVersion(input.expectedVersion, current.version)
+            if (current.state !== 'agent_blocked_retryable' && current.state !== 'agent_blocked') {
+                throw new IllustrationLedgerValidationError(
+                    'Only agent_blocked_retryable or agent_blocked records may be retried',
+                )
+            }
+            const nextState = input.kind === 'turn' ? 'awaiting_plan' : 'awaiting_prompt'
+            if (input.kind === 'turn') {
+                assertTransition('turn', current.state as IllustrationTurnState, 'awaiting_plan')
+            } else {
+                assertTransition('job', current.state as IllustrationJobState, 'awaiting_prompt')
+            }
+            const next = {
+                ...current,
+                state: nextState,
+                leaseId: null,
+                leaseExpiresAt: 0,
+                // Gate 4a decision 2A deliberately preserves the cumulative count.
+                // A successful manifest/prompt acceptance is the reset boundary.
+                agentAttemptCount: current.agentAttemptCount ?? 0,
+                version: current.version + 1,
+                updatedAt: now,
+            } as IllustrationTurnRecordV1 | IllustrationJobRecordV1
+            if (current.state === 'agent_blocked') next.agentHardRetryPending = true
+            else delete next.agentHardRetryPending
+            delete next.error
+            if (input.kind === 'job') {
+                delete (next as IllustrationJobRecordV1).lastHolderWrite
+                delete (next as IllustrationJobRecordV1).lastRetryWrite
+                await writePersistentJson(illustrationJobKey(input.id), next)
+            } else {
+                await writePersistentJson(illustrationTurnKey(input.id), next)
+            }
             return cloneJson(next)
         })
     }

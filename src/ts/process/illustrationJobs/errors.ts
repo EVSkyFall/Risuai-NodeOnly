@@ -64,8 +64,32 @@ export class IllustrationLedgerHolderMismatchError extends IllustrationLedgerErr
     }
 }
 
-export class IllustrationLedgerConfirmationRequiredError extends IllustrationLedgerError {
+export class IllustrationCoordinatorMismatchError extends IllustrationLedgerError {
+    constructor(message: string) {
+        super('coordinator_mismatch', message)
+    }
+}
+
+export class IllustrationCoordinatorExpiredError extends IllustrationLedgerError {
     constructor() {
-        super('confirmation_required', 'Retrying an uncertain job requires confirmNewCharge: true')
+        super('coordinator_expired', 'Illustration Agent coordinator lease has expired')
+    }
+}
+
+export class IllustrationCoordinatorDrainingError extends IllustrationLedgerError {
+    constructor() {
+        super('coordinator_draining', 'Illustration Agent coordinator is draining')
+    }
+}
+
+export class IllustrationLedgerIdempotencyConflictError extends IllustrationLedgerError {
+    constructor(message: string) {
+        super('idempotency_conflict', message)
+    }
+}
+
+export class IllustrationLedgerConfirmationRequiredError extends IllustrationLedgerError {
+    constructor(message = 'Retrying an uncertain job requires confirmNewCharge: true') {
+        super('confirmation_required', message)
     }
 }

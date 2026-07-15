@@ -3,6 +3,7 @@ import type {
     IllustrationJobRecordV1,
     IllustrationJobState,
     IllustrationJobTransitionPatch,
+    IllustrationCoordinatorProof,
     IllustrationTurnRecordV1,
     PlanManifestV1,
 } from '../types'
@@ -43,6 +44,7 @@ vi.mock('src/ts/parser/parser.svelte', () => ({
 }))
 
 const storeModule = await import('../store')
+const coordinatorRecordModule = await import('../coordinatorRecord')
 const lockModule = await import('../locks')
 const errorModule = await import('../errors')
 
@@ -59,11 +61,19 @@ const {
     validateHolderWrite,
 } = storeModule
 const {
+    COORDINATOR_LEASE_DURATION_MS,
+    claimCoordinator,
+    markCoordinatorDraining,
+} = coordinatorRecordModule
+const {
     resetIllustrationLockManagerAccessorForTests,
     setIllustrationLockManagerAccessorForTests,
 } = lockModule
 const {
     IllustrationLedgerConfirmationRequiredError,
+    IllustrationCoordinatorDrainingError,
+    IllustrationCoordinatorExpiredError,
+    IllustrationCoordinatorMismatchError,
     IllustrationLedgerCorruptError,
     IllustrationLedgerHolderMismatchError,
     IllustrationLedgerLeaseConflictError,
@@ -76,6 +86,21 @@ const store = new IllustrationJobStore()
 const BASE_TIME = Date.UTC(2026, 0, 1)
 let transitionSequence = 0
 let lockManager: InMemoryLockManager
+let coordinatorProof: IllustrationCoordinatorProof
+let coordinatorVersion: number
+
+async function refreshCoordinatorProof(): Promise<void> {
+    const snapshot = await claimCoordinator({
+        protocolVersion: 1,
+        leaseId: 'test-coordinator',
+        holderRuntimeId: 'test-runtime',
+    })
+    coordinatorVersion = snapshot.version
+    coordinatorProof = {
+        coordinatorLeaseId: 'test-coordinator',
+        coordinatorFence: snapshot.fence,
+    }
+}
 
 function jobIdFor(turnId: string, index = 0): string {
     return `${turnId}:job:${index}`
@@ -117,7 +142,12 @@ async function createClaimedTurn(turnId: string): Promise<{
             draft.state = 'awaiting_plan'
         },
     })
-    const turn = await store.claimTurn({ turnId, expectedVersion: awaiting.version, leaseId })
+    const turn = await store.claimTurn({
+        ...coordinatorProof,
+        turnId,
+        expectedVersion: awaiting.version,
+        leaseId,
+    })
     return { turn, leaseId }
 }
 
@@ -127,6 +157,7 @@ async function createPreparedJobs(
 ): Promise<IllustrationJobRecordV1[]> {
     const { turn, leaseId } = await createClaimedTurn(turnId)
     const manifest = await store.createManifestPrepared({
+        ...coordinatorProof,
         manifest: manifestInput,
         turnExpectedVersion: turn.version,
         leaseId,
@@ -155,7 +186,7 @@ async function transition(
             ...patch,
             idempotencyKey: patch.idempotencyKey ?? `transition:${jobId}:${++transitionSequence}`,
         },
-        ...(holder ?? {}),
+        ...(holder ? { ...holder, ...coordinatorProof } : {}),
     })
 }
 
@@ -165,13 +196,19 @@ async function queueJob(jobId: string): Promise<IllustrationJobRecordV1> {
     if (current.state === 'prepared') current = await transition(jobId, 'awaiting_prompt')
     if (current.state !== 'awaiting_prompt') throw new Error(`cannot queue ${current.state}`)
     const leaseId = `tagger:${jobId}`
-    const claimed = await store.claimJob({ jobId, expectedVersion: current.version, leaseId })
+    const claimed = await store.claimJob({
+        ...coordinatorProof,
+        jobId,
+        expectedVersion: current.version,
+        leaseId,
+    })
     return await store.transitionJob({
         jobId,
         expectedVersion: claimed.version,
         to: 'queued',
         leaseId,
         fence: claimed.fence,
+        ...coordinatorProof,
         patch: {
             idempotencyKey: `supply:${jobId}:${++transitionSequence}`,
             prompt: { positive: `positive:${jobId}`, negative: `negative:${jobId}` },
@@ -240,7 +277,7 @@ function encodeStored(key: string, value: unknown): void {
     storageMap.set(key, new TextEncoder().encode(JSON.stringify(value)))
 }
 
-beforeEach(() => {
+beforeEach(async () => {
     storageMap.clear()
     storageControl.failSetKey = null
     storageControl.failSetCount = 0
@@ -249,6 +286,7 @@ beforeEach(() => {
     vi.setSystemTime(BASE_TIME)
     lockManager = new InMemoryLockManager()
     setIllustrationLockManagerAccessorForTests(() => lockManager)
+    await refreshCoordinatorProof()
 })
 
 afterEach(() => {
@@ -322,6 +360,7 @@ describe('manifest and job materialization', () => {
     test('advances manifest phases one step forward only', async () => {
         const { turn, leaseId } = await createClaimedTurn('turn-phase')
         const prepared = await store.createManifestPrepared({
+            ...coordinatorProof,
             manifest: makeManifest('turn-phase'),
             turnExpectedVersion: turn.version,
             leaseId,
@@ -329,6 +368,7 @@ describe('manifest and job materialization', () => {
             idempotencyKey: 'submit-phase',
         })
         const duplicate = await store.createManifestPrepared({
+            ...coordinatorProof,
             manifest: makeManifest('turn-phase'),
             turnExpectedVersion: turn.version,
             leaseId,
@@ -371,6 +411,7 @@ describe('manifest and job materialization', () => {
         const turnId = 'turn-idempotent-jobs'
         const { turn, leaseId } = await createClaimedTurn(turnId)
         const manifest = await store.createManifestPrepared({
+            ...coordinatorProof,
             manifest: makeManifest(turnId, 3),
             turnExpectedVersion: turn.version,
             leaseId,
@@ -404,6 +445,7 @@ describe('manifest and job materialization', () => {
         const manifestInput = makeManifest(turnId)
         const { turn, leaseId } = await createClaimedTurn(turnId)
         const stored = await store.createManifestPrepared({
+            ...coordinatorProof,
             manifest: manifestInput,
             turnExpectedVersion: turn.version,
             leaseId,
@@ -412,8 +454,10 @@ describe('manifest and job materialization', () => {
         })
 
         vi.advanceTimersByTime(TURN_LEASE_DURATION_MS + 1)
+        await refreshCoordinatorProof()
         await expect(
             store.createManifestPrepared({
+                ...coordinatorProof,
                 manifest: manifestInput,
                 turnExpectedVersion: turn.version,
                 leaseId,
@@ -423,6 +467,7 @@ describe('manifest and job materialization', () => {
         ).resolves.toEqual(stored)
         await expect(
             store.createManifestPrepared({
+                ...coordinatorProof,
                 manifest: { ...manifestInput, planHash: 'mismatching-plan' },
                 turnExpectedVersion: turn.version,
                 leaseId,
@@ -437,6 +482,7 @@ describe('manifest and job materialization', () => {
         const manifestInput = makeManifest(turnId)
         const { turn, leaseId } = await createClaimedTurn(turnId)
         const stored = await store.createManifestPrepared({
+            ...coordinatorProof,
             manifest: manifestInput,
             turnExpectedVersion: turn.version,
             leaseId,
@@ -453,6 +499,7 @@ describe('manifest and job materialization', () => {
 
         await expect(
             store.createManifestPrepared({
+                ...coordinatorProof,
                 manifest: manifestInput,
                 turnExpectedVersion: turn.version,
                 leaseId,
@@ -462,6 +509,7 @@ describe('manifest and job materialization', () => {
         ).resolves.toEqual(stored)
         await expect(
             store.createManifestPrepared({
+                ...coordinatorProof,
                 manifest: { ...manifestInput, planHash: 'mismatching-plan' },
                 turnExpectedVersion: advancedTurn.version,
                 leaseId,
@@ -475,6 +523,7 @@ describe('manifest and job materialization', () => {
         const turnId = 'jobs-replay-advanced-manifest'
         const { turn, leaseId } = await createClaimedTurn(turnId)
         const manifest = await store.createManifestPrepared({
+            ...coordinatorProof,
             manifest: makeManifest(turnId, 2),
             turnExpectedVersion: turn.version,
             leaseId,
@@ -512,6 +561,7 @@ describe('manifest and job materialization', () => {
         const turnId = 'turn-partial-jobs'
         const { turn, leaseId } = await createClaimedTurn(turnId)
         const manifest = await store.createManifestPrepared({
+            ...coordinatorProof,
             manifest: makeManifest(turnId, 3),
             turnExpectedVersion: turn.version,
             leaseId,
@@ -549,6 +599,7 @@ describe('lease lifecycle and holder writes', () => {
             },
         })
         const claimed = await store.claimTurn({
+            ...coordinatorProof,
             turnId: created.turnId,
             expectedVersion: awaiting.version,
             leaseId: 'holder-a',
@@ -558,6 +609,7 @@ describe('lease lifecycle and holder writes', () => {
 
         vi.advanceTimersByTime(1_000)
         const renewed = await store.claimTurn({
+            ...coordinatorProof,
             turnId: created.turnId,
             expectedVersion: claimed.version,
             leaseId: 'holder-a',
@@ -566,6 +618,7 @@ describe('lease lifecycle and holder writes', () => {
         expect(renewed.leaseExpiresAt).toBe(BASE_TIME + 1_000 + TURN_LEASE_DURATION_MS)
         await expect(
             store.claimTurn({
+                ...coordinatorProof,
                 turnId: created.turnId,
                 expectedVersion: renewed.version,
                 leaseId: 'holder-b',
@@ -573,7 +626,9 @@ describe('lease lifecycle and holder writes', () => {
         ).rejects.toBeInstanceOf(IllustrationLedgerLeaseConflictError)
 
         vi.advanceTimersByTime(TURN_LEASE_DURATION_MS)
+        await refreshCoordinatorProof()
         const reclaimed = await store.claimTurn({
+            ...coordinatorProof,
             turnId: created.turnId,
             expectedVersion: renewed.version,
             leaseId: 'holder-b',
@@ -595,6 +650,7 @@ describe('lease lifecycle and holder writes', () => {
         ).toThrow(IllustrationLedgerVersionConflictError)
         await expect(
             store.createManifestPrepared({
+                ...coordinatorProof,
                 manifest: makeManifest(created.turnId),
                 turnExpectedVersion: reclaimed.version,
                 leaseId: 'holder-a',
@@ -604,6 +660,7 @@ describe('lease lifecycle and holder writes', () => {
         ).rejects.toBeInstanceOf(IllustrationLedgerHolderMismatchError)
         await expect(
             store.createManifestPrepared({
+                ...coordinatorProof,
                 manifest: makeManifest(created.turnId),
                 turnExpectedVersion: reclaimed.version,
                 leaseId: 'holder-b',
@@ -619,6 +676,7 @@ describe('lease lifecycle and holder writes', () => {
         const awaiting = await transition(prepared.jobId, 'awaiting_prompt')
         const leaseId = 'tagger:holder-replay-expired'
         const claimed = await store.claimJob({
+            ...coordinatorProof,
             jobId: prepared.jobId,
             expectedVersion: awaiting.version,
             leaseId,
@@ -628,6 +686,7 @@ describe('lease lifecycle and holder writes', () => {
             prompt: { positive: 'positive', negative: 'negative' },
         }
         const queued = await store.transitionJob({
+            ...coordinatorProof,
             jobId: prepared.jobId,
             expectedVersion: claimed.version,
             to: 'queued',
@@ -637,8 +696,10 @@ describe('lease lifecycle and holder writes', () => {
         })
 
         vi.advanceTimersByTime(JOB_LEASE_DURATION_MS + 1)
+        await refreshCoordinatorProof()
         await expect(
             store.transitionJob({
+                ...coordinatorProof,
                 jobId: prepared.jobId,
                 expectedVersion: claimed.version,
                 to: 'queued',
@@ -649,6 +710,7 @@ describe('lease lifecycle and holder writes', () => {
         ).resolves.toEqual(queued)
         await expect(
             store.transitionJob({
+                ...coordinatorProof,
                 jobId: prepared.jobId,
                 expectedVersion: claimed.version,
                 to: 'queued',
@@ -659,6 +721,7 @@ describe('lease lifecycle and holder writes', () => {
         ).rejects.toBeInstanceOf(IllustrationLedgerCorruptError)
         await expect(
             store.transitionJob({
+                ...coordinatorProof,
                 jobId: prepared.jobId,
                 expectedVersion: claimed.version,
                 to: 'queued',
@@ -674,6 +737,7 @@ describe('lease lifecycle and holder writes', () => {
         })
         await expect(
             store.transitionJob({
+                ...coordinatorProof,
                 jobId: prepared.jobId,
                 expectedVersion: claimed.version,
                 to: 'queued',
@@ -687,7 +751,9 @@ describe('lease lifecycle and holder writes', () => {
     test('renews an expired same bearer as a fenced reclaim', async () => {
         const { turn, leaseId } = await createClaimedTurn('turn-same-bearer-reclaim')
         vi.advanceTimersByTime(TURN_LEASE_DURATION_MS)
+        await refreshCoordinatorProof()
         const reclaimed = await store.claimTurn({
+            ...coordinatorProof,
             turnId: turn.turnId,
             expectedVersion: turn.version,
             leaseId,
@@ -707,12 +773,14 @@ describe('lease lifecycle and holder writes', () => {
         const awaiting = await transition(prepared.jobId, 'awaiting_prompt')
         const leaseId = 'tagger-holder'
         const claimed = await store.claimJob({
+            ...coordinatorProof,
             jobId: prepared.jobId,
             expectedVersion: awaiting.version,
             leaseId,
         })
         expect(claimed.leaseExpiresAt).toBe(BASE_TIME + JOB_LEASE_DURATION_MS)
         const input = {
+            ...coordinatorProof,
             jobId: prepared.jobId,
             expectedVersion: claimed.version,
             to: 'queued' as const,
@@ -838,6 +906,7 @@ describe('cancellation intent', () => {
 
 describe('fail-closed Web Locks behavior', () => {
     test('rejects every public store operation when Web Locks are unavailable', async () => {
+        storageMap.clear()
         setIllustrationLockManagerAccessorForTests(() => undefined)
         const manifest = makeManifest('no-lock')
         const operations: Array<() => Promise<unknown>> = [
@@ -852,6 +921,7 @@ describe('fail-closed Web Locks behavior', () => {
                 }),
             () =>
                 store.createManifestPrepared({
+                    ...coordinatorProof,
                     manifest,
                     turnExpectedVersion: 1,
                     leaseId: 'lease',
@@ -872,6 +942,8 @@ describe('fail-closed Web Locks behavior', () => {
                 }),
             () => store.getJob(jobIdFor('no-lock')),
             () => store.listJobs(),
+            () => store.listJobRecords(),
+            () => store.listPendingTurns(),
             () =>
                 store.transitionJob({
                     jobId: jobIdFor('no-lock'),
@@ -880,8 +952,61 @@ describe('fail-closed Web Locks behavior', () => {
                     patch: { idempotencyKey: 'cancel' },
                 }),
             () => store.requestCancel({ jobId: jobIdFor('no-lock'), expectedVersion: 1 }),
-            () => store.claimTurn({ turnId: 'no-lock', expectedVersion: 1, leaseId: 'lease' }),
-            () => store.claimJob({ jobId: jobIdFor('no-lock'), expectedVersion: 1, leaseId: 'lease' }),
+            () => store.requestCancelTurn({ turnId: 'no-lock', expectedVersion: 1 }),
+            () => store.closeTurnFromPlan({
+                ...coordinatorProof,
+                turnId: 'no-lock',
+                expectedVersion: 1,
+                leaseId: 'lease',
+                fence: 1,
+                to: 'stale',
+                code: 'test',
+                idempotencyKey: 'close',
+            }),
+            () => store.claimTurn({
+                ...coordinatorProof,
+                turnId: 'no-lock',
+                expectedVersion: 1,
+                leaseId: 'lease',
+            }),
+            () => store.claimJob({
+                ...coordinatorProof,
+                jobId: jobIdFor('no-lock'),
+                expectedVersion: 1,
+                leaseId: 'lease',
+            }),
+            () => store.claimTurnSnapshot({
+                ...coordinatorProof,
+                turnId: 'no-lock',
+                expectedVersion: 1,
+                leaseId: 'lease',
+            }),
+            () => store.claimJobSnapshot({
+                ...coordinatorProof,
+                jobId: jobIdFor('no-lock'),
+                expectedVersion: 1,
+                leaseId: 'lease',
+            }),
+            () => store.reportAgentFailure({
+                protocolVersion: 1,
+                kind: 'turn',
+                id: 'no-lock',
+                expectedVersion: 1,
+                leaseId: 'lease',
+                fence: 1,
+                ...coordinatorProof,
+                idempotencyKey: 'failure',
+                code: 'test',
+                retryable: true,
+            }),
+            () => store.retryAgentFailure({
+                protocolVersion: 1,
+                kind: 'turn',
+                id: 'no-lock',
+                expectedVersion: 1,
+                confirmNewLlmCharge: true,
+                ...coordinatorProof,
+            }),
             () => store.acquireWorkerEpoch(),
             () =>
                 store.retryUncertainJob({
@@ -908,6 +1033,7 @@ describe('manifest bounds', () => {
         const beforeKeys = [...storageMap.keys()].sort()
         await expect(
             store.createManifestPrepared({
+                ...coordinatorProof,
                 manifest,
                 turnExpectedVersion: turn.version,
                 leaseId,
@@ -923,6 +1049,7 @@ describe('manifest bounds', () => {
         const acceptedTurnId = 'bounds-fifteen'
         const { turn, leaseId } = await createClaimedTurn(acceptedTurnId)
         const accepted = await store.createManifestPrepared({
+            ...coordinatorProof,
             manifest: makeManifest(acceptedTurnId, MAX_JOBS_PER_TURN),
             turnExpectedVersion: turn.version,
             leaseId,
@@ -1021,6 +1148,7 @@ describe('retention pruning', () => {
             leaseExpiresAt: 0,
             fence: 0,
             workerEpoch: 0,
+            agentAttemptCount: 0,
             updatedAt,
             idempotencyKey: `create:${turnId}`,
         })
@@ -1044,12 +1172,15 @@ describe('retention pruning', () => {
             sceneId: 'guarded-scene',
             scenePayload: { schemaVersion: 1, data: {} },
             sourceRevisionHash: 'guarded-source',
+            slotOrdinal: 0,
+            createdAt: BASE_TIME - 1,
             state: 'prepared',
             version: 1,
             leaseId: null,
             leaseExpiresAt: 0,
             fence: 0,
             workerEpoch: 0,
+            agentAttemptCount: 0,
             updatedAt: BASE_TIME - 1,
             idempotencyKey: 'guarded-create',
             creationIdempotencyKey: 'guarded-create',
@@ -1076,6 +1207,7 @@ describe('retention pruning', () => {
             leaseExpiresAt: 0,
             fence: 0,
             workerEpoch: 0,
+            agentAttemptCount: 0,
             updatedAt,
             idempotencyKey: `create:${turnId}`,
         })
@@ -1186,11 +1318,13 @@ describe('manual uncertain retry', () => {
         const awaiting = await transition(prepared.jobId, 'awaiting_prompt')
         const leaseId = 'retry-prefix-tagger'
         const claimed = await store.claimJob({
+            ...coordinatorProof,
             jobId: prepared.jobId,
             expectedVersion: awaiting.version,
             leaseId,
         })
         const queued = await store.transitionJob({
+            ...coordinatorProof,
             jobId: prepared.jobId,
             expectedVersion: claimed.version,
             to: 'queued',
@@ -1249,5 +1383,396 @@ describe('index representation', () => {
         expect(index).toEqual([jobIdFor(turnId, 0), jobIdFor(turnId, 1)])
         expect(storageMap.has(illustrationTurnKey(turnId))).toBe(true)
         expect(storageMap.has(illustrationJobKey(jobIdFor(turnId, 0)))).toBe(true)
+    })
+})
+
+describe('Gate 4a snapshots and outstanding Agent states', () => {
+    function storedJob(
+        jobId: string,
+        state: IllustrationJobState,
+        options: { slotOrdinal?: number; createdAt?: number; updatedAt?: number } = {},
+    ): IllustrationJobRecordV1 {
+        const turnId = `turn:${jobId}`
+        const createdAt = options.createdAt ?? BASE_TIME
+        return {
+            schemaVersion: 1,
+            turnId,
+            jobId,
+            slotToken: `slot:${jobId}`,
+            insertAfterUtf16: options.slotOrdinal ?? 0,
+            sceneId: `scene:${jobId}`,
+            scenePayload: { schemaVersion: 1, data: { secret: `payload:${jobId}` } },
+            sourceRevisionHash: `source:${jobId}`,
+            slotOrdinal: options.slotOrdinal ?? 0,
+            createdAt,
+            state,
+            version: 1,
+            leaseId: null,
+            leaseExpiresAt: 0,
+            fence: 0,
+            workerEpoch: 0,
+            updatedAt: options.updatedAt ?? createdAt,
+            idempotencyKey: `state:${jobId}`,
+            agentAttemptCount: state.startsWith('agent_blocked') ? 1 : 0,
+            creationIdempotencyKey: `create:${jobId}`,
+            prompt: { positive: `positive:${jobId}`, negative: `negative:${jobId}` },
+        }
+    }
+
+    function storedTurn(
+        turnId: string,
+        state: IllustrationTurnRecordV1['state'],
+    ): IllustrationTurnRecordV1 {
+        return {
+            schemaVersion: 1,
+            turnId,
+            state,
+            version: 1,
+            leaseId: null,
+            leaseExpiresAt: 0,
+            fence: 0,
+            workerEpoch: 0,
+            updatedAt: BASE_TIME,
+            idempotencyKey: `create:${turnId}`,
+            agentAttemptCount: state.startsWith('agent_blocked') ? 1 : 0,
+        }
+    }
+
+    test('assigns immutable slot ordinals by offset then manifest order and lists stably', async () => {
+        const turnId = 'slot-order'
+        const { turn, leaseId } = await createClaimedTurn(turnId)
+        const baseManifest = makeManifest(turnId, 4)
+        const offsets = [8, 2, 2, 5]
+        const manifest = await store.createManifestPrepared({
+            ...coordinatorProof,
+            manifest: {
+                ...baseManifest,
+                jobs: baseManifest.jobs.map((job, index) => ({
+                    ...job,
+                    insertAfterUtf16: offsets[index],
+                })),
+            },
+            turnExpectedVersion: turn.version,
+            leaseId,
+            fence: turn.fence,
+            idempotencyKey: 'submit:slot-order',
+        })
+        const jobs = await store.createJobsFromManifest({
+            turnId,
+            expectedManifestVersion: manifest.version,
+        })
+        expect(jobs.map((job) => [job.jobId, job.slotOrdinal])).toEqual([
+            [jobIdFor(turnId, 0), 3],
+            [jobIdFor(turnId, 1), 0],
+            [jobIdFor(turnId, 2), 1],
+            [jobIdFor(turnId, 3), 2],
+        ])
+        const createdAt = jobs[1].createdAt
+        await transition(jobs[1].jobId, 'awaiting_prompt')
+        expect((await store.getJob(jobs[1].jobId))?.createdAt).toBe(createdAt)
+        const snapshots = await store.listJobs({ turnId })
+        expect(snapshots.map((job) => job.jobId)).toEqual([
+            jobIdFor(turnId, 1),
+            jobIdFor(turnId, 2),
+            jobIdFor(turnId, 3),
+            jobIdFor(turnId, 0),
+        ])
+    })
+
+    test('orders snapshots by slot ordinal, then creation time, then job id', async () => {
+        storageMap.clear()
+        const records = [
+            storedJob('sort:later', 'queued', { slotOrdinal: 0, createdAt: BASE_TIME + 1 }),
+            storedJob('sort:b', 'queued', { slotOrdinal: 0, createdAt: BASE_TIME }),
+            storedJob('sort:a', 'queued', { slotOrdinal: 0, createdAt: BASE_TIME }),
+            storedJob('sort:next-slot', 'queued', { slotOrdinal: 1, createdAt: BASE_TIME - 1 }),
+        ]
+        for (const record of records) {
+            encodeStored(illustrationJobKey(record.jobId), record)
+        }
+
+        expect((await store.listJobs()).map((record) => record.jobId)).toEqual([
+            'sort:a',
+            'sort:b',
+            'sort:later',
+            'sort:next-slot',
+        ])
+    })
+
+    test('returns all live and uncertain jobs plus only 50 sanitized recent terminal summaries', async () => {
+        storageMap.clear()
+        for (let index = 0; index < 60; index += 1) {
+            const record = storedJob(`terminal:${index}`, 'committed', {
+                slotOrdinal: index % 15,
+                createdAt: BASE_TIME + index,
+                updatedAt: BASE_TIME + index,
+            })
+            if (index === 59) {
+                record.error = {
+                    code: 'terminal_error',
+                    message: 'sensitive provider detail',
+                    retryable: false,
+                }
+                record.target = {
+                    chaId: 'character-1',
+                    conversationId: 'conversation-1',
+                    expectedMessageId: 'message-1',
+                    rootTurnId: 'root-1',
+                    requestNonce: 'request-secret',
+                    slotToken: 'slot-secret',
+                    capturedSwipeHint: 0,
+                    sourceRevisionHash: 'source-secret',
+                }
+            }
+            encodeStored(illustrationJobKey(record.jobId), record)
+        }
+        const fullStates: IllustrationJobState[] = [
+            'prepared',
+            'awaiting_prompt',
+            'agent_blocked_retryable',
+            'agent_blocked',
+            'queued',
+            'generating',
+            'cancel_requested',
+            'blocked_config',
+            'asset_writing',
+            'asset_ready',
+            'committing',
+            'uncertain',
+        ]
+        for (const [index, state] of fullStates.entries()) {
+            const record = storedJob(`full:${state}`, state, {
+                slotOrdinal: index,
+                createdAt: BASE_TIME + 100 + index,
+            })
+            encodeStored(illustrationJobKey(record.jobId), record)
+        }
+
+        const snapshots = await store.listJobs()
+        expect(snapshots).toHaveLength(50 + fullStates.length)
+        for (const state of fullStates) {
+            const full = snapshots.find((entry) => entry.jobId === `full:${state}`)!
+            expect(full).toHaveProperty('scenePayload')
+            expect(full).toMatchObject({ state, hasDurablePrompt: true })
+        }
+        const summaries = snapshots.filter((entry) => entry.state === 'committed')
+        expect(summaries).toHaveLength(50)
+        expect(summaries.some((entry) => entry.jobId === 'terminal:9')).toBe(false)
+        expect(summaries.some((entry) => entry.jobId === 'terminal:10')).toBe(true)
+        for (const summary of summaries) {
+            expect(summary).not.toHaveProperty('scenePayload')
+            expect(summary).not.toHaveProperty('prompt')
+            expect(summary).not.toHaveProperty('hasDurablePrompt')
+        }
+        const redacted = summaries.find((entry) => entry.jobId === 'terminal:59')!
+        expect(redacted.error).toEqual({ code: 'terminal_error' })
+        expect(redacted.target).toEqual({
+            chaId: 'character-1',
+            conversationId: 'conversation-1',
+            expectedMessageId: 'message-1',
+            rootTurnId: 'root-1',
+        })
+        expect(JSON.stringify(redacted)).not.toContain('sensitive provider detail')
+        expect(JSON.stringify(redacted)).not.toContain('request-secret')
+    })
+
+    test('keeps a 200-turn by 15-job terminal history well under 1 MiB', async () => {
+        storageMap.clear()
+        for (let turnIndex = 0; turnIndex < 200; turnIndex += 1) {
+            for (let slotOrdinal = 0; slotOrdinal < 15; slotOrdinal += 1) {
+                const jobId = `history:${turnIndex}:${slotOrdinal}`
+                const record = storedJob(jobId, 'committed', {
+                    slotOrdinal,
+                    createdAt: BASE_TIME + turnIndex,
+                    updatedAt: BASE_TIME + turnIndex * 15 + slotOrdinal,
+                })
+                encodeStored(illustrationJobKey(jobId), record)
+            }
+        }
+        const snapshots = await store.listJobs()
+        const byteLength = new TextEncoder().encode(JSON.stringify(snapshots)).byteLength
+        expect(snapshots).toHaveLength(50)
+        expect(byteLength).toBeLessThan(128 * 1024)
+    })
+
+    test('lists Agent-blocked turns and never prunes blocked turn or job records', async () => {
+        storageMap.clear()
+        for (const state of ['agent_blocked_retryable', 'agent_blocked'] as const) {
+            const turn = storedTurn(`pending:${state}`, state)
+            const job = storedJob(`outstanding:${state}`, state)
+            encodeStored(illustrationTurnKey(turn.turnId), turn)
+            encodeStored(illustrationJobKey(job.jobId), job)
+        }
+        const pending = await store.listPendingTurns()
+        expect(pending.map((turn) => turn.state).sort()).toEqual([
+            'agent_blocked',
+            'agent_blocked_retryable',
+        ])
+
+        vi.advanceTimersByTime(TERMINAL_RECORD_TTL_MS + 1)
+        const result = await store.pruneTerminalRecords({ maxDeletes: 100 })
+        expect(result).toEqual({ deletedJobIds: [], deletedTurnIds: [] })
+        expect(await store.getTurn('pending:agent_blocked')).not.toBeNull()
+        expect(await store.getJob('outstanding:agent_blocked_retryable')).not.toBeNull()
+    })
+})
+
+describe('atomic coordinator proof on plugin Agent writes', () => {
+    type ProofOperation = {
+        name: string
+        run: (proof: IllustrationCoordinatorProof) => Promise<unknown>
+        read: () => Promise<unknown>
+    }
+
+    async function makeProofOperations(prefix: string): Promise<ProofOperation[]> {
+        const claimTurnId = `${prefix}:claim-turn`
+        const claimTurnCreated = await store.createTurn({
+            turnId: claimTurnId,
+            idempotencyKey: `create:${claimTurnId}`,
+        })
+        await store.updateTurn({
+            turnId: claimTurnId,
+            expectedVersion: claimTurnCreated.version,
+            mutate: (draft) => {
+                draft.state = 'awaiting_plan'
+            },
+        })
+
+        const [claimJobPrepared] = await createPreparedJobs(`${prefix}:claim-job`)
+        const claimJobAwaiting = await transition(claimJobPrepared.jobId, 'awaiting_prompt')
+
+        const planTurnId = `${prefix}:plan`
+        const plan = await createClaimedTurn(planTurnId)
+        const planManifest = makeManifest(planTurnId)
+
+        const [promptPrepared] = await createPreparedJobs(`${prefix}:prompt`)
+        const promptAwaiting = await transition(promptPrepared.jobId, 'awaiting_prompt')
+        const promptLeaseId = `tagger:${prefix}:prompt`
+        const promptClaimed = await store.claimJob({
+            ...coordinatorProof,
+            jobId: promptPrepared.jobId,
+            expectedVersion: promptAwaiting.version,
+            leaseId: promptLeaseId,
+        })
+
+        return [
+            {
+                name: 'claimTurn',
+                run: async (proof) => await store.claimTurn({
+                    ...proof,
+                    turnId: claimTurnId,
+                    expectedVersion: claimTurnCreated.version + 1,
+                    leaseId: `planner:${prefix}:claim`,
+                }),
+                read: async () => await store.getTurn(claimTurnId),
+            },
+            {
+                name: 'claimJob',
+                run: async (proof) => await store.claimJob({
+                    ...proof,
+                    jobId: claimJobPrepared.jobId,
+                    expectedVersion: claimJobAwaiting.version,
+                    leaseId: `tagger:${prefix}:claim`,
+                }),
+                read: async () => await store.getJob(claimJobPrepared.jobId),
+            },
+            {
+                name: 'submitPlan ledger CAS',
+                run: async (proof) => await store.createManifestPrepared({
+                    ...proof,
+                    manifest: planManifest,
+                    turnExpectedVersion: plan.turn.version,
+                    leaseId: plan.leaseId,
+                    fence: plan.turn.fence,
+                    idempotencyKey: `submit:${prefix}:proof`,
+                }),
+                read: async () => ({
+                    turn: await store.getTurn(planTurnId),
+                    manifest: await store.getManifest(planTurnId),
+                }),
+            },
+            {
+                name: 'supplyPrompt ledger CAS',
+                run: async (proof) => await store.transitionJob({
+                    ...proof,
+                    jobId: promptPrepared.jobId,
+                    expectedVersion: promptClaimed.version,
+                    to: 'queued',
+                    leaseId: promptLeaseId,
+                    fence: promptClaimed.fence,
+                    patch: {
+                        idempotencyKey: `prompt:${prefix}:proof`,
+                        prompt: { positive: 'positive', negative: 'negative' },
+                    },
+                }),
+                read: async () => await store.getJob(promptPrepared.jobId),
+            },
+        ]
+    }
+
+    async function expectAllRejectedWithoutWrites(
+        operations: ProofOperation[],
+        proof: IllustrationCoordinatorProof,
+        errorType: new (...args: any[]) => Error,
+    ): Promise<void> {
+        for (const operation of operations) {
+            const before = await operation.read()
+            await expect(operation.run(proof), operation.name).rejects.toBeInstanceOf(errorType)
+            expect(await operation.read(), operation.name).toEqual(before)
+        }
+    }
+
+    test('rejects an awaiting_prompt to queued write that omits all proof', async () => {
+        const [prepared] = await createPreparedJobs('missing-prompt-proof')
+        const awaiting = await transition(prepared.jobId, 'awaiting_prompt')
+        await expect(store.transitionJob({
+            jobId: prepared.jobId,
+            expectedVersion: awaiting.version,
+            to: 'queued',
+            patch: {
+                idempotencyKey: 'prompt:missing-proof',
+                prompt: { positive: 'positive', negative: 'negative' },
+            },
+        })).rejects.toBeInstanceOf(IllustrationLedgerHolderMismatchError)
+        expect(await store.getJob(prepared.jobId)).toEqual(awaiting)
+    })
+
+    test('rejects wrong coordinator lease and fence on every claim/plan/prompt CAS', async () => {
+        const operations = await makeProofOperations('wrong-proof')
+        await expectAllRejectedWithoutWrites(
+            operations,
+            { ...coordinatorProof, coordinatorLeaseId: 'wrong-coordinator' },
+            IllustrationCoordinatorMismatchError,
+        )
+        await expectAllRejectedWithoutWrites(
+            operations,
+            { ...coordinatorProof, coordinatorFence: coordinatorProof.coordinatorFence + 1 },
+            IllustrationCoordinatorMismatchError,
+        )
+    })
+
+    test('rejects expired coordinator proof on every claim/plan/prompt CAS', async () => {
+        const operations = await makeProofOperations('expired-proof')
+        vi.advanceTimersByTime(COORDINATOR_LEASE_DURATION_MS)
+        await expectAllRejectedWithoutWrites(
+            operations,
+            coordinatorProof,
+            IllustrationCoordinatorExpiredError,
+        )
+    })
+
+    test('rejects draining coordinator proof on every new claim/plan/prompt CAS', async () => {
+        const operations = await makeProofOperations('draining-proof')
+        await markCoordinatorDraining({
+            protocolVersion: 1,
+            leaseId: coordinatorProof.coordinatorLeaseId,
+            expectedVersion: coordinatorVersion,
+            fence: coordinatorProof.coordinatorFence,
+        })
+        await expectAllRejectedWithoutWrites(
+            operations,
+            coordinatorProof,
+            IllustrationCoordinatorDrainingError,
+        )
     })
 })

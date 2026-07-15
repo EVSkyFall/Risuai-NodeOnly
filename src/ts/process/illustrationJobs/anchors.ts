@@ -271,7 +271,6 @@ function sameRange(
 }
 
 export function validatePlacementOffsets(sourceTextUtf16: string, offsets: number[]): number[] {
-    const seen = new Set<number>()
     const forbiddenSpans = [
         ...findRequestMarkers(sourceTextUtf16).map(({ start, end }) => ({ start, end })),
         ...findSlotNodes(sourceTextUtf16).map(({ start, end }) => ({ start, end })),
@@ -285,11 +284,6 @@ export function validatePlacementOffsets(sourceTextUtf16: string, offsets: numbe
         if (offset < 0 || offset > sourceTextUtf16.length) {
             throw new IllustrationPlacementOffsetError('out_of_range', offset)
         }
-        if (seen.has(offset)) {
-            throw new IllustrationPlacementOffsetError('duplicate', offset)
-        }
-        seen.add(offset)
-
         if (
             offset > 0
             && offset < sourceTextUtf16.length

@@ -10,9 +10,23 @@ export const JOB_TRANSITIONS: Readonly<Record<IllustrationJobState, readonly Ill
     ],
     awaiting_prompt: [
         'queued',
+        'agent_blocked_retryable', // Report §8: retryable Tagger failure is durably blocked.
+        'agent_blocked', // Report §8: non-retryable/exhausted Tagger failure is durably blocked.
         'cancelled',
         'stale', // §5-8 / §8.3 / §13: edited or moved target before dispatch.
         'corrupt', // §7.3 / §8.2: broken projection or duplicate anchor before dispatch.
+    ],
+    agent_blocked_retryable: [
+        'awaiting_prompt', // Report §8: only retryAgentFailure may reopen the Tagger.
+        'cancelled', // Report §8: blocked Agent work remains manually cancellable.
+        'stale', // Report §8: edit-staleness closure mirrors blocked_config.
+        'corrupt', // Report §8: projection-corruption closure mirrors blocked_config.
+    ],
+    agent_blocked: [
+        'awaiting_prompt', // Report §8: only retryAgentFailure may reopen the Tagger.
+        'cancelled', // Report §8: blocked Agent work remains manually cancellable.
+        'stale', // Report §8: edit-staleness closure mirrors blocked_config.
+        'corrupt', // Report §8: projection-corruption closure mirrors blocked_config.
     ],
     queued: [
         'generating',
@@ -51,13 +65,35 @@ export const JOB_TRANSITIONS: Readonly<Record<IllustrationJobState, readonly Ill
 }
 
 export const TURN_TRANSITIONS: Readonly<Record<IllustrationTurnState, readonly IllustrationTurnState[]>> = {
-    prepared: ['awaiting_plan', 'blocked_capture', 'stale', 'corrupt'],
-    blocked_capture: ['awaiting_plan', 'stale', 'corrupt'],
-    awaiting_plan: ['awaiting_prompt', 'blocked_manifest', 'no_scenes', 'stale', 'corrupt'],
+    prepared: ['awaiting_plan', 'blocked_capture', 'cancelled', 'stale', 'corrupt'],
+    blocked_capture: ['awaiting_plan', 'cancelled', 'stale', 'corrupt'],
+    awaiting_plan: [
+        'awaiting_prompt',
+        'agent_blocked_retryable', // Report §8: retryable Planner failure is durably blocked.
+        'agent_blocked', // Report §8: non-retryable/exhausted Planner failure is durably blocked.
+        'blocked_manifest',
+        'no_scenes',
+        'cancelled',
+        'stale',
+        'corrupt',
+    ],
+    agent_blocked_retryable: [
+        'awaiting_plan', // Report §8: only retryAgentFailure may reopen the Planner.
+        'cancelled', // Gate 4a decision 1A: blocked Planner work is cancellable.
+        'stale', // Report §8: edit-staleness closure mirrors blocked_config.
+        'corrupt', // Report §8: capture/projection corruption remains fail-closed.
+    ],
+    agent_blocked: [
+        'awaiting_plan', // Report §8: only retryAgentFailure may reopen the Planner.
+        'cancelled', // Gate 4a decision 1A: blocked Planner work is cancellable.
+        'stale', // Report §8: edit-staleness closure mirrors blocked_config.
+        'corrupt', // Report §8: capture/projection corruption remains fail-closed.
+    ],
     awaiting_prompt: ['completed', 'stale', 'corrupt'],
     blocked_manifest: [],
     no_scenes: [],
     completed: [],
+    cancelled: [],
     stale: [],
     corrupt: [],
 }
@@ -83,6 +119,7 @@ const terminalTurnStates = new Set<IllustrationTurnState>([
     'blocked_manifest',
     'no_scenes',
     'completed',
+    'cancelled',
     'stale',
     'corrupt',
 ])

@@ -67,6 +67,7 @@ vi.mock('src/ts/process/files/inlays', () => ({
 }))
 
 const coordinatorModule = await import('../coordinator')
+const coordinatorRecordModule = await import('../coordinatorRecord')
 const executorModule = await import('../executor')
 const featureModule = await import('../featureFlag')
 const lockModule = await import('../locks')
@@ -80,6 +81,7 @@ const {
     submitPlanLedger,
     supplyPromptLedger,
 } = coordinatorModule
+const { claimCoordinator } = coordinatorRecordModule
 const {
     commitIllustrationAssetReadyJob,
     deriveIllustrationAssetId,
@@ -99,6 +101,19 @@ const { illustrationJobStore } = storeModule
 
 const BASE_TIME = Date.UTC(2026, 0, 3)
 let lockManager: InMemoryLockManager
+let coordinatorProof: { coordinatorLeaseId: string; coordinatorFence: number }
+
+async function refreshCoordinatorProof(): Promise<void> {
+    const snapshot = await claimCoordinator({
+        protocolVersion: 1,
+        leaseId: 'test-coordinator',
+        holderRuntimeId: 'test-runtime',
+    })
+    coordinatorProof = {
+        coordinatorLeaseId: 'test-coordinator',
+        coordinatorFence: snapshot.fence,
+    }
+}
 
 function installDatabase(source = 'Executor source', swipes = false) {
     const message = swipes
@@ -117,6 +132,7 @@ function installDatabase(source = 'Executor source', swipes = false) {
             chaId: 'character-1',
             name: 'Character',
             image: '',
+            newGenData: { negative: 'character-current-negative-sentinel' },
             chats: [chat],
             chatPage: 0,
         }],
@@ -130,7 +146,12 @@ function installDatabase(source = 'Executor source', swipes = false) {
     return { chat, message }
 }
 
-async function createQueuedJob(source = 'Executor source', swipes = false) {
+async function createQueuedJob(
+    source = 'Executor source',
+    swipes = false,
+    positive = 'positive prompt',
+    negative = '',
+) {
     const target = installDatabase(source, swipes)
     const turn = await registerTrustedTurn({
         chaId: 'character-1',
@@ -140,11 +161,13 @@ async function createQueuedJob(source = 'Executor source', swipes = false) {
         sourceVariantText: source,
     })
     const claimedTurn = await illustrationJobStore.claimTurn({
+        ...coordinatorProof,
         turnId: turn.turnId,
         expectedVersion: turn.version,
         leaseId: 'planner',
     })
     const [projected] = await submitPlanLedger({
+        ...coordinatorProof,
         turnId: turn.turnId,
         expectedVersion: claimedTurn.version,
         leaseId: 'planner',
@@ -158,18 +181,20 @@ async function createQueuedJob(source = 'Executor source', swipes = false) {
         }],
     })
     const claimedJob = await illustrationJobStore.claimJob({
+        ...coordinatorProof,
         jobId: projected.jobId,
         expectedVersion: projected.version,
         leaseId: 'tagger',
     })
     const queued = await supplyPromptLedger({
+        ...coordinatorProof,
         jobId: projected.jobId,
         expectedVersion: claimedJob.version,
         leaseId: 'tagger',
         fence: claimedJob.fence,
         idempotencyKey: `prompt:${projected.jobId}`,
-        positive: 'positive prompt',
-        negative: '',
+        positive,
+        negative,
     })
     harness.events.length = 0
     harness.strictSave.mockClear()
@@ -190,11 +215,13 @@ async function createTwoQueuedJobs() {
         sourceVariantText: source,
     })
     const claimedTurn = await illustrationJobStore.claimTurn({
+        ...coordinatorProof,
         turnId: turn.turnId,
         expectedVersion: turn.version,
         leaseId: 'planner-two-queued',
     })
     const projected = await submitPlanLedger({
+        ...coordinatorProof,
         turnId: turn.turnId,
         expectedVersion: claimedTurn.version,
         leaseId: 'planner-two-queued',
@@ -218,11 +245,13 @@ async function createTwoQueuedJobs() {
     for (const [index, job] of projected.entries()) {
         const leaseId = `tagger-two-queued-${index}`
         const claimed = await illustrationJobStore.claimJob({
+            ...coordinatorProof,
             jobId: job.jobId,
             expectedVersion: job.version,
             leaseId,
         })
         queued.push(await supplyPromptLedger({
+            ...coordinatorProof,
             jobId: job.jobId,
             expectedVersion: claimed.version,
             leaseId,
@@ -267,6 +296,7 @@ beforeEach(async () => {
     setIllustrationLockManagerAccessorForTests(() => lockManager)
     setIllustrationOperationLockManagerAccessorForTests(() => lockManager)
     setIllustrationWorkerLockManagerAccessorForTests(() => lockManager)
+    await refreshCoordinatorProof()
     await setIllustrationFeatureEnabled(true)
     harness.provider.mockImplementation(async () => {
         harness.events.push('provider')
@@ -311,7 +341,9 @@ afterEach(async () => {
 describe('illustration executor', () => {
     // §20 Crash/storage + §12.2/§13 exact durable ordering.
     test('persists attempt, asset, integrity, and strict commit in the required order', async () => {
-        const { queued } = await createQueuedJob()
+        const positive = 'persisted (positive) prompt'
+        const negative = 'persisted negative prompt'
+        const { queued } = await createQueuedJob('Executor source', false, positive, negative)
 
         await startIllustrationExecutor()
         await pokeExecutor()
@@ -336,11 +368,12 @@ describe('illustration executor', () => {
             target: { charId: 'character-1', chatId: 'conversation-1' },
         })
         expect(harness.provider).toHaveBeenCalledWith(
-            'positive prompt',
+            positive,
             harness.database.characters[0],
-            '',
+            negative,
             'inlay',
             'background',
+            { preservePromptText: true },
         )
     })
 
@@ -357,6 +390,7 @@ describe('illustration executor', () => {
         await stopIllustrationExecutor()
 
         harness.storageMap.clear()
+        await refreshCoordinatorProof()
         await setIllustrationFeatureEnabled(true)
         const uncertain = await createQueuedJob('Uncertain source')
         harness.provider.mockResolvedValueOnce({
@@ -784,11 +818,13 @@ describe('illustration executor', () => {
             sourceVariantText: source,
         })
         const claimedTurn = await illustrationJobStore.claimTurn({
+            ...coordinatorProof,
             turnId: turn.turnId,
             expectedVersion: turn.version,
             leaseId: 'planner-wake',
         })
         const [projected] = await submitPlanLedger({
+            ...coordinatorProof,
             turnId: turn.turnId,
             expectedVersion: claimedTurn.version,
             leaseId: 'planner-wake',
@@ -802,6 +838,7 @@ describe('illustration executor', () => {
             }],
         })
         const claimedJob = await illustrationJobStore.claimJob({
+            ...coordinatorProof,
             jobId: projected.jobId,
             expectedVersion: projected.version,
             leaseId: 'tagger-wake',
@@ -809,6 +846,7 @@ describe('illustration executor', () => {
         await startIllustrationExecutor()
 
         await supplyPromptLedger({
+            ...coordinatorProof,
             jobId: projected.jobId,
             expectedVersion: claimedJob.version,
             leaseId: 'tagger-wake',
