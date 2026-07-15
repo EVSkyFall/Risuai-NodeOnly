@@ -1,5 +1,6 @@
 import { forageStorage } from "../globalApi.svelte"
 import { type Chat, type ChatStub, type ChatOrStub, isChatStub } from "./database.svelte"
+import type { DurableChatSaveResult } from "./nodeStorage"
 import { tick } from "svelte"
 
 // ── Stub ↔ Placeholder conversion ───────────────────────────────────────────
@@ -113,6 +114,16 @@ export async function fetchChatFromServer(chaId: string, chatIndex: number, chat
 export async function saveChatToServer(chaId: string, chatIndex: number, chatId: string, chat: Chat): Promise<void> {
     const storage = forageStorage.realStorage
     await storage.saveChatContent(chaId, chatIndex, chatId, chat)
+}
+
+export async function saveChatToServerStrict(
+    chaId: string,
+    chatIndex: number,
+    chatId: string,
+    chat: Chat,
+): Promise<DurableChatSaveResult> {
+    await forageStorage.Init()
+    return await forageStorage.realStorage.saveChatContentStrict(chaId, chatIndex, chatId, chat)
 }
 
 // ── Hydration ───────────────────────────────────────────────────────────────

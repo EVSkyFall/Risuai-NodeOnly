@@ -1,0 +1,527 @@
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
+import type { Chat, Message } from '../../../storage/database.svelte'
+import { InMemoryLockManager } from './inMemoryLockManager'
+
+const harness = vi.hoisted(() => ({
+    storageMap: new Map<string, Uint8Array>(),
+    storageEvents: [] as string[],
+    database: null as any,
+    strictFailure: null as Error | null,
+    storageHook: null as ((key: string) => void) | null,
+    strictSave: vi.fn(),
+}))
+
+vi.mock('src/ts/globalApi.svelte', () => ({
+    forageStorage: {
+        async Init() {},
+        async keys(prefix = '') {
+            return [...harness.storageMap.keys()].filter((key) => key.startsWith(prefix))
+        },
+        async getItem(key: string) {
+            return harness.storageMap.get(key) ?? null
+        },
+        async setItem(key: string, value: Uint8Array) {
+            harness.storageEvents.push(`storage:${key}`)
+            harness.storageHook?.(key)
+            harness.storageMap.set(key, new Uint8Array(value))
+        },
+        async removeItem(key: string) {
+            harness.storageMap.delete(key)
+        },
+    },
+}))
+
+vi.mock('src/ts/parser/parser.svelte', () => ({
+    hasher: vi.fn(async () => new Uint8Array(32)),
+}))
+
+vi.mock('src/ts/storage/database.svelte', () => ({
+    getDatabase: () => harness.database,
+}))
+
+vi.mock('src/ts/storage/chatStorage', () => ({
+    ensureChatHydrated: vi.fn(async (chats: Chat[], index: number) => chats[index] ?? null),
+    saveChatToServerStrict: harness.strictSave,
+}))
+
+const coordinatorModule = await import('../coordinator')
+const featureModule = await import('../featureFlag')
+const lockModule = await import('../locks')
+const operationLockModule = await import('../operationLock')
+const storeModule = await import('../store')
+
+const {
+    cancelLedger,
+    registerTrustedTurn,
+    submitPlanLedger,
+    supplyPromptLedger,
+} = coordinatorModule
+const { IllustrationFeatureDisabledError, setIllustrationFeatureEnabled } = featureModule
+const { resetIllustrationLockManagerAccessorForTests, setIllustrationLockManagerAccessorForTests } = lockModule
+const {
+    resetIllustrationOperationLockManagerAccessorForTests,
+    setIllustrationOperationLockManagerAccessorForTests,
+} = operationLockModule
+const {
+    illustrationJobStore,
+    illustrationJobKey,
+    illustrationManifestKey,
+    illustrationTurnKey,
+} = storeModule
+
+const BASE_TIME = Date.UTC(2026, 0, 2)
+let mutationEvents: string[]
+let lockManager: InMemoryLockManager
+
+function makeMessage(source: string): Message {
+    let data = source
+    const message = {
+        role: 'char',
+        chatId: 'message-1',
+    } as Message
+    Object.defineProperty(message, 'data', {
+        enumerable: true,
+        configurable: true,
+        get: () => data,
+        set: (value: string) => {
+            mutationEvents.push('marker')
+            data = value
+        },
+    })
+    return message
+}
+
+function installDatabase(source = 'A quiet scene.'): Chat {
+    const chat: Chat = {
+        id: 'conversation-1',
+        name: 'chat',
+        note: '',
+        localLore: [],
+        fmIndex: -1,
+        message: [makeMessage(source)],
+    }
+    harness.database = {
+        characters: [{ chaId: 'character-1', chats: [chat], chatPage: 0 }],
+        sdProvider: 'novelai',
+        NAIImgUrl: 'https://image.novelai.net/ai/generate-image',
+        NAIImgModel: 'nai-diffusion-4-5-full',
+        NAII2I: false,
+        NAIImgConfig: {},
+    }
+    return chat
+}
+
+function registerInput(sourceVariantText = 'A quiet scene.') {
+    return {
+        chaId: 'character-1',
+        conversationId: 'conversation-1',
+        expectedMessageId: 'message-1',
+        rootTurnId: 'root-turn-1',
+        sourceVariantText,
+    }
+}
+
+function decodeStored<T>(key: string): T | null {
+    const value = harness.storageMap.get(key)
+    return value ? JSON.parse(new TextDecoder().decode(value)) as T : null
+}
+
+async function registerAndClaim(source = 'A quiet scene.') {
+    installDatabase(source)
+    const registered = await registerTrustedTurn(registerInput(source))
+    const claimed = await illustrationJobStore.claimTurn({
+        turnId: registered.turnId,
+        expectedVersion: registered.version,
+        leaseId: 'planner-lease',
+    })
+    return { registered, claimed }
+}
+
+function submitInput(
+    claimed: Awaited<ReturnType<typeof illustrationJobStore.claimTurn>>,
+    offsets: number[],
+) {
+    return {
+        turnId: claimed.turnId,
+        expectedVersion: claimed.version,
+        leaseId: 'planner-lease',
+        fence: claimed.fence,
+        idempotencyKey: `plan:${claimed.turnId}`,
+        sourceRevisionHash: claimed.sourceRevisionHash!,
+        slots: offsets.map((insertAfterUtf16, index) => ({
+            sceneId: `scene-${index}`,
+            insertAfterUtf16,
+            scenePayload: { schemaVersion: 1, data: { description: `scene ${index}` } },
+        })),
+    }
+}
+
+beforeEach(async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(BASE_TIME)
+    harness.storageMap.clear()
+    harness.storageEvents.length = 0
+    harness.strictFailure = null
+    harness.storageHook = null
+    harness.strictSave.mockReset()
+    mutationEvents = []
+    installDatabase()
+    lockManager = new InMemoryLockManager()
+    setIllustrationLockManagerAccessorForTests(() => lockManager)
+    setIllustrationOperationLockManagerAccessorForTests(() => lockManager)
+    await setIllustrationFeatureEnabled(true)
+    harness.storageEvents.length = 0
+    harness.strictSave.mockImplementation(async () => {
+        mutationEvents.push('strict')
+        harness.storageEvents.push('strict')
+        if (harness.strictFailure) throw harness.strictFailure
+        return { success: true, durable: true }
+    })
+})
+
+describe('submitPlanLedger', () => {
+    // §20 Manifest/API + §7.3: prepared manifest -> records -> records_complete -> projection ACK.
+    test('materializes all slots in one transform and advances records only after strict ACK', async () => {
+        const { claimed } = await registerAndClaim('ABCD')
+        harness.storageEvents.length = 0
+        harness.strictSave.mockImplementation(async () => {
+            harness.storageEvents.push('strict')
+            const manifest = decodeStored<any>(illustrationManifestKey(claimed.turnId))
+            expect(manifest.phase).toBe('records_complete')
+            for (const entry of manifest.jobs) {
+                expect(decodeStored<any>(illustrationJobKey(entry.jobId)).state).toBe('prepared')
+            }
+            return { success: true, durable: true }
+        })
+
+        const jobs = await submitPlanLedger(submitInput(claimed, [1, 3]))
+        const manifest = await illustrationJobStore.getManifest(claimed.turnId)
+        const turn = await illustrationJobStore.getTurn(claimed.turnId)
+        const text = harness.database.characters[0].chats[0].message[0].data as string
+
+        expect(jobs).toHaveLength(2)
+        expect(jobs.every((job: any) => job.state === 'awaiting_prompt')).toBe(true)
+        expect(manifest?.phase).toBe('projection_durable')
+        expect(turn?.state).toBe('awaiting_prompt')
+        expect(text).not.toContain('risu-illustration-request')
+        expect(text.match(/<risu-illustration-slot /g)).toHaveLength(2)
+        expect(text.startsWith('A<risu-illustration-slot')).toBe(true)
+        expect(text.endsWith('</risu-illustration-slot>D')).toBe(true)
+
+        const strictIndex = harness.storageEvents.indexOf('strict')
+        const manifestWrites = harness.storageEvents
+            .map((event, index) => event === `storage:${illustrationManifestKey(claimed.turnId)}` ? index : -1)
+            .filter((index) => index >= 0)
+        expect(manifestWrites).toHaveLength(3)
+        expect(manifestWrites[1]).toBeLessThan(strictIndex)
+        expect(strictIndex).toBeLessThan(manifestWrites[2])
+    })
+
+    // §20 Maximum jobs and placement validation happen before chat mutation/flush.
+    test('rejects a sixteenth slot and invalid UTF-16 offsets before any chat write', async () => {
+        const { claimed } = await registerAndClaim('A😀B')
+        const markerText = harness.database.characters[0].chats[0].message[0].data
+        harness.strictSave.mockClear()
+
+        await expect(submitPlanLedger(submitInput(claimed, Array.from({ length: 16 }, (_, i) => i))))
+            .rejects.toThrow('at most 15')
+        await expect(submitPlanLedger(submitInput(claimed, [2])))
+            .rejects.toThrow('surrogate_split')
+
+        expect(harness.strictSave).not.toHaveBeenCalled()
+        expect(harness.database.characters[0].chats[0].message[0].data).toBe(markerText)
+        expect(await illustrationJobStore.getManifest(claimed.turnId)).toBeNull()
+    })
+
+    // §20 Target/edit: a changed normalized source becomes stale without chat write.
+    test('marks a changed source stale before manifest or chat write', async () => {
+        const { claimed } = await registerAndClaim('Original')
+        const message = harness.database.characters[0].chats[0].message[0]
+        message.data = `Edited${message.data.slice('Original'.length)}`
+        harness.strictSave.mockClear()
+
+        await expect(submitPlanLedger(submitInput(claimed, [1]))).rejects.toThrow('stale')
+
+        expect((await illustrationJobStore.getTurn(claimed.turnId))?.state).toBe('stale')
+        expect(await illustrationJobStore.getManifest(claimed.turnId)).toBeNull()
+        expect(harness.strictSave).not.toHaveBeenCalled()
+    })
+
+    // §20 zero-scene Planner result removes the request marker durably and ends the turn.
+    test('durably removes the marker and closes a zero-scene turn', async () => {
+        const { claimed } = await registerAndClaim('No image needed.')
+        harness.strictSave.mockClear()
+
+        const jobs = await submitPlanLedger(submitInput(claimed, []))
+
+        expect(jobs).toEqual([])
+        expect(harness.strictSave).toHaveBeenCalledTimes(1)
+        expect(harness.database.characters[0].chats[0].message[0].data).toBe('No image needed.')
+        expect((await illustrationJobStore.getManifest(claimed.turnId))?.phase).toBe('projection_durable')
+        expect((await illustrationJobStore.getTurn(claimed.turnId))?.state).toBe('no_scenes')
+    })
+
+    // §20 Manifest/API: a lost submitPlan response replays the durable projection.
+    test('returns the existing jobs for an identical submitPlan replay', async () => {
+        const { claimed } = await registerAndClaim('Replay plan')
+        const input = submitInput(claimed, [6])
+        const first = await submitPlanLedger(input)
+        harness.strictSave.mockClear()
+
+        const replay = await submitPlanLedger(input)
+
+        expect(replay).toEqual(first)
+        expect(await illustrationJobStore.listJobs({ turnId: claimed.turnId })).toHaveLength(1)
+        expect(harness.strictSave).not.toHaveBeenCalled()
+    })
+
+    test('reconciles an identical replay after strict ACK but before projection_durable', async () => {
+        const { claimed } = await registerAndClaim('Phase replay')
+        const input = submitInput(claimed, [5])
+        let manifestWrites = 0
+        harness.storageHook = (key) => {
+            if (key === illustrationManifestKey(claimed.turnId) && ++manifestWrites === 3) {
+                throw new Error('crash before projection phase')
+            }
+        }
+        await expect(submitPlanLedger(input)).rejects.toThrow('crash before projection phase')
+        harness.storageHook = null
+
+        const replay = await submitPlanLedger(input)
+
+        expect(replay).toHaveLength(1)
+        expect(replay[0].state).toBe('awaiting_prompt')
+        expect((await illustrationJobStore.getManifest(claimed.turnId))?.phase)
+            .toBe('projection_durable')
+        expect((await illustrationJobStore.getTurn(claimed.turnId))?.state).toBe('awaiting_prompt')
+    })
+
+    test('serializes concurrent identical submitPlan calls into one projection flush', async () => {
+        const { claimed } = await registerAndClaim('Concurrent plan')
+        const input = submitInput(claimed, [5])
+        harness.strictSave.mockClear()
+
+        const [first, second] = await Promise.all([
+            submitPlanLedger(input),
+            submitPlanLedger(input),
+        ])
+
+        expect(second).toEqual(first)
+        expect(harness.strictSave).toHaveBeenCalledTimes(1)
+        expect(await illustrationJobStore.listJobs({ turnId: claimed.turnId })).toHaveLength(1)
+    })
+
+    // §8.3 materialization CAS: an edit during ledger writes is never overwritten.
+    test('rechecks the source immediately before projection and preserves an intervening edit', async () => {
+        const { claimed } = await registerAndClaim('Race source')
+        const message = harness.database.characters[0].chats[0].message[0]
+        let edited = false
+        harness.storageHook = (key) => {
+            if (!edited && key.startsWith('illustration:v1:job:')) {
+                edited = true
+                message.data = message.data.replace('Race source', 'User edit')
+            }
+        }
+        harness.strictSave.mockClear()
+
+        await expect(submitPlanLedger(submitInput(claimed, [4]))).rejects.toThrow('stale')
+
+        expect(message.data).toContain('User edit')
+        expect(message.data).not.toContain('risu-illustration-slot')
+        expect(harness.strictSave).not.toHaveBeenCalled()
+        expect((await illustrationJobStore.getTurn(claimed.turnId))?.state).toBe('stale')
+        expect((await illustrationJobStore.listJobs({ turnId: claimed.turnId }))[0]?.state).toBe('stale')
+    })
+})
+
+describe('prompt handoff and cancellation', () => {
+    async function createClaimedPromptJob(source = 'Prompt source') {
+        const { claimed } = await registerAndClaim(source)
+        const [projected] = await submitPlanLedger(submitInput(claimed, [source.length]))
+        const job = await illustrationJobStore.claimJob({
+            jobId: projected.jobId,
+            expectedVersion: projected.version,
+            leaseId: 'tagger-lease',
+        })
+        return job
+    }
+
+    function promptInput(job: Awaited<ReturnType<typeof illustrationJobStore.claimJob>>) {
+        return {
+            jobId: job.jobId,
+            expectedVersion: job.version,
+            leaseId: 'tagger-lease',
+            fence: job.fence,
+            idempotencyKey: `prompt:${job.jobId}`,
+            positive: 'cinematic scene',
+            negative: '',
+        }
+    }
+
+    // §10.1 / §14: final prompts are validated and durable before queued.
+    test('queues a durable positive prompt while allowing an empty negative prompt', async () => {
+        const job = await createClaimedPromptJob()
+
+        const queued = await supplyPromptLedger(promptInput(job))
+
+        expect(queued).toMatchObject({
+            state: 'queued',
+            prompt: { positive: 'cinematic scene', negative: '' },
+        })
+    })
+
+    // §20 Manifest/API: a lost supplyPrompt response replays the same queued write.
+    test('returns the queued job for an identical supplyPrompt replay', async () => {
+        const job = await createClaimedPromptJob()
+        const input = promptInput(job)
+        const first = await supplyPromptLedger(input)
+
+        const replay = await supplyPromptLedger(input)
+
+        expect(replay).toEqual(first)
+        expect((await illustrationJobStore.getJob(job.jobId))?.version).toBe(first.version)
+    })
+
+    test('rejects blank or over-16-KiB UTF-8 prompts before any job write', async () => {
+        const job = await createClaimedPromptJob()
+        const before = await illustrationJobStore.getJob(job.jobId)
+
+        await expect(supplyPromptLedger({ ...promptInput(job), positive: '   ' }))
+            .rejects.toThrow('positive prompt')
+        await expect(supplyPromptLedger({ ...promptInput(job), positive: '가'.repeat(5_462) }))
+            .rejects.toThrow('16 KiB')
+        await expect(supplyPromptLedger({ ...promptInput(job), negative: '가'.repeat(5_462) }))
+            .rejects.toThrow('16 KiB')
+
+        expect(await illustrationJobStore.getJob(job.jobId)).toEqual(before)
+    })
+
+    // §5-8 / §8.3: edit discovered at Tagger handoff stales before prompt persistence.
+    test('stales an awaiting_prompt job when the source changed before handoff', async () => {
+        const job = await createClaimedPromptJob('Editable source')
+        const message = harness.database.characters[0].chats[0].message[0]
+        message.data = message.data.replace('Editable source', 'Edited source')
+
+        await expect(supplyPromptLedger(promptInput(job))).rejects.toThrow('stale')
+
+        const stale = await illustrationJobStore.getJob(job.jobId)
+        expect(stale?.state).toBe('stale')
+        expect(stale?.prompt).toBeUndefined()
+    })
+
+    // §10.3 queued cancel is immediate and needs no provider participation.
+    test('cancels a queued job immediately', async () => {
+        const claimed = await createClaimedPromptJob()
+        const queued = await supplyPromptLedger(promptInput(claimed))
+
+        const cancelled = await cancelLedger({
+            jobId: queued.jobId,
+            expectedVersion: queued.version,
+        })
+
+        expect(cancelled).toMatchObject({ state: 'cancelled', cancelRequestedAt: BASE_TIME })
+    })
+})
+
+afterEach(() => {
+    resetIllustrationLockManagerAccessorForTests()
+    resetIllustrationOperationLockManagerAccessorForTests()
+    vi.useRealTimers()
+})
+
+describe('registerTrustedTurn', () => {
+    // §20 Crash/storage/cancel + §6.2: ledger first, marker, strict ACK, awaiting_plan.
+    test('persists the prepared ledger before marker mutation and advances only after strict ACK', async () => {
+        const turn = await registerTrustedTurn(registerInput())
+
+        expect(harness.storageEvents[0]).toBe(`storage:${illustrationTurnKey(turn.turnId)}`)
+        expect(mutationEvents).toEqual(['marker', 'strict'])
+        expect(harness.strictSave).toHaveBeenCalledTimes(1)
+        expect(turn).toMatchObject({ state: 'awaiting_plan', sourceTextUtf16: 'A quiet scene.' })
+        expect(harness.database.characters[0].chats[0].message[0].data)
+            .toMatch(/^A quiet scene\.<!--risu-illustration-request:v1:[A-Za-z0-9_-]+-->$/)
+    })
+
+    test('leaves blocked_capture after strict failure without retrying the marker', async () => {
+        harness.strictFailure = new Error('durable write rejected')
+
+        await expect(registerTrustedTurn(registerInput())).rejects.toThrow('durable write rejected')
+
+        const [turn] = await illustrationJobStore.listTurns()
+        expect(turn.state).toBe('blocked_capture')
+        expect(harness.strictSave).toHaveBeenCalledTimes(1)
+        expect(mutationEvents).toEqual(['marker', 'strict'])
+        expect((harness.database.characters[0].chats[0].message[0].data.match(/risu-illustration-request/g) ?? []))
+            .toHaveLength(1)
+    })
+
+    test('blocks capture without mutating any swipe when the active variant changes during ledger creation', async () => {
+        const message = {
+            role: 'char',
+            chatId: 'message-1',
+            data: 'Swipe A',
+            swipes: ['Swipe A', 'Swipe B', 'Swipe C'],
+            swipeId: 0,
+        } as Message
+        harness.database.characters[0].chats[0].message = [message]
+        const originalSwipes = [...message.swipes!]
+        let changed = false
+        harness.storageHook = (key) => {
+            if (!changed && key.startsWith('illustration:v1:turn:')) {
+                changed = true
+                message.swipeId = 1
+                message.data = message.swipes![1]
+            }
+        }
+
+        await expect(registerTrustedTurn(registerInput('Swipe A')))
+            .rejects.toThrow('changed before capture')
+
+        const [turn] = await illustrationJobStore.listTurns()
+        expect(turn).toMatchObject({
+            state: 'blocked_capture',
+            error: { code: 'capture_variant_raced' },
+        })
+        expect(message.data).toBe('Swipe B')
+        expect(message.swipes).toEqual(originalSwipes)
+        expect([message.data, ...message.swipes!].join('\n')).not.toContain('risu-illustration-request')
+        expect(harness.strictSave).not.toHaveBeenCalled()
+    })
+
+    test('uses requestKey idempotency under concurrent registration', async () => {
+        const [first, second] = await Promise.all([
+            registerTrustedTurn(registerInput()),
+            registerTrustedTurn(registerInput()),
+        ])
+
+        expect(second).toEqual(first)
+        expect(await illustrationJobStore.listTurns()).toHaveLength(1)
+        expect(harness.strictSave).toHaveBeenCalledTimes(1)
+        expect((harness.database.characters[0].chats[0].message[0].data.match(/risu-illustration-request/g) ?? []))
+            .toHaveLength(1)
+    })
+
+    test('returns the existing turn on a sequential registration replay', async () => {
+        const first = await registerTrustedTurn(registerInput())
+        harness.strictSave.mockClear()
+
+        const replay = await registerTrustedTurn(registerInput())
+
+        expect(replay).toEqual(first)
+        expect(harness.strictSave).not.toHaveBeenCalled()
+        expect((harness.database.characters[0].chats[0].message[0].data.match(/risu-illustration-request/g) ?? []))
+            .toHaveLength(1)
+    })
+
+    // §20 feature flag OFF means capture is refused before any ledger/chat write.
+    test('refuses registration while the feature is off', async () => {
+        await setIllustrationFeatureEnabled(false)
+        harness.storageEvents.length = 0
+
+        await expect(registerTrustedTurn(registerInput()))
+            .rejects.toBeInstanceOf(IllustrationFeatureDisabledError)
+        expect(harness.storageEvents).toHaveLength(0)
+        expect(harness.strictSave).not.toHaveBeenCalled()
+        expect(mutationEvents).toHaveLength(0)
+    })
+})

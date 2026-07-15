@@ -2,15 +2,46 @@ import { IllustrationLedgerTransitionError } from './errors'
 import type { IllustrationJobState, IllustrationTurnState } from './types'
 
 export const JOB_TRANSITIONS: Readonly<Record<IllustrationJobState, readonly IllustrationJobState[]>> = {
-    prepared: ['awaiting_prompt', 'cancelled'],
-    awaiting_prompt: ['queued', 'cancelled'],
-    queued: ['generating', 'blocked_config', 'cancelled', 'stale'],
+    prepared: [
+        'awaiting_prompt',
+        'cancelled',
+        'stale', // §5-8 / §8.3 / §13: edited or moved target before dispatch.
+        'corrupt', // §7.3 / §8.2: broken projection or duplicate anchor before dispatch.
+    ],
+    awaiting_prompt: [
+        'queued',
+        'cancelled',
+        'stale', // §5-8 / §8.3 / §13: edited or moved target before dispatch.
+        'corrupt', // §7.3 / §8.2: broken projection or duplicate anchor before dispatch.
+    ],
+    queued: [
+        'generating',
+        'blocked_config',
+        'cancelled',
+        'stale',
+        'corrupt', // §7.3 / §8.2: broken projection or duplicate anchor before dispatch.
+    ],
     generating: ['asset_writing', 'failed', 'stale', 'uncertain', 'cancel_requested'],
     cancel_requested: ['asset_writing', 'failed', 'uncertain', 'cancelled'],
-    blocked_config: ['queued', 'cancelled'],
+    blocked_config: [
+        'queued',
+        'cancelled',
+        'stale', // §5-8 / §8.3 / §13: edited or moved target while configuration is blocked.
+        'corrupt', // §7.3 / §8.2: broken projection or duplicate anchor while blocked.
+    ],
     asset_writing: ['asset_ready', 'uncertain'],
-    asset_ready: ['committing', 'cancelled', 'stale'],
-    committing: ['committed', 'stale', 'corrupt'],
+    asset_ready: [
+        'committing',
+        'cancelled',
+        'stale',
+        'uncertain', // §13: neither asset nor provider result can be verified during reconcile.
+    ],
+    committing: [
+        'committed',
+        'stale',
+        'corrupt',
+        'uncertain', // §13: neither asset nor provider result can be verified during reconcile.
+    ],
     committed: [],
     failed: [],
     stale: [],

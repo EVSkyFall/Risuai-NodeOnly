@@ -8,14 +8,14 @@ import type { OpenAIChat } from "./index.svelte"
 import { processZip } from "./processzip"
 import random from "lodash/random"
 
-type ImageGenerationResult =
+export type ImageGenerationResult =
     | { ok: true; bytesOrDataUrl: string; providerStatus: number }
     | { ok: false; certainty: 'definite'; reason: string; providerStatus?: number }
     | { ok: false; certainty: 'uncertain'; reason: string }
 
-type ImageGenerationPriority = 'interactive' | 'background'
+export type ImageGenerationPriority = 'interactive' | 'background'
 
-type ImageGenerationAttempt = {
+export type ImageGenerationAttempt = {
     result: ImageGenerationResult
     compatibilityValue: string | false
     shouldNotify?: boolean
@@ -88,7 +88,7 @@ export async function generateAIImage(
     return attempt.compatibilityValue
 }
 
-async function generateAIImageTyped(
+export async function generateAIImageTyped(
     genPrompt:string,
     currentChar:character,
     neg:string,
