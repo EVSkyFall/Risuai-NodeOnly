@@ -6,8 +6,12 @@ export const RISU_ILLUSTRATION_AGENT_LLM_TIMEOUT_MS = 240_000
 type PinnedDigestRotation = readonly [string] | readonly [string, string]
 
 // Rotation may temporarily contain the old and new production digests, never more than two.
+// [0] = 0.1.1 (99,782 bytes), [1] = 0.1.3 (100,883 bytes; digest independently
+// recomputed from the bundle on 2026-07-16 per REQUEST_RISU_ILLUSTRATION_AGENT_CORE_REPIN_0.1.3).
+// Converge to a 0.1.3-only pin in a follow-up change once the rollout is confirmed.
 export const PINNED_ILLUSTRATION_PLUGIN_DIGESTS = Object.freeze([
     '12f76fef5047b9d161e5d8b4efe87c1f7dcff2d7a2f16a99f693c98c7d450ea7',
+    '126a7acf58368c102023d3f1e4489599a14e603ba922cad609d0cfb39744679b',
 ] as const satisfies PinnedDigestRotation)
 
 export type IllustrationV3AuthorizationInput = {

@@ -26,6 +26,7 @@ import {
     PRODUCTION_SLOT_NODE,
     PRODUCTION_SLOT_TOKEN,
     PRODUCTION_SLOT_TOKEN_RE,
+    REJECTED_INTERMEDIATE_PLUGIN_SHA256,
 } from './sharedFixtures'
 
 describe('Gate 4d shared Core fixtures', () => {
@@ -100,5 +101,30 @@ describe('Gate 4d shared Core fixtures', () => {
                 scriptDigest: PRODUCTION_PLUGIN.scriptSha256,
                 apiVersion: '3.0',
             })
+    })
+
+    // 0.1.3 repin: the [0.1.1, 0.1.3] rotation window authorizes both releases
+    // and the unapproved intermediate 0.1.2 digest never authorizes.
+    test('pins the 0.1.3 rotation window and rejects the unapproved 0.1.2 digest', async () => {
+        expect(PINNED_ILLUSTRATION_PLUGIN_DIGESTS).toEqual([
+            PRODUCTION_PLUGIN.scriptSha256,
+            PRODUCTION_PLUGIN.scriptSha256Next,
+        ])
+        expect(PINNED_ILLUSTRATION_PLUGIN_DIGESTS).not.toContain(REJECTED_INTERMEDIATE_PLUGIN_SHA256)
+
+        const authorize = (digest: string) => evaluateIllustrationV3Authorization({
+            pluginName: PRODUCTION_PLUGIN.name,
+            pluginScript: 'captured production script bytes',
+            apiVersion: '3.0',
+            persistedPluginNames: [PRODUCTION_PLUGIN.name],
+        }, PINNED_ILLUSTRATION_PLUGIN_DIGESTS, async () => digest)
+
+        await expect(authorize(PRODUCTION_PLUGIN.scriptSha256Next)).resolves.toMatchObject({
+            scriptDigest: PRODUCTION_PLUGIN.scriptSha256Next,
+        })
+        await expect(authorize(PRODUCTION_PLUGIN.scriptSha256)).resolves.toMatchObject({
+            scriptDigest: PRODUCTION_PLUGIN.scriptSha256,
+        })
+        await expect(authorize(REJECTED_INTERMEDIATE_PLUGIN_SHA256)).resolves.toBeNull()
     })
 })

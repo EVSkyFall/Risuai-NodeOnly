@@ -15,8 +15,16 @@ export const PRODUCTION_SLOT_TOKEN_RE = /^[0-9a-f]{32}$/
 
 export const PRODUCTION_PLUGIN = Object.freeze({
     name: 'lb_xnai_agent',
+    // 0.1.1 release bundle (99,782 bytes).
     scriptSha256: '12f76fef5047b9d161e5d8b4efe87c1f7dcff2d7a2f16a99f693c98c7d450ea7',
+    // 0.1.3 release bundle (100,883 bytes) — digest independently recomputed
+    // from the bundle on 2026-07-16 during the repin request.
+    scriptSha256Next: '126a7acf58368c102023d3f1e4489599a14e603ba922cad609d0cfb39744679b',
 })
+
+// The unapproved intermediate 0.1.2 candidate — must NEVER authorize.
+export const REJECTED_INTERMEDIATE_PLUGIN_SHA256 =
+    'c1a16920a71e39e090cf36905c93ee8315992125598c7b87aa8be39633f69c79'
 
 export type JobStateAcceptanceClassification = Readonly<{
     terminal: boolean
