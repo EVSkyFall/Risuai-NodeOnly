@@ -2,6 +2,8 @@ import { IllustrationLedgerValidationError } from './errors'
 
 const CONTROL_IDENTIFIER = '[A-Za-z0-9_-]+'
 const CONTROL_IDENTIFIER_RE = /^[A-Za-z0-9_-]+$/
+const REQUEST_MARKER_PREFIX = '<!--risu-illustration-request:v1:'
+const SLOT_NODE_PREFIX = '<risu-illustration-slot '
 const REQUEST_MARKER_RE = new RegExp(`<!--risu-illustration-request:v1:(${CONTROL_IDENTIFIER})-->`, 'g')
 const SLOT_NODE_RE = new RegExp(
     `<risu-illustration-slot data-v="1" data-job="(${CONTROL_IDENTIFIER})" data-token="(${CONTROL_IDENTIFIER})"></risu-illustration-slot>`,
@@ -93,7 +95,12 @@ function removeSpans(text: string, spans: readonly { start: number; end: number 
     return stripped + text.slice(cursor)
 }
 
+export function containsIllustrationControlNodes(text: string): boolean {
+    return text.includes(REQUEST_MARKER_PREFIX) || text.includes(SLOT_NODE_PREFIX)
+}
+
 export function stripIllustrationControlNodes(text: string): string {
+    if (!containsIllustrationControlNodes(text)) return text
     let stripped = text
 
     for (let pass = 0; pass < MAX_CONTROL_NODE_STRIP_PASSES; pass += 1) {
@@ -108,4 +115,17 @@ export function stripIllustrationControlNodes(text: string): string {
     ]
     if (spans.length > 0) throw new IllustrationControlNodeStripError()
     return stripped
+}
+
+export function stripIllustrationControlNodesFromPrompt<T extends { content: string }>(
+    messages: T[],
+): T[] {
+    let changed = false
+    const stripped = messages.map((message) => {
+        const content = stripIllustrationControlNodes(message.content)
+        if (content === message.content) return message
+        changed = true
+        return { ...message, content }
+    })
+    return changed ? stripped : messages
 }

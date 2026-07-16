@@ -27,7 +27,9 @@ import { getModelInfo, LLMFlags } from "../model/modellist";
 import { resolveChatModelBinding, resolvePresetMaxOutputTokens } from "./request/modelPresetBinding";
 import { hypaMemoryV3 } from "./memory/hypav3";
 import { getModuleAssets, getModuleToggles } from "./modules";
-import { readImage, setCurrentTurnId } from "../globalApi.svelte";
+import { getCurrentTurnId, readImage, setCurrentTurnId } from "../globalApi.svelte";
+import { stripIllustrationControlNodes, stripIllustrationControlNodesFromPrompt } from "./illustrationJobs/controlNodes";
+import { finalizeIllustrationRootTurn } from "./illustrationJobs/terminalCapture";
 
 export interface OpenAIChat{
     role: 'system'|'user'|'assistant'|'function'
@@ -74,7 +76,6 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     chatProcessStage.set(0)
     // Set turn ID for Copilot quota bundling — all API calls within this sendChat share the same turn
     const turnId = arg.copilotTurnId || v4()
-    setCurrentTurnId(turnId)
     const abortSignal = arg.signal ?? (new AbortController()).signal
     
     // NOTE: `throwError()` can be called before these are populated (e.g. HypaV3 early validation errors).
@@ -185,6 +186,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             return false
         }
     }
+    setCurrentTurnId(turnId)
+    try {
     doingChat.set(true)
 
     if(chatProcessIndex === -1 && DBState.db.presetChain){
@@ -810,9 +813,9 @@ export async function sendChat(chatProcessIndex = -1,arg:{
 
     let index = 0
     for(const msg of ms){
-        let formatedChat = (await processScriptFull(nowChatroom,risuChatParser(msg.data, {chara: currentChar, role: msg.role}), 'editprocess', index, {
+        let formatedChat = stripIllustrationControlNodes((await processScriptFull(nowChatroom,risuChatParser(msg.data, {chara: currentChar, role: msg.role}), 'editprocess', index, {
             chatRole: msg.role,
-        })).data
+        })).data)
         let name = ''
         if(msg.role === 'char'){
             if(msg.saying){
@@ -967,6 +970,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         chatProcessStage.set(2)
         stageTimings.stage2Start = Date.now()
         console.log("Current chat's hypaV3 Data: ", currentChat.hypaV3Data)
+        chats = stripIllustrationControlNodesFromPrompt(chats)
         const sp = await hypaMemoryV3(chats, currentTokens, maxContextTokens, currentChat, nowChatroom, tokenizer)
         if(sp.error){
             // Save new summary
@@ -1342,7 +1346,9 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         })
     }
 
+    formated = stripIllustrationControlNodesFromPrompt(formated)
     formated = await runLuaEditTrigger(currentChar, 'editRequest', formated)
+    formated = stripIllustrationControlNodesFromPrompt(formated)
 
     if(DBState.db.promptInfoInsideChat && DBState.db.promptTextInfoInsideChat){
         promptBodyformatedForChatStore = await runLuaEditTrigger(currentChar, 'editRequest', promptBodyformatedForChatStore)
@@ -1397,6 +1403,25 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
     }
     const generationId = v4()
+    let terminalMessageId = generationId
+    let terminalMessageReference: Message | undefined
+    const captureIllustrationRootTurn = () => {
+        try {
+            const chat = DBState.db.characters[selectedChar].chats[selectedChat]
+            const message = chat.message.find((candidate) => candidate.chatId === terminalMessageId)
+                ?? (terminalMessageReference && chat.message.includes(terminalMessageReference)
+                    ? terminalMessageReference
+                    : undefined)
+            if (!message || message.role !== 'char') return
+            finalizeIllustrationRootTurn({
+                outcome: 'normal',
+                chaId: currentChar.chaId,
+                chat,
+                message,
+                rootTurnId: turnId,
+            })
+        } catch {}
+    }
     const generationModel = getGenerationModelString()
 
     generationInfo = {
@@ -1421,8 +1446,11 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         return true
     }
 
+    const requestFormated = arg.replayRequest
+        ? stripIllustrationControlNodesFromPrompt(safeStructuredClone(arg.replayRequest.formated))
+        : formated
     const req = await requestChatData({
-        formated: arg.replayRequest ? safeStructuredClone(arg.replayRequest.formated) : formated,
+        formated: requestFormated,
         biasString: arg.replayRequest ? (arg.replayRequest.biasString ?? []) : biases,
         currentChar: currentChar,
         useStreaming: true,
@@ -1478,7 +1506,9 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         let prefix = ''
         if(arg.continue){
             msgIndex -= 1
-            prefix = DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data
+            terminalMessageReference = DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex]
+            terminalMessageId = terminalMessageReference.chatId ?? terminalMessageId
+            prefix = terminalMessageReference.data
         }
         else{
             DBState.db.characters[selectedChar].chats[selectedChat].message.push({
@@ -1490,6 +1520,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 promptInfo,
                 chatId: generationId,
             })
+            terminalMessageReference = DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex]
         }
         DBState.db.characters[selectedChar].chats[selectedChat].isStreaming = true
         armStreamingScriptCircuit(msgIndex)
@@ -1616,6 +1647,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         if(triggerResult && triggerResult.sendAIprompt){
             resendChat = true
         }
+        terminalMessageReference = currentChat.message[msgIndex]
         const inlayr = runInlayScreen(currentChar, currentChat.message[msgIndex].data)
         currentChat.message[msgIndex].data = inlayr.text
         DBState.db.characters[selectedChar].chats[selectedChat] = currentChat
@@ -1659,7 +1691,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     generationInfo,
                     promptInfo,
                     chatId: generationId,
-                }       
+                }
+                terminalMessageReference = DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex]
                 if(inlayResult.promise){
                     const p = await inlayResult.promise
                     DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = p
@@ -1676,6 +1709,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     chatId: generationId,
                 })
                 const ind = DBState.db.characters[selectedChar].chats[selectedChat].message.length - 1
+                terminalMessageReference = DBState.db.characters[selectedChar].chats[selectedChat].message[ind]
                 if(inlayResult.promise){
                     const p = await inlayResult.promise
                     DBState.db.characters[selectedChar].chats[selectedChat].message[ind].data = p
@@ -1697,6 +1731,19 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         const triggerResult = await runTrigger(currentChar, 'output', {chat:currentChat})
         if(triggerResult && triggerResult.chat){
             DBState.db.characters[selectedChar].chats[selectedChat] = normalizeChat(triggerResult.chat)
+            // The trigger deep-clones the chat, so the pre-trigger reference is
+            // no longer in the array; re-anchor like the streaming branch does.
+            const postTriggerMessages = DBState.db.characters[selectedChar].chats[selectedChat].message
+            let reanchored = postTriggerMessages.find((candidate) => candidate.chatId === terminalMessageId)
+            if(!reanchored){
+                for(let i = postTriggerMessages.length - 1; i >= 0; i--){
+                    if(postTriggerMessages[i].role === 'char'){
+                        reanchored = postTriggerMessages[i]
+                        break
+                    }
+                }
+            }
+            terminalMessageReference = reanchored ?? terminalMessageReference
         }
         if(triggerResult && triggerResult.sendAIprompt){
             resendChat = true
@@ -1868,6 +1915,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
 
                 
 
+                captureIllustrationRootTurn()
                 return true
             }
 
@@ -1930,16 +1978,20 @@ export async function sendChat(chatProcessIndex = -1,arg:{
 
             if(rq.type === 'fail'){
                 if(abortSignal.aborted){
+                    captureIllustrationRootTurn()
                     return true
                 }
                 throwError(rq.result)
+                captureIllustrationRootTurn()
                 return true
             }
             if(rq.type === 'streaming' || rq.type === 'multiline'){
                 if(abortSignal.aborted){
+                    captureIllustrationRootTurn()
                     return true
                 }
                 throwError('Unexpected response type')
+                captureIllustrationRootTurn()
                 return true
             }
             else{
@@ -1981,10 +2033,12 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     }
                 } catch (error) {
                     throwError(language.errors.httpError + `${error}`)
+                    captureIllustrationRootTurn()
                     return true
                 }
             }
             
+            captureIllustrationRootTurn()
             return true
 
 
@@ -2021,8 +2075,11 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         DBState.db.characters[selectedChar].chats[selectedChat].message[lastMessageIndex].generationInfo = generationInfo
     }
 
-    setCurrentTurnId(null)
+    captureIllustrationRootTurn()
     return true
+    } finally {
+        if (getCurrentTurnId() === turnId) setCurrentTurnId(null)
+    }
 }
 
 function systemizeChat(chat:OpenAIChat[]){

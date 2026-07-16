@@ -21,6 +21,7 @@ import { chatCompletion, unloadEngine } from "../webllm";
 import { hypaV3ProgressStore } from "src/ts/stores.svelte";
 import { type ChatTokenizer } from "src/ts/tokenizer";
 import { inlayTokenRegex } from "src/ts/util/inlayTokens";
+import { stripIllustrationControlNodesFromPrompt } from "../illustrationJobs/controlNodes";
 
 export interface HypaV3Preset {
     name: string;
@@ -1685,7 +1686,7 @@ export async function summarize(oaiMessages: OpenAIChat[], isResummarize: boolea
     const db = getDatabase();
     const settings = getCurrentHypaV3Preset().settings;
 
-    const strMessages = oaiMessages
+    const strMessages = stripIllustrationControlNodesFromPrompt(oaiMessages)
         .map((chat) => `${chat.role}: ${sanitizeSummaryContent(chat.content)}`)
         .join("\n");
 
@@ -1695,7 +1696,7 @@ export async function summarize(oaiMessages: OpenAIChat[], isResummarize: boolea
             ? "[Summarize the ongoing role story, It must also remove redundancy and unnecessary text and content from the output.]"
             : settings.summarizationPrompt;
 
-    const formated: OpenAIChat[] = parseChatML(
+    const formated: OpenAIChat[] = stripIllustrationControlNodesFromPrompt(parseChatML(
         summarizationPrompt.replaceAll("{{slot}}", strMessages)
     ) ?? [
             {
@@ -1706,7 +1707,7 @@ export async function summarize(oaiMessages: OpenAIChat[], isResummarize: boolea
                 role: "system",
                 content: summarizationPrompt,
             },
-        ];
+        ]);
 
     // API
     if (settings.summarizationModel === "subModel") {

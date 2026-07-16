@@ -180,6 +180,7 @@ export async function loadData() {
             // RisuAI's full requestChatData pipeline (provider routing, auth,
             // model translation) instead of server.cjs re-implementing it.
             import('./llmWorker').then(m => m.startLLMWorker()).catch(() => {})
+            import('./process/illustrationJobs/bootstrap').then(m => m.bootstrapIllustrationJobs()).catch(() => {})
             saveDb()
             moduleUpdate()
             // cleanChunks는 화면 진입 후 유휴 시간에 실행 (부트 블로킹 제거)

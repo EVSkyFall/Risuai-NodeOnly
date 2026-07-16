@@ -561,6 +561,15 @@ describe('registerTrustedTurn', () => {
         expect(mutationEvents).toEqual(['marker', 'strict'])
         expect((harness.database.characters[0].chats[0].message[0].data.match(/risu-illustration-request/g) ?? []))
             .toHaveLength(1)
+
+        harness.strictFailure = null
+        harness.strictSave.mockClear()
+        const replay = await registerTrustedTurn(registerInput())
+
+        expect(replay.state).toBe('blocked_capture')
+        expect(harness.strictSave).not.toHaveBeenCalled()
+        expect((harness.database.characters[0].chats[0].message[0].data.match(/risu-illustration-request/g) ?? []))
+            .toHaveLength(1)
     })
 
     test('blocks capture without mutating any swipe when the active variant changes during ledger creation', async () => {

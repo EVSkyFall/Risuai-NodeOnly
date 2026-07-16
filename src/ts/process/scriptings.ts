@@ -18,6 +18,7 @@ import { tokenize } from "../tokenizer";
 import { fetchNative, readImage } from "../globalApi.svelte";
 import { loadLoreBookV3Prompt } from './lorebook.svelte';
 import { getPersonaPrompt, getUserName, getUserIcon } from '../util';
+import { stripIllustrationControlNodes } from './illustrationJobs/controlNodes';
 let luaFactory:LuaFactory
 let ScriptingSafeIds = new Set<string>()
 let ScriptingEditDisplayIds = new Set<string>()
@@ -587,7 +588,7 @@ export async function runScripted(code:string, arg:{
                     }
 
                     return {
-                        content: dict['content'] ?? '',
+                        content: stripIllustrationControlNodes(dict['content'] ?? ''),
                         role: role,
                     }
                 })
@@ -947,7 +948,7 @@ export async function runScripted(code:string, arg:{
                     }
 
                     return {
-                        content: dict['content'] ?? '',
+                        content: stripIllustrationControlNodes(dict['content'] ?? ''),
                         role: role,
                     }
                 })

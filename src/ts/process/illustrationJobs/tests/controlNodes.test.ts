@@ -4,9 +4,11 @@ import {
     IllustrationControlNodeValidationError,
     buildRequestMarker,
     buildSlotNode,
+    containsIllustrationControlNodes,
     findRequestMarkers,
     findSlotNodes,
     stripIllustrationControlNodes,
+    stripIllustrationControlNodesFromPrompt,
 } from '../controlNodes'
 
 describe('illustration control nodes', () => {
@@ -69,6 +71,38 @@ describe('illustration control nodes', () => {
         const stripped = stripIllustrationControlNodes(text)
         expect(stripped).toBe(expected)
         expect(stripIllustrationControlNodes(stripped)).toBe(expected)
+    })
+
+    test('uses fixed prefixes to bypass node-free text', () => {
+        expect(containsIllustrationControlNodes('ordinary text\r\nwith <unrelated> markup'))
+            .toBe(false)
+        expect(containsIllustrationControlNodes(buildRequestMarker('nonce_fast'))).toBe(true)
+        expect(containsIllustrationControlNodes(buildSlotNode('job_fast', 'token_fast'))).toBe(true)
+    })
+
+    test('strips prompt message copies without mutating inputs and preserves the no-node fast path', () => {
+        const marker = buildRequestMarker('nonce_prompt')
+        const slot = buildSlotNode('job_prompt', 'token_prompt')
+        const original = [{
+            role: 'assistant' as const,
+            content: `before\r\n${marker}middle${slot}\tafter`,
+            memo: 'message-1',
+        }]
+
+        const stripped = stripIllustrationControlNodesFromPrompt(original)
+
+        expect(stripped).not.toBe(original)
+        expect(stripped[0]).not.toBe(original[0])
+        expect(stripped[0]).toEqual({
+            role: 'assistant',
+            content: 'before\r\nmiddle\tafter',
+            memo: 'message-1',
+        })
+        expect(original[0].content).toBe(`before\r\n${marker}middle${slot}\tafter`)
+
+        const nodeFree = [{ role: 'user' as const, content: 'unchanged\r\nbytes' }]
+        expect(stripIllustrationControlNodesFromPrompt(nodeFree)).toBe(nodeFree)
+        expect(stripIllustrationControlNodesFromPrompt(nodeFree)[0]).toBe(nodeFree[0])
     })
 
     test.each([
