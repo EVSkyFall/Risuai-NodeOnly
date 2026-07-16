@@ -27,9 +27,7 @@ import {
     PRODUCTION_SLOT_NODE,
     PRODUCTION_SLOT_TOKEN,
     PRODUCTION_SLOT_TOKEN_RE,
-    REJECTED_INTERMEDIATE_PLUGIN_SHA256,
-    REJECTED_PRE_CONTRACT_0_2_0_PLUGIN_SHA256,
-    REJECTED_RETIRED_0_1_1_PLUGIN_SHA256,
+    REJECTED_PLUGIN_SHA256S,
 } from './sharedFixtures'
 
 describe('Gate 4d shared Core fixtures', () => {
@@ -106,17 +104,17 @@ describe('Gate 4d shared Core fixtures', () => {
             })
     })
 
-    // 0.2.0 post-contract repin: the [0.1.3, 0.2.0] rotation window authorizes both
-    // releases while the retired 0.1.1 digest, the unapproved intermediate 0.1.2
-    // digest, and the discarded pre-contract 0.2.0 snapshot digest never authorize.
-    test('pins the 0.2.0 post-contract rotation window and rejects retired and unapproved digests', async () => {
+    // 0.2.1 UI hotfix repin: the [0.2.0, 0.2.1] rotation window authorizes both
+    // releases while every rejected digest — retired 0.1.1, unapproved 0.1.2,
+    // removed 0.1.3, the discarded pre-contract 0.2.0 snapshot, and the two
+    // discarded 0.2.1 interim drafts — never authorizes.
+    test('pins the 0.2.1 hotfix rotation window and rejects every superseded digest', async () => {
         expect(PINNED_ILLUSTRATION_PLUGIN_DIGESTS).toEqual([
             PRODUCTION_PLUGIN.scriptSha256,
             PRODUCTION_PLUGIN.scriptSha256Next,
         ])
-        expect(PINNED_ILLUSTRATION_PLUGIN_DIGESTS).not.toContain(REJECTED_INTERMEDIATE_PLUGIN_SHA256)
-        expect(PINNED_ILLUSTRATION_PLUGIN_DIGESTS).not.toContain(REJECTED_RETIRED_0_1_1_PLUGIN_SHA256)
-        expect(PINNED_ILLUSTRATION_PLUGIN_DIGESTS).not.toContain(REJECTED_PRE_CONTRACT_0_2_0_PLUGIN_SHA256)
+        expect(REJECTED_PLUGIN_SHA256S).toHaveLength(6)
+        expect(new Set(REJECTED_PLUGIN_SHA256S).size).toBe(REJECTED_PLUGIN_SHA256S.length)
 
         const authorize = (digest: string) => evaluateIllustrationV3Authorization({
             pluginName: PRODUCTION_PLUGIN.name,
@@ -131,9 +129,11 @@ describe('Gate 4d shared Core fixtures', () => {
         await expect(authorize(PRODUCTION_PLUGIN.scriptSha256)).resolves.toMatchObject({
             scriptDigest: PRODUCTION_PLUGIN.scriptSha256,
         })
-        await expect(authorize(REJECTED_INTERMEDIATE_PLUGIN_SHA256)).resolves.toBeNull()
-        await expect(authorize(REJECTED_RETIRED_0_1_1_PLUGIN_SHA256)).resolves.toBeNull()
-        await expect(authorize(REJECTED_PRE_CONTRACT_0_2_0_PLUGIN_SHA256)).resolves.toBeNull()
+        for (const rejected of REJECTED_PLUGIN_SHA256S) {
+            expect(rejected).toMatch(/^[0-9a-f]{64}$/)
+            expect(PINNED_ILLUSTRATION_PLUGIN_DIGESTS).not.toContain(rejected)
+            await expect(authorize(rejected)).resolves.toBeNull()
+        }
     })
 
     // Repin acceptance 6: through the production WebCrypto hash path against the real
