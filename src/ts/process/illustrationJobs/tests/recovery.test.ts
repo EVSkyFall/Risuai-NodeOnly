@@ -328,6 +328,40 @@ afterEach(async () => {
 })
 
 describe('illustration recovery', () => {
+    // §20 Finalization: concurrent callers converge and corrupt outranks stale.
+    test('finalizes one turn version exactly once under concurrent helper calls', async () => {
+        const { turn, queued } = await createTwoQueuedJobs()
+        await illustrationJobStore.transitionJob({
+            jobId: queued[0].jobId,
+            expectedVersion: queued[0].version,
+            to: 'stale',
+            patch: { idempotencyKey: 'test:concurrent-stale', workerEpoch: 1 },
+        })
+        await illustrationJobStore.transitionJob({
+            jobId: queued[1].jobId,
+            expectedVersion: queued[1].version,
+            to: 'corrupt',
+            patch: { idempotencyKey: 'test:concurrent-corrupt', workerEpoch: 1 },
+        })
+        const live = (await illustrationJobStore.getTurn(turn.turnId))!
+
+        await Promise.all([
+            illustrationJobStore.finalizeTurnAfterJobs(turn.turnId),
+            illustrationJobStore.finalizeTurnAfterJobs(turn.turnId),
+            illustrationJobStore.finalizeTurnAfterJobs(turn.turnId),
+        ])
+
+        const finalized = (await illustrationJobStore.getTurn(turn.turnId))!
+        expect(finalized).toMatchObject({
+            state: 'corrupt',
+            error: { code: 'job_corrupt' },
+            version: live.version + 1,
+        })
+        await illustrationJobStore.finalizeTurnAfterJobs(turn.turnId)
+        expect((await illustrationJobStore.getTurn(turn.turnId))?.version).toBe(finalized.version)
+    })
+
+    // §20 Recovery: the recovery pass delegates to the same terminal mapping.
     test('keeps a turn live until every sibling is terminal, then prefers a committed outcome', async () => {
         const { turn, queued } = await createTwoQueuedJobs()
         await illustrationJobStore.transitionJob({

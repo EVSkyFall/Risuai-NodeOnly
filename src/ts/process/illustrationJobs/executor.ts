@@ -100,6 +100,9 @@ async function transitionExecutorJob(
     input: Parameters<typeof illustrationJobStore.transitionJob>[0],
 ): Promise<IllustrationJobRecordV1> {
     const job = await illustrationJobStore.transitionJob(input)
+    if (isTerminalJobState(job.state)) {
+        await illustrationJobStore.finalizeTurnAfterJobs(job.turnId)
+    }
     emitIllustrationWakeHint('job_changed', job.turnId, job.jobId)
     return job
 }
@@ -108,6 +111,9 @@ async function cancelExecutorJob(
     input: Parameters<typeof illustrationJobStore.requestCancel>[0],
 ): Promise<IllustrationJobRecordV1> {
     const job = await illustrationJobStore.requestCancel(input)
+    if (isTerminalJobState(job.state)) {
+        await illustrationJobStore.finalizeTurnAfterJobs(job.turnId)
+    }
     emitIllustrationWakeHint('job_changed', job.turnId, job.jobId)
     return job
 }

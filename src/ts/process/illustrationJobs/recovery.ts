@@ -21,7 +21,6 @@ import { illustrationJobStore } from './store'
 import type {
     IllustrationJobRecordV1,
     IllustrationJobState,
-    IllustrationTurnRecordV1,
 } from './types'
 
 export type IllustrationRecoverySummary = {
@@ -203,31 +202,6 @@ async function recoverJob(job: IllustrationJobRecordV1, epoch: number): Promise<
     }
 }
 
-async function updateTurnAfterJobs(turn: IllustrationTurnRecordV1): Promise<void> {
-    const latest = await illustrationJobStore.getTurn(turn.turnId)
-    if (!latest || latest.state !== 'awaiting_prompt') return
-    const jobs = await illustrationJobStore.listJobRecords({ turnId: latest.turnId })
-    if (jobs.length === 0 || !jobs.every((job) => isTerminalJobState(job.state))) return
-
-    // A turn with any committed sibling completed its user-visible work; per-job
-    // states retain partial failures. Pure-failure sets use corrupt > stale.
-    let next: 'completed' | 'stale' | 'corrupt' | null = null
-    if (jobs.some((job) => job.state === 'committed')) next = 'completed'
-    else if (jobs.some((job) => job.state === 'corrupt')) next = 'corrupt'
-    else if (jobs.some((job) => job.state === 'stale')) next = 'stale'
-    else next = 'completed'
-    if (!next) return
-    await illustrationJobStore.updateTurn({
-        turnId: latest.turnId,
-        expectedVersion: latest.version,
-        mutate: (draft) => {
-            draft.state = next!
-            if (next === 'stale' || next === 'corrupt') draft.error = { code: `job_${next}` }
-            else delete draft.error
-        },
-    })
-}
-
 export async function runIllustrationRecovery(): Promise<IllustrationRecoverySummary> {
     if (!(await isIllustrationFeatureEnabled())) {
         return { turnsExamined: 0, jobsExamined: 0 }
@@ -262,7 +236,7 @@ export async function runIllustrationRecovery(): Promise<IllustrationRecoverySum
 
         for (const turn of turns) {
             try {
-                await updateTurnAfterJobs(turn)
+                await illustrationJobStore.finalizeTurnAfterJobs(turn.turnId)
             } catch {
                 console.warn('[illustration] recovery could not finalize one turn')
             }

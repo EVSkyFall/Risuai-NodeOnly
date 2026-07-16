@@ -699,6 +699,57 @@ export class IllustrationJobStore {
         return record
     }
 
+    private async listTurnJobRecordsUnlocked(turnId: string): Promise<IllustrationJobRecordV1[]> {
+        const jobIds =
+            (await readPersistentJson<string[]>(illustrationTurnJobsKey(turnId))) ?? []
+        const records = await Promise.all(jobIds.map((jobId) => this.readJobUnlocked(jobId)))
+        return records
+            .filter((record): record is IllustrationJobRecordV1 => record !== null)
+            .map((record) => {
+                if (record.turnId !== turnId) {
+                    throw new IllustrationLedgerCorruptError(
+                        `Turn-job index points to job ${record.jobId} from another turn`,
+                    )
+                }
+                return record
+            })
+    }
+
+    private async finalizeTurnAfterJobsUnlocked(
+        turnId: string,
+    ): Promise<IllustrationTurnRecordV1> {
+        const observed = await this.requireTurnUnlocked(turnId)
+        if (observed.state !== 'awaiting_prompt') return cloneJson(observed)
+
+        const jobs = await this.listTurnJobRecordsUnlocked(turnId)
+        if (jobs.length === 0 || !jobs.every((job) => isTerminalJobState(job.state))) {
+            return cloneJson(observed)
+        }
+
+        const current = await this.requireTurnUnlocked(turnId)
+        if (current.state !== 'awaiting_prompt') return cloneJson(current)
+        assertVersion(observed.version, current.version)
+
+        const next = cloneJson(current)
+        if (jobs.some((job) => job.state === 'committed')) next.state = 'completed'
+        else if (jobs.some((job) => job.state === 'corrupt')) next.state = 'corrupt'
+        else if (jobs.some((job) => job.state === 'stale')) next.state = 'stale'
+        else next.state = 'completed'
+
+        if (next.state === 'stale' || next.state === 'corrupt') {
+            next.error = { code: `job_${next.state}` }
+        } else {
+            delete next.error
+        }
+        assertTransition('turn', current.state, next.state)
+        validateRecordBasics(next)
+        assertJsonSerializable(next, 'turn record')
+        next.version = current.version + 1
+        next.updatedAt = Date.now()
+        await writePersistentJson(illustrationTurnKey(turnId), next)
+        return cloneJson(next)
+    }
+
     private async assertManifestRecordsCompleteUnlocked(
         manifest: StoredPlanManifestV1,
     ): Promise<void> {
@@ -1081,19 +1132,7 @@ export class IllustrationJobStore {
         return await withIllustrationLedgerLock(async () => {
             if (input.turnId !== undefined) {
                 assertNonEmptyString(input.turnId, 'turnId')
-                const jobIds =
-                    (await readPersistentJson<string[]>(illustrationTurnJobsKey(input.turnId))) ?? []
-                const records = await Promise.all(jobIds.map((jobId) => this.readJobUnlocked(jobId)))
-                return records
-                    .filter((record): record is IllustrationJobRecordV1 => record !== null)
-                    .map((record) => {
-                        if (record.turnId !== input.turnId) {
-                            throw new IllustrationLedgerCorruptError(
-                                `Turn-job index points to job ${record.jobId} from another turn`,
-                            )
-                        }
-                        return cloneJson(record)
-                    })
+                return (await this.listTurnJobRecordsUnlocked(input.turnId)).map(cloneJson)
             }
             const keys = await listPersistentKeys(ILLUSTRATION_JOB_PREFIX)
             const records = await Promise.all(
@@ -1103,6 +1142,13 @@ export class IllustrationJobStore {
                 .filter((record): record is IllustrationJobRecordV1 => record !== null)
                 .sort((left, right) => right.updatedAt - left.updatedAt)
                 .map(cloneJson)
+        })
+    }
+
+    async finalizeTurnAfterJobs(turnId: string): Promise<IllustrationTurnRecordV1> {
+        return await withIllustrationLedgerLock(async () => {
+            assertNonEmptyString(turnId, 'turnId')
+            return await this.finalizeTurnAfterJobsUnlocked(turnId)
         })
     }
 

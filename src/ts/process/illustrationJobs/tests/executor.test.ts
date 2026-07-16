@@ -206,14 +206,16 @@ async function createQueuedJob(
     return { ...target, queued }
 }
 
-async function createTwoQueuedJobs() {
-    const source = 'Two queued executor scenes'
+async function createQueuedJobs(
+    count = 2,
+    source = 'Queued executor scenes with enough distinct placement positions',
+) {
     const target = installDatabase(source)
     const turn = await registerTrustedTurn({
         chaId: 'character-1',
         conversationId: 'conversation-1',
         expectedMessageId: 'message-1',
-        rootTurnId: 'root-two-queued',
+        rootTurnId: `root-${count}-queued`,
         sourceVariantText: source,
     })
     const claimedTurn = await illustrationJobStore.claimTurn({
@@ -230,18 +232,14 @@ async function createTwoQueuedJobs() {
         fence: claimedTurn.fence,
         idempotencyKey: `plan:${turn.turnId}`,
         sourceRevisionHash: turn.sourceRevisionHash!,
-        slots: [
-            {
-                sceneId: 'scene-1',
-                insertAfterUtf16: Math.floor(source.length / 2),
-                scenePayload: { schemaVersion: 1, data: { description: 'first scene' } },
+        slots: Array.from({ length: count }, (_, index) => ({
+            sceneId: `scene-${index + 1}`,
+            insertAfterUtf16: Math.floor(((index + 1) * source.length) / count),
+            scenePayload: {
+                schemaVersion: 1,
+                data: { description: `scene ${index + 1}` },
             },
-            {
-                sceneId: 'scene-2',
-                insertAfterUtf16: source.length,
-                scenePayload: { schemaVersion: 1, data: { description: 'second scene' } },
-            },
-        ],
+        })),
     })
     const queued = []
     for (const [index, job] of projected.entries()) {
@@ -268,7 +266,7 @@ async function createTwoQueuedJobs() {
     harness.provider.mockClear()
     harness.writeInlay.mockClear()
     harness.inspectInlay.mockClear()
-    return { ...target, queued }
+    return { ...target, turn, queued }
 }
 
 function deferred<T>() {
@@ -341,6 +339,84 @@ afterEach(async () => {
 })
 
 describe('illustration executor', () => {
+    // §5-4 / §20 Crash-free live drain: recovery is not invoked by this test.
+    test('finalizes a 15-job crash-free live drain with every job committed', async () => {
+        const { turn, queued } = await createQueuedJobs(15)
+
+        await startIllustrationExecutor()
+        await pokeExecutor()
+
+        const jobs = await illustrationJobStore.listJobRecords({ turnId: turn.turnId })
+        expect(jobs).toHaveLength(15)
+        expect(jobs.every((job) => job.state === 'committed')).toBe(true)
+        expect(harness.provider).toHaveBeenCalledTimes(15)
+        expect((await illustrationJobStore.getTurn(turn.turnId))?.state).toBe('completed')
+        expect(queued).toHaveLength(15)
+    })
+
+    // §20 Finalization: a coordinator cancellation can be the final live settlement.
+    test('finalizes mixed committed and cancelled siblings from the last coordinator closure', async () => {
+        const { turn, queued } = await createQueuedJobs(3)
+        const secondProviderStarted = deferred<void>()
+        const secondProviderResult = deferred<any>()
+        let dispatches = 0
+        harness.provider.mockImplementation(async () => {
+            harness.events.push('provider')
+            dispatches += 1
+            if (dispatches === 2) {
+                secondProviderStarted.resolve()
+                return await secondProviderResult.promise
+            }
+            return {
+                result: {
+                    ok: true,
+                    bytesOrDataUrl: 'data:image/png;base64,AA==',
+                    providerStatus: 200,
+                },
+                compatibilityValue: 'data:image/png;base64,AA==',
+            }
+        })
+
+        await startIllustrationExecutor()
+        await secondProviderStarted.promise
+        const stopping = stopIllustrationExecutor()
+        secondProviderResult.resolve({
+            result: {
+                ok: true,
+                bytesOrDataUrl: 'data:image/png;base64,AA==',
+                providerStatus: 200,
+            },
+            compatibilityValue: 'data:image/png;base64,AA==',
+        })
+        await stopping
+
+        expect((await illustrationJobStore.getJob(queued[0].jobId))?.state).toBe('committed')
+        expect((await illustrationJobStore.getJob(queued[1].jobId))?.state).toBe('committed')
+        const last = (await illustrationJobStore.getJob(queued[2].jobId))!
+        expect(last.state).toBe('queued')
+        await cancelLedger({ jobId: last.jobId, expectedVersion: last.version })
+
+        expect((await illustrationJobStore.getJob(last.jobId))?.state).toBe('cancelled')
+        expect((await illustrationJobStore.getTurn(turn.turnId))?.state).toBe('completed')
+        expect(harness.provider).toHaveBeenCalledTimes(2)
+    })
+
+    // §20 Finalization + source edit: a pure live failure set maps to stale.
+    test('finalizes an all-stale live batch without provider dispatch', async () => {
+        const source = 'All sibling slots become stale after this source is edited'
+        const { message, turn } = await createQueuedJobs(3, source)
+        message.data = message.data.replace('All sibling', 'Edited sibling')
+
+        await startIllustrationExecutor()
+        await pokeExecutor()
+
+        const jobs = await illustrationJobStore.listJobRecords({ turnId: turn.turnId })
+        expect(jobs).toHaveLength(3)
+        expect(jobs.map((job) => job.state)).toEqual(['stale', 'stale', 'stale'])
+        expect(harness.provider).not.toHaveBeenCalled()
+        expect((await illustrationJobStore.getTurn(turn.turnId))?.state).toBe('stale')
+    })
+
     // §20 Crash/storage + §12.2/§13 exact durable ordering.
     test('persists attempt, asset, integrity, and strict commit in the required order', async () => {
         const positive = 'persisted (positive) prompt'
@@ -429,7 +505,7 @@ describe('illustration executor', () => {
     })
 
     test('continues to the next queued job when cancel wins a pre-dispatch version race', async () => {
-        const { queued } = await createTwoQueuedJobs()
+        const { queued } = await createQueuedJobs()
         const hydrationEntered = deferred<void>()
         const releaseHydration = deferred<void>()
         let shouldBlock = true
@@ -671,7 +747,7 @@ describe('illustration executor', () => {
     })
 
     test('stop lets the in-flight job settle without dispatching another queued job', async () => {
-        const { queued } = await createTwoQueuedJobs()
+        const { queued } = await createQueuedJobs()
         const providerResult = deferred<any>()
         const providerStarted = deferred<void>()
         harness.provider.mockImplementationOnce(async () => {
@@ -695,7 +771,7 @@ describe('illustration executor', () => {
     })
 
     test('an old stop never waits on fresh leadership started while its pump settles', async () => {
-        await createTwoQueuedJobs()
+        await createQueuedJobs()
         const providerResult = deferred<any>()
         const providerStarted = deferred<void>()
         harness.provider.mockImplementationOnce(async () => {

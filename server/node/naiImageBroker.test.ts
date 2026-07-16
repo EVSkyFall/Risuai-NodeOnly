@@ -70,7 +70,7 @@ async function waitFor(predicate: () => boolean, ms = 3_000): Promise<void> {
     throw new Error(`Condition did not become true within ${ms}ms`)
 }
 
-function seedActiveLease(saveDir: string, lease: ActiveLease) {
+function seedActiveLease(saveDir: string, lease: unknown) {
     const db = new Database(path.join(saveDir, 'risuai.db'))
     try {
         db.exec(`
@@ -634,6 +634,52 @@ describe('server-authoritative NAI image broker', { timeout: 30_000 }, () => {
         expect(finalStatus.queueDepth).toEqual({ interactive: 0, background: 0 })
         const output = context.server.getOutput()
         expect(output.stdout + output.stderr).toContain('previous upstream outcome UNKNOWN')
+    })
+
+    // §20 NAI C=1: an ambiguous persisted active lease fails closed before dispatch.
+    it('holds an agentic request when the persisted active lease is ambiguous', async () => {
+        let upstreamCalls = 0
+        const upstream = await startUpstream((_req, res) => {
+            upstreamCalls += 1
+            res.writeHead(200, { 'content-type': 'image/png' })
+            res.end(Buffer.from('image'))
+        })
+        const context = await boot(
+            {
+                RISU_NAI_IMAGE_MAX_HOLD_MS: '8000',
+                RISU_NAI_BROKER_COOLDOWN_MARGIN_MS: '4000',
+            },
+            {
+                seedSave: async (saveDir) => seedActiveLease(saveDir, {
+                    leaseId: 'seeded-ambiguous-lease',
+                    startedAt: 0,
+                    host: 'image.novelai.net',
+                    requestClass: 'interactive,background',
+                    pid: 12345,
+                }),
+            },
+        )
+
+        const initial = await readBrokerStatus(context)
+        expect(initial.active).toBe(false)
+        expect(initial.cooldownUntil).toBeGreaterThan(Date.now())
+        const abortController = new AbortController()
+        const request = proxyRequest(context, `${upstream.origin}/ai/generate-image`, {
+            id: 'malformed-lease',
+            requestClass: 'background',
+            signal: abortController.signal,
+        }).catch(() => null)
+        await delay(150)
+        expect(upstreamCalls).toBe(0)
+        expect((await readBrokerStatus(context)).queueDepth).toEqual({
+            interactive: 0,
+            background: 1,
+        })
+        const output = context.server.getOutput()
+        expect(output.stdout + output.stderr).toContain('reason=lease-invalid')
+        expect(output.stdout + output.stderr).toContain('previous upstream outcome UNKNOWN')
+        abortController.abort()
+        await within(request, 1_000)
     })
 
     it('clears an expired boot lease and proceeds without a cooldown', async () => {

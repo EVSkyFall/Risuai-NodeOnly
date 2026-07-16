@@ -30,7 +30,7 @@ import { signalIllustrationExecutor } from './executorSignal'
 import { withIllustrationOperationLock } from './operationLock'
 import { computeNaiSettingsFingerprint } from './settingsFingerprint'
 import { computeSourceRevisionHash, hashesMatch, sha256Hex } from './sourceHash'
-import { canTransition } from './stateMachine'
+import { canTransition, isTerminalJobState } from './stateMachine'
 import {
     MAX_JOBS_PER_TURN,
     illustrationJobStore,
@@ -372,7 +372,7 @@ async function closeTurnBeforeProjection(
             'queued',
             'blocked_config',
         ].includes(job.state)) continue
-        await illustrationJobStore.transitionJob({
+        const settled = await illustrationJobStore.transitionJob({
             jobId: job.jobId,
             expectedVersion: job.version,
             to: state,
@@ -381,6 +381,7 @@ async function closeTurnBeforeProjection(
                 error: { code },
             },
         })
+        await illustrationJobStore.finalizeTurnAfterJobs(settled.turnId)
     }
     throw new IllustrationLedgerValidationError(`Illustration turn is ${state}: ${code}`)
 }
@@ -744,9 +745,10 @@ async function settleProjectionFailure(
     workerEpoch: number,
 ): Promise<void> {
     const jobs = await illustrationJobStore.listJobRecords({ turnId: turn.turnId })
+    const settledJobTurnIds: string[] = []
     for (const job of jobs) {
         if (!canTransition('job', job.state, state)) continue
-        await illustrationJobStore.transitionJob({
+        const settled = await illustrationJobStore.transitionJob({
             jobId: job.jobId,
             expectedVersion: job.version,
             to: state,
@@ -756,10 +758,16 @@ async function settleProjectionFailure(
                 error: { code },
             },
         })
+        settledJobTurnIds.push(settled.turnId)
     }
     const latest = await illustrationJobStore.getTurn(turn.turnId)
     if (latest && canTransition('turn', latest.state, state)) {
         await updateRecoveryTurn(latest, state, code)
+    }
+    // The specific projection error owns the parent closure; invoke the shared
+    // finalizer only after that write so its generic mapping cannot preempt it.
+    for (const turnId of settledJobTurnIds) {
+        await illustrationJobStore.finalizeTurnAfterJobs(turnId)
     }
 }
 
@@ -1154,7 +1162,7 @@ export async function supplyPromptLedger(
 
     const context = await resolveIllustrationJobContext(job)
     if (context.kind !== 'valid') {
-        await illustrationJobStore.transitionJob({
+        const settled = await illustrationJobStore.transitionJob({
             jobId: job.jobId,
             expectedVersion: input.expectedVersion,
             to: context.kind,
@@ -1167,6 +1175,9 @@ export async function supplyPromptLedger(
                 error: { code: context.reason },
             },
         })
+        if (isTerminalJobState(settled.state)) {
+            await illustrationJobStore.finalizeTurnAfterJobs(settled.turnId)
+        }
         throw new IllustrationLedgerValidationError(
             `Illustration job is ${context.kind}: ${context.reason}`,
         )
@@ -1195,6 +1206,9 @@ export async function cancelLedger(input: {
     expectedVersion: number
 }): Promise<IllustrationJobRecordV1> {
     const cancelled = await illustrationJobStore.requestCancel(input)
+    if (isTerminalJobState(cancelled.state)) {
+        await illustrationJobStore.finalizeTurnAfterJobs(cancelled.turnId)
+    }
     signalIllustrationExecutor()
     emitIllustrationWakeHint('job_changed', cancelled.turnId, cancelled.jobId)
     return cancelled
