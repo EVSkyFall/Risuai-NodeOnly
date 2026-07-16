@@ -299,8 +299,8 @@ beforeEach(async () => {
     setIllustrationLockManagerAccessorForTests(() => lockManager)
     setIllustrationOperationLockManagerAccessorForTests(() => lockManager)
     setIllustrationWorkerLockManagerAccessorForTests(() => lockManager)
-    await refreshCoordinatorProof()
     await setIllustrationFeatureEnabled(true)
+    await refreshCoordinatorProof()
     harness.inspectInlay.mockImplementation(async (id: string) => {
         const status = harness.integrity.get(id) ?? 'missing'
         return {
@@ -648,8 +648,8 @@ describe('illustration recovery', () => {
         expect((await illustrationJobStore.getTurn(blocked.turnId))?.state).toBe('awaiting_plan')
 
         harness.storageMap.clear()
-        await refreshCoordinatorProof()
         await setIllustrationFeatureEnabled(true)
+        await refreshCoordinatorProof()
         installDatabase('Changed target')
         harness.strictFailure = new Error('capture failed')
         await expect(registerTrustedTurn({

@@ -32,33 +32,38 @@ vi.mock('src/ts/parser/parser.svelte', () => ({
 }))
 
 const coordinatorModule = await import('../coordinatorRecord')
+const featureModule = await import('../featureFlag')
 const lockModule = await import('../locks')
 const errorModule = await import('../errors')
 
 const {
     COORDINATOR_LEASE_DURATION_MS,
+    ORPHAN_TAKEOVER_COOLDOWN_MS,
     claimCoordinator,
     getCoordinatorRecord,
     markCoordinatorDraining,
     releaseCoordinator,
     releaseCoordinatorFinal,
+    setIllustrationFeatureEnabledWithCoordinatorDrain,
 } = coordinatorModule
+const { IllustrationFeatureDisabledError, setIllustrationFeatureEnabled } = featureModule
 const {
     resetIllustrationLockManagerAccessorForTests,
     setIllustrationLockManagerAccessorForTests,
 } = lockModule
-const { IllustrationCoordinatorDrainingError } = errorModule
+const { IllustrationCoordinatorCooldownError, IllustrationCoordinatorDrainingError } = errorModule
 
 const BASE_TIME = Date.UTC(2026, 6, 15)
 let lockManager: InMemoryLockManager
 
-beforeEach(() => {
+beforeEach(async () => {
     vi.useFakeTimers()
     vi.setSystemTime(BASE_TIME)
     harness.storageMap.clear()
     harness.writes.length = 0
     lockManager = new InMemoryLockManager()
     setIllustrationLockManagerAccessorForTests(() => lockManager)
+    await setIllustrationFeatureEnabled(true)
 })
 
 afterEach(() => {
@@ -102,6 +107,14 @@ describe('global Agent coordinator record', () => {
         expect(rival).not.toHaveProperty('leaseId')
 
         vi.advanceTimersByTime(COORDINATOR_LEASE_DURATION_MS)
+        await expect(claimCoordinator({
+            protocolVersion: 1,
+            leaseId: 'coordinator-b',
+            holderRuntimeId: 'runtime-b',
+            expectedVersion: renewed.version,
+            fence: renewed.fence,
+        })).rejects.toBeInstanceOf(IllustrationCoordinatorCooldownError)
+        vi.advanceTimersByTime(ORPHAN_TAKEOVER_COOLDOWN_MS)
         const takeover = await claimCoordinator({
             protocolVersion: 1,
             leaseId: 'coordinator-b',
@@ -189,6 +202,49 @@ describe('global Agent coordinator record', () => {
             expiresAt: 0,
             draining: false,
         })
+        const released = (await getCoordinatorRecord())!
+        await expect(claimCoordinator({
+            protocolVersion: 1,
+            leaseId: 'coordinator-b',
+            holderRuntimeId: 'runtime-b',
+            expectedVersion: released.version,
+            fence: released.fence,
+        })).resolves.toMatchObject({ ownedByCaller: true, fence: 2 })
+    })
+
+    test('rejects claims while OFF and atomically drains the latest owner across a renew race', async () => {
+        await setIllustrationFeatureEnabled(false)
+        await expect(claimCoordinator({
+            protocolVersion: 1,
+            leaseId: 'coordinator-a',
+            holderRuntimeId: 'runtime-a',
+        })).rejects.toBeInstanceOf(IllustrationFeatureDisabledError)
+        expect(await getCoordinatorRecord()).toBeNull()
+
+        await setIllustrationFeatureEnabled(true)
+        const claimed = await claimCoordinator({
+            protocolVersion: 1,
+            leaseId: 'coordinator-a',
+            holderRuntimeId: 'runtime-a',
+        })
+        const renewing = claimCoordinator({
+            protocolVersion: 1,
+            leaseId: 'coordinator-a',
+            holderRuntimeId: 'runtime-a',
+            expectedVersion: claimed.version,
+            fence: claimed.fence,
+        })
+        const disabling = setIllustrationFeatureEnabledWithCoordinatorDrain(false)
+        await expect(renewing).resolves.toMatchObject({ ownedByCaller: true })
+        await expect(disabling).resolves.toMatchObject({
+            featureEnabled: false,
+            coordinator: expect.objectContaining({ draining: true }),
+        })
+        expect(await getCoordinatorRecord()).toMatchObject({
+            leaseId: 'coordinator-a',
+            draining: true,
+            version: claimed.version + 2,
+        })
     })
 
     test('preserves draining on same-owner renewal and clears it only on an expired takeover', async () => {
@@ -213,6 +269,14 @@ describe('global Agent coordinator record', () => {
         expect(renewed).toMatchObject({ fence: 1, ownedByCaller: true, draining: true })
 
         vi.advanceTimersByTime(COORDINATOR_LEASE_DURATION_MS)
+        await expect(claimCoordinator({
+            protocolVersion: 1,
+            leaseId: 'coordinator-b',
+            holderRuntimeId: 'runtime-b',
+            expectedVersion: renewed.version,
+            fence: renewed.fence,
+        })).rejects.toBeInstanceOf(IllustrationCoordinatorCooldownError)
+        vi.advanceTimersByTime(ORPHAN_TAKEOVER_COOLDOWN_MS)
         const takeover = await claimCoordinator({
             protocolVersion: 1,
             leaseId: 'coordinator-b',

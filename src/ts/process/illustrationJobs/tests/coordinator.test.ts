@@ -48,6 +48,7 @@ vi.mock('src/ts/storage/chatStorage', () => ({
 const coordinatorModule = await import('../coordinator')
 const coordinatorRecordModule = await import('../coordinatorRecord')
 const featureModule = await import('../featureFlag')
+const illustrationEventsModule = await import('../illustrationEvents')
 const lockModule = await import('../locks')
 const operationLockModule = await import('../operationLock')
 const storeModule = await import('../store')
@@ -61,6 +62,7 @@ const {
 } = coordinatorModule
 const { claimCoordinator } = coordinatorRecordModule
 const { IllustrationFeatureDisabledError, setIllustrationFeatureEnabled } = featureModule
+const { subscribeIllustrationWakeHints } = illustrationEventsModule
 const { resetIllustrationLockManagerAccessorForTests, setIllustrationLockManagerAccessorForTests } = lockModule
 const {
     resetIllustrationOperationLockManagerAccessorForTests,
@@ -190,8 +192,8 @@ beforeEach(async () => {
     lockManager = new InMemoryLockManager()
     setIllustrationLockManagerAccessorForTests(() => lockManager)
     setIllustrationOperationLockManagerAccessorForTests(() => lockManager)
-    await refreshCoordinatorProof()
     await setIllustrationFeatureEnabled(true)
+    await refreshCoordinatorProof()
     harness.storageEvents.length = 0
     harness.strictSave.mockImplementation(async () => {
         mutationEvents.push('strict')
@@ -530,7 +532,11 @@ afterEach(() => {
 describe('registerTrustedTurn', () => {
     // §20 Crash/storage/cancel + §6.2: ledger first, marker, strict ACK, awaiting_plan.
     test('persists the prepared ledger before marker mutation and advances only after strict ACK', async () => {
+        const hints: Array<{ kind: string; turnId: string }> = []
+        const unsubscribe = subscribeIllustrationWakeHints((hint) => hints.push(hint))
         const turn = await registerTrustedTurn(registerInput())
+        await Promise.resolve()
+        unsubscribe()
 
         expect(harness.storageEvents[0]).toBe(`storage:${illustrationTurnKey(turn.turnId)}`)
         expect(mutationEvents).toEqual(['marker', 'strict'])
@@ -538,6 +544,10 @@ describe('registerTrustedTurn', () => {
         expect(turn).toMatchObject({ state: 'awaiting_plan', sourceTextUtf16: 'A quiet scene.' })
         expect(harness.database.characters[0].chats[0].message[0].data)
             .toMatch(/^A quiet scene\.<!--risu-illustration-request:v1:[A-Za-z0-9_-]+-->$/)
+        expect(hints).toContainEqual(expect.objectContaining({
+            kind: 'turn_changed',
+            turnId: turn.turnId,
+        }))
     })
 
     test('leaves blocked_capture after strict failure without retrying the marker', async () => {

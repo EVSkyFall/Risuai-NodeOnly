@@ -45,6 +45,7 @@ vi.mock('src/ts/parser/parser.svelte', () => ({
 
 const storeModule = await import('../store')
 const coordinatorRecordModule = await import('../coordinatorRecord')
+const featureModule = await import('../featureFlag')
 const lockModule = await import('../locks')
 const errorModule = await import('../errors')
 
@@ -65,6 +66,7 @@ const {
     claimCoordinator,
     markCoordinatorDraining,
 } = coordinatorRecordModule
+const { setIllustrationFeatureEnabled } = featureModule
 const {
     resetIllustrationLockManagerAccessorForTests,
     setIllustrationLockManagerAccessorForTests,
@@ -100,6 +102,18 @@ async function refreshCoordinatorProof(): Promise<void> {
         coordinatorLeaseId: 'test-coordinator',
         coordinatorFence: snapshot.fence,
     }
+}
+
+async function advanceTimeKeepingCoordinatorOwned(ms: number): Promise<void> {
+    let remaining = ms
+    const renewStep = COORDINATOR_LEASE_DURATION_MS - 1
+    await refreshCoordinatorProof()
+    while (remaining >= renewStep) {
+        vi.advanceTimersByTime(renewStep)
+        remaining -= renewStep
+        await refreshCoordinatorProof()
+    }
+    vi.advanceTimersByTime(remaining)
 }
 
 function jobIdFor(turnId: string, index = 0): string {
@@ -286,6 +300,7 @@ beforeEach(async () => {
     vi.setSystemTime(BASE_TIME)
     lockManager = new InMemoryLockManager()
     setIllustrationLockManagerAccessorForTests(() => lockManager)
+    await setIllustrationFeatureEnabled(true)
     await refreshCoordinatorProof()
 })
 
@@ -453,8 +468,7 @@ describe('manifest and job materialization', () => {
             idempotencyKey: 'submit-expired-replay',
         })
 
-        vi.advanceTimersByTime(TURN_LEASE_DURATION_MS + 1)
-        await refreshCoordinatorProof()
+        await advanceTimeKeepingCoordinatorOwned(TURN_LEASE_DURATION_MS + 1)
         await expect(
             store.createManifestPrepared({
                 ...coordinatorProof,
@@ -625,8 +639,7 @@ describe('lease lifecycle and holder writes', () => {
             }),
         ).rejects.toBeInstanceOf(IllustrationLedgerLeaseConflictError)
 
-        vi.advanceTimersByTime(TURN_LEASE_DURATION_MS)
-        await refreshCoordinatorProof()
+        await advanceTimeKeepingCoordinatorOwned(TURN_LEASE_DURATION_MS)
         const reclaimed = await store.claimTurn({
             ...coordinatorProof,
             turnId: created.turnId,
@@ -695,8 +708,7 @@ describe('lease lifecycle and holder writes', () => {
             patch,
         })
 
-        vi.advanceTimersByTime(JOB_LEASE_DURATION_MS + 1)
-        await refreshCoordinatorProof()
+        await advanceTimeKeepingCoordinatorOwned(JOB_LEASE_DURATION_MS + 1)
         await expect(
             store.transitionJob({
                 ...coordinatorProof,
@@ -750,8 +762,7 @@ describe('lease lifecycle and holder writes', () => {
 
     test('renews an expired same bearer as a fenced reclaim', async () => {
         const { turn, leaseId } = await createClaimedTurn('turn-same-bearer-reclaim')
-        vi.advanceTimersByTime(TURN_LEASE_DURATION_MS)
-        await refreshCoordinatorProof()
+        await advanceTimeKeepingCoordinatorOwned(TURN_LEASE_DURATION_MS)
         const reclaimed = await store.claimTurn({
             ...coordinatorProof,
             turnId: turn.turnId,

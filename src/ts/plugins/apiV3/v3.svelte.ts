@@ -22,6 +22,8 @@ import { getModelInfo } from "src/ts/model/modellist";
 import type { ModelModeExtended } from "src/ts/process/request/shared";
 import { requestChatDataMain } from "src/ts/process/request/request";
 import type { OpenAIChat } from "src/ts/process/index.svelte";
+import { authorizeIllustrationV3Plugin, createIllustrationV3CapabilityIfAuthorized, type AuthorizedIllustrationV3Bridge } from "src/ts/process/illustrationJobs/v3Bridge";
+import { createAuthorizedIllustrationV3HostBridge } from "src/ts/process/illustrationJobs/v3BridgeHost";
 import { tokenize as tokenizerTokenize, tokenizeAccurate as tokenizerTokenizeAccurate, encodeWithTokenizer, tokenizerList } from "src/ts/tokenizer";
 import { getModuleLorebooks } from "src/ts/process/modules";
 import {
@@ -549,6 +551,10 @@ const removePluginChatPanels = (pluginName: string) => {
 const unloadV3Plugin = async (pluginName: string) => {
     const callbacks = pluginUnloadCallbacks.get(pluginName);
     const instance = v3PluginInstances.find(p => p.name === pluginName);
+    const promises: Promise<void>[] = [];
+    if(instance?.illustrationBridge){
+        promises.push(instance.illustrationBridge.unload());
+    }
     if(instance){
         const index = v3PluginInstances.findIndex(p => p.name === pluginName);
         if(index !== -1){
@@ -557,7 +563,6 @@ const unloadV3Plugin = async (pluginName: string) => {
     }
     if(callbacks){
         pluginUnloadCallbacks.delete(pluginName); 
-        let promises: Promise<void>[] = [];
         for(const callback of callbacks){
             const result = callback();
             if(result instanceof Promise){
@@ -565,10 +570,12 @@ const unloadV3Plugin = async (pluginName: string) => {
             }
         }
 
+    }
+    if(promises.length > 0){
         await Promise.any([
             Promise.all(promises),
             sleep(1000) //timeout after 1 second
-        ])
+        ]);
     }
     try {
         instance?.host?.terminate();        
@@ -785,7 +792,7 @@ const authorizationHeaders = [
     'proxy-authorization',
 ]
 
-const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
+const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustrationBridge?:AuthorizedIllustrationV3Bridge) => {
 
     const oldApis = getV2PluginAPIs();
     return {
@@ -1425,10 +1432,11 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
                     'clear': '_clearSafeLocalStorage',
                     'key': '_keySafeLocalStorage',
                     'keys': '_keysSafeLocalStorage',
-                }
+                },
+                ...(illustrationBridge?.aliases ?? {})
             }
         },
-        runLLMModel: async (options: {
+        runLLMModel: illustrationBridge?.runLLMModel ?? (async (options: {
             mode: ModelModeExtended
             messages: OpenAIChat[]
             staticModel?: string
@@ -1448,7 +1456,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
                 // for avoiding provider-to-provider call loops.
                 blockPlugins: !options.allowPlugins,
             }, options.mode)
-        },
+        }),
         sendChat: async (message: string) => {
             const conf = await getPluginPermission(plugin.name, 'sendChat');
             if(!conf){
@@ -1533,18 +1541,23 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             //TODO: Implement server-side secret storage with write-only access for plugins, to enhance security when handling sensitive information like API keys.
             //This will have rate-limit, to prevent saving it publicly and writing as secret every time before using it.
             console.warn(`[RisuAI Plugin: ${plugin.name}] saveServerSecret is not implemented yet. This API is intended for securely storing sensitive information like API keys with write-only access for plugins. Please avoid using this API until it is implemented.`);
-        }
+        },
+        ...(illustrationBridge?.rootMethods ?? {})
     }
 }
 
 type V3PluginInstance = {
     name: string;
     host: SandboxHost;
+    illustrationBridge?: AuthorizedIllustrationV3Bridge;
 }
 
 const v3PluginInstances: V3PluginInstance[] = [];
+const pendingV3PluginGenerations = new Map<string, number>();
+let v3LoadGeneration = 0;
 
 export async function loadV3Plugins(plugins:RisuPlugin[]){
+    const loadGeneration = ++v3LoadGeneration;
     // Snapshot before iterating: unloadV3Plugin splices v3PluginInstances
     // SYNCHRONOUSLY (before its first await), so mapping over the live array
     // skips every other instance. The skipped survivor then hits
@@ -1555,28 +1568,63 @@ export async function loadV3Plugins(plugins:RisuPlugin[]){
     await Promise.all(instances.map(async (instance) => {
         await unloadV3Plugin(instance.name);
     }));
-    const loadPromises = plugins.map(plugin => executePluginV3(plugin));
+    if(loadGeneration !== v3LoadGeneration) return;
+    const loadPromises = plugins.map(plugin => executePluginV3(plugin, loadGeneration));
     await Promise.all(loadPromises);
 }
 
-export async function executePluginV3(plugin:RisuPlugin){
+export async function executePluginV3(plugin:RisuPlugin, loadGeneration = v3LoadGeneration){
 
     const alreadyRunning = v3PluginInstances.find(p => p.name === plugin.name);
-    if(alreadyRunning){
+    if(alreadyRunning || pendingV3PluginGenerations.get(plugin.name) === loadGeneration){
         console.log(`[RisuAI Plugin: ${plugin.name}] Plugin is already running. Skipping load.`);
         return;
     }
 
-    const iframe = document.createElement('iframe');
-    iframe.style.display = "none";
-    document.body.appendChild(iframe);
-    const host = new SandboxHost(makeRisuaiAPIV3(iframe, plugin));
-    v3PluginInstances.push({
+    pendingV3PluginGenerations.set(plugin.name, loadGeneration);
+    const pluginSnapshot = {
+        ...plugin,
         name: plugin.name,
-        host
-    });
-    host.run(iframe, plugin.script);
-    console.log(`[RisuAI Plugin: ${plugin.name}] Loaded API V3 plugin.`);
+        script: plugin.script,
+        version: plugin.version,
+    };
+    try {
+        // SandboxHost snapshots aliases during startup, so authorization must
+        // settle against this captured plugin before the API object is built.
+        const authorization = await authorizeIllustrationV3Plugin({
+            pluginName: pluginSnapshot.name,
+            pluginScript: pluginSnapshot.script,
+            apiVersion: pluginSnapshot.version,
+            persistedPluginNames: DBState.db.plugins.map(p => p.name),
+        });
+        if(
+            loadGeneration !== v3LoadGeneration
+            || pendingV3PluginGenerations.get(pluginSnapshot.name) !== loadGeneration
+            || v3PluginInstances.some(p => p.name === pluginSnapshot.name)
+        ){
+            return;
+        }
+
+        const illustrationBridge = createIllustrationV3CapabilityIfAuthorized(
+            authorization,
+            (context) => createAuthorizedIllustrationV3HostBridge(context, crypto.randomUUID()),
+        );
+        const iframe = document.createElement('iframe');
+        iframe.style.display = "none";
+        document.body.appendChild(iframe);
+        const host = new SandboxHost(makeRisuaiAPIV3(iframe, pluginSnapshot, illustrationBridge));
+        v3PluginInstances.push({
+            name: pluginSnapshot.name,
+            host,
+            illustrationBridge,
+        });
+        host.run(iframe, pluginSnapshot.script);
+        console.log(`[RisuAI Plugin: ${pluginSnapshot.name}] Loaded API V3 plugin.`);
+    } finally {
+        if(pendingV3PluginGenerations.get(pluginSnapshot.name) === loadGeneration){
+            pendingV3PluginGenerations.delete(pluginSnapshot.name);
+        }
+    }
 }
 
 export function getV3PluginInstance(name: string) {

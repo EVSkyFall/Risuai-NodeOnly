@@ -1577,7 +1577,11 @@ export class IllustrationJobStore {
                 throw new IllustrationLedgerValidationError('retryable must be a boolean')
             }
             const now = Date.now()
-            await validateCoordinatorProofUnlocked(input, { allowDraining: true, now })
+            await validateCoordinatorProofUnlocked(input, {
+                allowDraining: true,
+                allowFeatureDisabled: true,
+                now,
+            })
             const current = input.kind === 'turn'
                 ? await this.requireTurnUnlocked(input.id)
                 : await this.requireJobUnlocked(input.id)

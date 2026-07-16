@@ -82,6 +82,18 @@ export class IllustrationCoordinatorDrainingError extends IllustrationLedgerErro
     }
 }
 
+export class IllustrationCoordinatorCooldownError extends IllustrationLedgerError {
+    readonly retryAt: number
+
+    constructor(retryAt: number) {
+        super(
+            'coordinator_cooldown',
+            'Illustration Agent coordinator takeover is in orphan cooldown',
+        )
+        this.retryAt = retryAt
+    }
+}
+
 export class IllustrationLedgerIdempotencyConflictError extends IllustrationLedgerError {
     constructor(message: string) {
         super('idempotency_conflict', message)

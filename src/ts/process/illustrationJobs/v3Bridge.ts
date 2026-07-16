@@ -1,0 +1,826 @@
+import type { IllustrationWakeHintListener } from './illustrationEvents'
+
+export const ILLUSTRATION_V3_PROTECTED_PLUGIN_NAME = 'lb_xnai_agent'
+export const RISU_ILLUSTRATION_AGENT_LLM_TIMEOUT_MS = 240_000
+
+type PinnedDigestRotation = readonly [string] | readonly [string, string]
+
+// Rotation may temporarily contain the old and new production digests, never more than two.
+export const PINNED_ILLUSTRATION_PLUGIN_DIGESTS = Object.freeze([
+    '12f76fef5047b9d161e5d8b4efe87c1f7dcff2d7a2f16a99f693c98c7d450ea7',
+] as const satisfies PinnedDigestRotation)
+
+export type IllustrationV3AuthorizationInput = {
+    pluginName: string
+    pluginScript: string
+    apiVersion: unknown
+    persistedPluginNames: readonly string[]
+}
+
+export type IllustrationV3AuthorizationContext = Readonly<{
+    pluginName: typeof ILLUSTRATION_V3_PROTECTED_PLUGIN_NAME
+    scriptDigest: string
+    apiVersion: '3.0'
+}>
+
+type Sha256Hex = (value: string) => Promise<string>
+
+async function sha256HexUtf8(value: string): Promise<string> {
+    const digest = await globalThis.crypto.subtle.digest(
+        'SHA-256',
+        new TextEncoder().encode(value),
+    )
+    return Array.from(
+        new Uint8Array(digest),
+        (byte) => byte.toString(16).padStart(2, '0'),
+    ).join('')
+}
+
+export function validatePinnedIllustrationDigests(
+    digests: readonly string[],
+): asserts digests is PinnedDigestRotation {
+    if (digests.length < 1 || digests.length > 2) {
+        throw new Error('Illustration V3 authorization requires one or two pinned digests')
+    }
+    if (new Set(digests).size !== digests.length) {
+        throw new Error('Illustration V3 authorization digests must be unique')
+    }
+    for (const digest of digests) {
+        if (!/^[0-9a-f]{64}$/.test(digest)) {
+            throw new Error('Illustration V3 authorization digests must be lowercase SHA-256')
+        }
+    }
+}
+
+export async function evaluateIllustrationV3Authorization(
+    input: IllustrationV3AuthorizationInput,
+    pinnedDigests: readonly string[],
+    sha256Hex: Sha256Hex,
+): Promise<IllustrationV3AuthorizationContext | null> {
+    const capturedDigests = Object.freeze([...pinnedDigests])
+    const captured = Object.freeze({
+        pluginName: input.pluginName,
+        pluginScript: input.pluginScript,
+        apiVersion: input.apiVersion,
+        persistedPluginNames: Object.freeze([...input.persistedPluginNames]),
+    })
+    validatePinnedIllustrationDigests(capturedDigests)
+    if (
+        captured.pluginName !== ILLUSTRATION_V3_PROTECTED_PLUGIN_NAME
+        || captured.apiVersion !== '3.0'
+        || captured.persistedPluginNames.filter(
+            (name) => name === ILLUSTRATION_V3_PROTECTED_PLUGIN_NAME,
+        ).length > 1
+    ) return null
+
+    const scriptDigest = await sha256Hex(captured.pluginScript)
+    if (!capturedDigests.includes(scriptDigest)) return null
+    return Object.freeze({
+        pluginName: ILLUSTRATION_V3_PROTECTED_PLUGIN_NAME,
+        scriptDigest,
+        apiVersion: '3.0',
+    })
+}
+
+export async function authorizeIllustrationV3Plugin(
+    input: IllustrationV3AuthorizationInput,
+): Promise<IllustrationV3AuthorizationContext | null> {
+    return await evaluateIllustrationV3Authorization(
+        input,
+        PINNED_ILLUSTRATION_PLUGIN_DIGESTS,
+        sha256HexUtf8,
+    )
+}
+
+export const ILLUSTRATION_V3_CONTRACT_IMPLEMENTATION = Object.freeze({
+    marker: true,
+    coordinator: true,
+    agentFailure: true,
+    agentLlmDrain: true,
+} as const)
+
+export const ILLUSTRATION_V3_ERROR_MESSAGES = Object.freeze({
+    validation: 'The illustration request is invalid.',
+    version_conflict: 'The illustration record changed; refresh the snapshot.',
+    holder_mismatch: 'The illustration work lease is not owned by this caller.',
+    coordinator_required: 'This runtime does not own the current illustration coordinator.',
+    coordinator_draining: 'The illustration coordinator is draining.',
+    coordinator_cooldown: 'The illustration coordinator is in orphan cooldown.',
+    feature_disabled: 'Agentic illustration is disabled.',
+    confirmation_required: 'Explicit cost confirmation is required.',
+    unavailable: 'The illustration service is unavailable.',
+    not_found: 'The requested illustration record was not found.',
+    lease_conflict: 'The illustration work lease is already owned.',
+    invalid_transition: 'The illustration state transition is not allowed.',
+    idempotency_conflict: 'The illustration idempotency key conflicts with prior work.',
+    corrupt: 'The illustration record is corrupt.',
+    agent_llm_timeout: 'The illustration Agent LLM request timed out.',
+} as const)
+
+export type IllustrationV3ErrorCode = keyof typeof ILLUSTRATION_V3_ERROR_MESSAGES
+
+class IllustrationV3CodedError extends Error {
+    readonly code: IllustrationV3ErrorCode
+
+    constructor(code: IllustrationV3ErrorCode) {
+        super(ILLUSTRATION_V3_ERROR_MESSAGES[code])
+        this.code = code
+    }
+}
+
+export class IllustrationV3RpcError extends Error {
+    readonly code: IllustrationV3ErrorCode
+
+    constructor(code: IllustrationV3ErrorCode) {
+        super(`[IJ:${code}] ${ILLUSTRATION_V3_ERROR_MESSAGES[code]}`)
+        this.name = 'IllustrationV3RpcError'
+        this.code = code
+    }
+}
+
+function mappedErrorCode(error: unknown): IllustrationV3ErrorCode {
+    const rawCode = typeof error === 'object' && error !== null && 'code' in error
+        ? String((error as { code?: unknown }).code)
+        : ''
+    switch (rawCode) {
+        case 'validation':
+        case 'version_conflict':
+        case 'holder_mismatch':
+        case 'coordinator_required':
+        case 'coordinator_draining':
+        case 'coordinator_cooldown':
+        case 'feature_disabled':
+        case 'confirmation_required':
+        case 'unavailable':
+        case 'not_found':
+        case 'lease_conflict':
+        case 'invalid_transition':
+        case 'idempotency_conflict':
+        case 'corrupt':
+        case 'agent_llm_timeout':
+            return rawCode
+        case 'validation_failed':
+            return 'validation'
+        case 'ledger_unavailable':
+            return 'unavailable'
+        case 'coordinator_mismatch':
+        case 'coordinator_expired':
+            return 'coordinator_required'
+        default:
+            return 'unavailable'
+    }
+}
+
+export function toIllustrationV3RpcError(error: unknown): IllustrationV3RpcError {
+    if (error instanceof IllustrationV3RpcError) return error
+    return new IllustrationV3RpcError(mappedErrorCode(error))
+}
+
+function codedError(code: IllustrationV3ErrorCode): IllustrationV3CodedError {
+    return new IllustrationV3CodedError(code)
+}
+
+async function invokeRpc<T>(operation: () => T | Promise<T>): Promise<T> {
+    try {
+        return await operation()
+    } catch (error) {
+        throw toIllustrationV3RpcError(error)
+    }
+}
+
+type CoordinatorRecord = {
+    version: number
+    fence: number
+    leaseId: string | null
+    holderRuntimeId: string | null
+    expiresAt: number
+    draining: boolean
+}
+
+type CoordinatorSnapshot = {
+    protocolVersion: 1
+    version: number
+    fence: number
+    expiresAt: number
+    ownedByCaller: boolean
+    draining?: boolean
+}
+
+type CoordinatorProof = {
+    protocolVersion: 1
+    leaseId: string
+    expectedVersion: number
+    fence: number
+}
+
+type BridgeRecord = { turnId: string; jobId?: string; [key: string]: unknown }
+
+export type IllustrationV3BridgeDependencies = {
+    now(): number
+    randomUUID(): string
+    isFeatureEnabled(): Promise<boolean>
+    setFeatureEnabledWithCoordinatorDrain(enabled: boolean): Promise<{
+        featureEnabled: boolean
+        coordinator: CoordinatorRecord | null
+    }>
+    claimCoordinator(input: {
+        protocolVersion: 1
+        leaseId: string
+        holderRuntimeId: string
+        expectedVersion?: number
+        fence?: number
+    }): Promise<CoordinatorSnapshot>
+    releaseCoordinator(input: CoordinatorProof & { drain: boolean }): Promise<void>
+    markCoordinatorDraining(input: CoordinatorProof): Promise<CoordinatorRecord>
+    releaseCoordinatorFinal(input: CoordinatorProof): Promise<void>
+    getCoordinatorRecord(): Promise<CoordinatorRecord | null>
+    admitLlm<T>(
+        runtimeId: string,
+        start: (coordinator: CoordinatorRecord) => T,
+    ): Promise<{ coordinator: CoordinatorRecord; value: T }>
+    listPendingTurns(): Promise<unknown[]>
+    listJobs(input?: { turnId?: string }): Promise<unknown[]>
+    claimTurn(input: Record<string, unknown>): Promise<unknown>
+    claimJob(input: Record<string, unknown>): Promise<unknown>
+    submitPlan(input: Record<string, unknown>): Promise<BridgeRecord[]>
+    supplyPrompt(input: Record<string, unknown>): Promise<BridgeRecord>
+    cancelJob(input: { jobId: string; expectedVersion: number }): Promise<BridgeRecord>
+    cancelTurn(input: { turnId: string; expectedVersion: number }): Promise<unknown>
+    retryUncertain(input: Record<string, unknown>): Promise<BridgeRecord>
+    reportAgentFailure(input: Record<string, unknown>): Promise<unknown>
+    retryAgentFailure(input: Record<string, unknown>): Promise<unknown>
+    projectJobSnapshot(record: BridgeRecord, callerLeaseId?: string): unknown
+    runLlmModel(options: unknown, signal: AbortSignal): Promise<unknown>
+    subscribeWakeHints(listener: IllustrationWakeHintListener): () => void
+    setTimer(callback: () => void, delayMs: number): ReturnType<typeof setTimeout>
+    clearTimer(timer: ReturnType<typeof setTimeout>): void
+}
+
+type RuntimeState = { unloaded: boolean; cleanupReady: boolean }
+
+function coordinatorKey(runtimeId: string, fence: number): string {
+    return `${runtimeId}:${fence}`
+}
+
+function isRetryableCoordinatorRace(error: unknown): boolean {
+    const code = typeof error === 'object' && error !== null && 'code' in error
+        ? String((error as { code?: unknown }).code)
+        : ''
+    return code === 'version_conflict'
+        || code === 'coordinator_mismatch'
+        || code === 'coordinator_expired'
+}
+
+export class IllustrationV3HostLlmRegistry {
+    private readonly runtimes = new Map<string, RuntimeState>()
+    private readonly activeCounts = new Map<string, number>()
+    private serialTail: Promise<void> = Promise.resolve()
+
+    constructor(
+        private readonly deps: IllustrationV3BridgeDependencies,
+        private readonly timeoutMs = RISU_ILLUSTRATION_AGENT_LLM_TIMEOUT_MS,
+    ) {}
+
+    registerRuntime(runtimeId: string): void {
+        this.runtimes.set(runtimeId, { unloaded: false, cleanupReady: false })
+    }
+
+    getActiveCount(runtimeId: string, fence: number): number {
+        return this.activeCounts.get(coordinatorKey(runtimeId, fence)) ?? 0
+    }
+
+    private async exclusive<T>(operation: () => Promise<T>): Promise<T> {
+        const prior = this.serialTail
+        let release!: () => void
+        this.serialTail = new Promise<void>((resolve) => { release = resolve })
+        await prior.catch(() => {})
+        try {
+            return await operation()
+        } finally {
+            release()
+        }
+    }
+
+    private async requireOwnerLocked(
+        runtimeId: string,
+        options: { allowDraining?: boolean; allowFeatureDisabled?: boolean } = {},
+    ): Promise<CoordinatorRecord> {
+        const runtime = this.runtimes.get(runtimeId)
+        if (!runtime || runtime.unloaded) throw codedError('unavailable')
+        if (
+            options.allowFeatureDisabled !== true
+            && !(await this.deps.isFeatureEnabled())
+        ) throw codedError('feature_disabled')
+        const current = await this.deps.getCoordinatorRecord()
+        if (
+            !current
+            || current.leaseId === null
+            || current.holderRuntimeId !== runtimeId
+            || current.expiresAt <= this.deps.now()
+        ) throw codedError('coordinator_required')
+        if (current.draining && options.allowDraining !== true) {
+            throw codedError('coordinator_draining')
+        }
+        return current
+    }
+
+    async runOwned<T>(
+        runtimeId: string,
+        options: { allowDraining?: boolean; allowFeatureDisabled?: boolean },
+        operation: () => Promise<T>,
+    ): Promise<T> {
+        return await this.exclusive(async () => {
+            await this.requireOwnerLocked(runtimeId, options)
+            return await operation()
+        })
+    }
+
+    async claimCoordinator(
+        runtimeId: string,
+        input: Record<string, unknown>,
+    ): Promise<CoordinatorSnapshot> {
+        return await this.exclusive(async () => {
+            if (!(await this.deps.isFeatureEnabled())) throw codedError('feature_disabled')
+            const claimed = await this.deps.claimCoordinator({
+                protocolVersion: input.protocolVersion as 1,
+                leaseId: input.leaseId as string,
+                holderRuntimeId: runtimeId,
+                ...(input.expectedVersion === undefined ? {} : {
+                    expectedVersion: input.expectedVersion as number,
+                }),
+                ...(input.fence === undefined ? {} : { fence: input.fence as number }),
+            })
+            if (!(await this.deps.isFeatureEnabled())) {
+                const draining = await this.markLatestRuntimeDrainingLocked(runtimeId)
+                await this.releaseIfLocalDrainedLocked(draining)
+                throw codedError('feature_disabled')
+            }
+            if (claimed.draining) throw codedError('coordinator_draining')
+            return claimed
+        })
+    }
+
+    async setFeatureEnabled(enabled: boolean): Promise<boolean> {
+        return await this.exclusive(async () => {
+            const result = await this.deps.setFeatureEnabledWithCoordinatorDrain(enabled)
+            if (!result.featureEnabled) {
+                await this.releaseIfLocalDrainedLocked(result.coordinator)
+            }
+            return result.featureEnabled
+        })
+    }
+
+    async releaseCoordinator(
+        runtimeId: string,
+        input: CoordinatorProof & { drain: boolean },
+    ): Promise<void> {
+        await this.exclusive(async () => {
+            const current = await this.deps.getCoordinatorRecord()
+            if (
+                !current
+                || current.leaseId === null
+                || current.holderRuntimeId !== runtimeId
+                || current.fence !== input.fence
+            ) throw codedError('coordinator_required')
+            const activeCount = this.getActiveCount(runtimeId, input.fence)
+            if (input.drain || activeCount > 0) {
+                const draining = await this.deps.markCoordinatorDraining({
+                    protocolVersion: input.protocolVersion,
+                    leaseId: input.leaseId,
+                    expectedVersion: input.expectedVersion,
+                    fence: input.fence,
+                })
+                await this.releaseIfLocalDrainedLocked(draining)
+                if (!input.drain && activeCount > 0) throw codedError('coordinator_draining')
+                return
+            }
+            await this.deps.releaseCoordinator(input)
+        })
+    }
+
+    private async markLatestRuntimeDrainingLocked(
+        runtimeId: string,
+    ): Promise<CoordinatorRecord | null> {
+        for (let attempt = 0; attempt < 32; attempt += 1) {
+            const current = await this.deps.getCoordinatorRecord()
+            if (
+                !current
+                || current.leaseId === null
+                || current.holderRuntimeId !== runtimeId
+                || current.draining
+            ) return current
+            try {
+                return await this.deps.markCoordinatorDraining({
+                    protocolVersion: 1,
+                    leaseId: current.leaseId,
+                    expectedVersion: current.version,
+                    fence: current.fence,
+                })
+            } catch (error) {
+                if (!isRetryableCoordinatorRace(error)) throw error
+            }
+        }
+        throw codedError('unavailable')
+    }
+
+    private async releaseIfLocalDrainedLocked(
+        candidate: CoordinatorRecord | null,
+    ): Promise<void> {
+        if (
+            !candidate
+            || candidate.leaseId === null
+            || candidate.holderRuntimeId === null
+            || !candidate.draining
+            || !this.runtimes.has(candidate.holderRuntimeId)
+            || this.getActiveCount(candidate.holderRuntimeId, candidate.fence) !== 0
+        ) return
+
+        for (let attempt = 0; attempt < 8; attempt += 1) {
+            const latest = await this.deps.getCoordinatorRecord()
+            if (
+                !latest
+                || latest.leaseId === null
+                || latest.holderRuntimeId !== candidate.holderRuntimeId
+                || latest.fence !== candidate.fence
+                || !latest.draining
+                || this.getActiveCount(latest.holderRuntimeId, latest.fence) !== 0
+            ) return
+            try {
+                await this.deps.releaseCoordinatorFinal({
+                    protocolVersion: 1,
+                    leaseId: latest.leaseId,
+                    expectedVersion: latest.version,
+                    fence: latest.fence,
+                })
+                this.cleanupUnloadedRuntime(latest.holderRuntimeId)
+                return
+            } catch (error) {
+                if (!isRetryableCoordinatorRace(error)) throw error
+            }
+        }
+    }
+
+    private cleanupUnloadedRuntime(runtimeId: string): void {
+        const runtime = this.runtimes.get(runtimeId)
+        if (!runtime?.unloaded || !runtime.cleanupReady) return
+        for (const [key, count] of this.activeCounts) {
+            if (key.startsWith(`${runtimeId}:`) && count > 0) return
+        }
+        this.runtimes.delete(runtimeId)
+    }
+
+    async settleRuntime(runtimeId: string): Promise<void> {
+        await this.exclusive(async () => {
+            let current = await this.deps.getCoordinatorRecord()
+            if (
+                current?.holderRuntimeId === runtimeId
+                && !(await this.deps.isFeatureEnabled())
+                && !current.draining
+            ) {
+                current = await this.markLatestRuntimeDrainingLocked(runtimeId)
+            }
+            if (current?.holderRuntimeId === runtimeId) {
+                await this.releaseIfLocalDrainedLocked(current)
+            }
+        })
+    }
+
+    async unloadRuntime(runtimeId: string): Promise<void> {
+        const state = this.runtimes.get(runtimeId)
+        if (state) state.unloaded = true
+        await this.exclusive(async () => {
+            const draining = await this.markLatestRuntimeDrainingLocked(runtimeId)
+            await this.releaseIfLocalDrainedLocked(draining)
+            const latestState = this.runtimes.get(runtimeId)
+            if (latestState) latestState.cleanupReady = true
+            this.cleanupUnloadedRuntime(runtimeId)
+        })
+    }
+
+    async runLlmModel(runtimeId: string, options: unknown): Promise<unknown> {
+        const started = await this.exclusive(async () => {
+            const runtime = this.runtimes.get(runtimeId)
+            if (!runtime || runtime.unloaded) throw codedError('unavailable')
+            const admitted = await this.deps.admitLlm(runtimeId, (owner) => {
+                const admittedRuntime = this.runtimes.get(runtimeId)
+                if (!admittedRuntime || admittedRuntime.unloaded) {
+                    throw codedError('unavailable')
+                }
+                const key = coordinatorKey(runtimeId, owner.fence)
+                this.activeCounts.set(key, (this.activeCounts.get(key) ?? 0) + 1)
+                const controller = new AbortController()
+                let providerPromise: Promise<unknown>
+                try {
+                    providerPromise = Promise.resolve(this.deps.runLlmModel(options, controller.signal))
+                } catch (error) {
+                    providerPromise = Promise.reject(error)
+                }
+                return { controller, fence: owner.fence, key, providerPromise }
+            })
+            return admitted.value
+        })
+
+        let timer: ReturnType<typeof setTimeout> | undefined
+        const timeoutPromise = new Promise<never>((_resolve, reject) => {
+            timer = this.deps.setTimer(() => {
+                const timeoutError = codedError('agent_llm_timeout')
+                reject(timeoutError)
+                try { started.controller.abort(timeoutError) } catch {}
+            }, this.timeoutMs)
+        })
+        let outcome: { ok: true; value: unknown } | { ok: false; error: unknown }
+        try {
+            outcome = { ok: true, value: await Promise.race([started.providerPromise, timeoutPromise]) }
+        } catch (error) {
+            outcome = { ok: false, error }
+        } finally {
+            if (timer !== undefined) this.deps.clearTimer(timer)
+            await this.exclusive(async () => {
+                const count = this.activeCounts.get(started.key) ?? 0
+                if (count <= 1) this.activeCounts.delete(started.key)
+                else this.activeCounts.set(started.key, count - 1)
+                const current = await this.deps.getCoordinatorRecord()
+                if (
+                    current?.holderRuntimeId === runtimeId
+                    && current.fence === started.fence
+                    && current.draining
+                ) await this.releaseIfLocalDrainedLocked(current)
+                this.cleanupUnloadedRuntime(runtimeId)
+            }).catch((cleanupError) => {
+                if (outcome.ok) throw cleanupError
+            })
+        }
+        if (outcome.ok === false) throw outcome.error
+        return outcome.value
+    }
+}
+
+export const ILLUSTRATION_JOBS_ALIAS = Object.freeze({
+    getCapabilities: '_ijGetCapabilities',
+    setFeatureEnabled: '_ijSetFeatureEnabled',
+    claimCoordinator: '_ijClaimCoordinator',
+    releaseCoordinator: '_ijReleaseCoordinator',
+    listPendingTurns: '_ijListPendingTurns',
+    claimTurn: '_ijClaimTurn',
+    claimJob: '_ijClaimJob',
+    submitPlan: '_ijSubmitPlan',
+    supplyPrompt: '_ijSupplyPrompt',
+    listJobs: '_ijListJobs',
+    cancel: '_ijCancel',
+    retryUncertain: '_ijRetryUncertain',
+    reportAgentFailure: '_ijReportAgentFailure',
+    retryAgentFailure: '_ijRetryAgentFailure',
+    subscribe: '_ijSubscribe',
+    unsubscribe: '_ijUnsubscribe',
+} as const)
+
+const CALLER_IDENTITY_KEYS = [
+    'holderRuntimeId',
+    'runtimeId',
+    'pluginName',
+    'scriptHash',
+    'scriptDigest',
+] as const
+
+function inputRecord(value: unknown): Record<string, unknown> {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw codedError('validation')
+    }
+    return value as Record<string, unknown>
+}
+
+function sanitizedInput(value: unknown): Record<string, unknown> {
+    const input = { ...inputRecord(value) }
+    for (const key of CALLER_IDENTITY_KEYS) delete input[key]
+    return input
+}
+
+function assertProtocol(input: Record<string, unknown>): void {
+    if (input.protocolVersion !== 1) throw codedError('validation')
+}
+
+export type AuthorizedIllustrationV3Bridge = {
+    readonly rootMethods: Readonly<Record<string, (...args: unknown[]) => Promise<unknown>>>
+    readonly aliases: Readonly<{ illustrationJobs: typeof ILLUSTRATION_JOBS_ALIAS }>
+    runLLMModel(options: unknown): Promise<unknown>
+    unload(): Promise<void>
+}
+
+export function createIllustrationV3CapabilityIfAuthorized(
+    authorization: IllustrationV3AuthorizationContext | null,
+    createBridge: (
+        authorization: IllustrationV3AuthorizationContext,
+    ) => AuthorizedIllustrationV3Bridge,
+): AuthorizedIllustrationV3Bridge | undefined {
+    return authorization ? createBridge(authorization) : undefined
+}
+
+export function createAuthorizedIllustrationV3Bridge(input: {
+    auth: IllustrationV3AuthorizationContext
+    runtimeId: string
+    deps: IllustrationV3BridgeDependencies
+    hostRegistry: IllustrationV3HostLlmRegistry
+}): AuthorizedIllustrationV3Bridge {
+    const auth = Object.freeze({ ...input.auth, runtimeId: input.runtimeId })
+    const { deps, hostRegistry } = input
+    const subscriptions = new Map<string, () => void>()
+    let unloaded = false
+    hostRegistry.registerRuntime(auth.runtimeId)
+
+    const ensureLive = () => {
+        if (unloaded) throw codedError('unavailable')
+    }
+    const removeSubscription = (subscriptionId: string) => {
+        const dispose = subscriptions.get(subscriptionId)
+        subscriptions.delete(subscriptionId)
+        dispose?.()
+    }
+
+    const rootMethods: Record<string, (...args: unknown[]) => Promise<unknown>> = {
+        _ijGetCapabilities: async () => await invokeRpc(async () => {
+            ensureLive()
+            await hostRegistry.settleRuntime(auth.runtimeId)
+            return {
+                protocolVersion: 1,
+                markerContractVersion: ILLUSTRATION_V3_CONTRACT_IMPLEMENTATION.marker ? 1 : 0,
+                coordinatorContractVersion: ILLUSTRATION_V3_CONTRACT_IMPLEMENTATION.coordinator ? 1 : 0,
+                agentFailureContractVersion: ILLUSTRATION_V3_CONTRACT_IMPLEMENTATION.agentFailure ? 1 : 0,
+                agentLlmDrainContractVersion: ILLUSTRATION_V3_CONTRACT_IMPLEMENTATION.agentLlmDrain ? 1 : 0,
+                maxJobsPerTurn: 15,
+                offsetEncoding: 'utf-16',
+                promptOwnership: 'plugin-final',
+                featureEnabled: await deps.isFeatureEnabled(),
+            }
+        }),
+        _ijSetFeatureEnabled: async (value) => await invokeRpc(async () => {
+            ensureLive()
+            const request = inputRecord(value)
+            assertProtocol(request)
+            if (typeof request.enabled !== 'boolean') throw codedError('validation')
+            return {
+                featureEnabled: await hostRegistry.setFeatureEnabled(request.enabled),
+            }
+        }),
+        _ijClaimCoordinator: async (value) => await invokeRpc(async () => {
+            ensureLive()
+            const request = sanitizedInput(value)
+            assertProtocol(request)
+            return await hostRegistry.claimCoordinator(auth.runtimeId, request)
+        }),
+        _ijReleaseCoordinator: async (value) => await invokeRpc(async () => {
+            ensureLive()
+            const request = sanitizedInput(value)
+            assertProtocol(request)
+            if (typeof request.drain !== 'boolean') throw codedError('validation')
+            await hostRegistry.releaseCoordinator(auth.runtimeId, {
+                protocolVersion: 1,
+                leaseId: request.leaseId as string,
+                expectedVersion: request.expectedVersion as number,
+                fence: request.fence as number,
+                drain: request.drain,
+            })
+        }),
+        _ijListPendingTurns: async () => await invokeRpc(async () => {
+            ensureLive()
+            return await hostRegistry.runOwned(auth.runtimeId, {}, deps.listPendingTurns)
+        }),
+        _ijClaimTurn: async (value) => await invokeRpc(async () => {
+            ensureLive()
+            const request = sanitizedInput(value)
+            return await hostRegistry.runOwned(
+                auth.runtimeId,
+                {},
+                async () => await deps.claimTurn(request),
+            )
+        }),
+        _ijClaimJob: async (value) => await invokeRpc(async () => {
+            ensureLive()
+            const request = sanitizedInput(value)
+            return await hostRegistry.runOwned(
+                auth.runtimeId,
+                {},
+                async () => await deps.claimJob(request),
+            )
+        }),
+        _ijSubmitPlan: async (value) => await invokeRpc(async () => {
+            ensureLive()
+            const request = sanitizedInput(value)
+            const records = await hostRegistry.runOwned(
+                auth.runtimeId,
+                {},
+                async () => await deps.submitPlan(request),
+            )
+            return records.map((record) => deps.projectJobSnapshot(record))
+        }),
+        _ijSupplyPrompt: async (value) => await invokeRpc(async () => {
+            ensureLive()
+            const request = sanitizedInput(value)
+            const record = await hostRegistry.runOwned(
+                auth.runtimeId,
+                {},
+                async () => await deps.supplyPrompt(request),
+            )
+            return deps.projectJobSnapshot(record, request.leaseId as string)
+        }),
+        _ijListJobs: async (value) => await invokeRpc(async () => {
+            ensureLive()
+            const request = value === undefined ? {} : sanitizedInput(value)
+            const listInput = request.turnId === undefined
+                ? {}
+                : { turnId: request.turnId as string }
+            return await hostRegistry.runOwned(
+                auth.runtimeId,
+                {},
+                async () => await deps.listJobs(listInput),
+            )
+        }),
+        _ijCancel: async (value) => await invokeRpc(async () => {
+            ensureLive()
+            const request = sanitizedInput(value)
+            const hasJob = typeof request.jobId === 'string' && request.jobId.length > 0
+            const hasTurn = typeof request.turnId === 'string' && request.turnId.length > 0
+            if (hasJob === hasTurn || !Number.isSafeInteger(request.expectedVersion)) {
+                throw codedError('validation')
+            }
+            if (hasJob) {
+                await deps.cancelJob({
+                    jobId: request.jobId as string,
+                    expectedVersion: request.expectedVersion as number,
+                })
+            } else {
+                await deps.cancelTurn({
+                    turnId: request.turnId as string,
+                    expectedVersion: request.expectedVersion as number,
+                })
+            }
+        }),
+        _ijRetryUncertain: async (value) => await invokeRpc(async () => {
+            ensureLive()
+            const request = sanitizedInput(value)
+            const record = await hostRegistry.runOwned(
+                auth.runtimeId,
+                {},
+                async () => await deps.retryUncertain(request),
+            )
+            return deps.projectJobSnapshot(record)
+        }),
+        _ijReportAgentFailure: async (value) => await invokeRpc(async () => {
+            ensureLive()
+            const request = sanitizedInput(value)
+            return await hostRegistry.runOwned(
+                auth.runtimeId,
+                { allowDraining: true, allowFeatureDisabled: true },
+                async () => await deps.reportAgentFailure(request),
+            )
+        }),
+        _ijRetryAgentFailure: async (value) => await invokeRpc(async () => {
+            ensureLive()
+            const request = sanitizedInput(value)
+            return await hostRegistry.runOwned(
+                auth.runtimeId,
+                {},
+                async () => await deps.retryAgentFailure(request),
+            )
+        }),
+        _ijSubscribe: async (value) => await invokeRpc(async () => {
+            ensureLive()
+            if (typeof value !== 'function') throw codedError('validation')
+            let subscriptionId = deps.randomUUID()
+            while (subscriptions.has(subscriptionId)) subscriptionId = deps.randomUUID()
+            const listener = value as IllustrationWakeHintListener
+            const dispose = deps.subscribeWakeHints((hint) => {
+                try {
+                    const result = listener(hint)
+                    void Promise.resolve(result).catch(() => removeSubscription(subscriptionId))
+                } catch {
+                    removeSubscription(subscriptionId)
+                }
+            })
+            subscriptions.set(subscriptionId, dispose)
+            return { subscriptionId }
+        }),
+        _ijUnsubscribe: async (value) => await invokeRpc(async () => {
+            ensureLive()
+            const request = inputRecord(value)
+            if (typeof request.subscriptionId !== 'string') throw codedError('validation')
+            removeSubscription(request.subscriptionId)
+        }),
+    }
+
+    return Object.freeze({
+        rootMethods: Object.freeze(rootMethods),
+        aliases: Object.freeze({ illustrationJobs: ILLUSTRATION_JOBS_ALIAS }),
+        runLLMModel: async (options: unknown) => await invokeRpc(async () => {
+            ensureLive()
+            return await hostRegistry.runLlmModel(auth.runtimeId, options)
+        }),
+        unload: async () => {
+            if (unloaded) return
+            unloaded = true
+            for (const subscriptionId of [...subscriptions.keys()]) {
+                removeSubscription(subscriptionId)
+            }
+            await invokeRpc(async () => await hostRegistry.unloadRuntime(auth.runtimeId))
+        },
+    })
+}

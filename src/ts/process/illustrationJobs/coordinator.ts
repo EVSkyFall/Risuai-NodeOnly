@@ -25,6 +25,7 @@ import {
     type ReleaseCoordinatorInput,
 } from './coordinatorRecord'
 import { requireIllustrationFeatureEnabled } from './featureFlag'
+import { emitIllustrationWakeHint } from './illustrationEvents'
 import { signalIllustrationExecutor } from './executorSignal'
 import { withIllustrationOperationLock } from './operationLock'
 import { computeNaiSettingsFingerprint } from './settingsFingerprint'
@@ -92,31 +93,47 @@ export async function listJobsLedger(
 export async function claimTurnLedger(
     input: Parameters<typeof illustrationJobStore.claimTurnSnapshot>[0],
 ): Promise<IllustrationTurnSnapshotV1> {
-    return await illustrationJobStore.claimTurnSnapshot(input)
+    const claimed = await illustrationJobStore.claimTurnSnapshot(input)
+    emitIllustrationWakeHint('turn_changed', claimed.turnId)
+    return claimed
 }
 
 export async function claimJobLedger(
     input: Parameters<typeof illustrationJobStore.claimJobSnapshot>[0],
 ): Promise<IllustrationJobFullSnapshotV1> {
-    return await illustrationJobStore.claimJobSnapshot(input)
+    const claimed = await illustrationJobStore.claimJobSnapshot(input)
+    emitIllustrationWakeHint('job_changed', claimed.turnId, claimed.jobId)
+    return claimed
 }
 
 export async function reportAgentFailureLedger(
     input: ReportAgentFailureInput,
 ): Promise<IllustrationTurnSnapshotV1 | IllustrationJobSnapshotV1> {
     const record = await illustrationJobStore.reportAgentFailure(input)
-    return input.kind === 'turn'
+    const projected = input.kind === 'turn'
         ? projectTurnSnapshot(record as IllustrationTurnRecordV1)
         : projectFullJobSnapshot(record as IllustrationJobRecordV1)
+    emitIllustrationWakeHint(
+        input.kind === 'turn' ? 'turn_changed' : 'job_changed',
+        projected.turnId,
+        input.kind === 'job' ? input.id : undefined,
+    )
+    return projected
 }
 
 export async function retryAgentFailureLedger(
     input: RetryAgentFailureInput,
 ): Promise<IllustrationTurnSnapshotV1 | IllustrationJobSnapshotV1> {
     const record = await illustrationJobStore.retryAgentFailure(input)
-    return input.kind === 'turn'
+    const projected = input.kind === 'turn'
         ? projectTurnSnapshot(record as IllustrationTurnRecordV1)
         : projectFullJobSnapshot(record as IllustrationJobRecordV1)
+    emitIllustrationWakeHint(
+        input.kind === 'turn' ? 'turn_changed' : 'job_changed',
+        projected.turnId,
+        input.kind === 'job' ? input.id : undefined,
+    )
+    return projected
 }
 
 export type RegisterTrustedTurnInput = {
@@ -635,10 +652,12 @@ async function submitPlanLedgerLocked(
 export async function submitPlanLedger(
     input: SubmitPlanLedgerInput,
 ): Promise<IllustrationJobRecordV1[]> {
-    return await withIllustrationOperationLock(
+    const jobs = await withIllustrationOperationLock(
         `risu-illustration-materialize:${input.turnId}`,
         async () => await submitPlanLedgerLocked(input),
     )
+    emitIllustrationWakeHint('turn_changed', input.turnId)
+    return jobs
 }
 
 async function saveLoadedChatStrict(turn: IllustrationTurnRecordV1, loaded: LoadedChat): Promise<void> {
@@ -1167,6 +1186,7 @@ export async function supplyPromptLedger(
         },
     })
     signalIllustrationExecutor()
+    emitIllustrationWakeHint('job_changed', queued.turnId, queued.jobId)
     return queued
 }
 
@@ -1176,6 +1196,7 @@ export async function cancelLedger(input: {
 }): Promise<IllustrationJobRecordV1> {
     const cancelled = await illustrationJobStore.requestCancel(input)
     signalIllustrationExecutor()
+    emitIllustrationWakeHint('job_changed', cancelled.turnId, cancelled.jobId)
     return cancelled
 }
 
@@ -1207,7 +1228,9 @@ export async function cancelTurnLedger(input: {
 }): Promise<IllustrationTurnSnapshotV1> {
     const cancelled = await illustrationJobStore.requestCancelTurn(input)
     await removeCancelledTurnMarkerBestEffort(cancelled)
-    return projectTurnSnapshot(cancelled)
+    const projected = projectTurnSnapshot(cancelled)
+    emitIllustrationWakeHint('turn_changed', projected.turnId)
+    return projected
 }
 
 export async function retryUncertainLedger(input: {
@@ -1217,6 +1240,7 @@ export async function retryUncertainLedger(input: {
 }): Promise<IllustrationJobRecordV1> {
     const queued = await illustrationJobStore.retryUncertainJob(input)
     signalIllustrationExecutor()
+    emitIllustrationWakeHint('job_changed', queued.turnId, queued.jobId)
     return queued
 }
 
@@ -1335,7 +1359,7 @@ export async function registerTrustedTurn(
         throw error
     }
 
-    return await illustrationJobStore.updateTurn({
+    const registered = await illustrationJobStore.updateTurn({
         turnId,
         expectedVersion: prepared.version,
         mutate: (draft) => {
@@ -1343,4 +1367,6 @@ export async function registerTrustedTurn(
             delete draft.error
         },
     })
+    emitIllustrationWakeHint('turn_changed', registered.turnId)
+    return registered
 }

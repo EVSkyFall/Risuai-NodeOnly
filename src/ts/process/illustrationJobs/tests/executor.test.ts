@@ -70,6 +70,7 @@ const coordinatorModule = await import('../coordinator')
 const coordinatorRecordModule = await import('../coordinatorRecord')
 const executorModule = await import('../executor')
 const featureModule = await import('../featureFlag')
+const illustrationEventsModule = await import('../illustrationEvents')
 const lockModule = await import('../locks')
 const operationLockModule = await import('../operationLock')
 const storeModule = await import('../store')
@@ -92,6 +93,7 @@ const {
     stopIllustrationExecutor,
 } = executorModule
 const { IllustrationFeatureDisabledError, setIllustrationFeatureEnabled } = featureModule
+const { subscribeIllustrationWakeHints } = illustrationEventsModule
 const { resetIllustrationLockManagerAccessorForTests, setIllustrationLockManagerAccessorForTests } = lockModule
 const {
     resetIllustrationOperationLockManagerAccessorForTests,
@@ -296,8 +298,8 @@ beforeEach(async () => {
     setIllustrationLockManagerAccessorForTests(() => lockManager)
     setIllustrationOperationLockManagerAccessorForTests(() => lockManager)
     setIllustrationWorkerLockManagerAccessorForTests(() => lockManager)
-    await refreshCoordinatorProof()
     await setIllustrationFeatureEnabled(true)
+    await refreshCoordinatorProof()
     harness.provider.mockImplementation(async () => {
         harness.events.push('provider')
         return {
@@ -344,9 +346,13 @@ describe('illustration executor', () => {
         const positive = 'persisted (positive) prompt'
         const negative = 'persisted negative prompt'
         const { queued } = await createQueuedJob('Executor source', false, positive, negative)
+        const hints: Array<{ kind: string; jobId?: string }> = []
+        const unsubscribe = subscribeIllustrationWakeHints((hint) => hints.push(hint))
 
         await startIllustrationExecutor()
         await pokeExecutor()
+        await Promise.resolve()
+        unsubscribe()
 
         const committed = await illustrationJobStore.getJob(queued.jobId)
         expect(committed?.state).toBe('committed')
@@ -375,6 +381,8 @@ describe('illustration executor', () => {
             'background',
             { preservePromptText: true },
         )
+        expect(hints.length).toBeGreaterThan(0)
+        expect(hints.every((hint) => hint.kind === 'job_changed' && hint.jobId === queued.jobId)).toBe(true)
     })
 
     // §20 explicit reject is failed; uncertain is never auto-redispatched.
@@ -390,8 +398,8 @@ describe('illustration executor', () => {
         await stopIllustrationExecutor()
 
         harness.storageMap.clear()
-        await refreshCoordinatorProof()
         await setIllustrationFeatureEnabled(true)
+        await refreshCoordinatorProof()
         const uncertain = await createQueuedJob('Uncertain source')
         harness.provider.mockResolvedValueOnce({
             result: { ok: false, certainty: 'uncertain', reason: 'disconnect' },

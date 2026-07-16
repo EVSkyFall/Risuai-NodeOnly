@@ -710,8 +710,6 @@ export class SandboxHost {
                 }
 
                 const transferables = this.collectTransferables(response);
-                console.log("Original request:", data);
-                console.log('Original response:', response, transferables);
                 try {
                     this.iframe.contentWindow?.postMessage(response, '*', transferables);                    
                 } catch (error) {

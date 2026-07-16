@@ -20,6 +20,7 @@ import {
     IllustrationLedgerVersionConflictError,
 } from './errors'
 import { isIllustrationFeatureEnabled, requireIllustrationFeatureEnabled } from './featureFlag'
+import { emitIllustrationWakeHint } from './illustrationEvents'
 import { registerIllustrationExecutorWakeListener } from './executorSignal'
 import {
     ILLUSTRATION_WORKER_LOCK_NAME,
@@ -95,13 +96,29 @@ function transitionKey(epoch: number, job: IllustrationJobRecordV1, step: string
     return `worker:${epoch}:${job.jobId}:${job.attemptId ?? 'none'}:${step}:${job.version}`
 }
 
+async function transitionExecutorJob(
+    input: Parameters<typeof illustrationJobStore.transitionJob>[0],
+): Promise<IllustrationJobRecordV1> {
+    const job = await illustrationJobStore.transitionJob(input)
+    emitIllustrationWakeHint('job_changed', job.turnId, job.jobId)
+    return job
+}
+
+async function cancelExecutorJob(
+    input: Parameters<typeof illustrationJobStore.requestCancel>[0],
+): Promise<IllustrationJobRecordV1> {
+    const job = await illustrationJobStore.requestCancel(input)
+    emitIllustrationWakeHint('job_changed', job.turnId, job.jobId)
+    return job
+}
+
 async function transitionPreDispatchJob(
     snapshot: IllustrationJobRecordV1,
     to: 'blocked_config' | 'generating' | 'queued',
     patch: IllustrationJobTransitionPatch,
 ): Promise<IllustrationJobRecordV1 | null> {
     try {
-        return await illustrationJobStore.transitionJob({
+        return await transitionExecutorJob({
             jobId: snapshot.jobId,
             expectedVersion: snapshot.version,
             to,
@@ -123,7 +140,7 @@ async function settleContextFailure(
     context: Exclude<IllustrationJobContextResult, IllustrationJobLiveContext>,
     epoch: number,
 ): Promise<IllustrationJobRecordV1> {
-    return await illustrationJobStore.transitionJob({
+    return await transitionExecutorJob({
         jobId: job.jobId,
         expectedVersion: job.version,
         to: context.kind,
@@ -151,7 +168,7 @@ async function transitionProviderFailure(
             || (latest.state !== 'generating' && latest.state !== 'cancel_requested')
         ) return
         try {
-            await illustrationJobStore.transitionJob({
+            await transitionExecutorJob({
                 jobId,
                 expectedVersion: latest.version,
                 to: certainty === 'definite' ? 'failed' : 'uncertain',
@@ -237,7 +254,7 @@ async function reconcileDurableAssetReference(
     if (!loaded) return 'absent'
     const variants = logicalVariants(loaded.chat)
     if (variants.kind === 'corrupt') {
-        await illustrationJobStore.transitionJob({
+        await transitionExecutorJob({
             jobId: job.jobId,
             expectedVersion: job.version,
             to: 'corrupt',
@@ -263,7 +280,7 @@ async function reconcileDurableAssetReference(
         ))
         || loaded.chat.message[matches[0].messageIndex]?.chatId !== job.target.expectedMessageId
     ) {
-        await illustrationJobStore.transitionJob({
+        await transitionExecutorJob({
             jobId: job.jobId,
             expectedVersion: job.version,
             to: 'corrupt',
@@ -289,7 +306,7 @@ async function reconcileDurableAssetReference(
             .flatMap((candidate) => candidate.assetId ? [candidate.assetId] : []),
     })
     if (!hashesMatch(hash, job.sourceRevisionHash)) {
-        await illustrationJobStore.transitionJob({
+        await transitionExecutorJob({
             jobId: job.jobId,
             expectedVersion: job.version,
             to: 'stale',
@@ -311,7 +328,7 @@ async function reconcileDurableAssetReference(
         job.target.conversationId,
         loaded.chat,
     )
-    await illustrationJobStore.transitionJob({
+    await transitionExecutorJob({
         jobId: job.jobId,
         expectedVersion: job.version,
         to: 'committed',
@@ -361,7 +378,7 @@ export async function reconcileIllustrationCommittingJob(
         integrity = await inspectInlayAssetIntegrity(job.assetId)
     }
     if (integrity.status !== 'complete') {
-        return await illustrationJobStore.transitionJob({
+        return await transitionExecutorJob({
             jobId,
             expectedVersion: job.version,
             to: 'uncertain',
@@ -379,7 +396,7 @@ export async function reconcileIllustrationCommittingJob(
     if (variants.kind === 'corrupt' || variants.variants.some(
         (variant) => occurrenceCount(variant.text, `{{inlay::${job!.assetId}}}`) > 0,
     )) {
-        return await illustrationJobStore.transitionJob({
+        return await transitionExecutorJob({
             jobId,
             expectedVersion: job.version,
             to: 'corrupt',
@@ -404,7 +421,7 @@ export async function reconcileIllustrationCommittingJob(
         job.target.conversationId,
         context.chat,
     )
-    return await illustrationJobStore.transitionJob({
+    return await transitionExecutorJob({
         jobId,
         expectedVersion: job.version,
         to: 'committed',
@@ -424,10 +441,10 @@ export async function commitIllustrationAssetReadyJob(
     let job = await illustrationJobStore.getJob(jobId)
     if (!job || job.state !== 'asset_ready') return job
     if (job.cancelRequestedAt !== undefined) {
-        return await illustrationJobStore.requestCancel({ jobId, expectedVersion: job.version })
+        return await cancelExecutorJob({ jobId, expectedVersion: job.version })
     }
     try {
-        job = await illustrationJobStore.transitionJob({
+        job = await transitionExecutorJob({
             jobId,
             expectedVersion: job.version,
             to: 'committing',
@@ -479,7 +496,7 @@ async function processQueuedJob(job: IllustrationJobRecordV1, epoch: number): Pr
         || dispatchRecord.attemptId !== generating.attemptId
         || dispatchRecord.assetId !== generating.assetId) return
     if (dispatchRecord.state === 'cancel_requested') {
-        await illustrationJobStore.transitionJob({
+        await transitionExecutorJob({
             jobId: dispatchRecord.jobId,
             expectedVersion: dispatchRecord.version,
             to: 'cancelled',
@@ -497,7 +514,7 @@ async function processQueuedJob(job: IllustrationJobRecordV1, epoch: number): Pr
         if (dispatchContext.kind === 'stale') {
             await settleContextFailure(dispatchRecord, dispatchContext, epoch)
         } else {
-            await illustrationJobStore.transitionJob({
+            await transitionExecutorJob({
                 jobId: dispatchRecord.jobId,
                 expectedVersion: dispatchRecord.version,
                 to: 'stale',
@@ -533,7 +550,7 @@ async function processQueuedJob(job: IllustrationJobRecordV1, epoch: number): Pr
             if (returnedContext.kind === 'stale') {
                 await settleContextFailure(latest, returnedContext, epoch)
             } else {
-                await illustrationJobStore.transitionJob({
+                await transitionExecutorJob({
                     jobId: latest.jobId,
                     expectedVersion: latest.version,
                     to: 'stale',
@@ -554,7 +571,7 @@ async function processQueuedJob(job: IllustrationJobRecordV1, epoch: number): Pr
             || (latest.state !== 'generating' && latest.state !== 'cancel_requested')
         ) return
         try {
-            generating = await illustrationJobStore.transitionJob({
+            generating = await transitionExecutorJob({
                 jobId: job.jobId,
                 expectedVersion: latest.version,
                 to: 'asset_writing',
@@ -592,7 +609,7 @@ async function processQueuedJob(job: IllustrationJobRecordV1, epoch: number): Pr
                 || latestWriting.assetId !== generating.assetId
             ) return
             try {
-                await illustrationJobStore.transitionJob({
+                await transitionExecutorJob({
                     jobId: job.jobId,
                     expectedVersion: latestWriting.version,
                     to: 'uncertain',
@@ -620,7 +637,7 @@ async function processQueuedJob(job: IllustrationJobRecordV1, epoch: number): Pr
             || latestWriting.assetId !== generating.assetId
         ) return
         try {
-            ready = await illustrationJobStore.transitionJob({
+            ready = await transitionExecutorJob({
                 jobId: job.jobId,
                 expectedVersion: latestWriting.version,
                 to: 'asset_ready',
@@ -637,7 +654,7 @@ async function processQueuedJob(job: IllustrationJobRecordV1, epoch: number): Pr
     }
     ready = (await illustrationJobStore.getJob(job.jobId)) ?? ready
     if (ready.cancelRequestedAt !== undefined) {
-        await illustrationJobStore.requestCancel({ jobId: job.jobId, expectedVersion: ready.version })
+        await cancelExecutorJob({ jobId: job.jobId, expectedVersion: ready.version })
         return
     }
     await commitIllustrationAssetReadyJob(job.jobId, epoch)

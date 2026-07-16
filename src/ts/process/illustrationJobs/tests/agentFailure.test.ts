@@ -32,6 +32,7 @@ vi.mock('src/ts/parser/parser.svelte', () => ({
 
 const coordinatorModule = await import('../coordinatorRecord')
 const errorModule = await import('../errors')
+const featureModule = await import('../featureFlag')
 const lockModule = await import('../locks')
 const storeModule = await import('../store')
 
@@ -49,6 +50,7 @@ const {
     IllustrationLedgerIdempotencyConflictError,
     IllustrationLedgerValidationError,
 } = errorModule
+const { IllustrationFeatureDisabledError, setIllustrationFeatureEnabled } = featureModule
 const {
     resetIllustrationLockManagerAccessorForTests,
     setIllustrationLockManagerAccessorForTests,
@@ -180,6 +182,7 @@ beforeEach(async () => {
     storageMap.clear()
     lockManager = new InMemoryLockManager()
     setIllustrationLockManagerAccessorForTests(() => lockManager)
+    await setIllustrationFeatureEnabled(true)
     await installCoordinator()
 })
 
@@ -409,6 +412,21 @@ describe('Agent failure ledger operations', () => {
             ...coordinatorProof,
         })).rejects.toBeInstanceOf(IllustrationCoordinatorDrainingError)
         expect((await store.getTurn(claimed.turnId))?.state).toBe('agent_blocked_retryable')
+    })
+
+    test('allows failure reporting while feature OFF but rejects a retry', async () => {
+        const { claimed, leaseId } = await createClaimedTurn('turn-feature-off')
+        await setIllustrationFeatureEnabled(false)
+        const blocked = await reportTurnFailure(claimed, leaseId, 'failure:feature-off')
+        expect(blocked.state).toBe('agent_blocked_retryable')
+        await expect(store.retryAgentFailure({
+            protocolVersion: 1,
+            kind: 'turn',
+            id: blocked.turnId,
+            expectedVersion: blocked.version,
+            confirmNewLlmCharge: true,
+            ...coordinatorProof,
+        })).rejects.toBeInstanceOf(IllustrationFeatureDisabledError)
     })
 
     test('requires the literal charge confirmation and valid coordinator proof', async () => {

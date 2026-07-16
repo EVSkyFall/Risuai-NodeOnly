@@ -1,11 +1,16 @@
 import { readPersistentJson, writePersistentJson } from '../../storage/persistentKv'
 import {
+    IllustrationCoordinatorCooldownError,
     IllustrationCoordinatorDrainingError,
     IllustrationCoordinatorExpiredError,
     IllustrationCoordinatorMismatchError,
     IllustrationLedgerValidationError,
     IllustrationLedgerVersionConflictError,
 } from './errors'
+import {
+    requireIllustrationFeatureEnabled,
+    setIllustrationFeatureEnabled,
+} from './featureFlag'
 import { withIllustrationLedgerLock } from './locks'
 import type {
     IllustrationCoordinatorProof,
@@ -15,6 +20,7 @@ import type {
 
 export const ILLUSTRATION_COORDINATOR_KEY = 'illustration:v1:coordinator'
 export const COORDINATOR_LEASE_DURATION_MS = 60_000
+export const ORPHAN_TAKEOVER_COOLDOWN_MS = 300_000
 
 export type ClaimCoordinatorInput = {
     protocolVersion: 1
@@ -109,6 +115,20 @@ function validateReleaseProofShape(input: CoordinatorReleaseProof): void {
     assertNonNegativeInteger(input.fence, 'fence')
 }
 
+async function markCoordinatorDrainingUnlocked(
+    current: IllustrationCoordinatorRecordV1,
+): Promise<IllustrationCoordinatorRecordV1> {
+    if (current.draining) return structuredClone(current)
+    const next: IllustrationCoordinatorRecordV1 = {
+        ...current,
+        draining: true,
+        version: current.version + 1,
+        updatedAt: Date.now(),
+    }
+    await writePersistentJson(ILLUSTRATION_COORDINATOR_KEY, next)
+    return structuredClone(next)
+}
+
 export async function claimCoordinator(
     input: ClaimCoordinatorInput,
 ): Promise<IllustrationCoordinatorSnapshotV1> {
@@ -116,6 +136,7 @@ export async function claimCoordinator(
         assertProtocolVersion(input.protocolVersion)
         assertNonEmptyString(input.leaseId, 'leaseId')
         assertNonEmptyString(input.holderRuntimeId, 'holderRuntimeId')
+        await requireIllustrationFeatureEnabled()
         const current = await readCoordinatorUnlocked()
         const now = Date.now()
 
@@ -162,6 +183,16 @@ export async function claimCoordinator(
             return snapshot(renewed, true)
         }
 
+        if (
+            current.leaseId !== null
+            && current.expiresAt <= now
+            && now < current.expiresAt + ORPHAN_TAKEOVER_COOLDOWN_MS
+        ) {
+            throw new IllustrationCoordinatorCooldownError(
+                current.expiresAt + ORPHAN_TAKEOVER_COOLDOWN_MS,
+            )
+        }
+
         const takenOver: IllustrationCoordinatorRecordV1 = {
             version: current.version + 1,
             fence: current.fence + 1,
@@ -196,14 +227,62 @@ export async function markCoordinatorDraining(
             return structuredClone(current)
         }
         validateReleaseProof(current, input)
-        const next: IllustrationCoordinatorRecordV1 = {
-            ...current,
-            draining: true,
-            version: current.version + 1,
-            updatedAt: Date.now(),
+        return await markCoordinatorDrainingUnlocked(current)
+    })
+}
+
+export async function setIllustrationFeatureEnabledWithCoordinatorDrain(
+    enabled: boolean,
+): Promise<{
+    featureEnabled: boolean
+    coordinator: IllustrationCoordinatorRecordV1 | null
+}> {
+    if (typeof enabled !== 'boolean') {
+        throw new IllustrationLedgerValidationError('enabled must be a boolean')
+    }
+    return await withIllustrationLedgerLock(async () => {
+        const featureEnabled = await setIllustrationFeatureEnabled(enabled)
+        if (featureEnabled) {
+            return { featureEnabled, coordinator: null }
         }
-        await writePersistentJson(ILLUSTRATION_COORDINATOR_KEY, next)
-        return structuredClone(next)
+        const current = await readCoordinatorUnlocked()
+        if (!current || current.leaseId === null) {
+            return {
+                featureEnabled,
+                coordinator: current ? structuredClone(current) : null,
+            }
+        }
+        return {
+            featureEnabled,
+            coordinator: await markCoordinatorDrainingUnlocked(current),
+        }
+    })
+}
+
+export async function admitIllustrationCoordinatorLlm<T>(
+    holderRuntimeId: string,
+    start: (coordinator: IllustrationCoordinatorRecordV1) => T,
+): Promise<{ coordinator: IllustrationCoordinatorRecordV1; value: T }> {
+    assertNonEmptyString(holderRuntimeId, 'holderRuntimeId')
+    return await withIllustrationLedgerLock(async () => {
+        await requireIllustrationFeatureEnabled()
+        const current = await readCoordinatorUnlocked()
+        if (
+            !current
+            || current.leaseId === null
+            || current.holderRuntimeId !== holderRuntimeId
+        ) {
+            throw new IllustrationCoordinatorMismatchError(
+                'Illustration coordinator is not owned by this runtime',
+            )
+        }
+        if (current.expiresAt <= Date.now()) throw new IllustrationCoordinatorExpiredError()
+        if (current.draining) throw new IllustrationCoordinatorDrainingError()
+
+        const coordinator = structuredClone(current)
+        // The boxed result keeps a returned provider Promise from extending the
+        // ledger lock. Admission and dispatch still begin in the same lock turn.
+        return { coordinator, value: start(structuredClone(coordinator)) }
     })
 }
 
@@ -290,10 +369,11 @@ export async function getCoordinatorRecord(): Promise<IllustrationCoordinatorRec
 // and the target record CAS share one atomic boundary.
 export async function validateCoordinatorProofUnlocked(
     input: IllustrationCoordinatorProof,
-    options: { allowDraining?: boolean; now?: number } = {},
+    options: { allowDraining?: boolean; allowFeatureDisabled?: boolean; now?: number } = {},
 ): Promise<IllustrationCoordinatorRecordV1> {
     assertNonEmptyString(input.coordinatorLeaseId, 'coordinatorLeaseId')
     assertNonNegativeInteger(input.coordinatorFence, 'coordinatorFence')
+    if (options.allowFeatureDisabled !== true) await requireIllustrationFeatureEnabled()
     const current = await readCoordinatorUnlocked()
     if (!current) {
         throw new IllustrationCoordinatorMismatchError('Illustration coordinator does not exist')
