@@ -12,6 +12,7 @@ import {
     stripIllustrationControlNodes,
 } from './controlNodes'
 import {
+    IllustrationImagePromptContractError,
     IllustrationLedgerCorruptError,
     IllustrationLedgerValidationError,
 } from './errors'
@@ -27,6 +28,16 @@ import {
 import { requireIllustrationFeatureEnabled } from './featureFlag'
 import { emitIllustrationWakeHint } from './illustrationEvents'
 import { signalIllustrationExecutor } from './executorSignal'
+import {
+    isLegacyIllustrationStoredPrompt,
+    legacyStoredPrompt,
+    MAX_ILLUSTRATION_PROMPT_BYTES,
+    parseIllustrationPromptV1,
+    wrapLegacyIllustrationPrompt,
+} from './imagePrompt'
+import {
+    measureAndEnforceImagePromptForDispatch,
+} from './imagePromptMeasurement'
 import { withIllustrationOperationLock } from './operationLock'
 import { computeNaiSettingsFingerprint } from './settingsFingerprint'
 import { computeSourceRevisionHash, hashesMatch, sha256Hex } from './sourceHash'
@@ -48,6 +59,7 @@ import type {
     IllustrationJobFullSnapshotV1,
     IllustrationJobRecordV1,
     IllustrationJobSnapshotV1,
+    IllustrationPromptV1,
     IllustrationTurnRecordV1,
     IllustrationTurnSnapshotV1,
     ScenePayloadV1,
@@ -1049,14 +1061,25 @@ export async function recoverIllustrationProjection(
     )
 }
 
-export const MAX_ILLUSTRATION_PROMPT_BYTES = 16 * 1024
+export { MAX_ILLUSTRATION_PROMPT_BYTES } from './imagePrompt'
 
-export type SupplyPromptLedgerInput = IllustrationHolderWrite & IllustrationCoordinatorProof & {
+type SupplyPromptLedgerBaseInput = IllustrationHolderWrite & IllustrationCoordinatorProof & {
     jobId: string
     idempotencyKey: string
-    positive: string
-    negative: string
 }
+
+export type SupplyPromptLedgerInput = SupplyPromptLedgerBaseInput & (
+    | {
+        positive: string
+        negative: string
+        prompt?: never
+    }
+    | {
+        prompt: IllustrationPromptV1
+        positive?: never
+        negative?: never
+    }
+)
 
 export type IllustrationJobLiveContext = {
     kind: 'valid'
@@ -1080,6 +1103,28 @@ function resolvedVariantText(chat: Chat, resolution: FoundSlotResolution): strin
         throw new IllustrationLedgerCorruptError('Resolved illustration swipe disappeared')
     }
     return message.swipes[swipeIndex]
+}
+
+export function isIllustrationJobLiveContextCurrent(
+    job: IllustrationJobRecordV1,
+    context: IllustrationJobLiveContext,
+): boolean {
+    if (!job.target) return false
+    const character = getDatabase().characters.find(
+        (candidate) => candidate.chaId === job.target!.chaId,
+    )
+    if (character !== context.character) return false
+    const chat = character.chats[context.chatIndex]
+    if (chat !== context.chat || chat?.id !== job.target.conversationId || chat._placeholder) {
+        return false
+    }
+    try {
+        const resolution = resolveSlotAnchor(chat, job.target)
+        if (resolution.kind !== 'found') return false
+        return resolvedVariantText(chat, resolution) === context.variantText
+    } catch {
+        return false
+    }
 }
 
 export async function resolveIllustrationJobContext(
@@ -1135,13 +1180,55 @@ function validatePromptText(positive: string, negative: string): void {
     }
 }
 
+function supplyPromptValue(input: SupplyPromptLedgerInput): {
+    prompt: IllustrationPromptV1
+    legacyInput: boolean
+} {
+    if ('prompt' in input && input.prompt !== undefined) {
+        if (input.positive !== undefined || input.negative !== undefined) {
+            throw new IllustrationImagePromptContractError(
+                'image_prompt_invalid',
+                'Structured prompt supply may not include legacy prompt fields',
+            )
+        }
+        return { prompt: parseIllustrationPromptV1(input.prompt), legacyInput: false }
+    }
+    validatePromptText(input.positive, input.negative)
+    return {
+        prompt: wrapLegacyIllustrationPrompt(input.positive, input.negative),
+        legacyInput: true,
+    }
+}
+
+async function enforceSupplyPromptMeasurement(
+    job: IllustrationJobRecordV1,
+    prompt: IllustrationPromptV1,
+): Promise<void> {
+    if (!job.settingsFingerprint) {
+        throw new IllustrationImagePromptContractError(
+            'image_prompt_invalid',
+            'The illustration job has no captured settings fingerprint',
+        )
+    }
+    await measureAndEnforceImagePromptForDispatch({
+        protocolVersion: 1,
+        settingsFingerprint: job.settingsFingerprint,
+        prompt,
+    })
+}
+
 export async function supplyPromptLedger(
     input: SupplyPromptLedgerInput,
 ): Promise<IllustrationJobRecordV1> {
-    validatePromptText(input.positive, input.negative)
+    const supplied = supplyPromptValue(input)
     const job = await illustrationJobStore.getJob(input.jobId)
     if (!job) throw new IllustrationLedgerValidationError('Illustration job was not found')
     if (job.state !== 'awaiting_prompt') {
+        const crossUpgradeLegacyReplay = isLegacyIllustrationStoredPrompt(job.prompt)
+            && supplied.legacyInput
+        // A durable accepted write already passed its gate. Let the store's
+        // full-patch lost-ACK comparison decide replay identity before any
+        // live setting/tokenizer dependency can turn an ACK replay into a new failure.
         const replay = await illustrationJobStore.transitionJob({
             jobId: job.jobId,
             expectedVersion: input.expectedVersion,
@@ -1152,13 +1239,16 @@ export async function supplyPromptLedger(
             coordinatorFence: input.coordinatorFence,
             patch: {
                 idempotencyKey: input.idempotencyKey,
-                prompt: { positive: input.positive, negative: input.negative },
+                prompt: crossUpgradeLegacyReplay
+                    ? legacyStoredPrompt(input.positive!, input.negative!)
+                    : supplied.prompt,
             },
         })
         signalIllustrationExecutor()
         return replay
     }
     validateHolderWrite(job, input)
+    await enforceSupplyPromptMeasurement(job, supplied.prompt)
 
     const context = await resolveIllustrationJobContext(job)
     if (context.kind !== 'valid') {
@@ -1193,7 +1283,7 @@ export async function supplyPromptLedger(
         coordinatorFence: input.coordinatorFence,
         patch: {
             idempotencyKey: input.idempotencyKey,
-            prompt: { positive: input.positive, negative: input.negative },
+            prompt: supplied.prompt,
         },
     })
     signalIllustrationExecutor()

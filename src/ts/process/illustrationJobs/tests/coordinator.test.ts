@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import type { Chat, Message } from '../../../storage/database.svelte'
+import {
+    createImagePromptMeasurementService,
+    createImagePromptTokenizerLoader,
+    setImagePromptMeasurementServiceForTests,
+} from '../imagePromptMeasurement'
+import { installImagePromptMeasurementTestService } from './imagePromptTestHarness'
 import { InMemoryLockManager } from './inMemoryLockManager'
 
 const harness = vi.hoisted(() => ({
@@ -79,6 +85,7 @@ const BASE_TIME = Date.UTC(2026, 0, 2)
 let mutationEvents: string[]
 let lockManager: InMemoryLockManager
 let coordinatorProof: { coordinatorLeaseId: string; coordinatorFence: number }
+let restoreImagePromptMeasurement = () => {}
 
 async function refreshCoordinatorProof(): Promise<void> {
     const snapshot = await claimCoordinator({
@@ -189,6 +196,7 @@ beforeEach(async () => {
     harness.strictSave.mockReset()
     mutationEvents = []
     installDatabase()
+    restoreImagePromptMeasurement = installImagePromptMeasurementTestService(() => harness.database)
     lockManager = new InMemoryLockManager()
     setIllustrationLockManagerAccessorForTests(() => lockManager)
     setIllustrationOperationLockManagerAccessorForTests(() => lockManager)
@@ -428,7 +436,14 @@ describe('prompt handoff and cancellation', () => {
 
         expect(queued).toMatchObject({
             state: 'queued',
-            prompt: { positive: 'cinematic scene', negative: '' },
+            prompt: {
+                schemaVersion: 1,
+                layout: 'flat',
+                basePositive: 'cinematic scene',
+                characterPositives: [],
+                baseNegative: '',
+                characterNegatives: [],
+            },
         })
     })
 
@@ -442,6 +457,106 @@ describe('prompt handoff and cancellation', () => {
 
         expect(replay).toEqual(first)
         expect((await illustrationJobStore.getJob(job.jobId))?.version).toBe(first.version)
+    })
+
+    // Request §4 row 8: a pre-contract physical flat ACK replays without migration/measurement.
+    test('replays a physical legacy string handoff byte-exactly across the upgrade boundary', async () => {
+        const job = await createClaimedPromptJob()
+        const input = promptInput(job)
+        const accepted = await supplyPromptLedger(input)
+        const key = illustrationJobKey(job.jobId)
+        const physicalLegacy = decodeStored<any>(key)
+        physicalLegacy.prompt = { positive: input.positive, negative: input.negative }
+        harness.storageMap.set(key, new TextEncoder().encode(JSON.stringify(physicalLegacy)))
+
+        restoreImagePromptMeasurement()
+        restoreImagePromptMeasurement = setImagePromptMeasurementServiceForTests({
+            resolveSettings: async () => { throw new Error('legacy replay must not measure') },
+            measure: async () => { throw new Error('legacy replay must not measure') },
+        })
+
+        await expect(supplyPromptLedger(input)).resolves.toMatchObject({
+            version: accepted.version,
+            prompt: { positive: input.positive, negative: input.negative },
+        })
+        await expect(supplyPromptLedger({ ...input, positive: `${input.positive}!` }))
+            .rejects.toThrow('conflicting patch data')
+    })
+
+    // Request §4 row 5: durable structure/order is the lost-ACK provenance identity.
+    test('persists structured parts and rejects reordered replay as conflicting identity', async () => {
+        const job = await createClaimedPromptJob()
+        const { positive: _positive, negative: _negative, ...base } = promptInput(job)
+        const prompt = {
+            schemaVersion: 1 as const,
+            layout: 'nai-v4-characters' as const,
+            basePositive: 'base positive',
+            characterPositives: ['source#1 Alice', 'target#2 Bob'],
+            baseNegative: 'base negative',
+            characterNegatives: ['negative Alice', 'negative Bob'],
+        }
+        const input = { ...base, prompt }
+        const queued = await supplyPromptLedger(input)
+
+        expect(decodeStored<any>(illustrationJobKey(job.jobId)).prompt).toEqual(prompt)
+        await expect(supplyPromptLedger(input)).resolves.toEqual(queued)
+        await expect(supplyPromptLedger({
+            ...input,
+            prompt: {
+                ...prompt,
+                characterPositives: [...prompt.characterPositives].reverse(),
+            },
+        })).rejects.toThrow('conflicting patch data')
+        expect((await illustrationJobStore.getJob(job.jobId))?.prompt).toEqual(prompt)
+    })
+
+    // Request §4 rows 1-2: final combined over-limit rejects before the durable handoff.
+    test('rejects an over-limit final V4 prompt with measured payload and no state change', async () => {
+        const job = await createClaimedPromptJob()
+        const before = await illustrationJobStore.getJob(job.jobId)
+        restoreImagePromptMeasurement()
+        restoreImagePromptMeasurement = installImagePromptMeasurementTestService(
+            () => harness.database,
+            (text) => text === 'cinematic scene' ? 513 : 0,
+        )
+
+        await expect(supplyPromptLedger(promptInput(job))).rejects.toMatchObject({
+            code: 'image_prompt_over_limit',
+            payload: {
+                positiveTokens: 513,
+                negativeTokens: 0,
+                maxPositiveTokens: 512,
+                maxNegativeTokens: 512,
+                model: 'nai-diffusion-4-5-full',
+            },
+        })
+        expect(await illustrationJobStore.getJob(job.jobId)).toEqual(before)
+    })
+
+    // Request §4 row 7: transient tokenizer failure is fail-closed but does not poison retry.
+    test('keeps awaiting_prompt on tokenizer failure and accepts a later retry', async () => {
+        const job = await createClaimedPromptJob()
+        const loadModel = vi.fn()
+            .mockRejectedValueOnce(new Error('asset temporarily unavailable'))
+            .mockResolvedValue(new ArrayBuffer(0))
+        restoreImagePromptMeasurement()
+        restoreImagePromptMeasurement = setImagePromptMeasurementServiceForTests(
+            createImagePromptMeasurementService({
+                getDatabase: () => harness.database,
+                tokenizerLoader: createImagePromptTokenizerLoader({
+                    loadModel,
+                    createTokenizer: async () => ({ encode: () => ({ length: 1 }) }),
+                }),
+            }),
+        )
+
+        await expect(supplyPromptLedger(promptInput(job)))
+            .rejects.toMatchObject({ code: 'image_tokenizer_unavailable' })
+        const unchanged = await illustrationJobStore.getJob(job.jobId)
+        expect(unchanged?.state).toBe('awaiting_prompt')
+        expect(unchanged?.prompt).toBeUndefined()
+        await expect(supplyPromptLedger(promptInput(job))).resolves.toMatchObject({ state: 'queued' })
+        expect(loadModel).toHaveBeenCalledTimes(2)
     })
 
     test('rejects blank or over-16-KiB UTF-8 prompts before any job write', async () => {
@@ -524,6 +639,7 @@ describe('prompt handoff and cancellation', () => {
 })
 
 afterEach(() => {
+    restoreImagePromptMeasurement()
     resetIllustrationLockManagerAccessorForTests()
     resetIllustrationOperationLockManagerAccessorForTests()
     vi.useRealTimers()

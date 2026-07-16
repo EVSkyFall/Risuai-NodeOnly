@@ -30,12 +30,14 @@ const allowedJobEdges: Array<[IllustrationJobState, IllustrationJobState]> = [
     ['agent_blocked', 'corrupt'], // Report §8: corrupt closure.
     ['queued', 'generating'],
     ['queued', 'blocked_config'],
+    ['queued', 'failed'],
     ['queued', 'corrupt'],
     ['blocked_config', 'queued'],
     ['blocked_config', 'cancelled'],
     ['blocked_config', 'stale'],
     ['blocked_config', 'corrupt'],
     ['generating', 'asset_writing'],
+    ['generating', 'blocked_config'],
     ['generating', 'failed'],
     ['generating', 'stale'],
     ['generating', 'uncertain'],
@@ -80,10 +82,10 @@ describe('illustration job transition matrix', () => {
         expect(() => assertTransition('job', from, to)).toThrow(IllustrationLedgerTransitionError)
     })
 
-    test('pins the complete set of 46 allowed general transitions', () => {
+    test('pins the complete set of 48 allowed general transitions', () => {
         const allStates = Object.keys(JOB_TRANSITIONS) as IllustrationJobState[]
         const expected = new Set(allowedJobEdges.map(([from, to]) => `${from}->${to}`))
-        expect(expected.size).toBe(46)
+        expect(expected.size).toBe(48)
 
         for (const from of allStates) {
             for (const to of allStates) {

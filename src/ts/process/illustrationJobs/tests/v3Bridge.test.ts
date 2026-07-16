@@ -219,6 +219,14 @@ function makeHarness(runtimeId = 'host-runtime') {
         claimJob,
         submitPlan: vi.fn(async () => [structuredClone(rawJob)]),
         supplyPrompt: vi.fn(async () => structuredClone(rawJob)),
+        measureImagePrompt: vi.fn(async () => ({
+            model: 'nai-diffusion-4-5-full',
+            tokenizer: 't5-spiece-v1' as const,
+            positiveTokens: 4,
+            negativeTokens: 2,
+            maxPositiveTokens: 512,
+            maxNegativeTokens: 512,
+        })),
         cancelJob: vi.fn(async () => structuredClone(rawJob)),
         cancelTurn: vi.fn(async (input) => ({ turnId: input.turnId, state: 'cancelled' })),
         retryUncertain: vi.fn(async () => structuredClone(rawJob)),
@@ -367,6 +375,7 @@ describe('private V3 API shape and hygiene', () => {
             '_ijGetCapabilities',
             '_ijListJobs',
             '_ijListPendingTurns',
+            '_ijMeasureImagePrompt',
             '_ijReleaseCoordinator',
             '_ijReportAgentFailure',
             '_ijRetryAgentFailure',
@@ -392,6 +401,10 @@ describe('private V3 API shape and hygiene', () => {
             maxJobsPerTurn: 15,
             offsetEncoding: 'utf-16',
             promptOwnership: 'plugin-final',
+            imagePromptContractVersion: 1,
+            imagePromptOwnership: 'plugin-final-structured',
+            imagePromptMeasurement: 'core-provider-model-exact',
+            supportsNaiV4CharacterCaptions: true,
             featureEnabled: true,
         })
     })
@@ -414,6 +427,61 @@ describe('private V3 API shape and hygiene', () => {
         expect(log).not.toHaveBeenCalled()
         expect(warn).not.toHaveBeenCalled()
         expect(error).not.toHaveBeenCalled()
+    })
+
+    test('exposes exact measurement through the alias and strips caller identity fields', async () => {
+        const { bridge, deps } = makeHarness()
+        const prompt = {
+            schemaVersion: 1,
+            layout: 'nai-v4-characters',
+            basePositive: 'base',
+            characterPositives: ['source#1 Alice'],
+            baseNegative: 'negative',
+            characterNegatives: ['negative Alice'],
+        }
+        await expect(bridge.rootMethods._ijMeasureImagePrompt({
+            protocolVersion: 1,
+            settingsFingerprint: 'fingerprint',
+            prompt,
+            runtimeId: 'forged-runtime',
+            scriptDigest: 'forged-digest',
+        })).resolves.toEqual({
+            model: 'nai-diffusion-4-5-full',
+            tokenizer: 't5-spiece-v1',
+            positiveTokens: 4,
+            negativeTokens: 2,
+            maxPositiveTokens: 512,
+            maxNegativeTokens: 512,
+        })
+        expect(deps.measureImagePrompt).toHaveBeenCalledWith({
+            protocolVersion: 1,
+            settingsFingerprint: 'fingerprint',
+            prompt,
+        })
+        expect(bridge.aliases.illustrationJobs.measureImagePrompt).toBe('_ijMeasureImagePrompt')
+    })
+
+    test('carries only allowlisted numeric over-limit measurements in RPC errors', () => {
+        const payload = {
+            positiveTokens: 513,
+            negativeTokens: 12,
+            maxPositiveTokens: 512,
+            maxNegativeTokens: 512,
+            model: 'nai-diffusion-4-5-full',
+            secretPrompt: 'MUST NOT LEAK',
+        }
+        const error = toIllustrationV3RpcError({ code: 'image_prompt_over_limit', payload })
+        expect(error).toMatchObject({
+            code: 'image_prompt_over_limit',
+            payload: {
+                positiveTokens: 513,
+                negativeTokens: 12,
+                maxPositiveTokens: 512,
+                maxNegativeTokens: 512,
+                model: 'nai-diffusion-4-5-full',
+            },
+        })
+        expect(JSON.stringify(error.payload)).not.toContain('MUST NOT LEAK')
     })
 
     test('injects the host runtime identity and returns bearer-free ownership views', async () => {

@@ -15,6 +15,7 @@ import {
     withIllustrationWorkerEpoch,
 } from './executor'
 import { isIllustrationFeatureEnabled } from './featureFlag'
+import { isLegacyIllustrationStoredPrompt } from './imagePrompt'
 import { computeNaiSettingsFingerprint } from './settingsFingerprint'
 import { canTransition, isTerminalJobState, isTerminalTurnState } from './stateMachine'
 import { illustrationJobStore } from './store'
@@ -172,9 +173,13 @@ async function recoverPreDispatchJob(job: IllustrationJobRecordV1, epoch: number
         return
     }
 
-    const database = getDatabase()
-    const fingerprint = await computeNaiSettingsFingerprint(database)
     if (job.state === 'queued') {
+        // The live executor applies the resumable configuration gate uniformly,
+        // then measures structured records. Recovery only handles physical
+        // legacy records here so it never adds a retroactive tokenizer dependency.
+        if (!isLegacyIllustrationStoredPrompt(job.prompt)) return
+        const database = getDatabase()
+        const fingerprint = await computeNaiSettingsFingerprint(database)
         if (database.sdProvider !== 'novelai' || fingerprint !== job.settingsFingerprint) {
             await transitionRecoveryJob(job, 'blocked_config', epoch, 'blocked-config', {
                 code: database.sdProvider === 'novelai'
@@ -184,10 +189,15 @@ async function recoverPreDispatchJob(job: IllustrationJobRecordV1, epoch: number
         }
         return
     }
-    if (job.state === 'blocked_config'
-        && database.sdProvider === 'novelai'
-        && fingerprint === job.settingsFingerprint) {
-        await transitionRecoveryJob(job, 'queued', epoch, 'resume-config')
+    if (job.state === 'blocked_config') {
+        const database = getDatabase()
+        const fingerprint = await computeNaiSettingsFingerprint(database)
+        if (
+            database.sdProvider === 'novelai'
+            && fingerprint === job.settingsFingerprint
+        ) {
+            await transitionRecoveryJob(job, 'queued', epoch, 'resume-config')
+        }
     }
 }
 

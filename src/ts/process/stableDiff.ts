@@ -7,6 +7,7 @@ import { CharEmotion } from "../stores.svelte"
 import type { OpenAIChat } from "./index.svelte"
 import { processZip } from "./processzip"
 import random from "lodash/random"
+import type { IllustrationPromptV1 } from "./illustrationJobs/types"
 
 export type ImageGenerationResult =
     | { ok: true; bytesOrDataUrl: string; providerStatus: number }
@@ -20,6 +21,11 @@ export type ImageGenerationAttempt = {
     compatibilityValue: string | false
     shouldNotify?: boolean
     notifyErrorValue?: unknown
+}
+
+export type ImageGenerationOptions = {
+    preservePromptText?: boolean
+    illustrationPrompt?: IllustrationPromptV1
 }
 
 export async function stableDiff(currentChar:character,prompt:string){
@@ -94,7 +100,7 @@ export async function generateAIImageTyped(
     neg:string,
     returnSdData:string,
     priorityClass:ImageGenerationPriority,
-    options: { preservePromptText?: boolean } = {},
+    options: ImageGenerationOptions = {},
 ):Promise<ImageGenerationAttempt>{
     const result = await generateAIImageInternal(
         genPrompt,
@@ -125,9 +131,13 @@ async function generateAIImageInternal(
     neg:string,
     returnSdData:string,
     priorityClass:ImageGenerationPriority,
-    options: { preservePromptText?: boolean },
+    options: ImageGenerationOptions,
 ):Promise<string|false|ImageGenerationAttempt>{
     const db = getDatabase()
+    if(options.illustrationPrompt){
+        genPrompt = options.illustrationPrompt.basePositive
+        neg = options.illustrationPrompt.baseNegative
+    }
     console.log(db.sdProvider)
     if(db.sdProvider === 'webui'){
 
@@ -198,8 +208,26 @@ async function generateAIImageInternal(
 
         let reqlist:any = {}
 
+        // Illustration character captions are text-only. With coordinate
+        // placement disabled, the existing NAI schema represents that as an
+        // empty centers array and preserves the plugin's subject order.
+        const characterPositives = options.illustrationPrompt?.layout === 'nai-v4-characters'
+            ? options.illustrationPrompt.characterPositives.map((char_caption) => ({
+                char_caption,
+                centers: [] as Array<{ x: number, y: number }>,
+            }))
+            : []
+        const characterNegatives = options.illustrationPrompt?.layout === 'nai-v4-characters'
+            ? options.illustrationPrompt.characterNegatives.map((char_caption) => ({
+                char_caption,
+                centers: [] as Array<{ x: number, y: number }>,
+            }))
+            : []
+
         const commonReq = {
             body: {
+                // NAI's legacy compatibility field remains the base positive;
+                // v4_prompt below is authoritative for structured captions.
                 "input": genPrompt,
                 "model": db.NAIImgModel,
                 "parameters": {
@@ -231,7 +259,7 @@ async function generateAIImageInternal(
                     "v4_prompt":{
                         caption:{
                             base_caption:genPrompt,
-                            char_captions: []
+                            char_captions: characterPositives
                         },
                         use_coords: false,
                         use_order: true,
@@ -239,7 +267,7 @@ async function generateAIImageInternal(
                     "v4_negative_prompt":{
                         caption:{
                             base_caption:neg,
-                            char_captions: []
+                            char_captions: characterNegatives
                         },
                         legacy_uc: db.NAIImgConfig.legacy_uc,
                     },

@@ -1,4 +1,9 @@
 import type { IllustrationWakeHintListener } from './illustrationEvents'
+import type { MeasureImagePromptInputV1 } from './imagePromptMeasurement'
+import type {
+    IllustrationImagePromptMeasurementV1,
+    IllustrationImagePromptOverLimitPayloadV1,
+} from './types'
 
 export const ILLUSTRATION_V3_PROTECTED_PLUGIN_NAME = 'lb_xnai_agent'
 export const RISU_ILLUSTRATION_AGENT_LLM_TIMEOUT_MS = 240_000
@@ -101,6 +106,7 @@ export const ILLUSTRATION_V3_CONTRACT_IMPLEMENTATION = Object.freeze({
     coordinator: true,
     agentFailure: true,
     agentLlmDrain: true,
+    imagePrompt: true,
 } as const)
 
 export const ILLUSTRATION_V3_ERROR_MESSAGES = Object.freeze({
@@ -119,6 +125,11 @@ export const ILLUSTRATION_V3_ERROR_MESSAGES = Object.freeze({
     idempotency_conflict: 'The illustration idempotency key conflicts with prior work.',
     corrupt: 'The illustration record is corrupt.',
     agent_llm_timeout: 'The illustration Agent LLM request timed out.',
+    image_prompt_over_limit: 'The final image prompt exceeds the model token budget.',
+    image_tokenizer_unavailable: 'The exact image prompt tokenizer is unavailable.',
+    image_prompt_measurement_unsupported: 'Exact image prompt measurement is unsupported for these settings.',
+    image_prompt_invalid: 'The structured image prompt is invalid.',
+    settings_fingerprint_mismatch: 'The captured image settings no longer match the current settings.',
 } as const)
 
 export type IllustrationV3ErrorCode = keyof typeof ILLUSTRATION_V3_ERROR_MESSAGES
@@ -134,11 +145,16 @@ class IllustrationV3CodedError extends Error {
 
 export class IllustrationV3RpcError extends Error {
     readonly code: IllustrationV3ErrorCode
+    readonly payload?: IllustrationImagePromptOverLimitPayloadV1
 
-    constructor(code: IllustrationV3ErrorCode) {
+    constructor(
+        code: IllustrationV3ErrorCode,
+        payload?: IllustrationImagePromptOverLimitPayloadV1,
+    ) {
         super(`[IJ:${code}] ${ILLUSTRATION_V3_ERROR_MESSAGES[code]}`)
         this.name = 'IllustrationV3RpcError'
         this.code = code
+        this.payload = payload
     }
 }
 
@@ -162,6 +178,11 @@ function mappedErrorCode(error: unknown): IllustrationV3ErrorCode {
         case 'idempotency_conflict':
         case 'corrupt':
         case 'agent_llm_timeout':
+        case 'image_prompt_over_limit':
+        case 'image_tokenizer_unavailable':
+        case 'image_prompt_measurement_unsupported':
+        case 'image_prompt_invalid':
+        case 'settings_fingerprint_mismatch':
             return rawCode
         case 'validation_failed':
             return 'validation'
@@ -175,9 +196,37 @@ function mappedErrorCode(error: unknown): IllustrationV3ErrorCode {
     }
 }
 
+function overLimitPayload(error: unknown): IllustrationImagePromptOverLimitPayloadV1 | undefined {
+    if (!error || typeof error !== 'object' || !('payload' in error)) return undefined
+    const payload = (error as { payload?: unknown }).payload
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return undefined
+    const value = payload as Record<string, unknown>
+    const numericKeys = [
+        'positiveTokens',
+        'negativeTokens',
+        'maxPositiveTokens',
+        'maxNegativeTokens',
+    ] as const
+    if (typeof value.model !== 'string'
+        || numericKeys.some((key) => !Number.isSafeInteger(value[key]) || (value[key] as number) < 0)) {
+        return undefined
+    }
+    return {
+        positiveTokens: value.positiveTokens as number,
+        negativeTokens: value.negativeTokens as number,
+        maxPositiveTokens: value.maxPositiveTokens as number,
+        maxNegativeTokens: value.maxNegativeTokens as number,
+        model: value.model,
+    }
+}
+
 export function toIllustrationV3RpcError(error: unknown): IllustrationV3RpcError {
     if (error instanceof IllustrationV3RpcError) return error
-    return new IllustrationV3RpcError(mappedErrorCode(error))
+    const code = mappedErrorCode(error)
+    return new IllustrationV3RpcError(
+        code,
+        code === 'image_prompt_over_limit' ? overLimitPayload(error) : undefined,
+    )
 }
 
 function codedError(code: IllustrationV3ErrorCode): IllustrationV3CodedError {
@@ -248,6 +297,7 @@ export type IllustrationV3BridgeDependencies = {
     claimJob(input: Record<string, unknown>): Promise<unknown>
     submitPlan(input: Record<string, unknown>): Promise<BridgeRecord[]>
     supplyPrompt(input: Record<string, unknown>): Promise<BridgeRecord>
+    measureImagePrompt(input: MeasureImagePromptInputV1): Promise<IllustrationImagePromptMeasurementV1>
     cancelJob(input: { jobId: string; expectedVersion: number }): Promise<BridgeRecord>
     cancelTurn(input: { turnId: string; expectedVersion: number }): Promise<unknown>
     retryUncertain(input: Record<string, unknown>): Promise<BridgeRecord>
@@ -569,6 +619,7 @@ export const ILLUSTRATION_JOBS_ALIAS = Object.freeze({
     claimJob: '_ijClaimJob',
     submitPlan: '_ijSubmitPlan',
     supplyPrompt: '_ijSupplyPrompt',
+    measureImagePrompt: '_ijMeasureImagePrompt',
     listJobs: '_ijListJobs',
     cancel: '_ijCancel',
     retryUncertain: '_ijRetryUncertain',
@@ -653,8 +704,20 @@ export function createAuthorizedIllustrationV3Bridge(input: {
                 maxJobsPerTurn: 15,
                 offsetEncoding: 'utf-16',
                 promptOwnership: 'plugin-final',
+                // The tokenizer asset ships statically. Runtime asset/WASM
+                // failures remain fail-closed contract errors on measure/gates.
+                imagePromptContractVersion: ILLUSTRATION_V3_CONTRACT_IMPLEMENTATION.imagePrompt ? 1 : 0,
+                imagePromptOwnership: 'plugin-final-structured',
+                imagePromptMeasurement: 'core-provider-model-exact',
+                supportsNaiV4CharacterCaptions: true,
                 featureEnabled: await deps.isFeatureEnabled(),
             }
+        }),
+        _ijMeasureImagePrompt: async (value) => await invokeRpc(async () => {
+            ensureLive()
+            const request = sanitizedInput(value)
+            assertProtocol(request)
+            return await deps.measureImagePrompt(request as MeasureImagePromptInputV1)
         }),
         _ijSetFeatureEnabled: async (value) => await invokeRpc(async () => {
             ensureLive()

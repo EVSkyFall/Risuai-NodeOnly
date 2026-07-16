@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import type { Chat } from '../../../storage/database.svelte'
+import { IllustrationImagePromptContractError } from '../errors'
+import { setImagePromptMeasurementServiceForTests } from '../imagePromptMeasurement'
+import type { IllustrationPromptV1 } from '../types'
+import { installImagePromptMeasurementTestService } from './imagePromptTestHarness'
 import { InMemoryLockManager } from './inMemoryLockManager'
 
 const harness = vi.hoisted(() => ({
@@ -99,11 +103,12 @@ const {
     resetIllustrationOperationLockManagerAccessorForTests,
     setIllustrationOperationLockManagerAccessorForTests,
 } = operationLockModule
-const { illustrationJobStore } = storeModule
+const { illustrationJobKey, illustrationJobStore } = storeModule
 
 const BASE_TIME = Date.UTC(2026, 0, 3)
 let lockManager: InMemoryLockManager
 let coordinatorProof: { coordinatorLeaseId: string; coordinatorFence: number }
+let restoreImagePromptMeasurement = () => {}
 
 async function refreshCoordinatorProof(): Promise<void> {
     const snapshot = await claimCoordinator({
@@ -153,6 +158,7 @@ async function createQueuedJob(
     swipes = false,
     positive = 'positive prompt',
     negative = '',
+    prompt?: IllustrationPromptV1,
 ) {
     const target = installDatabase(source, swipes)
     const turn = await registerTrustedTurn({
@@ -195,8 +201,7 @@ async function createQueuedJob(
         leaseId: 'tagger',
         fence: claimedJob.fence,
         idempotencyKey: `prompt:${projected.jobId}`,
-        positive,
-        negative,
+        ...(prompt ? { prompt } : { positive, negative }),
     })
     harness.events.length = 0
     harness.strictSave.mockClear()
@@ -292,6 +297,7 @@ beforeEach(async () => {
     harness.hydrateHook = null
     harness.getItemHook = null
     installDatabase()
+    restoreImagePromptMeasurement = installImagePromptMeasurementTestService(() => harness.database)
     lockManager = new InMemoryLockManager()
     setIllustrationLockManagerAccessorForTests(() => lockManager)
     setIllustrationOperationLockManagerAccessorForTests(() => lockManager)
@@ -331,6 +337,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
+    restoreImagePromptMeasurement()
     await stopIllustrationExecutor()
     resetIllustrationWorkerLockManagerAccessorForTests()
     resetIllustrationLockManagerAccessorForTests()
@@ -455,10 +462,58 @@ describe('illustration executor', () => {
             negative,
             'inlay',
             'background',
-            { preservePromptText: true },
+            {
+                preservePromptText: true,
+                illustrationPrompt: {
+                    schemaVersion: 1,
+                    layout: 'flat',
+                    basePositive: positive,
+                    characterPositives: [],
+                    baseNegative: negative,
+                    characterNegatives: [],
+                },
+            },
         )
         expect(hints.length).toBeGreaterThan(0)
         expect(hints.every((hint) => hint.kind === 'job_changed' && hint.jobId === queued.jobId)).toBe(true)
+    })
+
+    test('passes an exact structured character prompt through the executor dispatch wiring', async () => {
+        const prompt: IllustrationPromptV1 = {
+            schemaVersion: 1,
+            layout: 'nai-v4-characters',
+            basePositive: 'base positive\r\nkept byte-exact',
+            characterPositives: [
+                'source#1  first character',
+                'target#2\tsecond character',
+            ],
+            baseNegative: 'base negative\nkept byte-exact',
+            characterNegatives: [
+                'source#1 negative  one',
+                'target#2 negative\ttwo',
+            ],
+        }
+        const { queued } = await createQueuedJob(
+            'Executor source',
+            false,
+            'unused positive',
+            'unused negative',
+            prompt,
+        )
+
+        await startIllustrationExecutor()
+        await pokeExecutor()
+
+        expect((await illustrationJobStore.getJob(queued.jobId))?.state).toBe('committed')
+        expect(harness.provider).toHaveBeenCalledTimes(1)
+        expect(harness.provider).toHaveBeenCalledWith(
+            prompt.basePositive,
+            harness.database.characters[0],
+            prompt.baseNegative,
+            'inlay',
+            'background',
+            { preservePromptText: true, illustrationPrompt: prompt },
+        )
     })
 
     // §20 explicit reject is failed; uncertain is never auto-redispatched.
@@ -488,9 +543,372 @@ describe('illustration executor', () => {
         expect(harness.provider).toHaveBeenCalledTimes(1)
     })
 
-    // §10.2 homogeneous batch: drift blocks with zero calls and restoration resumes.
-    test('blocks on fingerprint drift and resumes only after restoration and target CAS', async () => {
+    // Original spec §10.2: structured jobs share the resumable configuration block.
+    test('blocks a structured job on drift and remeasures before dispatch after restore', async () => {
         const { queued } = await createQueuedJob()
+        let measurements = 0
+        restoreImagePromptMeasurement()
+        restoreImagePromptMeasurement = setImagePromptMeasurementServiceForTests({
+            resolveSettings: async () => ({
+                provider: 'novelai',
+                model: 'nai-diffusion-4-5-full',
+            }),
+            measure: async () => {
+                measurements += 1
+                return {
+                    model: 'nai-diffusion-4-5-full',
+                    tokenizer: 't5-spiece-v1',
+                    positiveTokens: 1,
+                    negativeTokens: 0,
+                    maxPositiveTokens: 512,
+                    maxNegativeTokens: 512,
+                }
+            },
+        })
+        harness.database.NAIImgConfig.steps = 99
+
+        await startIllustrationExecutor()
+        await pokeExecutor()
+        expect(await illustrationJobStore.getJob(queued.jobId)).toMatchObject({
+            state: 'blocked_config',
+            error: { code: 'settings_fingerprint_mismatch' },
+        })
+        expect(measurements).toBe(0)
+        expect(harness.provider).not.toHaveBeenCalled()
+
+        delete harness.database.NAIImgConfig.steps
+        await pokeExecutor()
+        expect((await illustrationJobStore.getJob(queued.jobId))?.state).toBe('committed')
+        expect(measurements).toBe(2)
+        expect(harness.provider).toHaveBeenCalledTimes(1)
+    })
+
+    test('fails a resumed structured job when restored-settings remeasurement is over limit', async () => {
+        const { queued } = await createQueuedJob()
+        let measurements = 0
+        restoreImagePromptMeasurement()
+        restoreImagePromptMeasurement = setImagePromptMeasurementServiceForTests({
+            resolveSettings: async () => ({
+                provider: 'novelai',
+                model: 'nai-diffusion-4-5-full',
+            }),
+            measure: async () => {
+                measurements += 1
+                return {
+                    model: 'nai-diffusion-4-5-full',
+                    tokenizer: 't5-spiece-v1',
+                    positiveTokens: 513,
+                    negativeTokens: 0,
+                    maxPositiveTokens: 512,
+                    maxNegativeTokens: 512,
+                }
+            },
+        })
+        harness.database.NAIImgConfig.steps = 99
+
+        await startIllustrationExecutor()
+        await pokeExecutor()
+        expect((await illustrationJobStore.getJob(queued.jobId))?.state).toBe('blocked_config')
+        expect(measurements).toBe(0)
+        expect(harness.provider).not.toHaveBeenCalled()
+
+        delete harness.database.NAIImgConfig.steps
+        await pokeExecutor()
+        expect(await illustrationJobStore.getJob(queued.jobId)).toMatchObject({
+            state: 'failed',
+            error: { code: 'image_prompt_over_limit', retryable: false },
+        })
+        expect(measurements).toBe(1)
+        expect(harness.provider).not.toHaveBeenCalled()
+    })
+
+    // Request §4 rows 1-2: executor remeasurement independently catches a now-over-limit final.
+    test('fails an over-limit queued prompt before provider dispatch with measured payload', async () => {
+        const { queued } = await createQueuedJob()
+        restoreImagePromptMeasurement()
+        restoreImagePromptMeasurement = installImagePromptMeasurementTestService(
+            () => harness.database,
+            (text) => text === 'positive prompt' ? 513 : 0,
+        )
+
+        await startIllustrationExecutor()
+        await pokeExecutor()
+        expect(await illustrationJobStore.getJob(queued.jobId)).toMatchObject({
+            state: 'failed',
+            error: {
+                code: 'image_prompt_over_limit',
+                retryable: false,
+                payload: {
+                    positiveTokens: 513,
+                    negativeTokens: 0,
+                    maxPositiveTokens: 512,
+                    maxNegativeTokens: 512,
+                    model: 'nai-diffusion-4-5-full',
+                },
+            },
+        })
+        expect(harness.provider).not.toHaveBeenCalled()
+    })
+
+    test('fails tokenizer-unavailable pre-dispatch without a provider or heuristic fallback', async () => {
+        const { queued } = await createQueuedJob()
+        restoreImagePromptMeasurement()
+        restoreImagePromptMeasurement = setImagePromptMeasurementServiceForTests({
+            resolveSettings: async () => ({
+                provider: 'novelai',
+                model: 'nai-diffusion-4-5-full',
+            }),
+            measure: async () => {
+                throw new IllustrationImagePromptContractError(
+                    'image_tokenizer_unavailable',
+                    'test tokenizer outage',
+                )
+            },
+        })
+
+        await startIllustrationExecutor()
+        await pokeExecutor()
+        expect(await illustrationJobStore.getJob(queued.jobId)).toMatchObject({
+            state: 'failed',
+            error: { code: 'image_tokenizer_unavailable', retryable: false },
+        })
+        expect(harness.provider).not.toHaveBeenCalled()
+    })
+
+    test('lets cancellation win during the final measurement and never dispatches', async () => {
+        const { queued } = await createQueuedJob()
+        const finalEntered = deferred<void>()
+        const releaseFinal = deferred<void>()
+        let measurements = 0
+        restoreImagePromptMeasurement()
+        restoreImagePromptMeasurement = setImagePromptMeasurementServiceForTests({
+            resolveSettings: async () => ({
+                provider: 'novelai',
+                model: 'nai-diffusion-4-5-full',
+            }),
+            measure: async () => {
+                measurements += 1
+                if (measurements === 2) {
+                    finalEntered.resolve()
+                    await releaseFinal.promise
+                }
+                return {
+                    model: 'nai-diffusion-4-5-full',
+                    tokenizer: 't5-spiece-v1',
+                    positiveTokens: 1,
+                    negativeTokens: 0,
+                    maxPositiveTokens: 512,
+                    maxNegativeTokens: 512,
+                }
+            },
+        })
+
+        await startIllustrationExecutor()
+        await finalEntered.promise
+        const generating = (await illustrationJobStore.getJob(queued.jobId))!
+        expect(generating.state).toBe('generating')
+        await cancelLedger({ jobId: generating.jobId, expectedVersion: generating.version })
+        releaseFinal.resolve()
+        await pokeExecutor()
+
+        expect((await illustrationJobStore.getJob(queued.jobId))?.state).toBe('cancelled')
+        expect(harness.provider).not.toHaveBeenCalled()
+    })
+
+    test('lets cancellation win during the post-measurement context re-read', async () => {
+        const { queued } = await createQueuedJob()
+        const contextEntered = deferred<void>()
+        const releaseContext = deferred<void>()
+        let measurements = 0
+        let blockedContext = false
+        restoreImagePromptMeasurement()
+        restoreImagePromptMeasurement = setImagePromptMeasurementServiceForTests({
+            resolveSettings: async () => ({
+                provider: 'novelai',
+                model: 'nai-diffusion-4-5-full',
+            }),
+            measure: async () => {
+                measurements += 1
+                return {
+                    model: 'nai-diffusion-4-5-full',
+                    tokenizer: 't5-spiece-v1',
+                    positiveTokens: 1,
+                    negativeTokens: 0,
+                    maxPositiveTokens: 512,
+                    maxNegativeTokens: 512,
+                }
+            },
+        })
+        harness.hydrateHook = async (chats, index) => {
+            if (measurements === 2 && !blockedContext) {
+                blockedContext = true
+                contextEntered.resolve()
+                await releaseContext.promise
+            }
+            return chats[index] ?? null
+        }
+
+        await startIllustrationExecutor()
+        await contextEntered.promise
+        const generating = (await illustrationJobStore.getJob(queued.jobId))!
+        expect(generating.state).toBe('generating')
+        await cancelLedger({ jobId: generating.jobId, expectedVersion: generating.version })
+        releaseContext.resolve()
+        await pokeExecutor()
+
+        expect((await illustrationJobStore.getJob(queued.jobId))?.state).toBe('cancelled')
+        expect(harness.provider).not.toHaveBeenCalled()
+    })
+
+    test('stales a byte-identical message-fence edit during the final durable job read', async () => {
+        const { queued, message } = await createQueuedJob()
+        let measurements = 0
+        let postMeasurementJobReads = 0
+        restoreImagePromptMeasurement()
+        restoreImagePromptMeasurement = setImagePromptMeasurementServiceForTests({
+            resolveSettings: async () => ({
+                provider: 'novelai',
+                model: 'nai-diffusion-4-5-full',
+            }),
+            measure: async () => {
+                measurements += 1
+                return {
+                    model: 'nai-diffusion-4-5-full',
+                    tokenizer: 't5-spiece-v1',
+                    positiveTokens: 1,
+                    negativeTokens: 0,
+                    maxPositiveTokens: 512,
+                    maxNegativeTokens: 512,
+                }
+            },
+        })
+        harness.getItemHook = async (key) => {
+            if (measurements !== 2 || !key.startsWith('illustration:v1:job:')) return
+            postMeasurementJobReads += 1
+            if (postMeasurementJobReads === 2) message.chatId = 'replacement-message'
+        }
+
+        await startIllustrationExecutor()
+        await pokeExecutor()
+
+        expect(postMeasurementJobReads).toBeGreaterThanOrEqual(2)
+        expect(await illustrationJobStore.getJob(queued.jobId)).toMatchObject({
+            state: 'stale',
+            error: { code: 'pre_provider_context_changed' },
+        })
+        expect(harness.provider).not.toHaveBeenCalled()
+    })
+
+    test('blocks when settings drift during the post-measurement durable re-read', async () => {
+        const { queued } = await createQueuedJob()
+        let measurements = 0
+        let injectedDrift = false
+        restoreImagePromptMeasurement()
+        restoreImagePromptMeasurement = setImagePromptMeasurementServiceForTests({
+            resolveSettings: async () => ({
+                provider: 'novelai',
+                model: 'nai-diffusion-4-5-full',
+            }),
+            measure: async () => {
+                measurements += 1
+                return {
+                    model: 'nai-diffusion-4-5-full',
+                    tokenizer: 't5-spiece-v1',
+                    positiveTokens: 1,
+                    negativeTokens: 0,
+                    maxPositiveTokens: 512,
+                    maxNegativeTokens: 512,
+                }
+            },
+        })
+        harness.getItemHook = async () => {
+            if (measurements !== 2 || injectedDrift) return
+            injectedDrift = true
+            harness.database.NAIImgConfig.steps = 99
+        }
+
+        await startIllustrationExecutor()
+        await pokeExecutor()
+
+        expect(measurements).toBe(2)
+        expect(injectedDrift).toBe(true)
+        expect(await illustrationJobStore.getJob(queued.jobId)).toMatchObject({
+            state: 'blocked_config',
+            error: { code: 'settings_fingerprint_mismatch' },
+        })
+        expect(harness.provider).not.toHaveBeenCalled()
+    })
+
+    test('lets cancellation win the generating-to-blocked configuration CAS', async () => {
+        const { queued } = await createQueuedJob()
+        let measurements = 0
+        restoreImagePromptMeasurement()
+        restoreImagePromptMeasurement = setImagePromptMeasurementServiceForTests({
+            resolveSettings: async () => ({
+                provider: 'novelai',
+                model: 'nai-diffusion-4-5-full',
+            }),
+            measure: async () => {
+                measurements += 1
+                if (measurements === 2) harness.database.NAIImgConfig.steps = 99
+                return {
+                    model: 'nai-diffusion-4-5-full',
+                    tokenizer: 't5-spiece-v1',
+                    positiveTokens: 1,
+                    negativeTokens: 0,
+                    maxPositiveTokens: 512,
+                    maxNegativeTokens: 512,
+                }
+            },
+        })
+        const originalTransition = illustrationJobStore.transitionJob.bind(illustrationJobStore)
+        let injectedCancellation = false
+        const transitionSpy = vi.spyOn(illustrationJobStore, 'transitionJob').mockImplementation(async (input) => {
+            if (!injectedCancellation && input.to === 'blocked_config') {
+                const snapshot = await illustrationJobStore.getJob(input.jobId)
+                if (snapshot?.state === 'generating') {
+                    injectedCancellation = true
+                    await illustrationJobStore.requestCancel({
+                        jobId: snapshot.jobId,
+                        expectedVersion: snapshot.version,
+                    })
+                }
+            }
+            return await originalTransition(input)
+        })
+
+        try {
+            await startIllustrationExecutor()
+            await pokeExecutor()
+        } finally {
+            transitionSpy.mockRestore()
+        }
+
+        expect(measurements).toBe(2)
+        expect(injectedCancellation).toBe(true)
+        expect((await illustrationJobStore.getJob(queued.jobId))?.state).toBe('cancelled')
+        expect(harness.provider).not.toHaveBeenCalled()
+    })
+
+    // Row 8: physical pre-contract records retain Gate 3/4 block-and-resume behavior.
+    test('keeps a physical legacy flat record resumable across fingerprint drift', async () => {
+        const { queued } = await createQueuedJob()
+        let measurements = 0
+        restoreImagePromptMeasurement()
+        restoreImagePromptMeasurement = setImagePromptMeasurementServiceForTests({
+            resolveSettings: async () => ({
+                provider: 'novelai',
+                model: 'nai-diffusion-4-5-full',
+            }),
+            measure: async () => {
+                measurements += 1
+                throw new Error('A physical legacy job must not require prompt measurement')
+            },
+        })
+        const key = illustrationJobKey(queued.jobId)
+        const legacy = JSON.parse(new TextDecoder().decode(harness.storageMap.get(key)!))
+        legacy.prompt = { positive: 'positive prompt', negative: 'negative prompt' }
+        harness.storageMap.set(key, new TextEncoder().encode(JSON.stringify(legacy)))
         harness.database.NAIImgConfig.steps = 99
 
         await startIllustrationExecutor()
@@ -501,6 +919,7 @@ describe('illustration executor', () => {
         delete harness.database.NAIImgConfig.steps
         await pokeExecutor()
         expect((await illustrationJobStore.getJob(queued.jobId))?.state).toBe('committed')
+        expect(measurements).toBe(0)
         expect(harness.provider).toHaveBeenCalledTimes(1)
     })
 

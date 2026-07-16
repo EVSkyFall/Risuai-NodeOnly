@@ -15,6 +15,10 @@ import {
     IllustrationLedgerVersionConflictError,
 } from './errors'
 import { validateCoordinatorProofUnlocked } from './coordinatorRecord'
+import {
+    isLegacyIllustrationStoredPrompt,
+    parseIllustrationPromptV1,
+} from './imagePrompt'
 import { withIllustrationLedgerLock } from './locks'
 import {
     assertTransition,
@@ -1306,14 +1310,12 @@ export class IllustrationJobStore {
                 next.target = cloneJson(patch.target as IllustrationTargetV1)
             }
             if (hasOwn(patch, 'prompt')) {
-                if (
-                    !patch.prompt ||
-                    typeof patch.prompt.positive !== 'string' ||
-                    typeof patch.prompt.negative !== 'string'
-                ) {
-                    throw new IllustrationLedgerValidationError('patch.prompt must contain string prompts')
+                if (!patch.prompt || isLegacyIllustrationStoredPrompt(patch.prompt)) {
+                    throw new IllustrationLedgerValidationError(
+                        'New durable prompts must use IllustrationPromptV1',
+                    )
                 }
-                next.prompt = cloneJson(patch.prompt)
+                next.prompt = parseIllustrationPromptV1(patch.prompt)
             }
             if (hasOwn(patch, 'settingsFingerprint')) {
                 assertNonEmptyString(patch.settingsFingerprint, 'patch.settingsFingerprint')

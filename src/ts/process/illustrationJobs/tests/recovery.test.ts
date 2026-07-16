@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import type { Chat } from '../../../storage/database.svelte'
+import type { IllustrationPromptV1 } from '../types'
+import { installImagePromptMeasurementTestService } from './imagePromptTestHarness'
 import { InMemoryLockManager } from './inMemoryLockManager'
 
 const harness = vi.hoisted(() => ({
@@ -83,6 +85,7 @@ const { illustrationJobKey, illustrationJobStore } = storeModule
 const BASE_TIME = Date.UTC(2026, 0, 4)
 let lockManager: InMemoryLockManager
 let coordinatorProof: { coordinatorLeaseId: string; coordinatorFence: number }
+let restoreImagePromptMeasurement = () => {}
 
 async function refreshCoordinatorProof(): Promise<void> {
     const snapshot = await claimCoordinator({
@@ -141,7 +144,7 @@ async function createClaimedTurn(source = 'Recovery source') {
     return { ...target, turn, claimed }
 }
 
-async function createQueuedJob(source = 'Recovery source') {
+async function createQueuedJob(source = 'Recovery source', prompt?: IllustrationPromptV1) {
     const target = await createClaimedTurn(source)
     const [projected] = await submitPlanLedger({
         ...coordinatorProof,
@@ -163,16 +166,17 @@ async function createQueuedJob(source = 'Recovery source') {
         expectedVersion: projected.version,
         leaseId: 'tagger',
     })
-    const queued = await supplyPromptLedger({
+    const supplyBase = {
         ...coordinatorProof,
         jobId: projected.jobId,
         expectedVersion: claimedJob.version,
         leaseId: 'tagger',
         fence: claimedJob.fence,
         idempotencyKey: `prompt:${projected.jobId}`,
-        positive: 'prompt',
-        negative: '',
-    })
+    }
+    const queued = prompt
+        ? await supplyPromptLedger({ ...supplyBase, prompt })
+        : await supplyPromptLedger({ ...supplyBase, positive: 'prompt', negative: '' })
     harness.strictSave.mockClear()
     return { ...target, queued }
 }
@@ -295,6 +299,7 @@ beforeEach(async () => {
     harness.strictFailure = null
     harness.storageWriteHook = null
     installDatabase()
+    restoreImagePromptMeasurement = installImagePromptMeasurementTestService(() => harness.database)
     lockManager = new InMemoryLockManager()
     setIllustrationLockManagerAccessorForTests(() => lockManager)
     setIllustrationOperationLockManagerAccessorForTests(() => lockManager)
@@ -320,6 +325,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
+    restoreImagePromptMeasurement()
     expect(harness.provider).not.toHaveBeenCalled()
     resetIllustrationWorkerLockManagerAccessorForTests()
     resetIllustrationLockManagerAccessorForTests()
@@ -404,6 +410,27 @@ describe('illustration recovery', () => {
         await runIllustrationRecovery()
 
         expect((await illustrationJobStore.getJob(queued.jobId))?.state).toBe('queued')
+    })
+
+    // Request §4 row 5: recovery preserves structured caption bytes and order.
+    test('preserves structured prompt parts and identity through recovery reload', async () => {
+        const prompt: IllustrationPromptV1 = {
+            schemaVersion: 1,
+            layout: 'nai-v4-characters',
+            basePositive: 'base\r\npositive',
+            characterPositives: ['source#1 Alice', 'target#2 Bob'],
+            baseNegative: 'base negative',
+            characterNegatives: ['negative Alice', 'negative Bob'],
+        }
+        const { queued } = await createQueuedJob('Recovery structured source', prompt)
+
+        await runIllustrationRecovery()
+
+        expect(await illustrationJobStore.getJob(queued.jobId)).toMatchObject({
+            state: 'queued',
+            prompt,
+            idempotencyKey: queued.idempotencyKey,
+        })
     })
 
     // §12.2 crash after asset bytes: deterministic integrity resumes without a second charge.

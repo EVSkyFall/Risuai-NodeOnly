@@ -1,0 +1,17 @@
+spiece.model — SentencePiece tokenizer model from google-t5/t5-base
+Source: https://huggingface.co/google-t5/t5-base (resolve/main/spiece.model)
+Retrieved: 2026-07-16
+SHA-256: d60acb128cf7b7f2536e8f38a5b18a05535c9e14c7a355904270e15b0945ea86
+Size: 791,656 bytes
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.

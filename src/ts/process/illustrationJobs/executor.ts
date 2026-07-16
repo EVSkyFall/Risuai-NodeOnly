@@ -8,28 +8,43 @@ import {
 import { generateAIImageTyped } from '../stableDiff'
 import { patchSlotInVariant } from './anchors'
 import {
+    isIllustrationJobLiveContextCurrent,
     resolveIllustrationJobContext,
     type IllustrationJobContextResult,
     type IllustrationJobLiveContext,
 } from './coordinator'
 import { findSlotNodes } from './controlNodes'
 import {
+    IllustrationImagePromptContractError,
     IllustrationLedgerHolderMismatchError,
     IllustrationLedgerUnavailableError,
     IllustrationLedgerValidationError,
     IllustrationLedgerVersionConflictError,
 } from './errors'
+import {
+    decodeIllustrationStoredPrompt,
+    isLegacyIllustrationStoredPrompt,
+} from './imagePrompt'
+import { measureAndEnforceImagePromptForDispatch } from './imagePromptMeasurement'
 import { isIllustrationFeatureEnabled, requireIllustrationFeatureEnabled } from './featureFlag'
 import { emitIllustrationWakeHint } from './illustrationEvents'
 import { registerIllustrationExecutorWakeListener } from './executorSignal'
 import {
     ILLUSTRATION_WORKER_LOCK_NAME,
 } from './locks'
-import { computeNaiSettingsFingerprint } from './settingsFingerprint'
+import {
+    canonicalizeNaiSettings,
+    computeNaiSettingsFingerprint,
+    serializeCanonicalNaiSettings,
+} from './settingsFingerprint'
 import { computeSourceRevisionHash, hashesMatch, sha256Hex } from './sourceHash'
 import { isTerminalJobState } from './stateMachine'
 import { illustrationJobStore } from './store'
-import type { IllustrationJobRecordV1, IllustrationJobTransitionPatch } from './types'
+import type {
+    IllustrationJobRecordV1,
+    IllustrationJobTransitionPatch,
+    IllustrationPromptV1,
+} from './types'
 
 export const ILLUSTRATION_EXECUTOR_POLL_MS = 5_000
 export const ILLUSTRATION_IMAGE_DECODE_TIMEOUT_MS = 15_000
@@ -120,7 +135,7 @@ async function cancelExecutorJob(
 
 async function transitionPreDispatchJob(
     snapshot: IllustrationJobRecordV1,
-    to: 'blocked_config' | 'generating' | 'queued',
+    to: 'blocked_config' | 'failed' | 'generating' | 'queued',
     patch: IllustrationJobTransitionPatch,
 ): Promise<IllustrationJobRecordV1 | null> {
     try {
@@ -139,6 +154,139 @@ async function transitionPreDispatchJob(
         if (latest && latest.state !== snapshot.state) return null
         throw error
     }
+}
+
+type ImagePromptGateOutcome =
+    | { ok: true; settingsSnapshot: string }
+    | { ok: false; error: IllustrationImagePromptContractError }
+
+function currentNaiSettingsSnapshot(): string {
+    return serializeCanonicalNaiSettings(canonicalizeNaiSettings(getDatabase()))
+}
+
+type DispatchConfigurationBlockCode = 'settings_fingerprint_mismatch' | 'unsupported_provider'
+
+async function resolveDispatchConfigurationBlock(
+    job: IllustrationJobRecordV1,
+): Promise<DispatchConfigurationBlockCode | null> {
+    const database = getDatabase()
+    const settingsBefore = currentNaiSettingsSnapshot()
+    const fingerprint = await computeNaiSettingsFingerprint(database)
+    const settingsAfter = currentNaiSettingsSnapshot()
+    if (getDatabase().sdProvider !== 'novelai') return 'unsupported_provider'
+    if (settingsBefore !== settingsAfter || fingerprint !== job.settingsFingerprint) {
+        return 'settings_fingerprint_mismatch'
+    }
+    return null
+}
+
+async function settleDispatchConfigurationBlock(
+    job: IllustrationJobRecordV1,
+    epoch: number,
+    code: DispatchConfigurationBlockCode,
+    step: string,
+): Promise<void> {
+    if (job.state !== 'queued' && job.state !== 'generating') return
+    const blocked = await transitionPreDispatchJob(job, 'blocked_config', {
+        idempotencyKey: transitionKey(epoch, job, step),
+        workerEpoch: epoch,
+        error: { code },
+    })
+    if (blocked || job.state !== 'generating') return
+
+    let winner = await illustrationJobStore.getJob(job.jobId)
+    while (
+        winner?.state === 'cancel_requested'
+        && winner.attemptId === job.attemptId
+        && winner.assetId === job.assetId
+    ) {
+        try {
+            await transitionExecutorJob({
+                jobId: winner.jobId,
+                expectedVersion: winner.version,
+                to: 'cancelled',
+                patch: {
+                    idempotencyKey: transitionKey(epoch, winner, 'cancelled-config-race'),
+                    workerEpoch: epoch,
+                    error: null,
+                },
+            })
+            return
+        } catch (error) {
+            if (!(error instanceof IllustrationLedgerVersionConflictError)) throw error
+            winner = await illustrationJobStore.getJob(job.jobId)
+        }
+    }
+}
+
+async function runImagePromptGate(
+    job: IllustrationJobRecordV1,
+    prompt: IllustrationPromptV1,
+): Promise<ImagePromptGateOutcome> {
+    if (!job.settingsFingerprint) {
+        return {
+            ok: false,
+            error: new IllustrationImagePromptContractError(
+                'image_prompt_invalid',
+                'The illustration job has no captured settings fingerprint',
+            ),
+        }
+    }
+    try {
+        const settingsBefore = currentNaiSettingsSnapshot()
+        await measureAndEnforceImagePromptForDispatch({
+            protocolVersion: 1,
+            settingsFingerprint: job.settingsFingerprint,
+            prompt,
+        }, { requireNovelAiProvider: true })
+        const settingsAfter = currentNaiSettingsSnapshot()
+        if (settingsAfter !== settingsBefore) {
+            throw new IllustrationImagePromptContractError(
+                'settings_fingerprint_mismatch',
+                'The image settings changed while the prompt dispatch gate was running',
+            )
+        }
+        return { ok: true, settingsSnapshot: settingsAfter }
+    } catch (error) {
+        if (!(error instanceof IllustrationImagePromptContractError)) throw error
+        return { ok: false, error }
+    }
+}
+
+function imagePromptRecordError(error: IllustrationImagePromptContractError) {
+    return {
+        code: error.code,
+        retryable: false,
+        ...(error.payload ? { payload: { ...error.payload } } : {}),
+    }
+}
+
+async function settleImagePromptGateFailure(
+    job: IllustrationJobRecordV1,
+    epoch: number,
+    error: IllustrationImagePromptContractError,
+    step: string,
+): Promise<void> {
+    if (error.code === 'settings_fingerprint_mismatch') {
+        await settleDispatchConfigurationBlock(job, epoch, error.code, step)
+        return
+    }
+    const patch: IllustrationJobTransitionPatch = {
+        idempotencyKey: transitionKey(epoch, job, step),
+        workerEpoch: epoch,
+        error: imagePromptRecordError(error),
+    }
+    if (job.state === 'queued') {
+        await transitionPreDispatchJob(job, 'failed', patch)
+        return
+    }
+    if (job.state !== 'generating') return
+    await transitionExecutorJob({
+        jobId: job.jobId,
+        expectedVersion: job.version,
+        to: 'failed',
+        patch,
+    })
 }
 
 async function settleContextFailure(
@@ -469,21 +617,51 @@ export async function commitIllustrationAssetReadyJob(
 
 async function processQueuedJob(job: IllustrationJobRecordV1, epoch: number): Promise<void> {
     if (!(await isIllustrationFeatureEnabled())) return
-    const context = await resolveIllustrationJobContext(job)
+    let context = await resolveIllustrationJobContext(job)
     if (context.kind !== 'valid') {
         await settleContextFailure(job, context, epoch)
         return
     }
 
-    const database = getDatabase()
-    const fingerprint = await computeNaiSettingsFingerprint(database)
-    if (database.sdProvider !== 'novelai' || fingerprint !== job.settingsFingerprint) {
-        await transitionPreDispatchJob(job, 'blocked_config', {
-            idempotencyKey: transitionKey(epoch, job, 'blocked-config'),
-            workerEpoch: epoch,
-            error: { code: database.sdProvider === 'novelai' ? 'settings_fingerprint_mismatch' : 'unsupported_provider' },
-        })
+    const physicalLegacyPrompt = isLegacyIllustrationStoredPrompt(job.prompt)
+    let dispatchPrompt: IllustrationPromptV1
+    try {
+        dispatchPrompt = decodeIllustrationStoredPrompt(job.prompt)
+    } catch (error) {
+        if (!(error instanceof IllustrationImagePromptContractError)) throw error
+        await settleImagePromptGateFailure(job, epoch, error, 'prompt-invalid')
         return
+    }
+
+    // §10.2 configuration recovery precedes the additive measurement contract
+    // for both structured and physical legacy records.
+    const configurationBlock = await resolveDispatchConfigurationBlock(job)
+    if (configurationBlock) {
+        await settleDispatchConfigurationBlock(job, epoch, configurationBlock, 'blocked-config')
+        return
+    }
+
+    if (!physicalLegacyPrompt) {
+        // Cold-load while queued. A crash here cannot be mistaken for an
+        // ambiguous provider dispatch during recovery.
+        const coldGate = await runImagePromptGate(job, dispatchPrompt)
+        const latest = await illustrationJobStore.getJob(job.jobId)
+        if (!latest || latest.state !== 'queued') return
+        context = await resolveIllustrationJobContext(latest)
+        if (context.kind !== 'valid') {
+            await settleContextFailure(latest, context, epoch)
+            return
+        }
+        if (coldGate.ok === false) {
+            await settleImagePromptGateFailure(
+                latest,
+                epoch,
+                coldGate.error,
+                `prompt-contract-${coldGate.error.code}`,
+            )
+            return
+        }
+        job = latest
     }
 
     const attemptId = job.attemptId ?? freshAttemptId()
@@ -515,7 +693,7 @@ async function processQueuedJob(job: IllustrationJobRecordV1, epoch: number): Pr
         return
     }
     if (dispatchRecord.state !== 'generating') return
-    const dispatchContext = await resolveIllustrationJobContext(dispatchRecord)
+    let dispatchContext = await resolveIllustrationJobContext(dispatchRecord)
     if (dispatchContext.kind !== 'valid') {
         if (dispatchContext.kind === 'stale') {
             await settleContextFailure(dispatchRecord, dispatchContext, epoch)
@@ -535,13 +713,93 @@ async function processQueuedJob(job: IllustrationJobRecordV1, epoch: number): Pr
     }
     generating = dispatchRecord
 
+    if (!physicalLegacyPrompt) {
+        // The queued pass loads the tokenizer safely; this cached pass repeats
+        // the exact measurement after entering the provider-intent state.
+        const finalGate = await runImagePromptGate(generating, dispatchPrompt)
+        const finalContext = await resolveIllustrationJobContext(generating)
+        const finalLatest = await illustrationJobStore.getJob(generating.jobId)
+        if (!finalLatest) return
+        if (finalLatest.state === 'cancel_requested') {
+            await transitionExecutorJob({
+                jobId: finalLatest.jobId,
+                expectedVersion: finalLatest.version,
+                to: 'cancelled',
+                patch: {
+                    idempotencyKey: transitionKey(epoch, finalLatest, 'cancelled-final-measurement'),
+                    workerEpoch: epoch,
+                    error: null,
+                },
+            })
+            return
+        }
+        if (finalLatest.state !== 'generating') return
+        if (finalContext.kind !== 'valid') {
+            if (finalContext.kind === 'stale') {
+                await settleContextFailure(finalLatest, finalContext, epoch)
+            } else {
+                await transitionExecutorJob({
+                    jobId: finalLatest.jobId,
+                    expectedVersion: finalLatest.version,
+                    to: 'stale',
+                    patch: {
+                        idempotencyKey: transitionKey(epoch, finalLatest, 'final-pre-provider-corrupt'),
+                        workerEpoch: epoch,
+                        error: { code: `pre_provider_${finalContext.reason}` },
+                    },
+                })
+            }
+            return
+        }
+        if (!isIllustrationJobLiveContextCurrent(finalLatest, finalContext)) {
+            await transitionExecutorJob({
+                jobId: finalLatest.jobId,
+                expectedVersion: finalLatest.version,
+                to: 'stale',
+                patch: {
+                    idempotencyKey: transitionKey(epoch, finalLatest, 'final-context-changed'),
+                    workerEpoch: epoch,
+                    error: { code: 'pre_provider_context_changed' },
+                },
+            })
+            return
+        }
+        if (finalGate.ok === false) {
+            await settleImagePromptGateFailure(
+                finalLatest,
+                epoch,
+                finalGate.error,
+                `prompt-contract-final-${finalGate.error.code}`,
+            )
+            return
+        }
+        if (currentNaiSettingsSnapshot() !== finalGate.settingsSnapshot) {
+            await settleImagePromptGateFailure(
+                finalLatest,
+                epoch,
+                new IllustrationImagePromptContractError(
+                    'settings_fingerprint_mismatch',
+                    'The image settings changed after the final prompt measurement',
+                ),
+                'prompt-contract-final-settings-drift',
+            )
+            return
+        }
+        generating = finalLatest
+        dispatchContext = finalContext
+
+        // Measurement, hydration, and the final durable read are all async.
+        // Cancellation and context guards win their races before contract
+        // settlement; the synchronous settings guard then closes the last gap.
+    }
+
     const attempt = await generateAIImageTyped(
-        generating.prompt!.positive,
+        dispatchPrompt.basePositive,
         dispatchContext.character,
-        generating.prompt!.negative,
+        dispatchPrompt.baseNegative,
         'inlay',
         'background',
-        { preservePromptText: true },
+        { preservePromptText: true, illustrationPrompt: dispatchPrompt },
     )
     if (attempt.result.ok === false) {
         await transitionProviderFailure(job.jobId, epoch, attempt.result.certainty)

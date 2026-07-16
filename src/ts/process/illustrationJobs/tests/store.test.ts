@@ -87,6 +87,17 @@ const {
 const store = new IllustrationJobStore()
 const BASE_TIME = Date.UTC(2026, 0, 1)
 let transitionSequence = 0
+
+function flatPrompt(positive: string, negative: string) {
+    return {
+        schemaVersion: 1 as const,
+        layout: 'flat' as const,
+        basePositive: positive,
+        characterPositives: [],
+        baseNegative: negative,
+        characterNegatives: [],
+    }
+}
 let lockManager: InMemoryLockManager
 let coordinatorProof: IllustrationCoordinatorProof
 let coordinatorVersion: number
@@ -225,7 +236,7 @@ async function queueJob(jobId: string): Promise<IllustrationJobRecordV1> {
         ...coordinatorProof,
         patch: {
             idempotencyKey: `supply:${jobId}:${++transitionSequence}`,
-            prompt: { positive: `positive:${jobId}`, negative: `negative:${jobId}` },
+            prompt: flatPrompt(`positive:${jobId}`, `negative:${jobId}`),
         },
     })
 }
@@ -696,7 +707,7 @@ describe('lease lifecycle and holder writes', () => {
         })
         const patch = {
             idempotencyKey: 'supply:holder-replay-expired',
-            prompt: { positive: 'positive', negative: 'negative' },
+            prompt: flatPrompt('positive', 'negative'),
         }
         const queued = await store.transitionJob({
             ...coordinatorProof,
@@ -799,7 +810,7 @@ describe('lease lifecycle and holder writes', () => {
             fence: claimed.fence,
             patch: {
                 idempotencyKey: 'supply-once',
-                prompt: { positive: 'positive', negative: 'negative' },
+                prompt: flatPrompt('positive', 'negative'),
             },
         }
         const written = await store.transitionJob(input)
@@ -820,7 +831,7 @@ describe('lease lifecycle and holder writes', () => {
                 ...input,
                 patch: {
                     ...input.patch,
-                    prompt: { positive: 'different', negative: 'negative' },
+                    prompt: flatPrompt('different', 'negative'),
                 },
             }),
         ).rejects.toBeInstanceOf(IllustrationLedgerCorruptError)
@@ -1343,7 +1354,7 @@ describe('manual uncertain retry', () => {
             fence: claimed.fence,
             patch: {
                 idempotencyKey: 'retry:spoof',
-                prompt: { positive: 'positive', negative: 'negative' },
+                prompt: flatPrompt('positive', 'negative'),
             },
         })
         await expect(
@@ -1713,7 +1724,7 @@ describe('atomic coordinator proof on plugin Agent writes', () => {
                     fence: promptClaimed.fence,
                     patch: {
                         idempotencyKey: `prompt:${prefix}:proof`,
-                        prompt: { positive: 'positive', negative: 'negative' },
+                        prompt: flatPrompt('positive', 'negative'),
                     },
                 }),
                 read: async () => await store.getJob(promptPrepared.jobId),
@@ -1742,7 +1753,7 @@ describe('atomic coordinator proof on plugin Agent writes', () => {
             to: 'queued',
             patch: {
                 idempotencyKey: 'prompt:missing-proof',
-                prompt: { positive: 'positive', negative: 'negative' },
+                prompt: flatPrompt('positive', 'negative'),
             },
         })).rejects.toBeInstanceOf(IllustrationLedgerHolderMismatchError)
         expect(await store.getJob(prepared.jobId)).toEqual(awaiting)

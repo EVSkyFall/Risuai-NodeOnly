@@ -505,7 +505,14 @@ describe('Agent failure ledger operations', () => {
             fence: reclaimed.fence,
             patch: {
                 idempotencyKey: 'prompt:success',
-                prompt: { positive: 'positive', negative: 'negative' },
+                prompt: {
+                    schemaVersion: 1,
+                    layout: 'flat',
+                    basePositive: 'positive',
+                    characterPositives: [],
+                    baseNegative: 'negative',
+                    characterNegatives: [],
+                },
             },
         })
         expect(queued).toMatchObject({ state: 'queued', agentAttemptCount: 0 })

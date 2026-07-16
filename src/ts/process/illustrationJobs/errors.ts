@@ -1,3 +1,5 @@
+import type { IllustrationImagePromptOverLimitPayloadV1 } from './types'
+
 export class IllustrationLedgerError extends Error {
     readonly code: string
 
@@ -5,6 +7,26 @@ export class IllustrationLedgerError extends Error {
         super(message)
         this.name = new.target.name
         this.code = code
+    }
+}
+
+export type IllustrationImagePromptErrorCode =
+    | 'image_prompt_over_limit'
+    | 'image_tokenizer_unavailable'
+    | 'image_prompt_measurement_unsupported'
+    | 'image_prompt_invalid'
+    | 'settings_fingerprint_mismatch'
+
+export class IllustrationImagePromptContractError extends IllustrationLedgerError {
+    readonly payload?: IllustrationImagePromptOverLimitPayloadV1
+
+    constructor(
+        code: IllustrationImagePromptErrorCode,
+        message: string,
+        payload?: IllustrationImagePromptOverLimitPayloadV1,
+    ) {
+        super(code, message)
+        this.payload = payload
     }
 }
 

@@ -33,6 +33,42 @@ export type IllustrationTargetV1 = {
     sourceRevisionHash: string
 }
 
+export type IllustrationPromptV1 = {
+    schemaVersion: 1
+    layout: 'flat' | 'nai-v4-characters'
+    basePositive: string
+    characterPositives: string[]
+    baseNegative: string
+    characterNegatives: string[]
+}
+
+export type LegacyIllustrationJobPromptV1 = {
+    positive: string
+    negative: string
+}
+
+export type IllustrationStoredPromptV1 =
+    | IllustrationPromptV1
+    | LegacyIllustrationJobPromptV1
+
+export type IllustrationImagePromptMeasurementV1 = {
+    model: string
+    tokenizer: 't5-spiece-v1'
+    positiveTokens: number
+    negativeTokens: number
+    maxPositiveTokens: number
+    maxNegativeTokens: number
+}
+
+export type IllustrationImagePromptOverLimitPayloadV1 = Pick<
+    IllustrationImagePromptMeasurementV1,
+    | 'positiveTokens'
+    | 'negativeTokens'
+    | 'maxPositiveTokens'
+    | 'maxNegativeTokens'
+    | 'model'
+>
+
 export type IllustrationJobState =
     | 'prepared'
     | 'awaiting_prompt'
@@ -78,6 +114,7 @@ export type IllustrationRecordErrorV1 = {
     certainty?: 'definite' | 'uncertain'
     message?: string
     retryable?: boolean
+    payload?: IllustrationImagePromptOverLimitPayloadV1
 }
 
 export type IllustrationAgentFailureReceiptV1 = {
@@ -128,11 +165,6 @@ export type IllustrationTurnRecordV1 = IllustrationLeaseRecordFields & {
     lastPlanClosureWrite?: IllustrationPlanClosureReceiptV1
 }
 
-export type IllustrationJobPromptV1 = {
-    positive: string
-    negative: string
-}
-
 export type IllustrationJobRecordV1 = IllustrationLeaseRecordFields & {
     schemaVersion: 1
     turnId: string
@@ -157,7 +189,7 @@ export type IllustrationJobRecordV1 = IllustrationLeaseRecordFields & {
         assetId: string
     }
     target?: IllustrationTargetV1
-    prompt?: IllustrationJobPromptV1
+    prompt?: IllustrationStoredPromptV1
     settingsFingerprint?: string
     attemptId?: string
     assetId?: string
@@ -185,7 +217,7 @@ export type IllustrationJobTransitionPatch = {
     idempotencyKey?: string
     workerEpoch?: number
     target?: IllustrationTargetV1
-    prompt?: IllustrationJobPromptV1
+    prompt?: IllustrationStoredPromptV1
     settingsFingerprint?: string
     attemptId?: string
     assetId?: string

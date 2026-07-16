@@ -31,11 +31,19 @@ export const JOB_TRANSITIONS: Readonly<Record<IllustrationJobState, readonly Ill
     queued: [
         'generating',
         'blocked_config',
+        'failed', // Image prompt contract rejection before provider dispatch.
         'cancelled',
         'stale',
         'corrupt', // §7.3 / §8.2: broken projection or duplicate anchor before dispatch.
     ],
-    generating: ['asset_writing', 'failed', 'stale', 'uncertain', 'cancel_requested'],
+    generating: [
+        'asset_writing',
+        'blocked_config', // Only before provider dispatch when configuration drift is detected.
+        'failed',
+        'stale',
+        'uncertain',
+        'cancel_requested',
+    ],
     cancel_requested: ['asset_writing', 'failed', 'uncertain', 'cancelled'],
     blocked_config: [
         'queued',

@@ -20,6 +20,12 @@ function canonicalJson(value: unknown): string {
         .join(',')}}`
 }
 
+export type CanonicalNaiSettings = ReturnType<typeof canonicalizeNaiSettings>
+
+export function serializeCanonicalNaiSettings(settings: CanonicalNaiSettings): string {
+    return canonicalJson(settings)
+}
+
 function fallbackVibeModel(model: string): string {
     if (model.includes('nai-diffusion-4-full')) return 'v4full'
     if (model.includes('nai-diffusion-4-curated')) return 'v4curated'
@@ -127,5 +133,11 @@ export function canonicalizeNaiSettings(db: NaiSettingsFingerprintDatabase) {
 }
 
 export async function computeNaiSettingsFingerprint(db: NaiSettingsFingerprintDatabase): Promise<string> {
-    return sha256Hex(canonicalJson(canonicalizeNaiSettings(db)))
+    return computeCanonicalNaiSettingsFingerprint(canonicalizeNaiSettings(db))
+}
+
+export async function computeCanonicalNaiSettingsFingerprint(
+    settings: CanonicalNaiSettings,
+): Promise<string> {
+    return sha256Hex(serializeCanonicalNaiSettings(settings))
 }

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import type { Chat } from '../../../../storage/database.svelte'
+import { installImagePromptMeasurementTestService } from '../imagePromptTestHarness'
 import { InMemoryLockManager } from '../inMemoryLockManager'
 import {
     PRODUCTION_JOB_ID_RE,
@@ -142,6 +143,7 @@ const AUTH = Object.freeze({
 let lockManager: InMemoryLockManager
 let runtimeSequence = 0
 let bridges: Bridge[] = []
+let restoreImagePromptMeasurement = () => {}
 
 function deferred<T>() {
     let resolve!: (value: T | PromiseLike<T>) => void
@@ -330,6 +332,7 @@ beforeEach(async () => {
     harness.finalCoordinatorReleaseWrites = 0
     bridges = []
     installDatabase('Acceptance default source')
+    restoreImagePromptMeasurement = installImagePromptMeasurementTestService(() => harness.database)
     lockManager = new InMemoryLockManager()
     setIllustrationLockManagerAccessorForTests(() => lockManager)
     setIllustrationOperationLockManagerAccessorForTests(() => lockManager)
@@ -362,6 +365,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
+    restoreImagePromptMeasurement()
     await stopIllustrationExecutor()
     for (const bridge of bridges.reverse()) {
         await bridge.unload().catch(() => undefined)

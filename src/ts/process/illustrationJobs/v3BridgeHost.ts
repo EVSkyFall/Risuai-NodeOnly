@@ -25,6 +25,7 @@ import {
 import { IllustrationLedgerValidationError } from './errors'
 import { isIllustrationFeatureEnabled } from './featureFlag'
 import { subscribeIllustrationWakeHints } from './illustrationEvents'
+import { measureImagePrompt } from './imagePromptMeasurement'
 import { projectFullJobSnapshot } from './store'
 import type { IllustrationJobRecordV1 } from './types'
 import {
@@ -65,6 +66,7 @@ const bridgeDependencies: IllustrationV3BridgeDependencies = {
     supplyPrompt: async (input) => await supplyPromptLedger(
         input as Parameters<typeof supplyPromptLedger>[0],
     ),
+    measureImagePrompt: async (input) => await measureImagePrompt(input),
     cancelJob: cancelLedger,
     cancelTurn: cancelTurnLedger,
     retryUncertain: async (input) => await retryUncertainLedger(
