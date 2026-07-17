@@ -15,11 +15,11 @@ export const PRODUCTION_SLOT_TOKEN_RE = /^[0-9a-f]{32}$/
 
 export const PRODUCTION_PLUGIN = Object.freeze({
     name: 'lb_xnai_agent',
-    // 0.2.0 post-contract release bundle (222,921 bytes) — kept as the rollback window.
-    scriptSha256: '367cfd2ce589de20568b9633383e9a10ab60fdaa8a0a33048ad91ef8acfa26ad',
-    // 0.2.1 UI hotfix release bundle (225,493 bytes) — digest independently recomputed
-    // from the root and dist bundles on 2026-07-17 during the hotfix repin request.
-    scriptSha256Next: 'e5c096feb70b063543464cb0976c7cc1fe06d537850aa61a642d5a86e08f1479',
+    // 0.2.1 UI hotfix release bundle (225,493 bytes) — kept as the rollback window.
+    scriptSha256: 'e5c096feb70b063543464cb0976c7cc1fe06d537850aa61a642d5a86e08f1479',
+    // 0.2.2 role-compat recovery release bundle (239,175 bytes) — digest independently
+    // recomputed from the root and dist bundles on 2026-07-18 during the repin request.
+    scriptSha256Next: '2c1af1a7032999b9f0bad10d50fb6b80006bf1eb4e859d8deb987629eb4896f9',
 })
 
 // Digests that must NEVER authorize: releases removed from the rotation window,
@@ -38,6 +38,9 @@ export const REJECTED_PLUGIN_SHA256S = Object.freeze([
     // after the Event.currentTarget lifetime post-review).
     'db61c5961d950d2f9daea8417da0e6ed6e1ca81998d15f4e9786fdda50282e8b',
     '82f1b65d7f2c2ec99608b8ba0f62c00e79e668452dfc75d838afa71f18939deb',
+    // 0.2.0 post-contract release (222,921 bytes), removed from the window in the
+    // 0.2.2 role-compat recovery rotation.
+    '367cfd2ce589de20568b9633383e9a10ab60fdaa8a0a33048ad91ef8acfa26ad',
 ])
 
 export type JobStateAcceptanceClassification = Readonly<{

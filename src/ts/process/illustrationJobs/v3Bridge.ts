@@ -11,15 +11,15 @@ export const RISU_ILLUSTRATION_AGENT_LLM_TIMEOUT_MS = 240_000
 type PinnedDigestRotation = readonly [string] | readonly [string, string]
 
 // Rotation may temporarily contain the old and new production digests, never more than two.
-// [0] = 0.2.0 post-contract (222,921 bytes; rollback window), [1] = 0.2.1 UI hotfix
-// (225,493 bytes; digest independently recomputed from the root and dist bundles on
-// 2026-07-17 per REQUEST_RISU_ILLUSTRATION_AGENT_CORE_REPIN_0.2.1_UI_HOTFIX). Retired
-// releases, the discarded pre-contract 0.2.0 snapshot, and the two discarded 0.2.1
-// interim drafts must never re-enter (regressions in tests/acceptance/sharedFixtures.ts).
-// Converge to a 0.2.1-only pin in a follow-up change once the rollout is confirmed.
+// [0] = 0.2.1 UI hotfix (225,493 bytes; rollback window), [1] = 0.2.2 role-compat
+// recovery (239,175 bytes; digest independently recomputed from the root and dist
+// bundles on 2026-07-18 per REQUEST_RISU_ILLUSTRATION_AGENT_CORE_REPIN_0.2.2
+// _ROLE_COMPAT_RECOVERY). Retired releases, the discarded pre-contract 0.2.0 snapshot,
+// and the discarded interim drafts must never re-enter (regressions in
+// tests/acceptance/sharedFixtures.ts). Converge to a single pin once rollout confirms.
 export const PINNED_ILLUSTRATION_PLUGIN_DIGESTS = Object.freeze([
-    '367cfd2ce589de20568b9633383e9a10ab60fdaa8a0a33048ad91ef8acfa26ad',
     'e5c096feb70b063543464cb0976c7cc1fe06d537850aa61a642d5a86e08f1479',
+    '2c1af1a7032999b9f0bad10d50fb6b80006bf1eb4e859d8deb987629eb4896f9',
 ] as const satisfies PinnedDigestRotation)
 
 export type IllustrationV3AuthorizationInput = {
