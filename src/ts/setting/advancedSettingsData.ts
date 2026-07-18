@@ -172,6 +172,10 @@ export const advancedSettingsItems: SettingItem[] = [
         id: 'adv.promptTextInfo', type: 'check', labelKey: 'promptTextInfoInsideChat', bindKey: 'promptTextInfoInsideChat',
         condition: (ctx) => ctx.db.promptInfoInsideChat, helpKey: 'promptTextInfoInsideChat', classes: 'mt-4'
     },
+    {
+        id: 'adv.serverSideRequests', type: 'check', labelKey: 'nodeOnlyServerSideRequests', bindKey: 'nodeOnlyServerSideRequests',
+        helpKey: 'nodeOnlyServerSideRequests', showExperimental: true, classes: 'mt-4'
+    },
     // Remote saving removed — incompatible with NodeOnly server
 
     // Dynamic Assets & Others

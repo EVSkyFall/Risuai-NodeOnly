@@ -281,6 +281,7 @@ export const helpEn = {
             "The number of recent chat messages used as the query for similarity search. " +
             "Higher values use more chat context to determine similarity.",
         nodeOnlyScrollButtonType: "How the chat scroll buttons are shown. 4 Buttons adds jump-to-top and jump-to-bottom controls; 2 Buttons keeps only previous/next message navigation; Off hides them.",
+        nodeOnlyServerSideRequests: "The server sends model preset requests on your behalf and preserves the response — generation keeps going even if the screen turns off or the connection drops, and it is recovered automatically when you return. Experimental feature.",
         confirmReroll: "Ask for confirmation before regenerating a message.",
         sendWithEnter: "Send the message with Enter.",
         sendKeyPC: "Which key sends a message on desktop.",

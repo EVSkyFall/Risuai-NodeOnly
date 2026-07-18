@@ -48,6 +48,7 @@ export const languageKorean = {
     chatGuardPersistTitle: "기존 채팅 데이터 보호를 위해 저장을 중단했어요",
     chatGuardPersistDesc:
       "서버에서 손상된 채팅 구조를 감지하여 디스크 기록을 거부했어요. 최근 변경사항이 아직 디스크에 반영되지 않았을 수 있으니 새로고침 전에 다시 확인해주세요. 기존 데이터는 안전합니다.",
+    backgroundGenerationFailed: "백그라운드 생성 실패 ({char}): {error}",
   },
   showHelp: "도움말 보기",
   help: helpKo,
@@ -1935,6 +1936,7 @@ export const languageKorean = {
   scrollButtonTypeFour: "4버튼",
   scrollButtonTypeTwo: "2버튼",
   scrollButtonTypeOff: "사용 안 함",
+  nodeOnlyServerSideRequests: "서버 사이드 요청",
   // 원격 접속 (Cloudflare Quick Tunnel)
   remoteAccess: "원격 접속",
   remoteAccessDesc:
@@ -2302,6 +2304,7 @@ export const languageKorean = {
     responding: "응답 중…",
     retrying: "재시도 중…",
     stalled: "멈춤…",
+    background: "백그라운드 진행 중…",
     done: "완료",
     failed: "실패",
     aborted: "취소됨",
