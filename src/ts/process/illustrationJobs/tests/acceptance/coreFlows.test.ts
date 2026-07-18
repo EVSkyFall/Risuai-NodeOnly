@@ -87,6 +87,7 @@ vi.mock('src/ts/process/request/request', () => ({
 
 const coordinatorModule = await import('../../coordinator')
 const coordinatorRecordModule = await import('../../coordinatorRecord')
+const capturePolicyModule = await import('../../capturePolicy')
 const executorModule = await import('../../executor')
 const featureModule = await import('../../featureFlag')
 const lockModule = await import('../../locks')
@@ -98,6 +99,7 @@ const v3BridgeHostModule = await import('../../v3BridgeHost')
 
 const { registerTrustedTurn } = coordinatorModule
 const { getCoordinatorRecord } = coordinatorRecordModule
+const { writeDurableCaptureMode } = capturePolicyModule
 const {
     deriveIllustrationAssetId,
     pokeExecutor,
@@ -348,6 +350,10 @@ beforeEach(async () => {
     setIllustrationOperationLockManagerAccessorForTests(() => lockManager)
     setIllustrationWorkerLockManagerAccessorForTests(() => lockManager)
     await setIllustrationFeatureEnabled(true)
+    // The one finalizeIllustrationRootTurn (automatic-seam) flow in this suite needs
+    // the durable policy on 'automatic'; the registerTrustedTurn-direct flows do not
+    // enforce the mode, so this is a no-op for them.
+    await writeDurableCaptureMode('automatic')
     harness.provider.mockResolvedValue({
         result: {
             ok: true,

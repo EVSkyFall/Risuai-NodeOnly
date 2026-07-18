@@ -3,11 +3,16 @@ import type { Chat, Message } from '../../../storage/database.svelte'
 
 const harness = vi.hoisted(() => ({
     featureEnabled: vi.fn(),
+    captureAdmitted: vi.fn(),
     registerTrustedTurn: vi.fn(),
 }))
 
 vi.mock('../featureFlag', () => ({
     isIllustrationFeatureEnabled: harness.featureEnabled,
+}))
+
+vi.mock('../capturePolicy', () => ({
+    isAutomaticCaptureAdmitted: harness.captureAdmitted,
 }))
 
 vi.mock('../coordinator', () => ({
@@ -21,8 +26,10 @@ let finalizeIllustrationRootTurn: TerminalCaptureModule['finalizeIllustrationRoo
 beforeEach(async () => {
     vi.resetModules()
     harness.featureEnabled.mockReset()
+    harness.captureAdmitted.mockReset()
     harness.registerTrustedTurn.mockReset()
     harness.featureEnabled.mockResolvedValue(true)
+    harness.captureAdmitted.mockResolvedValue(true)
     harness.registerTrustedTurn.mockResolvedValue({})
     ;({ finalizeIllustrationRootTurn } = await import('../terminalCapture'))
 })
@@ -95,6 +102,8 @@ describe('terminal illustration capture', () => {
             expectedMessageId: 'message-1',
             rootTurnId: 'root-turn-1',
             sourceVariantText: 'Original final text.',
+            origin: 'automatic',
+            enforceCaptureMode: true,
         })
 
         finalizeIllustrationRootTurn(context)
@@ -105,6 +114,31 @@ describe('terminal illustration capture', () => {
         finalizeIllustrationRootTurn(context)
         await Promise.resolve()
         expect(harness.registerTrustedTurn).toHaveBeenCalledTimes(1)
+    })
+
+    test('manual capture mode suppresses the automatic path with no ID mint or registration', async () => {
+        harness.captureAdmitted.mockResolvedValue(false)
+        const { context, chat, message } = normalContext()
+
+        finalizeIllustrationRootTurn(context)
+        await vi.waitFor(() => expect(harness.captureAdmitted).toHaveBeenCalledTimes(1))
+        await Promise.resolve()
+
+        expect(harness.registerTrustedTurn).not.toHaveBeenCalled()
+        expect(chat.id).toBeUndefined()
+        expect(message.chatId).toBeUndefined()
+    })
+
+    test('does not consult the capture policy once the feature is off', async () => {
+        harness.featureEnabled.mockResolvedValue(false)
+        const { context } = normalContext()
+
+        finalizeIllustrationRootTurn(context)
+        await vi.waitFor(() => expect(harness.featureEnabled).toHaveBeenCalledTimes(1))
+        await Promise.resolve()
+
+        expect(harness.captureAdmitted).not.toHaveBeenCalled()
+        expect(harness.registerTrustedTurn).not.toHaveBeenCalled()
     })
 
     test('feature OFF has no registration or ID-minting side effects', async () => {

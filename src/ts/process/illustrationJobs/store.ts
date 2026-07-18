@@ -26,8 +26,10 @@ import {
     isPrunableJobState,
     isPrunableTurnState,
     isTerminalJobState,
+    isTerminalTurnState,
 } from './stateMachine'
 import type {
+    IllustrationCaptureOrigin,
     IllustrationHolderWrite,
     IllustrationCoordinatorProof,
     IllustrationJobFullSnapshotV1,
@@ -52,6 +54,19 @@ export const ILLUSTRATION_MANIFEST_PREFIX = 'illustration:v1:manifest:'
 export const ILLUSTRATION_JOB_PREFIX = 'illustration:v1:job:'
 export const ILLUSTRATION_TURN_JOBS_PREFIX = 'illustration:v1:turnjobs:'
 export const ILLUSTRATION_WORKER_EPOCH_KEY = 'illustration:v1:workerEpoch'
+// Durable pending-turn index: the set of non-terminal turn IDs. `listPendingTurns`
+// reads this and bulk-reads only those records, so the pending-listing cost stays
+// proportional to in-flight turns instead of O(total accumulated turn history).
+export const ILLUSTRATION_PENDING_TURNS_KEY = 'illustration:v1:pendingTurns'
+
+// The listing subset of pending turn states (a subset of the full non-terminal set
+// that the index tracks). Prepared/blocked_capture/awaiting_prompt turns stay in
+// the index — they are in-flight, not terminal — but are not surfaced as pending.
+const PENDING_TURN_LISTING_STATES: readonly IllustrationTurnState[] = [
+    'awaiting_plan',
+    'agent_blocked_retryable',
+    'agent_blocked',
+]
 
 export const MAX_JOBS_PER_TURN = 15
 export const MAX_SCENE_PAYLOAD_BYTES = 16 * 1024
@@ -78,6 +93,7 @@ export type CreateTurnInput = {
     turnId: string
     idempotencyKey: string
     workerEpoch?: number
+    origin?: IllustrationCaptureOrigin
     target?: IllustrationTurnTargetV1
     sourceTextUtf16?: string
     sourceRevisionHash?: string
@@ -377,6 +393,7 @@ export function projectTurnSnapshot(
         turnId: record.turnId,
         version: record.version,
         state: record.state,
+        origin: record.origin ?? 'automatic',
         ...(record.leaseId === null ? {} : {
             lease: {
                 expiresAt: record.leaseExpiresAt,
@@ -552,6 +569,7 @@ function turnMatchesCreateInput(record: IllustrationTurnRecordV1, input: CreateT
         record.turnId === input.turnId &&
         record.idempotencyKey === input.idempotencyKey &&
         record.workerEpoch === (input.workerEpoch ?? 0) &&
+        record.origin === input.origin &&
         jsonValuesEqual(record.target, input.target) &&
         record.sourceTextUtf16 === input.sourceTextUtf16 &&
         record.sourceRevisionHash === input.sourceRevisionHash &&
@@ -722,6 +740,61 @@ export class IllustrationJobStore {
             })
     }
 
+    private async readPendingIndexUnlocked(): Promise<string[] | null> {
+        let raw: unknown
+        try {
+            raw = await readPersistentJson<unknown>(ILLUSTRATION_PENDING_TURNS_KEY)
+        } catch {
+            // Corrupt index bytes: report as missing so the caller rebuilds from
+            // the authoritative turn scan rather than fabricating a listing.
+            return null
+        }
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+        const parsed = raw as { schemaVersion?: unknown; turnIds?: unknown }
+        if (parsed.schemaVersion !== 1 || !Array.isArray(parsed.turnIds)) return null
+        if (!parsed.turnIds.every((id) => typeof id === 'string' && id.length > 0)) return null
+        return [...new Set(parsed.turnIds as string[])]
+    }
+
+    private async writePendingIndexUnlocked(turnIds: readonly string[]): Promise<void> {
+        const unique = [...new Set(turnIds)].sort()
+        await writePersistentJson(ILLUSTRATION_PENDING_TURNS_KEY, { schemaVersion: 1, turnIds: unique })
+    }
+
+    private async rebuildPendingIndexUnlocked(): Promise<string[]> {
+        const keys = await listPersistentKeys(ILLUSTRATION_TURN_PREFIX)
+        const records = await readManyPersistentJson<IllustrationTurnRecordV1>(keys)
+        const turnIds = records
+            .filter((record): record is IllustrationTurnRecordV1 =>
+                record !== null && !isTerminalTurnState(record.state))
+            .map((record) => record.turnId)
+        const unique = [...new Set(turnIds)].sort()
+        await this.writePendingIndexUnlocked(unique)
+        return unique
+    }
+
+    private async ensurePendingIndexUnlocked(): Promise<string[]> {
+        return (await this.readPendingIndexUnlocked()) ?? (await this.rebuildPendingIndexUnlocked())
+    }
+
+    // Called within the ledger lock after every turn-state write. Membership tracks
+    // non-terminal turns; a terminal transition removes the turn. Missing/corrupt
+    // index triggers a one-time rebuild from the scan before the delta is applied,
+    // so a partial write can never overwrite the complete set with a single entry.
+    private async syncPendingIndexUnlocked(
+        turnId: string,
+        state: IllustrationTurnState,
+    ): Promise<void> {
+        const ids = await this.ensurePendingIndexUnlocked()
+        const shouldBePending = !isTerminalTurnState(state)
+        const has = ids.includes(turnId)
+        if (shouldBePending && !has) {
+            await this.writePendingIndexUnlocked([...ids, turnId])
+        } else if (!shouldBePending && has) {
+            await this.writePendingIndexUnlocked(ids.filter((id) => id !== turnId))
+        }
+    }
+
     private async finalizeTurnAfterJobsUnlocked(
         turnId: string,
     ): Promise<IllustrationTurnRecordV1> {
@@ -754,6 +827,7 @@ export class IllustrationJobStore {
         next.version = current.version + 1
         next.updatedAt = Date.now()
         await writePersistentJson(illustrationTurnKey(turnId), next)
+        await this.syncPendingIndexUnlocked(next.turnId, next.state)
         return cloneJson(next)
     }
 
@@ -809,6 +883,7 @@ export class IllustrationJobStore {
                 updatedAt: now,
                 idempotencyKey: input.idempotencyKey,
                 agentAttemptCount: 0,
+                ...(input.origin !== undefined ? { origin: input.origin } : {}),
                 ...(input.target ? { target: cloneJson(input.target) } : {}),
                 ...(input.sourceTextUtf16 !== undefined ? { sourceTextUtf16: input.sourceTextUtf16 } : {}),
                 ...(input.sourceRevisionHash !== undefined
@@ -819,6 +894,7 @@ export class IllustrationJobStore {
                     : {}),
             }
             await writePersistentJson(illustrationTurnKey(input.turnId), record)
+            await this.syncPendingIndexUnlocked(record.turnId, record.state)
             return cloneJson(record)
         })
     }
@@ -854,7 +930,11 @@ export class IllustrationJobStore {
             if (!candidate || typeof candidate !== 'object') {
                 throw new IllustrationLedgerValidationError('Turn mutator must return a turn record or void')
             }
-            if (candidate.turnId !== current.turnId || candidate.schemaVersion !== 1) {
+            if (
+                candidate.turnId !== current.turnId
+                || candidate.schemaVersion !== 1
+                || candidate.origin !== current.origin
+            ) {
                 throw new IllustrationLedgerValidationError('Turn identity fields are immutable')
             }
             if (
@@ -904,6 +984,7 @@ export class IllustrationJobStore {
             candidate.version = current.version + 1
             candidate.updatedAt = Date.now()
             await writePersistentJson(illustrationTurnKey(current.turnId), candidate)
+            await this.syncPendingIndexUnlocked(candidate.turnId, candidate.state)
             return cloneJson(candidate)
         })
     }
@@ -1187,15 +1268,31 @@ export class IllustrationJobStore {
 
     async listPendingTurns(): Promise<IllustrationTurnSnapshotV1[]> {
         return await withIllustrationLedgerLock(async () => {
-            const keys = await listPersistentKeys(ILLUSTRATION_TURN_PREFIX)
-            const records = await readManyPersistentJson<IllustrationTurnRecordV1>(keys)
-            return records
-                .filter((record): record is IllustrationTurnRecordV1 => record !== null)
-                .filter((record) => [
-                    'awaiting_plan',
-                    'agent_blocked_retryable',
-                    'agent_blocked',
-                ].includes(record.state))
+            // Read the durable pending index (rebuilding once from a full scan if it
+            // is missing or corrupt) and bulk-read exactly those records, so the cost
+            // stays proportional to in-flight turns, not O(total turn history).
+            const ids = await this.ensurePendingIndexUnlocked()
+            const records = await readManyPersistentJson<IllustrationTurnRecordV1>(
+                ids.map((turnId) => illustrationTurnKey(turnId)),
+            )
+            const listing: IllustrationTurnRecordV1[] = []
+            const healthy: string[] = []
+            let indexChanged = false
+            for (let index = 0; index < ids.length; index += 1) {
+                const record = records[index]
+                // Self-heal: an indexed ID whose record is missing or has become
+                // terminal is dropped from the index (never fabricated). In-flight
+                // non-terminal turns stay indexed even when they are not listed as
+                // pending (prepared/blocked_capture/awaiting_prompt).
+                if (record === null || isTerminalTurnState(record.state)) {
+                    indexChanged = true
+                    continue
+                }
+                healthy.push(ids[index])
+                if (PENDING_TURN_LISTING_STATES.includes(record.state)) listing.push(record)
+            }
+            if (indexChanged) await this.writePendingIndexUnlocked(healthy)
+            return listing
                 .sort((left, right) =>
                     left.updatedAt - right.updatedAt || left.turnId.localeCompare(right.turnId))
                 .map((record) => projectTurnSnapshot(record))
@@ -1489,6 +1586,7 @@ export class IllustrationJobStore {
                 },
             }
             await writePersistentJson(illustrationTurnKey(current.turnId), next)
+            await this.syncPendingIndexUnlocked(next.turnId, next.state)
             return cloneJson(next)
         })
     }
@@ -1528,6 +1626,7 @@ export class IllustrationJobStore {
                 updatedAt: now,
             }
             await writePersistentJson(illustrationTurnKey(current.turnId), next)
+            await this.syncPendingIndexUnlocked(next.turnId, next.state)
             return cloneJson(next)
         })
     }

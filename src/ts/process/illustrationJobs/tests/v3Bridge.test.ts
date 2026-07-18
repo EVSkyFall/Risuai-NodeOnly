@@ -215,6 +215,31 @@ function makeHarness(runtimeId = 'host-runtime') {
         getCoordinatorRecord: async () => state.coordinator
             ? structuredClone(state.coordinator)
             : null,
+        getCapturePolicy: vi.fn(async () => ({
+            protocolVersion: 1 as const,
+            capturePolicyContractVersion: 1 as const,
+            mode: 'manual' as const,
+        })),
+        setCaptureMode: vi.fn(async (input: { protocolVersion: 1; mode: 'manual' | 'automatic' }) => ({
+            protocolVersion: 1 as const,
+            mode: input.mode,
+        })),
+        requestCurrentVariant: vi.fn(async () => ({
+            protocolVersion: 1,
+            turnId: 'manual-turn-1',
+            version: 1,
+            state: 'awaiting_plan',
+            origin: 'manual',
+            offsetEncoding: 'utf-16',
+            agentAttemptCount: 0,
+            updatedAt: 0,
+        })),
+        purgeAutomaticBacklog: vi.fn(async () => ({
+            protocolVersion: 1,
+            scanned: 0,
+            purged: 0,
+            remaining: false,
+        })),
         admitLlm: async <T>(admittedRuntimeId: string, start: (record: CoordinatorRecord) => T) => {
             if (state.admitBeforeStart) await state.admitBeforeStart
             if (!state.featureEnabled) throw coded('feature_disabled')
@@ -446,13 +471,17 @@ describe('private V3 API shape and hygiene', () => {
             '_ijClaimJob',
             '_ijClaimTurn',
             '_ijGetCapabilities',
+            '_ijGetCapturePolicy',
             '_ijListJobs',
             '_ijListPendingTurns',
             '_ijMeasureImagePrompt',
+            '_ijPurgeAutomaticBacklog',
             '_ijReleaseCoordinator',
             '_ijReportAgentFailure',
+            '_ijRequestCurrentVariant',
             '_ijRetryAgentFailure',
             '_ijRetryUncertain',
+            '_ijSetCaptureMode',
             '_ijSetFeatureEnabled',
             '_ijSubmitPlan',
             '_ijSubscribe',
@@ -478,6 +507,7 @@ describe('private V3 API shape and hygiene', () => {
             imagePromptOwnership: 'plugin-final-structured',
             imagePromptMeasurement: 'core-provider-model-exact',
             supportsNaiV4CharacterCaptions: true,
+            capturePolicyContractVersion: 1,
             illustrationStructuredOutputContractVersion: 1,
             illustrationSingleGeneration: true,
             featureEnabled: true,
@@ -490,6 +520,7 @@ describe('private V3 API shape and hygiene', () => {
         // The additive fields are present...
         expect(capabilities.illustrationStructuredOutputContractVersion).toBe(1)
         expect(capabilities.illustrationSingleGeneration).toBe(true)
+        expect(capabilities.capturePolicyContractVersion).toBe(1)
         // ...while none of the pre-existing required contract versions were bumped,
         // so a 0.2.5 plugin is never forced into contract_pending.
         expect(capabilities.protocolVersion).toBe(1)
@@ -602,6 +633,78 @@ describe('private V3 API shape and hygiene', () => {
         }) as any
         expect(supplied).not.toHaveProperty('leaseId')
         expect(supplied.lease.ownedByCaller).toBe(true)
+    })
+})
+
+describe('capture policy V1 RPC surface', () => {
+    test('reads the durable capture policy without requiring coordinator ownership', async () => {
+        const harness = makeHarness()
+        // Not the coordinator owner, yet the read still resolves.
+        harness.state.coordinator!.holderRuntimeId = 'other-runtime'
+        await expect(harness.bridge.rootMethods._ijGetCapturePolicy()).resolves.toEqual({
+            protocolVersion: 1,
+            capturePolicyContractVersion: 1,
+            mode: 'manual',
+        })
+        expect(harness.deps.getCapturePolicy).toHaveBeenCalledTimes(1)
+    })
+
+    test('setCaptureMode strips caller identity, validates the enum, and forwards protocol 1', async () => {
+        const harness = makeHarness()
+        await expect(harness.bridge.rootMethods._ijSetCaptureMode({
+            protocolVersion: 1,
+            mode: 'automatic',
+            runtimeId: 'forged-runtime',
+            scriptDigest: DIGEST_A,
+        })).resolves.toEqual({ protocolVersion: 1, mode: 'automatic' })
+        expect(harness.deps.setCaptureMode).toHaveBeenCalledWith({ protocolVersion: 1, mode: 'automatic' })
+
+        await expect(harness.bridge.rootMethods._ijSetCaptureMode({ protocolVersion: 1, mode: 'nonsense' }))
+            .rejects.toThrow('[IJ:validation]')
+        await expect(harness.bridge.rootMethods._ijSetCaptureMode({ protocolVersion: 2, mode: 'manual' }))
+            .rejects.toThrow('[IJ:validation]')
+    })
+
+    test('requestCurrentVariant and purgeAutomaticBacklog are coordinator-owned', async () => {
+        const harness = makeHarness()
+        harness.state.coordinator!.holderRuntimeId = 'other-runtime'
+        await expect(harness.bridge.rootMethods._ijRequestCurrentVariant({
+            protocolVersion: 1,
+            characterIndex: 0,
+            chatIndex: 0,
+            messageIndex: 0,
+            expectedSwipeIndex: null,
+            expectedSourceTextUtf16: 'x',
+        })).rejects.toThrow('[IJ:coordinator_required]')
+        await expect(harness.bridge.rootMethods._ijPurgeAutomaticBacklog({
+            protocolVersion: 1,
+            confirm: true,
+            maxTurns: 10,
+        })).rejects.toThrow('[IJ:coordinator_required]')
+        expect(harness.deps.requestCurrentVariant).not.toHaveBeenCalled()
+        expect(harness.deps.purgeAutomaticBacklog).not.toHaveBeenCalled()
+    })
+
+    test('forwards owned capture requests with caller identity stripped', async () => {
+        const harness = makeHarness()
+        await harness.bridge.rootMethods._ijRequestCurrentVariant({
+            protocolVersion: 1,
+            characterIndex: 2,
+            chatIndex: 1,
+            messageIndex: 4,
+            expectedSwipeIndex: 0,
+            expectedSourceTextUtf16: 'live text',
+            runtimeId: 'forged-runtime',
+            pluginName: ILLUSTRATION_V3_PROTECTED_PLUGIN_NAME,
+        })
+        expect(harness.deps.requestCurrentVariant).toHaveBeenCalledWith({
+            protocolVersion: 1,
+            characterIndex: 2,
+            chatIndex: 1,
+            messageIndex: 4,
+            expectedSwipeIndex: 0,
+            expectedSourceTextUtf16: 'live text',
+        })
     })
 })
 

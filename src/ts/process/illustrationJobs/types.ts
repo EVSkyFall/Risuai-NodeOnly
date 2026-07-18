@@ -3,6 +3,15 @@ export type ScenePayloadV1 = {
     data: unknown
 }
 
+// Durable capture policy. The default (absent/invalid record) is 'manual'.
+export type IllustrationCaptureMode = 'manual' | 'automatic'
+
+// How a durable capture turn was admitted: 'manual' turns come from an explicit
+// user "generate for this response" request; 'automatic' turns from the eager
+// terminal-capture seam. Legacy records without this field decode as 'automatic'
+// so pre-contract turns keep their historical meaning.
+export type IllustrationCaptureOrigin = 'manual' | 'automatic'
+
 export type PlanManifestV1 = {
     turnId: string
     planHash: string
@@ -157,6 +166,8 @@ export type IllustrationTurnRecordV1 = IllustrationLeaseRecordFields & {
     schemaVersion: 1
     turnId: string
     state: IllustrationTurnState
+    // Absent on legacy records; decoded as 'automatic' at every read boundary.
+    origin?: IllustrationCaptureOrigin
     target?: IllustrationTurnTargetV1
     sourceTextUtf16?: string
     sourceRevisionHash?: string
@@ -266,6 +277,8 @@ export type IllustrationTurnSnapshotV1 = {
     turnId: string
     version: number
     state: IllustrationTurnState
+    // Always projected; legacy records without a durable origin surface 'automatic'.
+    origin: IllustrationCaptureOrigin
     lease?: IllustrationLeaseViewV1
     target?: IllustrationTurnTargetV1
     sourceTextUtf16?: string

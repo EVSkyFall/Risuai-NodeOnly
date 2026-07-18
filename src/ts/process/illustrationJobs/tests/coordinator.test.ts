@@ -54,6 +54,7 @@ vi.mock('src/ts/storage/chatStorage', () => ({
 
 const coordinatorModule = await import('../coordinator')
 const coordinatorRecordModule = await import('../coordinatorRecord')
+const capturePolicyModule = await import('../capturePolicy')
 const featureModule = await import('../featureFlag')
 const illustrationEventsModule = await import('../illustrationEvents')
 const lockModule = await import('../locks')
@@ -63,10 +64,13 @@ const storeModule = await import('../store')
 const {
     cancelLedger,
     cancelTurnLedger,
+    purgeAutomaticBacklog,
     registerTrustedTurn,
+    requestCurrentVariant,
     submitPlanLedger,
     supplyPromptLedger,
 } = coordinatorModule
+const { writeDurableCaptureMode } = capturePolicyModule
 const { claimCoordinator } = coordinatorRecordModule
 const { IllustrationFeatureDisabledError, setIllustrationFeatureEnabled } = featureModule
 const { subscribeIllustrationWakeHints } = illustrationEventsModule
@@ -827,5 +831,237 @@ describe('registerTrustedTurn', () => {
         expect(harness.storageEvents).toHaveLength(0)
         expect(harness.strictSave).not.toHaveBeenCalled()
         expect(mutationEvents).toHaveLength(0)
+    })
+
+    // Acceptance 6: with the mode-enforcing flag, the admission-time policy recheck
+    // decides. Manual (or unset default) suppresses; automatic admits.
+    test('admits an enforced automatic capture only under an automatic policy', async () => {
+        await writeDurableCaptureMode('automatic')
+        const turn = await registerTrustedTurn({
+            ...registerInput(),
+            origin: 'automatic',
+            enforceCaptureMode: true,
+        })
+        expect(turn).not.toBeNull()
+        expect(turn!.state).toBe('awaiting_plan')
+        expect(turn!.origin).toBe('automatic')
+        expect(await illustrationJobStore.listTurns()).toHaveLength(1)
+    })
+
+    test('suppresses an enforced automatic capture under manual mode with zero residue', async () => {
+        await writeDurableCaptureMode('manual')
+        harness.storageEvents.length = 0
+        mutationEvents.length = 0
+
+        const result = await registerTrustedTurn({
+            ...registerInput(),
+            origin: 'automatic',
+            enforceCaptureMode: true,
+        })
+
+        expect(result).toBeNull()
+        expect(await illustrationJobStore.listTurns()).toHaveLength(0)
+        expect(harness.strictSave).not.toHaveBeenCalled()
+        // No turn record and no marker mutation were written.
+        expect(harness.storageEvents).toHaveLength(0)
+        expect(mutationEvents).toHaveLength(0)
+        expect(harness.database.characters[0].chats[0].message[0].data).toBe('A quiet scene.')
+    })
+
+    test('the unset default policy (manual) suppresses an enforced automatic capture', async () => {
+        const result = await registerTrustedTurn({
+            ...registerInput(),
+            origin: 'automatic',
+            enforceCaptureMode: true,
+        })
+        expect(result).toBeNull()
+        expect(await illustrationJobStore.listTurns()).toHaveLength(0)
+    })
+
+    test('a non-enforcing caller captures regardless of the manual policy', async () => {
+        await writeDurableCaptureMode('manual')
+        const turn = await registerTrustedTurn(registerInput())
+        expect(turn).not.toBeNull()
+        expect(turn!.state).toBe('awaiting_plan')
+        // The default origin is 'automatic' for callers that do not specify one.
+        expect(turn!.origin).toBe('automatic')
+    })
+
+    test('an already-admitted turn is returned even after the mode switches to manual', async () => {
+        await writeDurableCaptureMode('automatic')
+        const first = await registerTrustedTurn({
+            ...registerInput(),
+            origin: 'automatic',
+            enforceCaptureMode: true,
+        })
+        expect(first).not.toBeNull()
+        await writeDurableCaptureMode('manual')
+        const replay = await registerTrustedTurn({
+            ...registerInput(),
+            origin: 'automatic',
+            enforceCaptureMode: true,
+        })
+        expect(replay).toEqual(first)
+        expect(await illustrationJobStore.listTurns()).toHaveLength(1)
+    })
+})
+
+describe('requestCurrentVariant (manual capture)', () => {
+    function currentVariantInput(overrides: Record<string, unknown> = {}) {
+        return {
+            protocolVersion: 1 as const,
+            characterIndex: 0,
+            chatIndex: 0,
+            messageIndex: 0,
+            expectedMessageId: 'message-1' as string | undefined,
+            expectedSwipeIndex: null as number | null,
+            expectedSourceTextUtf16: 'A quiet scene.',
+            ...overrides,
+        }
+    }
+
+    // Acceptance 2: the selected variant is captured as exactly one manual turn.
+    test('captures the selected active variant as a single manual-origin turn', async () => {
+        const snapshot = await requestCurrentVariant(currentVariantInput())
+        expect(snapshot.state).toBe('awaiting_plan')
+        expect(snapshot.origin).toBe('manual')
+        expect(await illustrationJobStore.listTurns()).toHaveLength(1)
+        expect(harness.database.characters[0].chats[0].message[0].data)
+            .toMatch(/^A quiet scene\.\n<!--risu-illustration-request:v1:[A-Za-z0-9_-]+-->$/)
+    })
+
+    // Acceptance 2 (swipe selection): capturing a chosen past swipe writes exactly
+    // one turn carrying that swipe's text, mutating only the selected swipe.
+    test('captures a selected past swipe among many with exactly one turn', async () => {
+        const message = {
+            role: 'char',
+            chatId: 'message-1',
+            data: 'Swipe B',
+            swipes: ['Swipe A', 'Swipe B', 'Swipe C'],
+            swipeId: 1,
+        } as Message
+        harness.database.characters[0].chats[0].message = [message]
+
+        const snapshot = await requestCurrentVariant(currentVariantInput({
+            expectedSwipeIndex: 1,
+            expectedSourceTextUtf16: 'Swipe B',
+        }))
+
+        expect(snapshot.origin).toBe('manual')
+        expect(await illustrationJobStore.listTurns()).toHaveLength(1)
+        expect(message.swipes![1]).toMatch(/^Swipe B\n<!--risu-illustration-request:v1:[A-Za-z0-9_-]+-->$/)
+        expect(message.swipes![0]).toBe('Swipe A')
+        expect(message.swipes![2]).toBe('Swipe C')
+    })
+
+    // Acceptance 3: any selection mismatch fails validation and leaves zero residue.
+    test.each([
+        ['source text', { expectedSourceTextUtf16: 'a different body' }],
+        ['message identity', { expectedMessageId: 'other-message' }],
+        ['active swipe', { expectedSwipeIndex: 4 }],
+        ['message index', { messageIndex: 9 }],
+    ])('fails with %s mismatch and no residue', async (_label, overrides) => {
+        harness.storageEvents.length = 0
+        mutationEvents.length = 0
+        await expect(requestCurrentVariant(currentVariantInput(overrides)))
+            .rejects.toThrow(/selection changed/)
+        expect(await illustrationJobStore.listTurns()).toHaveLength(0)
+        expect(harness.strictSave).not.toHaveBeenCalled()
+        expect(mutationEvents).toHaveLength(0)
+        expect(harness.database.characters[0].chats[0].message[0].data).toBe('A quiet scene.')
+    })
+
+    // Acceptance 4: double click / reload re-request of the same selected variant
+    // resolves to the same single turn (content-addressed manual identity that
+    // survives the injected marker).
+    test('double click and reload of the same variant return the same single turn', async () => {
+        const first = await requestCurrentVariant(currentVariantInput())
+        harness.strictSave.mockClear()
+
+        // A reload re-request: the Plugin re-reads the now-marked live text.
+        const markedText = harness.database.characters[0].chats[0].message[0].data
+        const second = await requestCurrentVariant(currentVariantInput({
+            expectedSourceTextUtf16: markedText,
+        }))
+
+        expect(second.turnId).toBe(first.turnId)
+        expect(await illustrationJobStore.listTurns()).toHaveLength(1)
+        expect(harness.strictSave).not.toHaveBeenCalled()
+    })
+
+    // §3.1: greeting-style variants whose conversation/message ids do not yet exist
+    // are minted safely by Core on a confirmed match.
+    test('mints identity for a greeting-style variant lacking a conversation and message id', async () => {
+        const chat = harness.database.characters[0].chats[0]
+        delete chat.id
+        delete chat.message[0].chatId
+
+        const snapshot = await requestCurrentVariant(currentVariantInput({ expectedMessageId: undefined }))
+
+        expect(snapshot.state).toBe('awaiting_plan')
+        expect(snapshot.origin).toBe('manual')
+        expect(typeof chat.id).toBe('string')
+        expect(typeof chat.message[0].chatId).toBe('string')
+    })
+})
+
+describe('purgeAutomaticBacklog', () => {
+    async function makePendingTurn(turnId: string, origin: 'manual' | 'automatic'): Promise<void> {
+        await illustrationJobStore.createTurn({
+            turnId,
+            idempotencyKey: `capture:${turnId}`,
+            origin,
+            target: {
+                chaId: 'character-1',
+                conversationId: 'conversation-1',
+                expectedMessageId: 'message-1',
+                rootTurnId: turnId,
+                requestNonce: `nonce-${turnId}`,
+            },
+            sourceTextUtf16: 'x',
+            sourceRevisionHash: `hash-${turnId}`,
+            settingsFingerprint: 'fp',
+        })
+        const turn = await illustrationJobStore.getTurn(turnId)
+        await illustrationJobStore.updateTurn({
+            turnId,
+            expectedVersion: turn!.version,
+            mutate: (draft) => { draft.state = 'awaiting_plan' },
+        })
+    }
+
+    // Acceptance 7 / §3.2: a bounded purge cancels only automatic-origin pending
+    // turns and never touches manual-origin turns.
+    test('cancels only automatic-origin pending turns up to the bound', async () => {
+        for (let index = 0; index < 3; index += 1) await makePendingTurn(`auto-${index}`, 'automatic')
+        await makePendingTurn('manual-0', 'manual')
+
+        const result = await purgeAutomaticBacklog({ protocolVersion: 1, confirm: true, maxTurns: 2 })
+        expect(result).toEqual({ protocolVersion: 1, scanned: 3, purged: 2, remaining: true })
+
+        const pending = await illustrationJobStore.listPendingTurns()
+        expect(pending.filter((turn) => turn.origin === 'manual')).toHaveLength(1)
+        expect(pending.filter((turn) => turn.origin === 'automatic')).toHaveLength(1)
+    })
+
+    test('drains the whole automatic backlog when the bound is generous', async () => {
+        for (let index = 0; index < 3; index += 1) await makePendingTurn(`auto-${index}`, 'automatic')
+        await makePendingTurn('manual-0', 'manual')
+
+        const result = await purgeAutomaticBacklog({ protocolVersion: 1, confirm: true, maxTurns: 50 })
+        expect(result).toEqual({ protocolVersion: 1, scanned: 3, purged: 3, remaining: false })
+
+        const pending = await illustrationJobStore.listPendingTurns()
+        expect(pending.map((turn) => turn.origin)).toEqual(['manual'])
+    })
+
+    test('requires confirmation and a positive bound', async () => {
+        await makePendingTurn('auto-0', 'automatic')
+        await expect(purgeAutomaticBacklog({ protocolVersion: 1, confirm: false as never, maxTurns: 5 }))
+            .rejects.toThrow(/confirm/)
+        await expect(purgeAutomaticBacklog({ protocolVersion: 1, confirm: true, maxTurns: 0 }))
+            .rejects.toThrow(/maxTurns/)
+        // Nothing was cancelled.
+        expect(await illustrationJobStore.listPendingTurns()).toHaveLength(1)
     })
 })

@@ -1,5 +1,6 @@
 import type { Chat, Message } from '../../storage/database.svelte'
 import { v4 } from 'uuid'
+import { isAutomaticCaptureAdmitted } from './capturePolicy'
 import { isIllustrationFeatureEnabled } from './featureFlag'
 
 export type IllustrationRootTurnOutcome = 'normal' | 'continuing' | 'aborted' | 'failed'
@@ -40,6 +41,13 @@ export function finalizeIllustrationRootTurn(context: IllustrationRootTurnContex
     void (async () => {
         try {
             if (!(await isIllustrationFeatureEnabled())) return
+            // Fast-path capture-policy gate: in manual (or unknown/broken) mode the
+            // automatic finalization path does NOTHING — no id mint, no ledger
+            // record, no marker, no LLM/provider work. Only an explicit 'automatic'
+            // policy proceeds. registerTrustedTurn re-checks at admission to close
+            // the mode-switch race; this check keeps the common case free of any
+            // id-minting side effect.
+            if (!(await isAutomaticCaptureAdmitted())) return
             if (inFlightRootTurnIds.has(rootTurnId) || doneRootTurnIds.has(rootTurnId)) return
             inFlightRootTurnIds.add(rootTurnId)
             try {
@@ -52,6 +60,8 @@ export function finalizeIllustrationRootTurn(context: IllustrationRootTurnContex
                     expectedMessageId,
                     rootTurnId,
                     sourceVariantText,
+                    origin: 'automatic',
+                    enforceCaptureMode: true,
                 })
                 rememberDoneRootTurn(rootTurnId)
             } finally {

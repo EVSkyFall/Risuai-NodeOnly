@@ -10,14 +10,17 @@ import {
     listJobsLedger,
     listPendingTurnsLedger,
     markCoordinatorDrainingLedger,
+    purgeAutomaticBacklog,
     releaseCoordinatorFinalLedger,
     releaseCoordinatorLedger,
     reportAgentFailureLedger,
+    requestCurrentVariant,
     retryAgentFailureLedger,
     retryUncertainLedger,
     submitPlanLedger,
     supplyPromptLedger,
 } from './coordinator'
+import { getCapturePolicy, setCaptureMode } from './capturePolicy'
 import {
     admitIllustrationCoordinatorLlm,
     getCoordinatorRecord,
@@ -59,6 +62,14 @@ const bridgeDependencies: IllustrationV3BridgeDependencies = {
     releaseCoordinatorFinal: releaseCoordinatorFinalLedger,
     getCoordinatorRecord,
     admitLlm: admitIllustrationCoordinatorLlm,
+    getCapturePolicy,
+    setCaptureMode: async (input) => await setCaptureMode(input),
+    requestCurrentVariant: async (input) => await requestCurrentVariant(
+        input as Parameters<typeof requestCurrentVariant>[0],
+    ),
+    purgeAutomaticBacklog: async (input) => await purgeAutomaticBacklog(
+        input as Parameters<typeof purgeAutomaticBacklog>[0],
+    ),
     listPendingTurns: listPendingTurnsLedger,
     listJobs: listJobsLedger,
     claimTurn: async (input) => await claimTurnLedger(

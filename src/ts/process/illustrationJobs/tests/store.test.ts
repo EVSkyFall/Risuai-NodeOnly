@@ -19,10 +19,13 @@ const { storageMap, storageControl, storageCounters } = vi.hoisted(() => ({
         duplicateBulkKey: null as string | null,
     },
     // Per-record vs bulk request accounting for the read fan-out regressions.
-    // getItem counts single-record `/api/read`; getItems counts bulk reads.
+    // getItem counts single-record `/api/read`; getItems counts bulk reads;
+    // bulkReadKeyCounts records the request width of each bulk read so a listing's
+    // fan-out can be asserted proportional to pending work, not total history.
     storageCounters: {
         getItem: 0,
         getItems: 0,
+        bulkReadKeyCounts: [] as number[],
     },
 }))
 
@@ -38,6 +41,7 @@ vi.mock('src/ts/globalApi.svelte', () => ({
         },
         async getItems(keys: string[]) {
             storageCounters.getItems += 1
+            storageCounters.bulkReadKeyCounts.push(keys.length)
             // Mirror the Node bulk-read server contract: missing keys are
             // silently omitted from the response (no null placeholder), and the
             // caller must correlate results by the `key` field.
@@ -78,6 +82,7 @@ const errorModule = await import('../errors')
 
 const {
     IllustrationJobStore,
+    ILLUSTRATION_PENDING_TURNS_KEY,
     JOB_LEASE_DURATION_MS,
     MAX_JOBS_PER_TURN,
     TERMINAL_RECORD_TTL_MS,
@@ -336,6 +341,7 @@ beforeEach(async () => {
     storageControl.duplicateBulkKey = null
     storageCounters.getItem = 0
     storageCounters.getItems = 0
+    storageCounters.bulkReadKeyCounts = []
     transitionSequence = 0
     vi.useFakeTimers()
     vi.setSystemTime(BASE_TIME)
@@ -1726,7 +1732,7 @@ describe('bounded snapshot reads (bulk read fan-out)', () => {
         }
     }
 
-    test('reads a full listJobs+listPendingTurns pass with zero per-record reads', async () => {
+    test('reads listJobs with no per-record reads and lists pending turns from the bounded index', async () => {
         storageMap.clear()
         // 3,000 terminal jobs — only the 50 most-recently-updated survive the cap.
         for (let index = 0; index < 3_000; index += 1) {
@@ -1776,16 +1782,26 @@ describe('bounded snapshot reads (bulk read fan-out)', () => {
             )
         })
 
+        // Prime the pending index: the first listing rebuilds it once from a full
+        // scan and persists it, so the steady-state pass never rescans history.
+        expect(await store.listPendingTurns()).toHaveLength(6)
+
         storageCounters.getItem = 0
         storageCounters.getItems = 0
+        storageCounters.bulkReadKeyCounts = []
 
         const jobs = await store.listJobs()
         const turns = await store.listPendingTurns()
 
-        // Acceptance: no per-record `/api/read`, at most one Turn bulk-read and
-        // one Job bulk-read for the whole reconcile pass.
-        expect(storageCounters.getItem).toBe(0)
+        // Acceptance: no per-record `/api/read` for records; the pending listing
+        // reads only the small index record (one getItem) plus one bulk read of
+        // exactly the indexed pending turns, alongside listJobs' single bulk read.
+        expect(storageCounters.getItem).toBe(1)
         expect(storageCounters.getItems).toBe(2)
+        // Acceptance 8: the pending bulk-read width tracks the 6 pending turns, NOT
+        // the 200 terminal turns — the listing does not scale with terminal history.
+        expect(storageCounters.bulkReadKeyCounts).toContain(6)
+        expect(Math.min(...storageCounters.bulkReadKeyCounts)).toBe(6)
 
         // Result parity: every live/uncertain job plus the newest 50 terminal.
         const live = jobs.filter((job) => liveStates.includes(job.state))
@@ -2024,5 +2040,140 @@ describe('atomic coordinator proof on plugin Agent writes', () => {
             coordinatorProof,
             IllustrationCoordinatorDrainingError,
         )
+    })
+})
+
+describe('pending turn index and origin', () => {
+    function pendingIndexTurnIds(): string[] | undefined {
+        return decodeStored<{ schemaVersion: number; turnIds: string[] }>(
+            ILLUSTRATION_PENDING_TURNS_KEY,
+        )?.turnIds
+    }
+
+    function indexTurnRecord(
+        turnId: string,
+        state: IllustrationTurnRecordV1['state'],
+    ): IllustrationTurnRecordV1 {
+        return {
+            schemaVersion: 1,
+            turnId,
+            state,
+            version: 1,
+            leaseId: null,
+            leaseExpiresAt: 0,
+            fence: 0,
+            workerEpoch: 0,
+            updatedAt: BASE_TIME,
+            idempotencyKey: `create:${turnId}`,
+            agentAttemptCount: state.startsWith('agent_blocked') ? 1 : 0,
+        }
+    }
+
+    test('createTurn adds the new turn to the durable pending index', async () => {
+        await store.createTurn({ turnId: 't1', idempotencyKey: 'i1' })
+        expect(decodeStored(ILLUSTRATION_PENDING_TURNS_KEY)).toEqual({
+            schemaVersion: 1,
+            turnIds: ['t1'],
+        })
+    })
+
+    test('a non-terminal transition keeps the turn indexed', async () => {
+        await store.createTurn({ turnId: 't1', idempotencyKey: 'i1' })
+        const turn = await store.getTurn('t1')
+        await store.updateTurn({
+            turnId: 't1',
+            expectedVersion: turn!.version,
+            mutate: (draft) => { draft.state = 'awaiting_plan' },
+        })
+        expect(pendingIndexTurnIds()).toEqual(['t1'])
+    })
+
+    test('a terminal transition removes the turn from the index', async () => {
+        await store.createTurn({ turnId: 't1', idempotencyKey: 'i1' })
+        const turn = await store.getTurn('t1')
+        await store.requestCancelTurn({ turnId: 't1', expectedVersion: turn!.version })
+        expect(pendingIndexTurnIds()).toEqual([])
+    })
+
+    test('rebuilds the index from a full scan when it is missing', async () => {
+        encodeStored(illustrationTurnKey('a'), indexTurnRecord('a', 'awaiting_plan'))
+        encodeStored(illustrationTurnKey('b'), indexTurnRecord('b', 'completed'))
+        encodeStored(illustrationTurnKey('c'), indexTurnRecord('c', 'prepared'))
+        expect(decodeStored(ILLUSTRATION_PENDING_TURNS_KEY)).toBeNull()
+
+        const pending = await store.listPendingTurns()
+
+        // Only the listing-pending turn surfaces...
+        expect(pending.map((turn) => turn.turnId)).toEqual(['a'])
+        // ...but the index tracks every non-terminal turn (a + c), never the
+        // terminal one (b).
+        expect(pendingIndexTurnIds()).toEqual(['a', 'c'])
+    })
+
+    test('rebuilds the index from a full scan when it is structurally corrupt', async () => {
+        encodeStored(ILLUSTRATION_PENDING_TURNS_KEY, { schemaVersion: 2, turnIds: 'nope' })
+        encodeStored(illustrationTurnKey('a'), indexTurnRecord('a', 'awaiting_plan'))
+
+        const pending = await store.listPendingTurns()
+
+        expect(pending.map((turn) => turn.turnId)).toEqual(['a'])
+        expect(decodeStored(ILLUSTRATION_PENDING_TURNS_KEY)).toEqual({
+            schemaVersion: 1,
+            turnIds: ['a'],
+        })
+    })
+
+    test('self-heals an indexed turn whose record is missing', async () => {
+        encodeStored(ILLUSTRATION_PENDING_TURNS_KEY, { schemaVersion: 1, turnIds: ['ghost', 'real'] })
+        encodeStored(illustrationTurnKey('real'), indexTurnRecord('real', 'awaiting_plan'))
+
+        const pending = await store.listPendingTurns()
+
+        expect(pending.map((turn) => turn.turnId)).toEqual(['real'])
+        expect(pendingIndexTurnIds()).toEqual(['real'])
+    })
+
+    test('self-heals an indexed turn that has become terminal', async () => {
+        encodeStored(ILLUSTRATION_PENDING_TURNS_KEY, { schemaVersion: 1, turnIds: ['done', 'active'] })
+        encodeStored(illustrationTurnKey('done'), indexTurnRecord('done', 'completed'))
+        encodeStored(illustrationTurnKey('active'), indexTurnRecord('active', 'awaiting_plan'))
+
+        const pending = await store.listPendingTurns()
+
+        expect(pending.map((turn) => turn.turnId)).toEqual(['active'])
+        expect(pendingIndexTurnIds()).toEqual(['active'])
+    })
+
+    test('createTurn persists an explicit origin', async () => {
+        await store.createTurn({ turnId: 'm1', idempotencyKey: 'i', origin: 'manual' })
+        expect((await store.getTurn('m1'))!.origin).toBe('manual')
+    })
+
+    test('projects a legacy origin-less turn as automatic and forbids mutating origin', async () => {
+        await store.createTurn({ turnId: 'leg', idempotencyKey: 'i' })
+        const turn = await store.getTurn('leg')
+        expect(turn!.origin).toBeUndefined()
+        await expect(store.updateTurn({
+            turnId: 'leg',
+            expectedVersion: turn!.version,
+            mutate: (draft) => {
+                draft.origin = 'manual'
+                draft.state = 'awaiting_plan'
+            },
+        })).rejects.toThrow(/immutable/)
+    })
+
+    test('listPendingTurns projects origin, defaulting a legacy turn to automatic', async () => {
+        encodeStored(illustrationTurnKey('legacy'), indexTurnRecord('legacy', 'awaiting_plan'))
+        encodeStored(illustrationTurnKey('manual'), {
+            ...indexTurnRecord('manual', 'awaiting_plan'),
+            origin: 'manual',
+        })
+
+        const pending = await store.listPendingTurns()
+        const originById = Object.fromEntries(pending.map((turn) => [turn.turnId, turn.origin]))
+
+        expect(originById.legacy).toBe('automatic')
+        expect(originById.manual).toBe('manual')
     })
 })

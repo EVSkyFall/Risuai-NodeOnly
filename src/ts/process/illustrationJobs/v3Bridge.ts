@@ -293,6 +293,17 @@ export type IllustrationV3BridgeDependencies = {
         runtimeId: string,
         start: (coordinator: CoordinatorRecord) => T,
     ): Promise<{ coordinator: CoordinatorRecord; value: T }>
+    getCapturePolicy(): Promise<{
+        protocolVersion: 1
+        capturePolicyContractVersion: 1
+        mode: 'manual' | 'automatic'
+    }>
+    setCaptureMode(input: { protocolVersion: 1; mode: 'manual' | 'automatic' }): Promise<{
+        protocolVersion: 1
+        mode: 'manual' | 'automatic'
+    }>
+    requestCurrentVariant(input: Record<string, unknown>): Promise<unknown>
+    purgeAutomaticBacklog(input: Record<string, unknown>): Promise<unknown>
     listPendingTurns(): Promise<unknown[]>
     listJobs(input?: { turnId?: string }): Promise<unknown[]>
     claimTurn(input: Record<string, unknown>): Promise<unknown>
@@ -755,6 +766,10 @@ export class IllustrationV3HostLlmRegistry {
 
 export const ILLUSTRATION_JOBS_ALIAS = Object.freeze({
     getCapabilities: '_ijGetCapabilities',
+    getCapturePolicy: '_ijGetCapturePolicy',
+    setCaptureMode: '_ijSetCaptureMode',
+    requestCurrentVariant: '_ijRequestCurrentVariant',
+    purgeAutomaticBacklog: '_ijPurgeAutomaticBacklog',
     setFeatureEnabled: '_ijSetFeatureEnabled',
     claimCoordinator: '_ijClaimCoordinator',
     releaseCoordinator: '_ijReleaseCoordinator',
@@ -854,6 +869,9 @@ export function createAuthorizedIllustrationV3Bridge(input: {
                 imagePromptOwnership: 'plugin-final-structured',
                 imagePromptMeasurement: 'core-provider-model-exact',
                 supportsNaiV4CharacterCaptions: true,
+                // Capture Policy V1: durable manual/automatic capture mode, manual
+                // per-response capture, and the pending-only backlog controls. Additive.
+                capturePolicyContractVersion: 1,
                 // Additive capabilities. The host always forces a single generation
                 // (noMultiGen) and, on supported providers only, forwards a validated
                 // structured-output schema to native JSON schema / response format;
@@ -863,6 +881,41 @@ export function createAuthorizedIllustrationV3Bridge(input: {
                 illustrationSingleGeneration: true,
                 featureEnabled: await deps.isFeatureEnabled(),
             }
+        }),
+        _ijGetCapturePolicy: async () => await invokeRpc(async () => {
+            ensureLive()
+            // Read-only durable mode. Readable without coordinator ownership so a
+            // reloading Plugin can resolve the mode before opening its scheduler.
+            return await deps.getCapturePolicy()
+        }),
+        _ijSetCaptureMode: async (value) => await invokeRpc(async () => {
+            ensureLive()
+            const request = sanitizedInput(value)
+            assertProtocol(request)
+            if (request.mode !== 'manual' && request.mode !== 'automatic') {
+                throw codedError('validation')
+            }
+            return await deps.setCaptureMode({ protocolVersion: 1, mode: request.mode })
+        }),
+        _ijRequestCurrentVariant: async (value) => await invokeRpc(async () => {
+            ensureLive()
+            const request = sanitizedInput(value)
+            assertProtocol(request)
+            return await hostRegistry.runOwned(
+                auth.runtimeId,
+                {},
+                async () => await deps.requestCurrentVariant(request),
+            )
+        }),
+        _ijPurgeAutomaticBacklog: async (value) => await invokeRpc(async () => {
+            ensureLive()
+            const request = sanitizedInput(value)
+            assertProtocol(request)
+            return await hostRegistry.runOwned(
+                auth.runtimeId,
+                {},
+                async () => await deps.purgeAutomaticBacklog(request),
+            )
         }),
         _ijMeasureImagePrompt: async (value) => await invokeRpc(async () => {
             ensureLive()

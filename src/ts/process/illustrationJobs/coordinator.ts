@@ -1,5 +1,7 @@
+import { v4 } from 'uuid'
 import { getDatabase, type Chat, type Message, type character } from '../../storage/database.svelte'
 import { ensureChatHydrated, saveChatToServerStrict } from '../../storage/chatStorage'
+import { isAutomaticCaptureAdmitted } from './capturePolicy'
 import {
     resolveSlotAnchor,
     validatePlacementOffsets,
@@ -14,6 +16,7 @@ import {
 } from './controlNodes'
 import {
     IllustrationImagePromptContractError,
+    IllustrationLedgerConfirmationRequiredError,
     IllustrationLedgerCorruptError,
     IllustrationLedgerValidationError,
 } from './errors'
@@ -53,6 +56,7 @@ import {
     validateHolderWrite,
 } from './store'
 import type {
+    IllustrationCaptureOrigin,
     IllustrationCoordinatorProof,
     IllustrationCoordinatorRecordV1,
     IllustrationCoordinatorSnapshotV1,
@@ -155,6 +159,14 @@ export type RegisterTrustedTurnInput = {
     expectedMessageId: string
     rootTurnId: string
     sourceVariantText: string
+    // Durably recorded on the turn. Defaults to 'automatic' (the legacy meaning) so
+    // pre-existing callers and pre-contract records keep their historical semantics.
+    origin?: IllustrationCaptureOrigin
+    // When set, the durable capture policy is re-read at admission time and an
+    // automatic capture is suppressed (returns null, zero side effects) unless the
+    // policy is explicitly 'automatic'. Only the automatic terminal-capture seam
+    // sets this; manual capture and direct callers never enforce the mode.
+    enforceCaptureMode?: boolean
 }
 
 type LoadedChat = {
@@ -1401,7 +1413,7 @@ async function requestKeyFor(input: RegisterTrustedTurnInput): Promise<string> {
 
 export async function registerTrustedTurn(
     input: RegisterTrustedTurnInput,
-): Promise<IllustrationTurnRecordV1> {
+): Promise<IllustrationTurnRecordV1 | null> {
     await requireIllustrationFeatureEnabled()
     requireNonEmpty(input.chaId, 'chaId')
     requireNonEmpty(input.conversationId, 'conversationId')
@@ -1410,9 +1422,12 @@ export async function registerTrustedTurn(
     if (typeof input.sourceVariantText !== 'string') {
         throw new IllustrationLedgerValidationError('sourceVariantText must be a string')
     }
+    const origin: IllustrationCaptureOrigin = input.origin ?? 'automatic'
 
     const turnId = await requestKeyFor(input)
     const existing = await illustrationJobStore.getTurn(turnId)
+    // An already-admitted turn is always returned, regardless of a later mode
+    // switch: idempotency wins over the admission gate.
     if (existing) return existing
 
     const loaded = await loadChat(input.chaId, input.conversationId)
@@ -1430,11 +1445,18 @@ export async function registerTrustedTurn(
     })
     const settingsFingerprint = await computeNaiSettingsFingerprint(getDatabase())
 
+    // Admission-time recheck for the automatic seam, placed immediately before the
+    // first durable write. The prior reads (loadChat/resolveCaptureVariant) are
+    // side-effect free, so suppressing here leaves zero illustration residue: no
+    // turn record, no ledger mint, no marker mutation, no extra strict save.
+    if (input.enforceCaptureMode && !(await isAutomaticCaptureAdmitted())) return null
+
     let prepared: IllustrationTurnRecordV1
     try {
         prepared = await illustrationJobStore.createTurn({
             turnId,
             idempotencyKey: `capture:${turnId}`,
+            origin,
             target: {
                 chaId: input.chaId,
                 conversationId: input.conversationId,
@@ -1506,4 +1528,209 @@ export async function registerTrustedTurn(
     })
     emitIllustrationWakeHint('turn_changed', registered.turnId)
     return registered
+}
+
+type ActiveVariant = { activeSwipeIndex: number | null; text: string }
+
+// Read-only resolution of the active variant text and swipe index. Corrupt swipe
+// mirrors throw (surfacing as a stable `corrupt` code); a plain selection mismatch
+// is decided by the caller as a validation error, never here.
+function readActiveVariant(message: Message): ActiveVariant {
+    if (message.swipes === undefined) {
+        return { activeSwipeIndex: null, text: message.data }
+    }
+    if (
+        message.swipes.length === 0
+        || !Number.isSafeInteger(message.swipeId)
+        || message.swipeId! < 0
+        || message.swipeId! >= message.swipes.length
+        || message.data !== message.swipes[message.swipeId!]
+    ) {
+        throw new IllustrationLedgerCorruptError('Illustration message has an invalid active swipe')
+    }
+    return { activeSwipeIndex: message.swipeId!, text: message.data }
+}
+
+// Normalizes a variant body to its control-node-free, trailing-newline-free form.
+// Used ONLY for manual-capture selection matching and idempotency identity: Core's
+// own request marker is appended at a line boundary on a prior capture of the same
+// variant (body + injected U+000A + marker). Stripping the marker leaves that
+// injected LF, and the durable source is the only thing that can disambiguate it in
+// general — but for identity we deliberately fold away trailing newlines so a
+// double click / lost ACK / reload re-request of the same selection resolves to the
+// same turn whether the Plugin re-sends the original body or the marked live text.
+function normalizeManualSource(text: string): string {
+    return stripIllustrationControlNodes(text).replace(/\n+$/, '')
+}
+
+// Deterministic manual-capture identity. Keyed on the message, the selected swipe,
+// and the normalized (canonical) source so the same selection always maps to the
+// same turn, even after the request marker has been spliced into the live text.
+async function manualCaptureRootTurnId(
+    expectedMessageId: string,
+    activeSwipeIndex: number | null,
+    canonicalSource: string,
+): Promise<string> {
+    const digest = await sha256Hex(JSON.stringify([
+        ILLUSTRATION_PROTOCOL_VERSION,
+        'manual-capture-v1',
+        expectedMessageId,
+        activeSwipeIndex,
+        canonicalSource,
+    ]))
+    return `manual:${digest}`
+}
+
+export type RequestCurrentVariantInput = {
+    protocolVersion: 1
+    characterIndex: number
+    chatIndex: number
+    messageIndex: number
+    expectedMessageId?: string
+    expectedSwipeIndex: number | null
+    expectedSourceTextUtf16: string
+}
+
+function assertSelectionIndex(value: unknown, label: string): void {
+    if (!Number.isSafeInteger(value) || (value as number) < 0) {
+        throw new IllustrationLedgerValidationError(`${label} must be a non-negative integer`)
+    }
+}
+
+/**
+ * Manual capture entry point. Re-reads the live character/chat/message, the active
+ * swipe index, and the source text, and validates each against the Plugin's
+ * expected selection under a single read pass. ANY mismatch throws a stable
+ * validation error (the Plugin distinguishes `selection_changed` via its own
+ * expected-state check) and leaves ZERO residue — no id mint, no ledger record, no
+ * marker, no save. On a confirmed match it captures via the same trusted path as
+ * automatic capture, with durable origin 'manual' and content-addressed idempotency.
+ */
+export async function requestCurrentVariant(
+    input: RequestCurrentVariantInput,
+): Promise<IllustrationTurnSnapshotV1> {
+    await requireIllustrationFeatureEnabled()
+    if (input.protocolVersion !== 1) {
+        throw new IllustrationLedgerValidationError('protocolVersion must be 1')
+    }
+    assertSelectionIndex(input.characterIndex, 'characterIndex')
+    assertSelectionIndex(input.chatIndex, 'chatIndex')
+    assertSelectionIndex(input.messageIndex, 'messageIndex')
+    if (
+        input.expectedSwipeIndex !== null
+        && (!Number.isSafeInteger(input.expectedSwipeIndex) || input.expectedSwipeIndex < 0)
+    ) {
+        throw new IllustrationLedgerValidationError('expectedSwipeIndex must be a non-negative integer or null')
+    }
+    if (typeof input.expectedSourceTextUtf16 !== 'string') {
+        throw new IllustrationLedgerValidationError('expectedSourceTextUtf16 must be a string')
+    }
+    if (input.expectedMessageId !== undefined) {
+        requireNonEmpty(input.expectedMessageId, 'expectedMessageId')
+    }
+
+    const database = getDatabase()
+    const character = database.characters?.[input.characterIndex]
+    if (!character) {
+        throw new IllustrationLedgerValidationError('Illustration capture selection changed: character is missing')
+    }
+    const chat = character.chats?.[input.chatIndex]
+    if (!chat || chat._placeholder) {
+        throw new IllustrationLedgerValidationError('Illustration capture selection changed: chat is missing')
+    }
+    const message = chat.message?.[input.messageIndex]
+    if (!message || message.role !== 'char') {
+        throw new IllustrationLedgerValidationError('Illustration capture selection changed: message is missing')
+    }
+    if (input.expectedMessageId !== undefined && message.chatId !== input.expectedMessageId) {
+        throw new IllustrationLedgerValidationError('Illustration capture selection changed: message identity')
+    }
+
+    const variant = readActiveVariant(message)
+    if (variant.activeSwipeIndex !== input.expectedSwipeIndex) {
+        throw new IllustrationLedgerValidationError('Illustration capture selection changed: active swipe')
+    }
+    // Compare canonical (marker/trailing-newline folded) forms so a re-request of a
+    // variant Core has already marked is not misread as a changed selection.
+    const canonicalSource = normalizeManualSource(input.expectedSourceTextUtf16)
+    if (normalizeManualSource(variant.text) !== canonicalSource) {
+        throw new IllustrationLedgerValidationError('Illustration capture selection changed: source text')
+    }
+
+    // Selection confirmed. Durable identity is minted in place only now, never on a
+    // mismatch. greeting-style variants whose conversation/message ids do not yet
+    // exist are safely minted here (mirroring the automatic seam).
+    const conversationId = chat.id ?? (chat.id = v4())
+    const messageId = message.chatId ?? (message.chatId = v4())
+    const rootTurnId = await manualCaptureRootTurnId(messageId, variant.activeSwipeIndex, canonicalSource)
+
+    const record = await registerTrustedTurn({
+        chaId: character.chaId,
+        conversationId,
+        expectedMessageId: messageId,
+        rootTurnId,
+        sourceVariantText: variant.text,
+        origin: 'manual',
+    })
+    if (!record) {
+        // Manual capture never enforces the capture mode, so suppression is
+        // impossible; guard defensively rather than dereference null.
+        throw new IllustrationLedgerValidationError('Illustration manual capture was unexpectedly suppressed')
+    }
+    return projectTurnSnapshot(record)
+}
+
+export type PurgeAutomaticBacklogInput = {
+    protocolVersion: 1
+    confirm: true
+    maxTurns: number
+}
+
+export type PurgeAutomaticBacklogResult = {
+    protocolVersion: 1
+    scanned: number
+    purged: number
+    remaining: boolean
+}
+
+/**
+ * One-shot bounded purge of the automatic-origin pending backlog. Cancels up to
+ * `maxTurns` automatic-origin pending turns through the existing per-turn cancel
+ * machinery (marker cleanup best-effort included). Never touches manual-origin
+ * turns or non-pending turns, and is never invoked automatically.
+ */
+export async function purgeAutomaticBacklog(
+    input: PurgeAutomaticBacklogInput,
+): Promise<PurgeAutomaticBacklogResult> {
+    if (input.protocolVersion !== 1) {
+        throw new IllustrationLedgerValidationError('protocolVersion must be 1')
+    }
+    if (input.confirm !== true) {
+        throw new IllustrationLedgerConfirmationRequiredError(
+            'Purging the automatic backlog requires confirm: true',
+        )
+    }
+    if (!Number.isSafeInteger(input.maxTurns) || input.maxTurns <= 0) {
+        throw new IllustrationLedgerValidationError('maxTurns must be a positive integer')
+    }
+
+    const pending = await illustrationJobStore.listPendingTurns()
+    const automatic = pending.filter((turn) => turn.origin === 'automatic')
+    let purged = 0
+    for (const turn of automatic) {
+        if (purged >= input.maxTurns) break
+        try {
+            await cancelTurnLedger({ turnId: turn.turnId, expectedVersion: turn.version })
+            purged += 1
+        } catch {
+            // Raced version or a turn that already left the cancellable set. Skip it;
+            // a subsequent explicit purge picks up whatever remains pending.
+        }
+    }
+    return {
+        protocolVersion: 1,
+        scanned: automatic.length,
+        purged,
+        remaining: automatic.length > purged,
+    }
 }

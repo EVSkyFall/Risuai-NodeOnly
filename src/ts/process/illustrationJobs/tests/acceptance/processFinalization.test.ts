@@ -162,12 +162,14 @@ vi.mock('src/ts/process/modules', () => ({
 }))
 
 const featureModule = await import('../../featureFlag')
+const capturePolicyModule = await import('../../capturePolicy')
 const lockModule = await import('../../locks')
 const operationLockModule = await import('../../operationLock')
 const storeModule = await import('../../store')
 const processModule = await import('../../../index.svelte')
 
 const { setIllustrationFeatureEnabled } = featureModule
+const { writeDurableCaptureMode } = capturePolicyModule
 const {
     resetIllustrationLockManagerAccessorForTests,
     setIllustrationLockManagerAccessorForTests,
@@ -277,6 +279,9 @@ beforeEach(async () => {
     setIllustrationLockManagerAccessorForTests(() => lockManager)
     setIllustrationOperationLockManagerAccessorForTests(() => lockManager)
     await setIllustrationFeatureEnabled(true)
+    // These acceptance tests exercise the automatic terminal-capture seam, so the
+    // durable capture policy must be 'automatic' for admission to proceed.
+    await writeDurableCaptureMode('automatic')
 })
 
 afterEach(() => {
