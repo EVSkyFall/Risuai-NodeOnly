@@ -1,5 +1,6 @@
 import {
     listPersistentKeys,
+    readManyPersistentJson,
     readPersistentJson,
     removePersistentKey,
     writePersistentJson,
@@ -706,7 +707,9 @@ export class IllustrationJobStore {
     private async listTurnJobRecordsUnlocked(turnId: string): Promise<IllustrationJobRecordV1[]> {
         const jobIds =
             (await readPersistentJson<string[]>(illustrationTurnJobsKey(turnId))) ?? []
-        const records = await Promise.all(jobIds.map((jobId) => this.readJobUnlocked(jobId)))
+        const records = await readManyPersistentJson<IllustrationJobRecordV1>(
+            jobIds.map((jobId) => illustrationJobKey(jobId)),
+        )
         return records
             .filter((record): record is IllustrationJobRecordV1 => record !== null)
             .map((record) => {
@@ -1161,24 +1164,10 @@ export class IllustrationJobStore {
             let records: IllustrationJobRecordV1[]
             if (input.turnId !== undefined) {
                 assertNonEmptyString(input.turnId, 'turnId')
-                const jobIds =
-                    (await readPersistentJson<string[]>(illustrationTurnJobsKey(input.turnId))) ?? []
-                const read = await Promise.all(jobIds.map((jobId) => this.readJobUnlocked(jobId)))
-                records = read
-                    .filter((record): record is IllustrationJobRecordV1 => record !== null)
-                    .map((record) => {
-                        if (record.turnId !== input.turnId) {
-                            throw new IllustrationLedgerCorruptError(
-                                `Turn-job index points to job ${record.jobId} from another turn`,
-                            )
-                        }
-                        return record
-                    })
+                records = await this.listTurnJobRecordsUnlocked(input.turnId)
             } else {
                 const keys = await listPersistentKeys(ILLUSTRATION_JOB_PREFIX)
-                const read = await Promise.all(
-                    keys.map((key) => readPersistentJson<IllustrationJobRecordV1>(key)),
-                )
+                const read = await readManyPersistentJson<IllustrationJobRecordV1>(keys)
                 records = read.filter((record): record is IllustrationJobRecordV1 => record !== null)
             }
 
@@ -1199,9 +1188,7 @@ export class IllustrationJobStore {
     async listPendingTurns(): Promise<IllustrationTurnSnapshotV1[]> {
         return await withIllustrationLedgerLock(async () => {
             const keys = await listPersistentKeys(ILLUSTRATION_TURN_PREFIX)
-            const records = await Promise.all(
-                keys.map((key) => readPersistentJson<IllustrationTurnRecordV1>(key)),
-            )
+            const records = await readManyPersistentJson<IllustrationTurnRecordV1>(keys)
             return records
                 .filter((record): record is IllustrationTurnRecordV1 => record !== null)
                 .filter((record) => [

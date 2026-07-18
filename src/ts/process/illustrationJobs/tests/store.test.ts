@@ -9,11 +9,20 @@ import type {
 } from '../types'
 import { InMemoryLockManager } from './inMemoryLockManager'
 
-const { storageMap, storageControl } = vi.hoisted(() => ({
+const { storageMap, storageControl, storageCounters } = vi.hoisted(() => ({
     storageMap: new Map<string, Uint8Array>(),
     storageControl: {
         failSetKey: null as string | null,
         failSetCount: 0,
+        // When set, the bulk-read mock emits the named key twice so the
+        // duplicate-row fail-closed guard can be exercised end to end.
+        duplicateBulkKey: null as string | null,
+    },
+    // Per-record vs bulk request accounting for the read fan-out regressions.
+    // getItem counts single-record `/api/read`; getItems counts bulk reads.
+    storageCounters: {
+        getItem: 0,
+        getItems: 0,
     },
 }))
 
@@ -24,7 +33,25 @@ vi.mock('src/ts/globalApi.svelte', () => ({
             return [...storageMap.keys()].filter((key) => key.startsWith(prefix))
         },
         async getItem(key: string) {
+            storageCounters.getItem += 1
             return storageMap.get(key) ?? null
+        },
+        async getItems(keys: string[]) {
+            storageCounters.getItems += 1
+            // Mirror the Node bulk-read server contract: missing keys are
+            // silently omitted from the response (no null placeholder), and the
+            // caller must correlate results by the `key` field.
+            const results: { key: string; value: Uint8Array }[] = []
+            for (const key of keys) {
+                const value = storageMap.get(key)
+                if (value !== undefined) {
+                    results.push({ key, value: new Uint8Array(value) })
+                    if (storageControl.duplicateBulkKey === key) {
+                        results.push({ key, value: new Uint8Array(value) })
+                    }
+                }
+            }
+            return results
         },
         async setItem(key: string, value: Uint8Array) {
             if (storageControl.failSetKey === key && storageControl.failSetCount > 0) {
@@ -306,6 +333,9 @@ beforeEach(async () => {
     storageMap.clear()
     storageControl.failSetKey = null
     storageControl.failSetCount = 0
+    storageControl.duplicateBulkKey = null
+    storageCounters.getItem = 0
+    storageCounters.getItems = 0
     transitionSequence = 0
     vi.useFakeTimers()
     vi.setSystemTime(BASE_TIME)
@@ -1636,6 +1666,204 @@ describe('Gate 4a snapshots and outstanding Agent states', () => {
         expect(result).toEqual({ deletedJobIds: [], deletedTurnIds: [] })
         expect(await store.getTurn('pending:agent_blocked')).not.toBeNull()
         expect(await store.getJob('outstanding:agent_blocked_retryable')).not.toBeNull()
+    })
+})
+
+describe('bounded snapshot reads (bulk read fan-out)', () => {
+    function bulkStoredJob(
+        jobId: string,
+        state: IllustrationJobState,
+        options: {
+            turnId?: string
+            slotOrdinal?: number
+            createdAt?: number
+            updatedAt?: number
+        } = {},
+    ): IllustrationJobRecordV1 {
+        const createdAt = options.createdAt ?? BASE_TIME
+        return {
+            schemaVersion: 1,
+            turnId: options.turnId ?? `turn:${jobId}`,
+            jobId,
+            slotToken: `slot:${jobId}`,
+            insertAfterUtf16: options.slotOrdinal ?? 0,
+            sceneId: `scene:${jobId}`,
+            scenePayload: { schemaVersion: 1, data: { secret: `payload:${jobId}` } },
+            sourceRevisionHash: `source:${jobId}`,
+            slotOrdinal: options.slotOrdinal ?? 0,
+            createdAt,
+            state,
+            version: 1,
+            leaseId: null,
+            leaseExpiresAt: 0,
+            fence: 0,
+            workerEpoch: 0,
+            updatedAt: options.updatedAt ?? createdAt,
+            idempotencyKey: `state:${jobId}`,
+            agentAttemptCount: state.startsWith('agent_blocked') ? 1 : 0,
+            creationIdempotencyKey: `create:${jobId}`,
+            prompt: { positive: `positive:${jobId}`, negative: `negative:${jobId}` },
+        }
+    }
+
+    function bulkStoredTurn(
+        turnId: string,
+        state: IllustrationTurnRecordV1['state'],
+        updatedAt = BASE_TIME,
+    ): IllustrationTurnRecordV1 {
+        return {
+            schemaVersion: 1,
+            turnId,
+            state,
+            version: 1,
+            leaseId: null,
+            leaseExpiresAt: 0,
+            fence: 0,
+            workerEpoch: 0,
+            updatedAt,
+            idempotencyKey: `create:${turnId}`,
+            agentAttemptCount: state.startsWith('agent_blocked') ? 1 : 0,
+        }
+    }
+
+    test('reads a full listJobs+listPendingTurns pass with zero per-record reads', async () => {
+        storageMap.clear()
+        // 3,000 terminal jobs — only the 50 most-recently-updated survive the cap.
+        for (let index = 0; index < 3_000; index += 1) {
+            const jobId = `terminal:${index}`
+            encodeStored(
+                illustrationJobKey(jobId),
+                bulkStoredJob(jobId, 'committed', {
+                    slotOrdinal: index % 15,
+                    createdAt: BASE_TIME + index,
+                    updatedAt: BASE_TIME + index,
+                }),
+            )
+        }
+        // N live/uncertain jobs — all survive regardless of the cap.
+        const liveStates: IllustrationJobState[] = ['queued', 'generating', 'uncertain']
+        liveStates.forEach((state, index) => {
+            const jobId = `live:${state}`
+            encodeStored(
+                illustrationJobKey(jobId),
+                bulkStoredJob(jobId, state, {
+                    slotOrdinal: 20 + index,
+                    createdAt: BASE_TIME + 10_000 + index,
+                }),
+            )
+        })
+        // 200 terminal turns + 6 pending/blocked turns.
+        for (let index = 0; index < 200; index += 1) {
+            const turnId = `done:${index}`
+            encodeStored(
+                illustrationTurnKey(turnId),
+                bulkStoredTurn(turnId, 'completed', BASE_TIME + index),
+            )
+        }
+        const blockedStates: IllustrationTurnRecordV1['state'][] = [
+            'awaiting_plan',
+            'awaiting_plan',
+            'agent_blocked_retryable',
+            'agent_blocked_retryable',
+            'agent_blocked',
+            'agent_blocked',
+        ]
+        blockedStates.forEach((state, index) => {
+            const turnId = `pending:${index}`
+            encodeStored(
+                illustrationTurnKey(turnId),
+                bulkStoredTurn(turnId, state, BASE_TIME + 5_000 + index),
+            )
+        })
+
+        storageCounters.getItem = 0
+        storageCounters.getItems = 0
+
+        const jobs = await store.listJobs()
+        const turns = await store.listPendingTurns()
+
+        // Acceptance: no per-record `/api/read`, at most one Turn bulk-read and
+        // one Job bulk-read for the whole reconcile pass.
+        expect(storageCounters.getItem).toBe(0)
+        expect(storageCounters.getItems).toBe(2)
+
+        // Result parity: every live/uncertain job plus the newest 50 terminal.
+        const live = jobs.filter((job) => liveStates.includes(job.state))
+        const terminals = jobs.filter((job) => job.state === 'committed')
+        expect(live.map((job) => job.jobId).sort()).toEqual([
+            'live:generating',
+            'live:queued',
+            'live:uncertain',
+        ])
+        expect(terminals).toHaveLength(50)
+        expect(terminals.some((job) => job.jobId === 'terminal:2999')).toBe(true)
+        expect(terminals.some((job) => job.jobId === 'terminal:2949')).toBe(false)
+
+        expect(turns).toHaveLength(6)
+        expect(turns.map((turn) => turn.state).sort()).toEqual([
+            'agent_blocked',
+            'agent_blocked',
+            'agent_blocked_retryable',
+            'agent_blocked_retryable',
+            'awaiting_plan',
+            'awaiting_plan',
+        ])
+    })
+
+    test('listJobs({turnId}) uses a single bulk-read and drops a missing indexed job', async () => {
+        storageMap.clear()
+        const turnId = 'bulk-turn'
+        const present = bulkStoredJob(`${turnId}:job:0`, 'queued', { turnId, slotOrdinal: 0 })
+        const alsoPresent = bulkStoredJob(`${turnId}:job:1`, 'generating', { turnId, slotOrdinal: 1 })
+        encodeStored(illustrationJobKey(present.jobId), present)
+        encodeStored(illustrationJobKey(alsoPresent.jobId), alsoPresent)
+        // Index references a third job whose record was never written (lost ACK).
+        encodeStored(illustrationTurnJobsKey(turnId), [
+            present.jobId,
+            `${turnId}:job:missing`,
+            alsoPresent.jobId,
+        ])
+
+        storageCounters.getItem = 0
+        storageCounters.getItems = 0
+
+        const jobs = await store.listJobs({ turnId })
+
+        // One single read for the turnjobs index, one bulk read for the jobs.
+        expect(storageCounters.getItem).toBe(1)
+        expect(storageCounters.getItems).toBe(1)
+        expect(jobs.map((job) => job.jobId)).toEqual([`${turnId}:job:0`, `${turnId}:job:1`])
+    })
+
+    test('fails closed when the turn-job index points at another turn', async () => {
+        storageMap.clear()
+        const turnId = 'guard-turn'
+        const foreign = bulkStoredJob(`${turnId}:job:0`, 'queued', { turnId: 'other-turn' })
+        encodeStored(illustrationJobKey(foreign.jobId), foreign)
+        encodeStored(illustrationTurnJobsKey(turnId), [foreign.jobId])
+
+        await expect(store.listJobs({ turnId })).rejects.toBeInstanceOf(
+            IllustrationLedgerCorruptError,
+        )
+    })
+
+    test('fails closed on corrupt JSON bytes in a scanned job record', async () => {
+        storageMap.clear()
+        encodeStored(illustrationJobKey('good:job'), bulkStoredJob('good:job', 'queued'))
+        storageMap.set(
+            illustrationJobKey('corrupt:job'),
+            new TextEncoder().encode('{ this is not json'),
+        )
+
+        await expect(store.listJobs()).rejects.toBeInstanceOf(SyntaxError)
+    })
+
+    test('fails closed when the bulk response returns a duplicate row', async () => {
+        storageMap.clear()
+        encodeStored(illustrationJobKey('dup:job'), bulkStoredJob('dup:job', 'queued'))
+        storageControl.duplicateBulkKey = illustrationJobKey('dup:job')
+
+        await expect(store.listJobs()).rejects.toThrow(/duplicate/i)
     })
 })
 

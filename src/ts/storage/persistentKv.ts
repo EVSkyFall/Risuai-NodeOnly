@@ -38,6 +38,61 @@ export async function readPersistentJson<T>(storageKey: string): Promise<T | nul
     return JSON.parse(decoder.decode(data)) as T;
 }
 
+type BulkCapableStorage = {
+    getItems?: (keys: string[]) => Promise<{ key: string; value: Uint8Array | null }[]>
+}
+
+/**
+ * Read many storage keys in a single round trip and JSON-decode each value,
+ * preserving one output slot per input key (including duplicate inputs).
+ *
+ * On Node storage this uses the existing bulk endpoint
+ * (`forageStorage.getItems` / `POST /api/assets/bulk-read`) so a scan of N keys
+ * costs one request rather than N per-record `/api/read`s. Storage backends
+ * without a bulk API fall back to per-key reads.
+ *
+ * Semantics match `readPersistentJson` exactly per key: a key that is absent
+ * from the response (or stored empty) decodes to `null`; corrupt bytes throw
+ * from `JSON.parse`. The bulk correlation itself is fail-closed — an unrequested
+ * key or a duplicate row in the response throws instead of being silently
+ * dropped or letting a stray row shadow the wrong slot.
+ */
+export async function readManyPersistentJson<T>(
+    storageKeys: readonly string[],
+): Promise<(T | null)[]> {
+    await ensureStorageReady();
+    if (storageKeys.length === 0) {
+        return [];
+    }
+
+    const bulkReader = (forageStorage as BulkCapableStorage).getItems;
+    if (typeof bulkReader !== "function") {
+        return await Promise.all(storageKeys.map((key) => readPersistentJson<T>(key)));
+    }
+
+    const uniqueKeys = [...new Set(storageKeys)];
+    const rows = await bulkReader.call(forageStorage, uniqueKeys);
+    const requested = new Set(uniqueKeys);
+    const rowByKey = new Map<string, Uint8Array | null>();
+    for (const row of rows) {
+        if (!requested.has(row.key)) {
+            throw new Error(`Bulk read returned an unrequested key: ${row.key}`);
+        }
+        if (rowByKey.has(row.key)) {
+            throw new Error(`Bulk read returned a duplicate row for key: ${row.key}`);
+        }
+        rowByKey.set(row.key, row.value ?? null);
+    }
+
+    return storageKeys.map((key) => {
+        const value = rowByKey.get(key);
+        if (!value || value.length === 0) {
+            return null;
+        }
+        return JSON.parse(decoder.decode(value)) as T;
+    });
+}
+
 export async function writePersistentJson<T>(storageKey: string, value: T): Promise<void> {
     await ensureStorageReady();
     await forageStorage.setItem(storageKey, encoder.encode(JSON.stringify(value)));
