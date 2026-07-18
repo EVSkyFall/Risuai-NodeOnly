@@ -17,6 +17,7 @@ import { getLLMCache, searchLLMCache } from "src/ts/translator/translator";
 import { hasher } from "src/ts/parser/parser.svelte";
 import { LLMFlags, LLMFormat, LLMProvider, LLMTokenizer, type LLMModel } from "src/ts/model/types";
 import { readPersistentJson, removePersistentKey, writePersistentJson } from "src/ts/storage/persistentKv";
+import { endAllGenerations } from "src/ts/process/generationState";
 import { sendChat as processSendChat, doingChat } from "src/ts/process/index.svelte";
 import { getModelInfo } from "src/ts/model/modellist";
 import type { ModelModeExtended } from "src/ts/process/request/shared";
@@ -1434,7 +1435,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             } finally {
                 // Plugin API path does not pass through the UI unlock logic,
                 // so release doingChat here on both success and failure.
-                doingChat.set(false);
+                endAllGenerations();
             }
 
             return true;

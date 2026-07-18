@@ -6,6 +6,7 @@ import { language } from "src/lang"
 import { updateTextThemeAndCSS } from "./gui/colorscheme"
 import { defaultHotkeys } from "./defaulthotkeys"
 import { doingChat, previewBody, sendChat } from "./process/index.svelte"
+import { endAllGenerations } from "./process/generationState"
 
 export function initHotkey(){
     document.addEventListener('keydown', async (ev) => {
@@ -139,7 +140,7 @@ export function initHotkey(){
                     let md = ''
                     md += '### Prompt\n'
                     md += '```json\n' + JSON.stringify(JSON.parse(previewBody), null, 2).replaceAll('```', '\\`\\`\\`') + '\n```\n'
-                    doingChat.set(false)
+                    endAllGenerations()
                     alertMd(md)
                     return
                 }

@@ -14,6 +14,7 @@
     import { DBState } from 'src/ts/stores.svelte';
     import { getCharImage } from "../../ts/characters";
     import { chatProcessStage, doingChat, sendChat } from "../../ts/process/index.svelte";
+    import { abortGeneration, chatGenKey, endGeneration, generationStates, registerAbort } from "../../ts/process/generationState";
     import { ensureCurrentChatReady } from "../../ts/storage/chatStorage";
     import { sleep } from "../../ts/util";
     import { language } from "../../lang";
@@ -539,12 +540,27 @@ import { isMobile } from 'src/ts/platform'
         DBState.db.characters[$selectedCharID].reloadKeys += 1
     }
 
-    let abortController:null|AbortController = null
+    // The abort controller lives in the per-chat generation-state registry so
+    // the Stop button aborts the generation of the chat it is shown for (not
+    // whatever this screen instance last started). See generationState.ts.
+    function currentChatGenKey(){
+        const char = DBState.db.characters[$selectedCharID]
+        return chatGenKey(char?.chats?.[char.chatPage]?.id)
+    }
+
+    // Stop affordance is per-chat: shown when the CURRENTLY SELECTED chat has
+    // a generation entry (live or background), so the button always targets
+    // the chat it is rendered for — generate in A, switch to B, and B shows
+    // Send while A (revisited) still shows a working Stop. Recomputes on chat
+    // switch because currentChatGenKey reads the selected char/chatPage.
+    let currentChatGenerating = $derived($generationStates.has(currentChatGenKey()))
 
     async function sendChatMain(continued:boolean = false) {
 
         messageInput = ''
-        abortController = new AbortController()
+        const genKey = currentChatGenKey()
+        const abortController = new AbortController()
+        registerAbort(genKey, abortController)
         let generated = false
         try {
             generated = await sendChat(-1, {
@@ -555,7 +571,7 @@ import { isMobile } from 'src/ts/platform'
             console.error(error)
             alertError(error)
         }
-        $doingChat = false
+        endGeneration(genKey)
         if(DBState.db.playMessage){
             playNotificationSound(DBState.db.messageSound, DBState.db.messageSoundVolume)
         }
@@ -563,9 +579,7 @@ import { isMobile } from 'src/ts/platform'
     }
 
     function abortChat(){
-        if(abortController){
-            abortController.abort()
-        }
+        abortGeneration(currentChatGenKey())
     }
 
     let { userIconPortrait, currentUsername, userIcon } = $derived.by(() => {
@@ -1076,7 +1090,7 @@ import { isMobile } from 'src/ts/platform'
                     <Maximize2 size={18} />
                 </button>
 
-                {#if $doingChat || doingChatInputTranslate}
+                {#if currentChatGenerating || doingChatInputTranslate}
                     <button
                             aria-labelledby="cancel"
                             class="order-2 shrink-0 flex justify-center items-center w-9 h-9 rounded-full text-textcolor hover:bg-primary/20 transition-colors" onclick={abortChat}

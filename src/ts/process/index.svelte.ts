@@ -1,4 +1,4 @@
-import { get, writable } from "svelte/store";
+import { get } from "svelte/store";
 import { type character, type MessageGenerationInfo, type Chat, type MessagePresetInfo, changeToPreset, setCurrentChat, type Message, normalizeChat } from "../storage/database.svelte";
 import { DBState } from '../stores.svelte';
 import { CharEmotion, selectedCharID } from "../stores.svelte";
@@ -27,6 +27,7 @@ import { resolveChatModelBinding, resolvePresetMaxOutputTokens } from "./request
 import { hypaMemoryV3 } from "./memory/hypav3";
 import { getModuleAssets, getModuleToggles } from "./modules";
 import { readImage } from "../globalApi.svelte";
+import { chatGenKey, chatProcessStage, endGeneration, isChatGenerating, setGenerationStage, startGeneration } from "./generationState";
 
 export interface OpenAIChat{
     role: 'system'|'user'|'assistant'|'function'
@@ -52,9 +53,7 @@ export interface requestTokenPart{
     tokens:number
 }
 
-export const doingChat = writable(false)
-export const chatProcessStage = writable(0)
-export const abortChat = writable(false)
+export { doingChat, chatProcessStage } from "./generationState"
 export let requestTokenParts:{[key:string]:requestTokenPart[]} = {}
 export let previewFormated:OpenAIChat[] = []
 export let previewBody:string = ''
@@ -172,14 +171,20 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
     }
 
-    let isDoing = get(doingChat)
+    // Concurrency guard, per chat: block a new send only when THIS chat is
+    // already generating. Keyed by the real chat id (chat.id); legacy chats
+    // without an id share one fallback key. See generationState.ts.
+    const guardChar = DBState.db.characters[get(selectedCharID)]
+    const realChatId = guardChar?.chats?.[guardChar.chatPage]?.id
+    const genKey = chatGenKey(realChatId)
 
-    if(isDoing){
+    if(isChatGenerating(genKey)){
         if(chatProcessIndex === -1){
             return false
         }
     }
-    doingChat.set(true)
+    const generationId = v4()
+    startGeneration(genKey, generationId)
 
     if(chatProcessIndex === -1 && DBState.db.presetChain){
         const names = DBState.db.presetChain.split(',').map((v) => v.trim())
@@ -206,7 +211,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     // Block send if chat is still a placeholder (hydration not complete)
     if (nowChatroom.chats[nowChatroom.chatPage]?._placeholder) {
         alertError('Chat is still loading. Please wait a moment.')
-        doingChat.set(false)
+        endGeneration(genKey)
         return false
     }
     nowChatroom.chats[nowChatroom.chatPage].message = nowChatroom.chats[nowChatroom.chatPage].message.map((v) => {
@@ -280,7 +285,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
     }
 
-    chatProcessStage.set(1)
+    setGenerationStage(genKey, 1)
     stageTimings.stage1Start = Date.now()
     let unformated = {
         'main':([] as OpenAIChat[]),
@@ -791,7 +796,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         ms = makeMs(currentChat)
         currentTokens += triggerResult.tokens
         if(triggerResult.stopSending){
-            doingChat.set(false)
+            endGeneration(genKey)
             return false
         }
     }
@@ -952,7 +957,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     
     if((currentChat.supaMemory ?? nowChatroom.supaMemory) && DBState.db.hypaV3){
         stageTimings.stage1Duration = Date.now() - stageTimings.stage1Start
-        chatProcessStage.set(2)
+        setGenerationStage(genKey, 2)
         stageTimings.stage2Start = Date.now()
         console.log("Current chat's hypaV3 Data: ", currentChat.hypaV3Data)
         const sp = await hypaMemoryV3(chats, currentTokens, maxContextTokens, currentChat, nowChatroom, tokenizer)
@@ -974,7 +979,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         currentChat = DBState.db.characters[selectedChar].chats[selectedChat];
         console.log("[Expected to be updated] chat's HypaV3Data: ", currentChat.hypaV3Data)
         stageTimings.stage2Duration = Date.now() - stageTimings.stage2Start
-        chatProcessStage.set(1)
+        setGenerationStage(genKey, 1)
     }
     else{
         stageTimings.stage1Duration = Date.now() - stageTimings.stage1Start
@@ -1367,7 +1372,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     if(inputTokens + outputTokens > maxContextTokens){
         outputTokens = maxContextTokens - inputTokens
     }
-    const generationId = v4()
+    // generationId minted at the top of sendChat (registered in the
+    // generation-state map alongside the real chat id).
     const generationModel = getGenerationModelString()
 
     generationInfo = {
@@ -1384,7 +1390,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
     }
 
-    chatProcessStage.set(3)
+    setGenerationStage(genKey, 3)
     stageTimings.stage3Start = Date.now()
     if(arg.preview){
         previewFormated = formated
@@ -1400,6 +1406,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         bias: {},
         continue: arg.continue,
         chatId: generationId,
+        realChatId: realChatId,
         imageResponse: DBState.db.outputImageModal,
         previewBody: arg.previewPrompt,
         escape: nowChatroom.type === 'character' && nowChatroom.escapeOutput,
@@ -1608,7 +1615,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     }
 
     if(needsAutoContinue){
-        doingChat.set(false)
+        endGeneration(genKey, { keepPendingAbort: true })
         return await sendChat(chatProcessIndex, {
             chatAdditonalTokens: arg.chatAdditonalTokens,
             continue: true,
@@ -1634,7 +1641,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     if(generationInfo.stageTiming) {
         generationInfo.stageTiming.stage3 = stageTimings.stage3Duration
     }
-    chatProcessStage.set(4)
+    setGenerationStage(genKey, 4)
     stageTimings.stage4Start = Date.now()
 
     if(resendChat){
@@ -1652,7 +1659,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             DBState.db.characters[selectedChar].chats[selectedChat].message[lastMessageIndex].generationInfo = generationInfo
         }
         
-        doingChat.set(false)
+        endGeneration(genKey, { keepPendingAbort: true })
         return await sendChat(chatProcessIndex, {
             signal: abortSignal
         })
