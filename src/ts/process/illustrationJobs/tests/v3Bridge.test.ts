@@ -478,8 +478,26 @@ describe('private V3 API shape and hygiene', () => {
             imagePromptOwnership: 'plugin-final-structured',
             imagePromptMeasurement: 'core-provider-model-exact',
             supportsNaiV4CharacterCaptions: true,
+            illustrationStructuredOutputContractVersion: 1,
+            illustrationSingleGeneration: true,
             featureEnabled: true,
         })
+    })
+
+    test('additive illustration capabilities do not disturb the required contract versions', async () => {
+        const { bridge } = makeHarness()
+        const capabilities = await bridge.rootMethods._ijGetCapabilities() as Record<string, unknown>
+        // The additive fields are present...
+        expect(capabilities.illustrationStructuredOutputContractVersion).toBe(1)
+        expect(capabilities.illustrationSingleGeneration).toBe(true)
+        // ...while none of the pre-existing required contract versions were bumped,
+        // so a 0.2.5 plugin is never forced into contract_pending.
+        expect(capabilities.protocolVersion).toBe(1)
+        expect(capabilities.markerContractVersion).toBe(1)
+        expect(capabilities.coordinatorContractVersion).toBe(1)
+        expect(capabilities.agentFailureContractVersion).toBe(1)
+        expect(capabilities.agentLlmDrainContractVersion).toBe(1)
+        expect(capabilities.imagePromptContractVersion).toBe(1)
     })
 
     test('maps every stable code without echoing payloads or logging RPC values', async () => {

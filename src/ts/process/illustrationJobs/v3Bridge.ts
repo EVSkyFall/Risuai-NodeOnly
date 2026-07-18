@@ -854,6 +854,13 @@ export function createAuthorizedIllustrationV3Bridge(input: {
                 imagePromptOwnership: 'plugin-final-structured',
                 imagePromptMeasurement: 'core-provider-model-exact',
                 supportsNaiV4CharacterCaptions: true,
+                // Additive capabilities. The host always forces a single generation
+                // (noMultiGen) and, on supported providers only, forwards a validated
+                // structured-output schema to native JSON schema / response format;
+                // unsupported providers fall back to the prompt-only strict path.
+                // These are additive: older plugins that ignore them keep working.
+                illustrationStructuredOutputContractVersion: 1,
+                illustrationSingleGeneration: true,
                 featureEnabled: await deps.isFeatureEnabled(),
             }
         }),

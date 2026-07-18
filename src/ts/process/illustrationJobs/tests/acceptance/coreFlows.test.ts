@@ -50,10 +50,20 @@ vi.mock('src/ts/globalApi.svelte', () => ({
 
 vi.mock('src/ts/parser/parser.svelte', () => ({
     hasher: vi.fn(async () => new Uint8Array(32)),
+    // Satisfies the jsonSchema converter's import binding (pulled in transitively via
+    // v3BridgeHost's host-boundary schema validation). Only the interface-form schema
+    // branch invokes it, which these tests never exercise (all schemas are raw JSON).
+    risuChatParser: (input: string) => input,
 }))
 
 vi.mock('src/ts/storage/database.svelte', () => ({
-    getDatabase: () => harness.database,
+    // The host-boundary schema validator transitively loads util.ts -> stores.svelte,
+    // whose module-update $effect reads the database and current chat/character at
+    // import time (before beforeEach installs the real fixture). Fall back to a minimal
+    // shape so that eager effect is a harmless no-op; installed fixtures win afterward.
+    getDatabase: () => harness.database ?? ({ enabledModules: [] } as any),
+    getCurrentChat: () => undefined,
+    getCurrentCharacter: () => undefined,
 }))
 
 vi.mock('src/ts/storage/chatStorage', () => ({
@@ -642,6 +652,7 @@ describe('Gate 4d Core-side joint acceptance', () => {
                 bias: {},
                 blockPlugins: true,
                 useStreaming: false,
+                noMultiGen: true,
                 hostOmitCallerGenerationCap: true,
             }),
             'model',
@@ -796,5 +807,98 @@ describe('Gate 4d Core-side joint acceptance', () => {
         )
         expect(committed.assetId).not.toBe(placeholderAssetId)
         expect(harness.provider).toHaveBeenCalledTimes(2)
+    })
+})
+
+describe('authorized illustration host LLM single generation and structured output', () => {
+    async function readyBridge(label: string): Promise<Bridge> {
+        const bridge = createBridge(label)
+        await claimCoordinator(bridge, `coordinator-${label}`)
+        return bridge
+    }
+
+    // §5-1 / §4.1 + §4.2: the host forces noMultiGen and forwards a validated schema
+    // string verbatim into requestChatDataMain, and returns the single success shape.
+    test('forwards noMultiGen:true and the validated schema into requestChatDataMain', async () => {
+        const bridge = await readyBridge('llm-passthrough')
+        let capturedArg: Record<string, unknown> | undefined
+        harness.requestLlm.mockImplementationOnce(async (arg: Record<string, unknown>) => {
+            capturedArg = arg
+            return { type: 'success', result: '{"foo":"bar"}' }
+        })
+        const schema = '{"type":"object","properties":{"foo":{"type":"string"}},"required":["foo"]}'
+        await expect(bridge.runLLMModel({ mode: 'model', messages: [], schema }))
+            .resolves.toEqual({ type: 'success', result: '{"foo":"bar"}' })
+        expect(capturedArg?.noMultiGen).toBe(true)
+        expect(capturedArg?.schema).toBe(schema)
+        expect(harness.requestLlm).toHaveBeenCalledTimes(1)
+    })
+
+    // §5-3: a real multi-generation tuple fails closed with a stable validation code;
+    // the ['char', ...] role strings and scene payloads never leak into the outcome.
+    test('fails closed on a real multiline tuple without leaking role strings', async () => {
+        const bridge = await readyBridge('llm-multiline')
+        harness.requestLlm.mockResolvedValueOnce({
+            type: 'multiline',
+            result: [['char', '{"scene":1}'], ['char', '{"scene":2}']],
+        })
+        const call = bridge.runLLMModel({ mode: 'model', messages: [] })
+        await expect(call).rejects.toThrow('[IJ:validation]')
+        const leak = await call.then(() => '', (error) => `${String(error)} ${String((error as { message?: unknown }).message ?? '')}`)
+        expect(leak).not.toContain('char')
+        expect(leak).not.toContain('scene')
+    })
+
+    // §5-4: a malformed multiline tuple is also fail-closed with the same stable code.
+    test('fails closed on a malformed multiline tuple', async () => {
+        const bridge = await readyBridge('llm-multiline-malformed')
+        harness.requestLlm.mockResolvedValueOnce({
+            type: 'multiline',
+            result: [['char']],
+        })
+        await expect(bridge.runLLMModel({ mode: 'model', messages: [] }))
+            .rejects.toThrow('[IJ:validation]')
+    })
+
+    // §5-8: malformed, oversized, and non-string schemas are rejected at the host
+    // boundary before any provider call — requestChatDataMain is never reached, so the
+    // core never fabricates a follow-up LLM request.
+    test('rejects a malformed schema before dispatching to the provider', async () => {
+        const bridge = await readyBridge('llm-bad-schema')
+        await expect(bridge.runLLMModel({ mode: 'model', messages: [], schema: '{ not valid json' }))
+            .rejects.toThrow('[IJ:validation]')
+        expect(harness.requestLlm).not.toHaveBeenCalled()
+    })
+
+    test('rejects an oversized schema before dispatching to the provider', async () => {
+        const bridge = await readyBridge('llm-big-schema')
+        const oversized = `{"type":"object","x":"${'a'.repeat(32 * 1024)}"}`
+        await expect(bridge.runLLMModel({ mode: 'model', messages: [], schema: oversized }))
+            .rejects.toThrow('[IJ:validation]')
+        expect(harness.requestLlm).not.toHaveBeenCalled()
+    })
+
+    test('rejects a non-string schema before dispatching to the provider', async () => {
+        const bridge = await readyBridge('llm-nonstring-schema')
+        await expect(bridge.runLLMModel({ mode: 'model', messages: [], schema: { type: 'object' } }))
+            .rejects.toThrow('[IJ:validation]')
+        expect(harness.requestLlm).not.toHaveBeenCalled()
+    })
+
+    // §5-8 regression: a primitive/null-valued schema string is JSON-parseable, so the
+    // bare convertInterfaceToSchema accepts it without throwing — but the Gemini/Vertex
+    // builder (getGeneralJSONSchema) walks the parsed value with Object.keys, and
+    // Object.keys(null) throws a TypeError. Since the resolved provider is not known at
+    // the host boundary, acceptance must exercise the same full converter so these
+    // payloads fail closed with the stable [IJ:validation] code before any provider
+    // dispatch, instead of leaking an unmapped TypeError from inside the request builder.
+    test.each([
+        ['a top-level null schema', 'null'],
+        ['a nested-null schema', '{"foo":null}'],
+    ] as const)('rejects %s that breaks the Gemini converter before dispatching', async (_label, schema) => {
+        const bridge = await readyBridge(`llm-primitive-schema-${schema.length}`)
+        await expect(bridge.runLLMModel({ mode: 'model', messages: [], schema }))
+            .rejects.toThrow('[IJ:validation]')
+        expect(harness.requestLlm).not.toHaveBeenCalled()
     })
 })

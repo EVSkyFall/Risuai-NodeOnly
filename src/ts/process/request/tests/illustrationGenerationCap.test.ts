@@ -147,15 +147,30 @@ function requestArgument(staticModel: string, extras: Record<string, unknown> = 
     } as any
 }
 
-async function previewBody(staticModel: string): Promise<Record<string, any>> {
+async function previewBody(
+    staticModel: string,
+    extras: Record<string, unknown> = {},
+): Promise<Record<string, any>> {
     const response = await requestChatDataMain(requestArgument(staticModel, {
         previewBody: true,
         hostOmitCallerGenerationCap: true,
+        ...extras,
     }), 'model')
     expect(response.type).toBe('success')
     if (response.type !== 'success') throw new Error('Expected a preview success response')
     return JSON.parse(response.result).body
 }
+
+// A raw JSON-Schema string, mirroring how the protected Illustration plugin ships
+// its Planner/Tagger schema (convertInterfaceToSchema JSON.parses non-`interface`
+// strings verbatim).
+const SAMPLE_SCHEMA = JSON.stringify({
+    $schema: 'https://json-schema.org/draft/2020-12/schema',
+    type: 'object',
+    additionalProperties: false,
+    properties: { foo: { type: 'string' } },
+    required: ['foo'],
+})
 
 beforeEach(() => {
     harness.db = {
@@ -262,6 +277,7 @@ beforeEach(() => {
         harness.formats.Plugin,
     ))
     harness.models.set('openai-test', model('openai-test', harness.formats.OpenAICompatible))
+    harness.models.set('gpt-illustration-test', model('gpt-illustration-test', harness.formats.OpenAICompatible))
     harness.models.set('openai-completion-test', model(
         'openai-completion-test',
         harness.formats.OpenAICompatible,
@@ -379,5 +395,63 @@ describe('authorized illustration caller generation-cap omission', () => {
             userValues: { max_tokens: 12_345 },
         } as any
         expect(resolvePresetMaxOutputTokens(preset)).toBe(12_345)
+    })
+})
+
+describe('authorized illustration structured output and single generation', () => {
+    // §5-5: the OpenAI-compatible builder emits an exact json_schema response_format
+    // from the passed-through schema string, without relying on the global toggle.
+    test('OpenAI-compatible body carries the exact json_schema response_format', async () => {
+        const body = await previewBody('openai-test', { schema: SAMPLE_SCHEMA })
+        expect(body.response_format.type).toBe('json_schema')
+        expect(body.response_format.json_schema.name).toBe('format')
+        expect(body.response_format.json_schema.schema).toEqual(JSON.parse(SAMPLE_SCHEMA))
+    })
+
+    // §5-6: the Gemini builder emits the JSON mime type and a response schema, with
+    // Gemini-incompatible keys ($schema / additionalProperties) stripped.
+    test('Gemini body carries JSON mime type and a stripped response schema', async () => {
+        const body = await previewBody('gemini-test', { schema: SAMPLE_SCHEMA })
+        expect(body.generation_config.response_mime_type).toBe('application/json')
+        expect(body.generation_config.response_schema.type).toBe('object')
+        expect(body.generation_config.response_schema.properties.foo).toEqual({ type: 'string' })
+        expect(Object.hasOwn(body.generation_config.response_schema, '$schema')).toBe(false)
+        expect(Object.hasOwn(body.generation_config.response_schema, 'additionalProperties')).toBe(false)
+    })
+
+    // §5-7: providers without native structured-output support get no bogus schema
+    // wire field and keep their normal prompt, so the plugin's strict prompt-only
+    // fallback path is intact.
+    test.each([
+        ['anthropic-test', 'messages'],
+        ['ooba-test', 'prompt'],
+    ] as const)('unsupported provider %s gets no schema wire field and keeps its prompt', async (modelId, promptField) => {
+        const body = await previewBody(modelId, { schema: SAMPLE_SCHEMA })
+        const serialized = JSON.stringify(body)
+        expect(serialized).not.toContain('response_format')
+        expect(serialized).not.toContain('response_schema')
+        expect(serialized).not.toContain('response_mime_type')
+        expect(Object.hasOwn(body, promptField)).toBe(true)
+    })
+
+    // §5-2: with the user's multi-generation setting on, forcing noMultiGen (as the
+    // Illustration host does) suppresses the OpenAI `n` fan-out — one dispatch, one
+    // result — even for a gpt-prefixed model that would otherwise multi-generate.
+    test('noMultiGen suppresses the OpenAI n fan-out while generic calls still fan out', async () => {
+        harness.db.genTime = 2
+        const forced = await previewBody('gpt-illustration-test', { noMultiGen: true })
+        expect(Object.hasOwn(forced, 'n')).toBe(false)
+
+        // §5-10: a generic (non-Illustration) call with the same multi-gen setting is
+        // unchanged — it still requests the fan-out.
+        const generic = await previewBody('gpt-illustration-test')
+        expect(generic.n).toBe(2)
+    })
+
+    // §5-10: generic calls that pass no schema get no structured-output wire field,
+    // proving the schema behavior is opt-in per call and does not leak globally.
+    test('generic OpenAI-compatible call without a schema gets no response_format', async () => {
+        const body = await previewBody('openai-test')
+        expect(Object.hasOwn(body, 'response_format')).toBe(false)
     })
 })

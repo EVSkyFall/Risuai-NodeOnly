@@ -1,5 +1,6 @@
 import type { OpenAIChat } from '../index.svelte'
 import { requestChatDataMain } from '../request/request'
+import { getGeneralJSONSchema } from '../templates/jsonSchema'
 import {
     cancelLedger,
     cancelTurnLedger,
@@ -35,6 +36,12 @@ import {
     type IllustrationV3AuthorizationContext,
     type IllustrationV3BridgeDependencies,
 } from './v3Bridge'
+
+// Upper bound on the authorized-bridge structured-output schema string. 32 KiB
+// (measured in UTF-16 code units, matching String.length) comfortably fits the
+// Planner/Tagger interface contracts while rejecting pathological payloads before
+// any provider call.
+const ILLUSTRATION_LLM_SCHEMA_MAX_LENGTH = 32 * 1024
 
 const bridgeDependencies: IllustrationV3BridgeDependencies = {
     now: () => Date.now(),
@@ -91,6 +98,7 @@ const bridgeDependencies: IllustrationV3BridgeDependencies = {
             messages?: unknown
             staticModel?: unknown
             allowPlugins?: unknown
+            schema?: unknown
         }
         const allowedModes = new Set(['model', 'submodel', 'memory', 'emotion', 'otherAx', 'translate'])
         if (!allowedModes.has(String(options.mode)) || !Array.isArray(options.messages)) {
@@ -102,14 +110,59 @@ const bridgeDependencies: IllustrationV3BridgeDependencies = {
         if (options.allowPlugins !== undefined && typeof options.allowPlugins !== 'boolean') {
             throw new IllustrationLedgerValidationError('runLLMModel allowPlugins must be a boolean')
         }
-        return await requestChatDataMain({
+        let schema: string | undefined
+        if (options.schema !== undefined) {
+            if (typeof options.schema !== 'string') {
+                throw new IllustrationLedgerValidationError('runLLMModel schema must be a string')
+            }
+            if (options.schema.length > ILLUSTRATION_LLM_SCHEMA_MAX_LENGTH) {
+                throw new IllustrationLedgerValidationError('runLLMModel schema exceeds the maximum length')
+            }
+            // Reject malformed schema strings at the host boundary, before any
+            // provider request. The provider builders (requestOpenAI/google) call
+            // the schema converter with no local guard, so an unconvertible string
+            // would otherwise throw synchronously inside the request builder.
+            //
+            // We run getGeneralJSONSchema — the Gemini/Vertex builder's exact
+            // converter (google.ts uses these same excludes) — rather than the bare
+            // convertInterfaceToSchema. getGeneralJSONSchema is a strict superset of
+            // every provider path's conversion: it does convertInterfaceToSchema
+            // (covering the OpenAI path, which only embeds that result) AND then
+            // walks the parsed value with Object.keys. A primitive/null-valued
+            // payload such as schema='null' parses to a non-object that
+            // convertInterfaceToSchema accepts without throwing, but Object.keys(null)
+            // throws a TypeError inside the Gemini builder. Running the full converter
+            // here means acceptance genuinely guarantees the downstream conversion
+            // cannot fail, so such payloads fail closed with a stable validation error
+            // instead of surfacing an unmapped TypeError from the request builder.
+            schema = options.schema
+            try {
+                getGeneralJSONSchema(schema, ['$schema', 'additionalProperties'])
+            } catch {
+                throw new IllustrationLedgerValidationError('runLLMModel schema is not a valid structured-output schema')
+            }
+        }
+        const response = await requestChatDataMain({
             formated: options.messages as OpenAIChat[],
             bias: {},
             staticModel: options.staticModel as string | undefined,
             blockPlugins: options.allowPlugins !== true,
             useStreaming: false,
+            // The Illustration Agent always resolves a single generation regardless
+            // of the user's multi-generation DB setting. Public/generic V3 and other
+            // plugin calls are unaffected.
+            noMultiGen: true,
+            schema,
             hostOmitCallerGenerationCap: true,
         }, options.mode as Parameters<typeof requestChatDataMain>[1], signal)
+        // Fail-closed if a provider ignores noMultiGen and returns a multi-generation
+        // tuple. Silently concatenating the tuple would splice ['user'|'char'] role
+        // strings into the plugin's JSON payload, so we surface a stable validation
+        // error instead of returning the tuple.
+        if (response?.type === 'multiline') {
+            throw new IllustrationLedgerValidationError('runLLMModel received an unexpected multi-generation response')
+        }
+        return response
     },
     subscribeWakeHints: subscribeIllustrationWakeHints,
     setTimer: (callback, delayMs) => setTimeout(callback, delayMs),
