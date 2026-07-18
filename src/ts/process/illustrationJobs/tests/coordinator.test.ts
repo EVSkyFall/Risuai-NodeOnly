@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import type { Chat, Message } from '../../../storage/database.svelte'
+import { buildRequestMarker } from '../controlNodes'
 import {
     createImagePromptMeasurementService,
     createImagePromptTokenizerLoader,
@@ -364,6 +365,41 @@ describe('submitPlanLedger', () => {
         expect((await illustrationJobStore.getTurn(claimed.turnId))?.state).toBe('stale')
         expect((await illustrationJobStore.listJobs({ turnId: claimed.turnId }))[0]?.state).toBe('stale')
     })
+
+    // §5-3 / real-path 3+6: a framed marker (LF injected at capture) submits without
+    // a source_text/hash mismatch, and the projection leaves no injected-LF residue.
+    test('submits a framed-marker turn and materializes the canonical source without LF residue', async () => {
+        const { claimed } = await registerAndClaim('Body with no trailing newline')
+        expect(harness.database.characters[0].chats[0].message[0].data)
+            .toMatch(/^Body with no trailing newline\n<!--risu-illustration-request:v1:[A-Za-z0-9_-]+-->$/)
+
+        const jobs = await submitPlanLedger(submitInput(claimed, [4]))
+
+        expect(jobs).toHaveLength(1)
+        expect((await illustrationJobStore.getTurn(claimed.turnId))?.state).toBe('awaiting_prompt')
+        const data = harness.database.characters[0].chats[0].message[0].data as string
+        expect(data).not.toContain('risu-illustration-request')
+        expect(data.match(/<risu-illustration-slot /g)).toHaveLength(1)
+        expect(data.replace(/<risu-illustration-slot[\s\S]*?<\/risu-illustration-slot>/, ''))
+            .toBe('Body with no trailing newline')
+    })
+
+    // §5-9 / real-path 9: a legacy adjacent-marker turn (durable source + marker with
+    // no injected LF) still submits, restored via the marker-only candidate.
+    test('keeps a legacy adjacent-marker turn submitting through the marker-only candidate', async () => {
+        const { registered, claimed } = await registerAndClaim('Legacy adjacent body')
+        const message = harness.database.characters[0].chats[0].message[0]
+        // Rewrite to the pre-contract adjacent serialization: no injected LF.
+        message.data = `Legacy adjacent body${buildRequestMarker(registered.target!.requestNonce)}`
+
+        const jobs = await submitPlanLedger(submitInput(claimed, [6]))
+
+        expect(jobs).toHaveLength(1)
+        expect((await illustrationJobStore.getTurn(claimed.turnId))?.state).toBe('awaiting_prompt')
+        expect(message.data).not.toContain('risu-illustration-request')
+        expect(message.data.replace(/<risu-illustration-slot[\s\S]*?<\/risu-illustration-slot>/, ''))
+            .toBe('Legacy adjacent body')
+    })
 })
 
 describe('prompt handoff and cancellation', () => {
@@ -411,8 +447,28 @@ describe('prompt handoff and cancellation', () => {
         expect(cancelled).toMatchObject({ state: 'cancelled' })
         expect(order).toEqual(['ledger', 'marker', 'strict'])
         expect((await illustrationJobStore.getTurn(claimed.turnId))?.leaseId).toBeNull()
-        expect(harness.database.characters[0].chats[0].message[0].data)
-            .not.toContain('risu-illustration-request')
+        // §5 cancel priority 1 / real-path 7: source-aware cleanup restores the exact
+        // captured source, dropping the injected line-boundary LF (no residue).
+        expect(harness.database.characters[0].chats[0].message[0].data).toBe('Cancelled source')
+    })
+
+    // §5 cancel priority 2 / real-path 8: when the user edited the marked body so
+    // neither restore candidate matches, cleanup removes ONLY the marker span and
+    // preserves the edit and surrounding whitespace (the injected LF may remain).
+    test('preserves a user edit and strips only the marker when the source no longer matches', async () => {
+        const { claimed } = await registerAndClaim('Editable cancel source')
+        const message = harness.database.characters[0].chats[0].message[0]
+        expect(message.data).toMatch(/^Editable cancel source\n<!--risu-illustration-request:v1:[A-Za-z0-9_-]+-->$/)
+        message.data = message.data.replace('Editable cancel source', 'User rewrote this\ttext')
+
+        const cancelled = await cancelTurnLedger({
+            turnId: claimed.turnId,
+            expectedVersion: claimed.version,
+        })
+
+        expect(cancelled.state).toBe('cancelled')
+        expect(message.data).toBe('User rewrote this\ttext\n')
+        expect(message.data).not.toContain('risu-illustration-request')
     })
 
     test('does not roll back cancelled when strict marker removal fails', async () => {
@@ -658,12 +714,27 @@ describe('registerTrustedTurn', () => {
         expect(mutationEvents).toEqual(['marker', 'strict'])
         expect(harness.strictSave).toHaveBeenCalledTimes(1)
         expect(turn).toMatchObject({ state: 'awaiting_plan', sourceTextUtf16: 'A quiet scene.' })
+        // §5-1: the request marker begins on its own line (a single injected LF),
+        // never fused to the body's last code unit.
         expect(harness.database.characters[0].chats[0].message[0].data)
-            .toMatch(/^A quiet scene\.<!--risu-illustration-request:v1:[A-Za-z0-9_-]+-->$/)
+            .toMatch(/^A quiet scene\.\n<!--risu-illustration-request:v1:[A-Za-z0-9_-]+-->$/)
         expect(hints).toContainEqual(expect.objectContaining({
             kind: 'turn_changed',
             turnId: turn.turnId,
         }))
+    })
+
+    // §5-1 / followup §2: a body ending in a closing ``` fence gets the marker on
+    // its own line, so markdown-it closes the fence instead of swallowing it.
+    test('frames the request marker on its own line after a closing code fence', async () => {
+        const source = '```html\n<b>x</b>\n```'
+        installDatabase(source)
+        const turn = await registerTrustedTurn(registerInput(source))
+
+        expect(turn.sourceTextUtf16).toBe(source)
+        const data = harness.database.characters[0].chats[0].message[0].data as string
+        expect(data.startsWith(`${source}\n`)).toBe(true)
+        expect(data).toMatch(/```\n<!--risu-illustration-request:v1:[A-Za-z0-9_-]+-->$/)
     })
 
     test('leaves blocked_capture after strict failure without retrying the marker', async () => {

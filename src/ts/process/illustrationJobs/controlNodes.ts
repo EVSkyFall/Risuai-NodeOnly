@@ -55,6 +55,22 @@ export function buildRequestMarker(nonce: string): string {
     return `<!--risu-illustration-request:v1:${nonce}-->`
 }
 
+/**
+ * Appends the v1 request marker so it always begins on its own line. If the
+ * target text already ends with exactly U+000A the marker is appended verbatim;
+ * otherwise exactly one U+000A is injected first. No trim, CRLF conversion, or
+ * Unicode-newline normalization is performed, and the marker bytes are unchanged
+ * — only line-boundary framing is added. An empty target yields `\n` + marker.
+ *
+ * The marker grammar is unchanged; this is purely the serialization boundary the
+ * core owns so downstream RisuAI regex/markdown never sees the marker fused to the
+ * body's last code unit (e.g. a closing ``` fence).
+ */
+export function appendRequestMarkerAtLineBoundary(text: string, nonce: string): string {
+    const marker = buildRequestMarker(nonce)
+    return text.endsWith('\n') ? `${text}${marker}` : `${text}\n${marker}`
+}
+
 export function buildSlotNode(jobId: string, slotToken: string): string {
     assertControlIdentifier(jobId, 'jobId')
     assertControlIdentifier(slotToken, 'slotToken')
@@ -67,6 +83,36 @@ export function findRequestMarkers(text: string): RequestMarkerMatch[] {
         end: match.index + match[0].length,
         nonce: match[1],
     }))
+}
+
+/**
+ * Restores the canonical captured source from raw marked text, given the durable
+ * `expectedSourceTextUtf16`. The stored marked text is ambiguous by shape alone:
+ * a legacy source-owned trailing LF (`body\n` + adjacent marker) and a new
+ * source `body` + an injected LF + marker serialize identically. The durable
+ * source is the only authority that disambiguates them.
+ *
+ * Candidate 1 removes only the marker span; if it matches the durable source
+ * exactly (byte/code-unit) it is canonical — this preserves legacy adjacent-marker
+ * turns and any source that genuinely owns its trailing LF. Candidate 2 is tried
+ * only when candidate 1 mismatches AND the char immediately before the marker is
+ * exactly U+000A: it additionally removes that one injected LF. If neither matches,
+ * the source is no longer canonical (returns null); callers must NOT hash the raw
+ * marked text or guess — they take the existing stale/corrupt path.
+ */
+export function restoreExpectedCapturedSource(
+    raw: string,
+    marker: { start: number; end: number },
+    expectedSourceTextUtf16: string,
+): string | null {
+    const markerOnly = raw.slice(0, marker.start) + raw.slice(marker.end)
+    if (markerOnly === expectedSourceTextUtf16) return markerOnly
+
+    if (marker.start > 0 && raw[marker.start - 1] === '\n') {
+        const withInjectedLfRemoved = raw.slice(0, marker.start - 1) + raw.slice(marker.end)
+        if (withInjectedLfRemoved === expectedSourceTextUtf16) return withInjectedLfRemoved
+    }
+    return null
 }
 
 export function findSlotNodes(text: string): SlotNodeMatch[] {

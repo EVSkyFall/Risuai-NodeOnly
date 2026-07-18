@@ -728,6 +728,31 @@ describe('illustration recovery', () => {
         expect((await illustrationJobStore.getTurn(second.turnId))?.state).toBe('blocked_capture')
     })
 
+    // §6.2 / real-path 2: blocked-capture recovery re-appends a MISSING marker on its
+    // own line (the same line-boundary framing as the initial capture), not fused to
+    // the body's last code unit.
+    test('re-appends a missing marker on its own line during blocked-capture recovery', async () => {
+        installDatabase('Recovery reappend source')
+        harness.strictFailure = new Error('capture failed')
+        await expect(registerTrustedTurn({
+            chaId: 'character-1',
+            conversationId: 'conversation-1',
+            expectedMessageId: 'message-1',
+            rootTurnId: 'root-reappend',
+            sourceVariantText: 'Recovery reappend source',
+        })).rejects.toThrow('capture failed')
+        const [blocked] = await illustrationJobStore.listTurns()
+        // Simulate the marker never reaching durable storage: reset to the clean source.
+        harness.database.characters[0].chats[0].message[0].data = 'Recovery reappend source'
+        harness.strictFailure = null
+
+        await runIllustrationRecovery()
+
+        expect((await illustrationJobStore.getTurn(blocked.turnId))?.state).toBe('awaiting_plan')
+        expect(harness.database.characters[0].chats[0].message[0].data)
+            .toMatch(/^Recovery reappend source\n<!--risu-illustration-request:v1:[A-Za-z0-9_-]+-->$/)
+    })
+
     test('keeps Agent-blocked jobs live when updating the parent turn', async () => {
         const target = await createClaimedTurn('Agent blocked recovery')
         const [projected] = await submitPlanLedger(planInput(target, [5]))

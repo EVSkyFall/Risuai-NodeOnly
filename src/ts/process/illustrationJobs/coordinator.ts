@@ -6,9 +6,10 @@ import {
     type FoundSlotResolution,
 } from './anchors'
 import {
-    buildRequestMarker,
+    appendRequestMarkerAtLineBoundary,
     buildSlotNode,
     findRequestMarkers,
+    restoreExpectedCapturedSource,
     stripIllustrationControlNodes,
 } from './controlNodes'
 import {
@@ -536,18 +537,24 @@ async function submitPlanLedgerLocked(
         return await closeTurnBeforeProjection(turn, 'corrupt', marker.reason, input)
     }
 
-    const liveHash = await computeSourceRevisionHash(marker.location.getText(), {
+    // Restore the canonical source line-boundary-aware (durable source is the
+    // authority that disambiguates an injected LF from a source-owned LF), then
+    // hash the RESTORED canonical text — never the raw marked text.
+    const restoredSource = restoreExpectedCapturedSource(
+        marker.location.getText(),
+        { start: marker.start, end: marker.end },
+        turn.sourceTextUtf16,
+    )
+    if (restoredSource === null) {
+        return await closeTurnBeforeProjection(turn, 'stale', 'source_text_mismatch', input)
+    }
+    const liveHash = await computeSourceRevisionHash(restoredSource, {
         requestNonce: turn.target.requestNonce,
         slotTokens: [],
         committedAssetIds: [],
     })
     if (!hashesMatch(liveHash, turn.sourceRevisionHash)) {
         return await closeTurnBeforeProjection(turn, 'stale', 'source_hash_mismatch', input)
-    }
-    const markerless = marker.location.getText().slice(0, marker.start)
-        + marker.location.getText().slice(marker.end)
-    if (markerless !== turn.sourceTextUtf16) {
-        return await closeTurnBeforeProjection(turn, 'stale', 'source_text_mismatch', input)
     }
 
     if (!manifest) {
@@ -599,16 +606,21 @@ async function submitPlanLedgerLocked(
     if (currentMarker.kind === 'corrupt') {
         return await closeTurnBeforeProjection(turn, 'corrupt', currentMarker.reason, input)
     }
-    const currentHash = await computeSourceRevisionHash(currentMarker.location.getText(), {
-        requestNonce: turn.target.requestNonce,
-        slotTokens: [],
-        committedAssetIds: [],
-    })
-    const currentMarkerless = currentMarker.location.getText().slice(0, currentMarker.start)
-        + currentMarker.location.getText().slice(currentMarker.end)
+    const currentRestoredSource = restoreExpectedCapturedSource(
+        currentMarker.location.getText(),
+        { start: currentMarker.start, end: currentMarker.end },
+        turn.sourceTextUtf16,
+    )
+    const currentHash = currentRestoredSource === null
+        ? null
+        : await computeSourceRevisionHash(currentRestoredSource, {
+            requestNonce: turn.target.requestNonce,
+            slotTokens: [],
+            committedAssetIds: [],
+        })
     if (
-        !hashesMatch(currentHash, turn.sourceRevisionHash)
-        || currentMarkerless !== turn.sourceTextUtf16
+        currentRestoredSource === null
+        || !hashesMatch(currentHash!, turn.sourceRevisionHash)
     ) {
         return await closeTurnBeforeProjection(
             turn,
@@ -812,14 +824,20 @@ export async function recoverIllustrationCapture(turnId: string): Promise<void> 
         return
     }
     if (marker.kind === 'found') {
-        const markerless = marker.location.getText().slice(0, marker.start)
-            + marker.location.getText().slice(marker.end)
-        const hash = await computeSourceRevisionHash(marker.location.getText(), {
-            requestNonce: turn.target.requestNonce,
-            slotTokens: [],
-            committedAssetIds: [],
-        })
-        if (markerless !== turn.sourceTextUtf16 || !hashesMatch(hash, turn.sourceRevisionHash)) {
+        const restored = restoreExpectedCapturedSource(
+            marker.location.getText(),
+            { start: marker.start, end: marker.end },
+            turn.sourceTextUtf16,
+        )
+        const matches = restored !== null && hashesMatch(
+            await computeSourceRevisionHash(restored, {
+                requestNonce: turn.target.requestNonce,
+                slotTokens: [],
+                committedAssetIds: [],
+            }),
+            turn.sourceRevisionHash,
+        )
+        if (!matches) {
             if (turn.state === 'prepared') await updateRecoveryTurn(turn, 'stale', 'capture_source_changed')
             return
         }
@@ -839,7 +857,7 @@ export async function recoverIllustrationCapture(turnId: string): Promise<void> 
             return
         }
         location = candidates[0]
-        location.setText(`${location.getText()}${buildRequestMarker(turn.target.requestNonce)}`)
+        location.setText(appendRequestMarkerAtLineBoundary(location.getText(), turn.target.requestNonce))
     }
 
     try {
@@ -1000,9 +1018,12 @@ async function recoverIllustrationProjectionLocked(
             return
         }
         if (marker.kind === 'found') {
-            const markerless = marker.location.getText().slice(0, marker.start)
-                + marker.location.getText().slice(marker.end)
-            if (markerless !== turn.sourceTextUtf16) {
+            const restored = restoreExpectedCapturedSource(
+                marker.location.getText(),
+                { start: marker.start, end: marker.end },
+                turn.sourceTextUtf16,
+            )
+            if (restored === null) {
                 await settleProjectionFailure(turn, 'stale', 'source_hash_mismatch', workerEpoch)
                 return
             }
@@ -1317,7 +1338,19 @@ async function removeCancelledTurnMarkerBestEffort(
         )
         if (marker.kind !== 'found') return
         const text = marker.location.getText()
-        marker.location.setText(text.slice(0, marker.start) + text.slice(marker.end))
+        // Priority 1: source-aware exact restore reproduces the captured source
+        // and drops any injected line-boundary LF. Priority 2 (user edited the
+        // marked body so neither candidate matches, or no durable source exists):
+        // remove ONLY the marker span and preserve surrounding whitespace — an
+        // injected LF may remain, but that beats deleting the user's edit.
+        const restored = turn.sourceTextUtf16 === undefined
+            ? null
+            : restoreExpectedCapturedSource(
+                text,
+                { start: marker.start, end: marker.end },
+                turn.sourceTextUtf16,
+            )
+        marker.location.setText(restored ?? (text.slice(0, marker.start) + text.slice(marker.end)))
         await saveLoadedChatStrict(turn, loaded)
     } catch {
         // The ledger transition is the authority and has already ACKed. A marker
@@ -1447,7 +1480,7 @@ export async function registerTrustedTurn(
         })
         throw error
     }
-    currentLocation.setText(`${currentLocation.getText()}${buildRequestMarker(requestNonce)}`)
+    currentLocation.setText(appendRequestMarkerAtLineBoundary(currentLocation.getText(), requestNonce))
 
     try {
         await saveChatToServerStrict(input.chaId, currentIndex, input.conversationId, loaded.chat)

@@ -2,11 +2,13 @@ import fc from 'fast-check'
 import { describe, expect, test } from 'vitest'
 import {
     IllustrationControlNodeValidationError,
+    appendRequestMarkerAtLineBoundary,
     buildRequestMarker,
     buildSlotNode,
     containsIllustrationControlNodes,
     findRequestMarkers,
     findSlotNodes,
+    restoreExpectedCapturedSource,
     stripIllustrationControlNodes,
     stripIllustrationControlNodesFromPrompt,
 } from '../controlNodes'
@@ -214,6 +216,91 @@ describe('illustration control nodes', () => {
             expect(error).toBeInstanceOf(IllustrationControlNodeValidationError)
             expect(error).toMatchObject({ field, reason: 'invalid_charset' })
         }
+    })
+})
+
+describe('request marker line-boundary serialization and source-aware restore', () => {
+    const NONCE = 'nonce_boundary'
+    const marker = buildRequestMarker(NONCE)
+
+    function restoreSingle(marked: string, expected: string): string | null {
+        const found = findRequestMarkers(marked)
+        expect(found).toHaveLength(1)
+        return restoreExpectedCapturedSource(
+            marked,
+            { start: found[0].start, end: found[0].end },
+            expected,
+        )
+    }
+
+    // §7 direct 1-4: append injects exactly one U+000A only when the body does not
+    // already end in U+000A (no trim / CRLF conversion / Unicode normalization),
+    // and source-aware restore recovers the exact canonical source.
+    test.each([
+        ['body without a trailing newline', 'A quiet scene.', `A quiet scene.\n${marker}`],
+        ['body already ending in LF', 'A quiet scene.\n', `A quiet scene.\n${marker}`],
+        ['body ending in CRLF (no conversion)', 'A quiet scene.\r\n', `A quiet scene.\r\n${marker}`],
+        ['an empty body', '', `\n${marker}`],
+    ])('appends and restores %s', (_label, canonical, expectedMarked) => {
+        const marked = appendRequestMarkerAtLineBoundary(canonical, NONCE)
+        expect(marked).toBe(expectedMarked)
+        expect(restoreSingle(marked, canonical)).toBe(canonical)
+    })
+
+    // §7 direct 5: a legacy adjacent-marker turn (no injected LF) restores via the
+    // marker-only candidate, so pre-contract captures keep working.
+    test('restores a legacy adjacent marker via the marker-only candidate', () => {
+        expect(restoreSingle(`body${marker}`, 'body')).toBe('body')
+    })
+
+    // §7 direct 6: identical marked bytes resolve to DIFFERENT canonical sources —
+    // a source-owned trailing LF is preserved (candidate 1) while an injected LF is
+    // dropped (candidate 2). The durable source is the sole authority.
+    test('preserves a source-owned trailing LF but drops an injected one from identical bytes', () => {
+        const marked = `body\n${marker}`
+        expect(restoreSingle(marked, 'body\n')).toBe('body\n')
+        expect(restoreSingle(marked, 'body')).toBe('body')
+    })
+
+    // §7 direct 7: restore peels only the current marker (and at most one injected
+    // LF); other-nonce markers and ordinary LF/CRLF bytes are never touched.
+    test('never removes other-nonce markers or ordinary newlines', () => {
+        const otherMarker = buildRequestMarker('nonce_other')
+        const canonical = `line1\r\n${otherMarker}line2`
+        const marked = appendRequestMarkerAtLineBoundary(canonical, NONCE)
+        expect(marked).toBe(`line1\r\n${otherMarker}line2\n${marker}`)
+        // Restore the *current* nonce's marker (the last one) against the canonical.
+        const markers = findRequestMarkers(marked)
+        const current = markers.find((match) => match.nonce === NONCE)!
+        expect(restoreExpectedCapturedSource(
+            marked,
+            { start: current.start, end: current.end },
+            canonical,
+        )).toBe(canonical)
+    })
+
+    // §7 direct 8 (parse layer): malformed markers do not match, and duplicate
+    // current-nonce markers surface as multiple matches, so resolveRequestMarker
+    // keeps its existing stale ('marker_missing') / corrupt ('duplicate_marker')
+    // handling — restore is never reached for those.
+    test('leaves malformed and duplicate markers to the existing stale/corrupt path', () => {
+        expect(findRequestMarkers('<!--risu-illustration-request:v1:-->')).toEqual([])
+        expect(findRequestMarkers(`x${marker}y${marker}z`)).toHaveLength(2)
+    })
+
+    // §4 point 4: restore refuses to fabricate a canonical source when the marked
+    // body was genuinely edited (both candidates mismatch) -> null (stale path).
+    test('returns null when neither candidate reproduces the durable source', () => {
+        const marked = appendRequestMarkerAtLineBoundary('edited body', NONCE)
+        expect(restoreSingle(marked, 'original body')).toBeNull()
+    })
+
+    // §6 / §7 real-path 10: the generic control-node strip removes only the marker
+    // span and preserves the user's surrounding whitespace — it must NOT swallow a
+    // pre-marker LF by shape alone (durable source is absent at this generic layer).
+    test('generic control-node strip preserves whitespace around the marker', () => {
+        expect(stripIllustrationControlNodes(`body\n${marker}`)).toBe('body\n')
+        expect(stripIllustrationControlNodes(`body \t${marker}\n`)).toBe('body \t\n')
     })
 })
 

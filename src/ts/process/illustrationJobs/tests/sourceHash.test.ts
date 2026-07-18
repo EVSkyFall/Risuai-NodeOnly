@@ -1,5 +1,11 @@
 import { describe, expect, test } from 'vitest'
-import { buildRequestMarker, buildSlotNode } from '../controlNodes'
+import {
+    appendRequestMarkerAtLineBoundary,
+    buildRequestMarker,
+    buildSlotNode,
+    findRequestMarkers,
+    restoreExpectedCapturedSource,
+} from '../controlNodes'
 import {
     computeSourceRevisionHash,
     findInlayReferences,
@@ -178,6 +184,34 @@ describe('normalized source revision hash', () => {
             'asset_one',
             'asset:123e4567-e89b-12d3-a456-426614174000',
         ])
+    })
+
+    // Request marker §3-§4: the durable revision hash is computed on the RESTORED
+    // canonical source, never on the raw marked text. A legacy adjacent marker and a
+    // new line-boundary marker both restore to the same canonical body and therefore
+    // hash identically; hashing the raw injected-LF marked text would diverge.
+    test('hashes the restored canonical source identically for legacy and line-boundary markers', async () => {
+        const canonical = 'A body that ends without a newline.'
+        const durable = await computeSourceRevisionHash(canonical, context)
+
+        const lineBoundary = appendRequestMarkerAtLineBoundary(canonical, context.requestNonce)
+        const legacyAdjacent = `${canonical}${buildRequestMarker(context.requestNonce)}`
+        expect(lineBoundary).toBe(`${canonical}\n${buildRequestMarker(context.requestNonce)}`)
+
+        for (const marked of [lineBoundary, legacyAdjacent]) {
+            const [found] = findRequestMarkers(marked)
+            const restored = restoreExpectedCapturedSource(
+                marked,
+                { start: found.start, end: found.end },
+                canonical,
+            )
+            expect(restored).toBe(canonical)
+            expect(await computeSourceRevisionHash(restored!, context)).toBe(durable)
+        }
+
+        // Hashing the raw injected-LF marked text (marker stripped, LF surviving)
+        // would NOT match the durable hash — which is exactly why restore comes first.
+        expect(await computeSourceRevisionHash(lineBoundary, context)).not.toBe(durable)
     })
 
     test('uses happy-dom WebCrypto SHA-256 and returns lowercase 64-hex', async () => {
