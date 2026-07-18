@@ -31,7 +31,7 @@ const {
     logger, installProcessHandlers, expressErrorMiddleware,
 } = require('./logs.cjs');
 const { applyPatch } = require('fast-json-patch');
-const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, hasRemoteBlocks } = require('./utils.cjs');
+const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, normalizeForwardHeaders, hasRemoteBlocks } = require('./utils.cjs');
 const { spawn, execSync } = require('child_process');
 const os = require('os');
 const { Readable, Transform } = require('stream');
@@ -1626,25 +1626,7 @@ function sanitizeTargetUrl(raw) {
 }
 
 // --- Proxy Stream: request/response helpers ---
-
-function normalizeForwardHeaders(input) {
-    if (!input || typeof input !== 'object' || Array.isArray(input)) {
-        return {};
-    }
-    const normalized = {};
-    for (const [key, value] of Object.entries(input)) {
-        if (typeof key !== 'string') continue;
-        if (typeof value === 'string') {
-            normalized[key] = value;
-        }
-    }
-    delete normalized['risu-auth'];
-    delete normalized['risu-timeout-ms'];
-    delete normalized['host'];
-    delete normalized['connection'];
-    delete normalized['content-length'];
-    return normalized;
-}
+// normalizeForwardHeaders (the shared security strip-list) lives in utils.cjs.
 
 function normalizeProxyResponseHeaders(headers) {
     const normalized = {};
@@ -2946,6 +2928,15 @@ app.delete('/proxy-stream-jobs/:jobId', async (req, res) => {
     cleanupJob(job.id);
     res.send({ success: true });
 });
+
+// --- Model Job endpoints (durable server-side model-preset relay) ---
+// Recorder pattern: the server makes the provider request, streams the bytes
+// to the client unchanged, and journals the same bytes to disk so a client
+// that disconnects mid-generation can recover the response. All logic lives
+// in model-jobs.cjs; registers /api/model-jobs* with /proxy2-level auth.
+const { createModelJobs } = require('./model-jobs.cjs');
+const modelJobs = createModelJobs({ saveDir: savePath, logger });
+modelJobs.registerRoutes(app, { auth: checkProxyAuth });
 
 // app.get('/api/password', async(req, res)=> {
 //     if(password === ''){
