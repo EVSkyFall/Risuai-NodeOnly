@@ -54,6 +54,8 @@ interface requestDataArgument{
     currentChar?: character
     temperature?: number
     maxTokens?:number
+    /** Host-internal: set only by the authorized illustration bridge host handler. */
+    hostOmitCallerGenerationCap?: true
     PresensePenalty?: number
     frequencyPenalty?: number,
     useStreaming?:boolean
@@ -1243,7 +1245,7 @@ async function requestOobaLegacy(arg:RequestDataArgumentExtended):Promise<reques
     }
 
     bodyTemplate = {
-        'max_new_tokens': db.maxResponse,
+        ...(arg.hostOmitCallerGenerationCap ? {} : { 'max_new_tokens': db.maxResponse }),
         'do_sample': db.ooba.do_sample,
         'temperature': (db.temperature / 100),
         'top_p': db.ooba.top_p,
@@ -1257,7 +1259,7 @@ async function requestOobaLegacy(arg:RequestDataArgumentExtended):Promise<reques
         'penalty_alpha': db.ooba.penalty_alpha,
         'length_penalty': db.ooba.length_penalty,
         'early_stopping': false,
-        'truncation_length': maxTokens,
+        ...(arg.hostOmitCallerGenerationCap ? {} : { 'truncation_length': maxTokens }),
         'ban_eos_token': db.ooba.ban_eos_token,
         'stopping_strings': stopStrings,
         'seed': -1,
@@ -1378,7 +1380,7 @@ async function requestOoba(arg:RequestDataArgumentExtended):Promise<requestDataR
         presence_penalty: arg.PresensePenalty || (db.PresensePenalty / 100),
         frequency_penalty: arg.frequencyPenalty || (db.frequencyPenalty / 100),
         logit_bias: {},
-        max_tokens: maxTokens,
+        ...(arg.hostOmitCallerGenerationCap ? {} : { max_tokens: maxTokens }),
         stop: stopStrings,
         temperature: temperature,
         top_p: db.top_p,
@@ -1454,7 +1456,7 @@ async function requestPlugin(arg:RequestDataArgumentExtended):Promise<requestDat
             prompt_chat: formated,
             mode: arg.mode,
             bias: [],
-            max_tokens: maxTokens,
+            ...(arg.hostOmitCallerGenerationCap ? {} : { max_tokens: maxTokens }),
         }, [
             'frequency_penalty','min_p','presence_penalty','repetition_penalty','top_k','top_p','temperature'
         ], {}, arg.mode, {
@@ -1463,7 +1465,7 @@ async function requestPlugin(arg:RequestDataArgumentExtended):Promise<requestDat
             bias: bias,
             prompt_chat: formated,
             temperature: (db.temperature / 100),
-            max_tokens: maxTokens,
+            ...(arg.hostOmitCallerGenerationCap ? {} : { max_tokens: maxTokens }),
             presence_penalty: (db.PresensePenalty / 100),
             frequency_penalty: (db.frequencyPenalty / 100)
         })

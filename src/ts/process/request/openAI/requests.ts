@@ -308,7 +308,7 @@ export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<req
                 model: requestModel,
                 messages: reformatedChat,
                 safe_prompt: false,
-                max_tokens: arg.maxTokens,
+                ...(arg.hostOmitCallerGenerationCap ? {} : { max_tokens: arg.maxTokens }),
             }, ['temperature', 'presence_penalty', 'frequency_penalty', 'top_p'], {}, arg.mode, {
                 modelId: arg.modelInfo.id
             } ),
@@ -404,7 +404,7 @@ export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<req
             : (!requestModel) ? 'gpt-3.5-turbo'
             : requestModel,
         messages: formatedChat,
-        max_tokens: arg.maxTokens,
+        ...(arg.hostOmitCallerGenerationCap ? {} : { max_tokens: arg.maxTokens }),
         logit_bias: arg.bias,
         stream: false,
 
@@ -415,7 +415,10 @@ export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<req
         delete body.logit_bias
     }
 
-    if(arg.modelInfo.flags.includes(LLMFlags.OAICompletionTokens)){
+    if(
+        arg.modelInfo.flags.includes(LLMFlags.OAICompletionTokens)
+        && Object.hasOwn(body, 'max_tokens')
+    ){
         body.max_completion_tokens = body.max_tokens
         delete body.max_tokens
     }
@@ -966,7 +969,7 @@ export async function requestOpenAILegacyInstruct(arg:RequestDataArgumentExtende
         body: {
             model: "gpt-3.5-turbo-instruct",
             prompt: prompt,
-            max_tokens: maxTokens,
+            ...(arg.hostOmitCallerGenerationCap ? {} : { max_tokens: maxTokens }),
             temperature: temperature,
             top_p: 1,
             stop:["User:"," User:", "user:", " user:"],
@@ -1069,7 +1072,7 @@ export async function requestOpenAIResponseAPI(arg:RequestDataArgumentExtended):
     const body = applyParameters({
         model: arg.modelInfo.internalID ?? aiModel,
         input: items,
-        max_output_tokens: maxTokens,
+        ...(arg.hostOmitCallerGenerationCap ? {} : { max_output_tokens: maxTokens }),
         tools: [],
         store: false
     }, ['temperature', 'top_p'], {}, arg.mode, {

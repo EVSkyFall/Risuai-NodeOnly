@@ -6,7 +6,6 @@ import type {
 } from './types'
 
 export const ILLUSTRATION_V3_PROTECTED_PLUGIN_NAME = 'lb_xnai_agent'
-export const RISU_ILLUSTRATION_AGENT_LLM_TIMEOUT_MS = 240_000
 
 type PinnedDigestRotation = readonly [string] | readonly [string, string]
 
@@ -315,8 +314,43 @@ export type IllustrationV3BridgeDependencies = {
 
 type RuntimeState = { unloaded: boolean; cleanupReady: boolean }
 
+type ActiveLlmOutcome =
+    | { ok: true; value: unknown }
+    | { ok: false; error: unknown }
+
+type ActiveLlmCall = {
+    key: string
+    runtimeId: string
+    fence: number
+    controller: AbortController
+    settled: boolean
+    streamReader?: ReadableStreamDefaultReader<unknown>
+    settle(outcome: ActiveLlmOutcome): void
+}
+
+type StreamingLlmResponse = {
+    type: 'streaming'
+    result: ReadableStream<unknown>
+    model?: unknown
+}
+
 function coordinatorKey(runtimeId: string, fence: number): string {
     return `${runtimeId}:${fence}`
+}
+
+function isStreamingLlmResponse(value: unknown): value is StreamingLlmResponse {
+    return typeof value === 'object'
+        && value !== null
+        && 'type' in value
+        && value.type === 'streaming'
+        && 'result' in value
+        && value.result instanceof ReadableStream
+}
+
+function cancelStreamReaderNoWait(reader: ReadableStreamDefaultReader<unknown>): void {
+    try {
+        void Promise.resolve(reader.cancel()).catch(() => {})
+    } catch {}
 }
 
 function isRetryableCoordinatorRace(error: unknown): boolean {
@@ -331,12 +365,10 @@ function isRetryableCoordinatorRace(error: unknown): boolean {
 export class IllustrationV3HostLlmRegistry {
     private readonly runtimes = new Map<string, RuntimeState>()
     private readonly activeCounts = new Map<string, number>()
+    private readonly activeCalls = new Set<ActiveLlmCall>()
     private serialTail: Promise<void> = Promise.resolve()
 
-    constructor(
-        private readonly deps: IllustrationV3BridgeDependencies,
-        private readonly timeoutMs = RISU_ILLUSTRATION_AGENT_LLM_TIMEOUT_MS,
-    ) {}
+    constructor(private readonly deps: IllustrationV3BridgeDependencies) {}
 
     registerRuntime(runtimeId: string): void {
         this.runtimes.set(runtimeId, { unloaded: false, cleanupReady: false })
@@ -355,6 +387,131 @@ export class IllustrationV3HostLlmRegistry {
             return await operation()
         } finally {
             release()
+        }
+    }
+
+    private createActiveLlmCallLocked(
+        runtimeId: string,
+        fence: number,
+        controller: AbortController,
+    ): { call: ActiveLlmCall; outcomePromise: Promise<ActiveLlmOutcome> } {
+        const key = coordinatorKey(runtimeId, fence)
+        let resolveOutcome!: (outcome: ActiveLlmOutcome) => void
+        const outcomePromise = new Promise<ActiveLlmOutcome>((resolve) => {
+            resolveOutcome = resolve
+        })
+        const call: ActiveLlmCall = {
+            key,
+            runtimeId,
+            fence,
+            controller,
+            settled: false,
+            settle: (outcome) => {
+                if (call.settled) return
+                call.settled = true
+                void this.exclusive(async () => {
+                    this.activeCalls.delete(call)
+                    const count = this.activeCounts.get(call.key) ?? 0
+                    if (count <= 1) this.activeCounts.delete(call.key)
+                    else this.activeCounts.set(call.key, count - 1)
+                    const current = await this.deps.getCoordinatorRecord()
+                    if (
+                        current?.holderRuntimeId === call.runtimeId
+                        && current.fence === call.fence
+                        && current.draining
+                    ) await this.releaseIfLocalDrainedLocked(current)
+                    this.cleanupUnloadedRuntime(call.runtimeId)
+                }).then(
+                    () => resolveOutcome(outcome),
+                    (cleanupError) => resolveOutcome(outcome.ok
+                        ? { ok: false, error: cleanupError }
+                        : outcome),
+                )
+            },
+        }
+        this.activeCalls.add(call)
+        this.activeCounts.set(key, (this.activeCounts.get(key) ?? 0) + 1)
+        return { call, outcomePromise }
+    }
+
+    private cancelActiveCallsLocked(
+        matches: (call: ActiveLlmCall) => boolean,
+    ): void {
+        for (const call of this.activeCalls) {
+            if (call.settled || !matches(call)) continue
+            const cancellationError = codedError('unavailable')
+            try { call.controller.abort(cancellationError) } catch {}
+            if (call.streamReader) cancelStreamReaderNoWait(call.streamReader)
+            call.settle({ ok: false, error: cancellationError })
+        }
+    }
+
+    private cancelAllActiveCallsLocked(): void {
+        this.cancelActiveCallsLocked(() => true)
+    }
+
+    private cancelRuntimeActiveCallsLocked(runtimeId: string): void {
+        this.cancelActiveCallsLocked((call) => call.runtimeId === runtimeId)
+    }
+
+    private cancelCoordinatorActiveCallsLocked(runtimeId: string, fence: number): void {
+        this.cancelActiveCallsLocked((call) => (
+            call.runtimeId === runtimeId && call.fence === fence
+        ))
+    }
+
+    private handleProviderResolution(call: ActiveLlmCall, value: unknown): void {
+        if (call.settled) return
+        if (!isStreamingLlmResponse(value)) {
+            call.settle({ ok: true, value })
+            return
+        }
+
+        let reader: ReadableStreamDefaultReader<unknown>
+        try {
+            reader = value.result.getReader()
+        } catch (error) {
+            call.settle({ ok: false, error })
+            return
+        }
+        if (call.settled) {
+            cancelStreamReaderNoWait(reader)
+            return
+        }
+        call.streamReader = reader
+        void this.consumeProviderStream(call, value, reader)
+    }
+
+    private async consumeProviderStream(
+        call: ActiveLlmCall,
+        response: StreamingLlmResponse,
+        reader: ReadableStreamDefaultReader<unknown>,
+    ): Promise<void> {
+        let lastText = ''
+        try {
+            while (!call.settled) {
+                const { done, value } = await reader.read()
+                if (call.settled) return
+                if (done) {
+                    call.settle({
+                        ok: true,
+                        value: {
+                            type: 'success',
+                            result: lastText,
+                            model: response.model,
+                        },
+                    })
+                    return
+                }
+                if (
+                    typeof value === 'object'
+                    && value !== null
+                    && '0' in value
+                    && typeof value[0] === 'string'
+                ) lastText = value[0]
+            }
+        } catch (error) {
+            call.settle({ ok: false, error })
         }
     }
 
@@ -409,6 +566,7 @@ export class IllustrationV3HostLlmRegistry {
             })
             if (!(await this.deps.isFeatureEnabled())) {
                 const draining = await this.markLatestRuntimeDrainingLocked(runtimeId)
+                this.cancelAllActiveCallsLocked()
                 await this.releaseIfLocalDrainedLocked(draining)
                 throw codedError('feature_disabled')
             }
@@ -421,6 +579,7 @@ export class IllustrationV3HostLlmRegistry {
         return await this.exclusive(async () => {
             const result = await this.deps.setFeatureEnabledWithCoordinatorDrain(enabled)
             if (!result.featureEnabled) {
+                this.cancelAllActiveCallsLocked()
                 await this.releaseIfLocalDrainedLocked(result.coordinator)
             }
             return result.featureEnabled
@@ -447,6 +606,7 @@ export class IllustrationV3HostLlmRegistry {
                     expectedVersion: input.expectedVersion,
                     fence: input.fence,
                 })
+                this.cancelCoordinatorActiveCallsLocked(runtimeId, input.fence)
                 await this.releaseIfLocalDrainedLocked(draining)
                 if (!input.drain && activeCount > 0) throw codedError('coordinator_draining')
                 return
@@ -529,13 +689,15 @@ export class IllustrationV3HostLlmRegistry {
     async settleRuntime(runtimeId: string): Promise<void> {
         await this.exclusive(async () => {
             let current = await this.deps.getCoordinatorRecord()
+            const featureEnabled = await this.deps.isFeatureEnabled()
             if (
                 current?.holderRuntimeId === runtimeId
-                && !(await this.deps.isFeatureEnabled())
+                && !featureEnabled
                 && !current.draining
             ) {
                 current = await this.markLatestRuntimeDrainingLocked(runtimeId)
             }
+            if (!featureEnabled) this.cancelAllActiveCallsLocked()
             if (current?.holderRuntimeId === runtimeId) {
                 await this.releaseIfLocalDrainedLocked(current)
             }
@@ -547,6 +709,7 @@ export class IllustrationV3HostLlmRegistry {
         if (state) state.unloaded = true
         await this.exclusive(async () => {
             const draining = await this.markLatestRuntimeDrainingLocked(runtimeId)
+            this.cancelRuntimeActiveCallsLocked(runtimeId)
             await this.releaseIfLocalDrainedLocked(draining)
             const latestState = this.runtimes.get(runtimeId)
             if (latestState) latestState.cleanupReady = true
@@ -563,50 +726,28 @@ export class IllustrationV3HostLlmRegistry {
                 if (!admittedRuntime || admittedRuntime.unloaded) {
                     throw codedError('unavailable')
                 }
-                const key = coordinatorKey(runtimeId, owner.fence)
-                this.activeCounts.set(key, (this.activeCounts.get(key) ?? 0) + 1)
                 const controller = new AbortController()
+                const active = this.createActiveLlmCallLocked(
+                    runtimeId,
+                    owner.fence,
+                    controller,
+                )
                 let providerPromise: Promise<unknown>
                 try {
                     providerPromise = Promise.resolve(this.deps.runLlmModel(options, controller.signal))
                 } catch (error) {
                     providerPromise = Promise.reject(error)
                 }
-                return { controller, fence: owner.fence, key, providerPromise }
+                void providerPromise.then(
+                    (value) => this.handleProviderResolution(active.call, value),
+                    (error) => active.call.settle({ ok: false, error }),
+                ).catch(() => {})
+                return active
             })
             return admitted.value
         })
 
-        let timer: ReturnType<typeof setTimeout> | undefined
-        const timeoutPromise = new Promise<never>((_resolve, reject) => {
-            timer = this.deps.setTimer(() => {
-                const timeoutError = codedError('agent_llm_timeout')
-                reject(timeoutError)
-                try { started.controller.abort(timeoutError) } catch {}
-            }, this.timeoutMs)
-        })
-        let outcome: { ok: true; value: unknown } | { ok: false; error: unknown }
-        try {
-            outcome = { ok: true, value: await Promise.race([started.providerPromise, timeoutPromise]) }
-        } catch (error) {
-            outcome = { ok: false, error }
-        } finally {
-            if (timer !== undefined) this.deps.clearTimer(timer)
-            await this.exclusive(async () => {
-                const count = this.activeCounts.get(started.key) ?? 0
-                if (count <= 1) this.activeCounts.delete(started.key)
-                else this.activeCounts.set(started.key, count - 1)
-                const current = await this.deps.getCoordinatorRecord()
-                if (
-                    current?.holderRuntimeId === runtimeId
-                    && current.fence === started.fence
-                    && current.draining
-                ) await this.releaseIfLocalDrainedLocked(current)
-                this.cleanupUnloadedRuntime(runtimeId)
-            }).catch((cleanupError) => {
-                if (outcome.ok) throw cleanupError
-            })
-        }
+        const outcome = await started.outcomePromise
         if (outcome.ok === false) throw outcome.error
         return outcome.value
     }

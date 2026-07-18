@@ -606,7 +606,8 @@ describe('Gate 4d Core-side joint acceptance', () => {
         expect(harness.provider).not.toHaveBeenCalled()
     })
 
-    // §5-7/8 / §20 feature OFF: in-flight host LLM drains, new cost work rejects, failure ACKs.
+    // §5-7/8 / §20 feature OFF: in-flight host LLM detaches, new cost work rejects,
+    // and stale coordinator ACKs remain proof-gated after final release.
     test('converges feature OFF against an in-flight host LLM and releases once', async () => {
         const bridge = createBridge('feature-drain')
         const coordinatorLeaseId = 'coordinator-feature-drain'
@@ -635,16 +636,27 @@ describe('Gate 4d Core-side joint acceptance', () => {
         })
         const running = bridge.runLLMModel({ mode: 'model', messages: [] })
         await providerStarted.promise
+        expect(harness.requestLlm).toHaveBeenCalledWith(
+            expect.objectContaining({
+                formated: [],
+                bias: {},
+                blockPlugins: true,
+                useStreaming: false,
+                hostOmitCallerGenerationCap: true,
+            }),
+            'model',
+            expect.any(AbortSignal),
+        )
         harness.finalCoordinatorReleaseWrites = 0
 
         await expect(bridge.rootMethods._ijSetFeatureEnabled({
             protocolVersion: 1,
             enabled: false,
         })).resolves.toEqual({ featureEnabled: false })
-        expect(await getCoordinatorRecord()).toMatchObject({
-            leaseId: coordinatorLeaseId,
-            draining: true,
-        })
+        expect(await getCoordinatorRecord()).toMatchObject({ draining: true })
+        await expect(running).rejects.toThrow('[IJ:unavailable]')
+        expect(await getCoordinatorRecord()).toMatchObject({ leaseId: null, draining: true })
+        expect(harness.finalCoordinatorReleaseWrites).toBe(1)
         await expect(bridge.rootMethods._ijClaimCoordinator({
             protocolVersion: 1,
             leaseId: 'late-claim',
@@ -661,10 +673,10 @@ describe('Gate 4d Core-side joint acceptance', () => {
             idempotencyKey: 'failure:feature-drain',
             code: 'tagger_failed_after_off',
             retryable: true,
-        })).resolves.toMatchObject({ state: 'agent_blocked_retryable' })
+        })).rejects.toThrow('[IJ:coordinator_required]')
 
         provider.resolve({ result: 'late fake completion' })
-        await expect(running).resolves.toEqual({ result: 'late fake completion' })
+        await Promise.resolve()
         expect(await getCoordinatorRecord()).toMatchObject({ leaseId: null, draining: true })
         expect(harness.finalCoordinatorReleaseWrites).toBe(1)
         expect(harness.requestLlm).toHaveBeenCalledTimes(1)

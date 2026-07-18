@@ -5,7 +5,6 @@ import {
     ILLUSTRATION_V3_PROTECTED_PLUGIN_NAME,
     IllustrationV3HostLlmRegistry,
     PINNED_ILLUSTRATION_PLUGIN_DIGESTS,
-    RISU_ILLUSTRATION_AGENT_LLM_TIMEOUT_MS,
     createAuthorizedIllustrationV3Bridge,
     createIllustrationV3CapabilityIfAuthorized,
     evaluateIllustrationV3Authorization,
@@ -53,14 +52,14 @@ function deferred<T>() {
 }
 
 async function flushMicrotasks(): Promise<void> {
-    await Promise.resolve()
-    await Promise.resolve()
+    for (let index = 0; index < 8; index += 1) await Promise.resolve()
 }
 
 function makeHarness(runtimeId = 'host-runtime') {
     const state = {
         now: 1_000,
         featureEnabled: true,
+        disableFeatureAfterClaim: false,
         admitBeforeStart: null as Promise<void> | null,
         coordinator: {
             version: 1,
@@ -81,14 +80,18 @@ function makeHarness(runtimeId = 'host-runtime') {
         expectedVersion?: number
         fence?: number
     }) => {
+        const previous = state.coordinator
         state.coordinator = {
             version: (state.coordinator?.version ?? 0) + 1,
-            fence: state.coordinator?.fence ?? 1,
+            fence: previous?.leaseId === null
+                ? previous.fence + 1
+                : previous?.fence ?? 1,
             leaseId: input.leaseId,
             holderRuntimeId: input.holderRuntimeId,
             expiresAt: state.now + 60_000,
             draining: false,
         }
+        if (state.disableFeatureAfterClaim) state.featureEnabled = false
         return {
             protocolVersion: 1 as const,
             version: state.coordinator.version,
@@ -130,16 +133,25 @@ function makeHarness(runtimeId = 'host-runtime') {
         }
         return structuredClone(state.coordinator)
     })
-    const releaseCoordinatorFinal = vi.fn(async () => {
-        if (state.coordinator) {
-            state.coordinator = {
-                ...state.coordinator,
-                version: state.coordinator.version + 1,
-                leaseId: null,
-                holderRuntimeId: null,
-                expiresAt: 0,
-                draining: true,
-            }
+    const releaseCoordinatorFinal = vi.fn(async (input: {
+        protocolVersion: 1
+        leaseId: string
+        expectedVersion: number
+        fence: number
+    }) => {
+        if (
+            !state.coordinator
+            || state.coordinator.leaseId !== input.leaseId
+            || state.coordinator.version !== input.expectedVersion
+            || state.coordinator.fence !== input.fence
+        ) throw coded('coordinator_mismatch')
+        state.coordinator = {
+            ...state.coordinator,
+            version: state.coordinator.version + 1,
+            leaseId: null,
+            holderRuntimeId: null,
+            expiresAt: 0,
+            draining: true,
         }
     })
     const listPendingTurns = vi.fn(async () => [{ turnId: 'turn-1', state: 'awaiting_plan' }])
@@ -175,6 +187,8 @@ function makeHarness(runtimeId = 'host-runtime') {
             ownedByCaller: callerLeaseId === record.leaseId,
         },
     }))
+    const setTimer = vi.fn((callback: () => void, delayMs: number) => setTimeout(callback, delayMs))
+    const clearTimer = vi.fn((timer: ReturnType<typeof setTimeout>) => clearTimeout(timer))
     const deps: IllustrationV3BridgeDependencies = {
         now: () => state.now,
         randomUUID: () => `subscription-${++uuidSequence}`,
@@ -241,8 +255,8 @@ function makeHarness(runtimeId = 'host-runtime') {
             wakeListeners.add(listener)
             return () => wakeListeners.delete(listener)
         },
-        setTimer: (callback, delayMs) => setTimeout(callback, delayMs),
-        clearTimer: (timer) => clearTimeout(timer),
+        setTimer,
+        clearTimer,
     }
     const registry = new IllustrationV3HostLlmRegistry(deps)
     const bridge = createAuthorizedIllustrationV3Bridge({ auth: AUTH, runtimeId, deps, hostRegistry: registry })
@@ -260,6 +274,8 @@ function makeHarness(runtimeId = 'host-runtime') {
         releaseCoordinator,
         markCoordinatorDraining,
         releaseCoordinatorFinal,
+        setTimer,
+        clearTimer,
         listPendingTurns,
         listJobs,
         claimTurn,
@@ -270,6 +286,63 @@ function makeHarness(runtimeId = 'host-runtime') {
         rawJob,
         runtimeId,
     }
+}
+
+type DrainInitiator = 'feature OFF' | 'drain:true' | 'drain:false' | 'unload'
+
+function currentCoordinatorProof(harness: ReturnType<typeof makeHarness>) {
+    const coordinator = harness.state.coordinator
+    if (!coordinator?.leaseId) throw new Error('Expected an owned coordinator')
+    return {
+        protocolVersion: 1 as const,
+        leaseId: coordinator.leaseId,
+        expectedVersion: coordinator.version,
+        fence: coordinator.fence,
+    }
+}
+
+async function initiateDrain(
+    harness: ReturnType<typeof makeHarness>,
+    initiator: DrainInitiator,
+): Promise<void> {
+    if (initiator === 'feature OFF') {
+        await expect(harness.bridge.rootMethods._ijSetFeatureEnabled({
+            protocolVersion: 1,
+            enabled: false,
+        })).resolves.toEqual({ featureEnabled: false })
+        return
+    }
+    if (initiator === 'unload') {
+        await expect(harness.bridge.unload()).resolves.toBeUndefined()
+        return
+    }
+    const request = {
+        ...currentCoordinatorProof(harness),
+        drain: initiator === 'drain:true',
+    }
+    if (initiator === 'drain:false') {
+        await expect(harness.bridge.rootMethods._ijReleaseCoordinator(request))
+            .rejects.toThrow('[IJ:coordinator_draining]')
+        return
+    }
+    await expect(harness.bridge.rootMethods._ijReleaseCoordinator(request))
+        .resolves.toBeUndefined()
+}
+
+type ReaderCancelBehavior = 'resolve' | 'reject' | 'throw' | 'pending'
+
+function controlledStream(cancelBehavior: ReaderCancelBehavior) {
+    const read = deferred<ReadableStreamReadResult<unknown>>()
+    const cancel = vi.fn(() => {
+        if (cancelBehavior === 'reject') return Promise.reject(new Error('reader cancel rejected'))
+        if (cancelBehavior === 'throw') throw new Error('reader cancel threw')
+        if (cancelBehavior === 'pending') return new Promise<void>(() => {})
+        return Promise.resolve()
+    })
+    const reader = { read: vi.fn(() => read.promise), cancel }
+    const stream = new ReadableStream<unknown>()
+    const getReader = vi.spyOn(stream, 'getReader').mockReturnValue(reader as never)
+    return { stream, reader, read, cancel, getReader }
 }
 
 afterEach(() => {
@@ -545,80 +618,403 @@ describe('host coordinator and LLM drain lifecycle', () => {
         expect(harness.registry.getActiveCount(harness.runtimeId, 7)).toBe(0)
     })
 
-    test('aborts at the four-minute hard bound, preserves timeout code, and decrements', async () => {
+    test('has no elapsed limit, schedules no timer, and settles once after the old threshold', async () => {
         vi.useFakeTimers()
         const harness = makeHarness()
+        const provider = deferred<unknown>()
         let providerSignal: AbortSignal | undefined
-        harness.provider.mockImplementationOnce(async (_options, signal) => {
+        harness.provider.mockImplementationOnce((_options, signal) => {
             providerSignal = signal
-            return await new Promise(() => {})
+            return provider.promise
         })
-        const outcome = harness.bridge.runLLMModel({ mode: 'model', messages: [] })
-            .catch((caught) => caught as Error)
+        let settled = false
+        const running = harness.bridge.runLLMModel({ mode: 'model', messages: [] })
+        void running.finally(() => { settled = true }).catch(() => {})
         await flushMicrotasks()
         expect(harness.registry.getActiveCount(harness.runtimeId, 7)).toBe(1)
-        await vi.advanceTimersByTimeAsync(RISU_ILLUSTRATION_AGENT_LLM_TIMEOUT_MS)
-        const timeout = await outcome as Error
-        expect(timeout.message).toContain('[IJ:agent_llm_timeout]')
-        expect(providerSignal?.aborted).toBe(true)
+        expect(harness.setTimer).not.toHaveBeenCalled()
+
+        await vi.advanceTimersByTimeAsync(1_000_000)
+        expect(settled).toBe(false)
+        expect(providerSignal?.aborted).toBe(false)
+        expect(harness.registry.getActiveCount(harness.runtimeId, 7)).toBe(1)
+
+        provider.resolve({ answer: 'late but valid' })
+        await expect(running).resolves.toEqual({ answer: 'late but valid' })
+        expect(harness.registry.getActiveCount(harness.runtimeId, 7)).toBe(0)
+        expect(harness.releaseCoordinatorFinal).not.toHaveBeenCalled()
+        expect(harness.state.coordinator).toMatchObject({
+            leaseId: 'coordinator-lease',
+            draining: false,
+        })
+    })
+
+    test('keeps provider rejection sanitization and never replaces it with agent_llm_timeout', async () => {
+        const harness = makeHarness()
+        harness.provider.mockRejectedValueOnce(coded('validation'))
+        const error = (await harness.bridge.runLLMModel({ mode: 'model', messages: [] })
+            .catch((caught) => caught as Error)) as Error
+        expect(error.message).toContain('[IJ:validation]')
+        expect(error.message).not.toContain('agent_llm_timeout')
+        expect(harness.setTimer).not.toHaveBeenCalled()
         expect(harness.registry.getActiveCount(harness.runtimeId, 7)).toBe(0)
     })
 
-    test('feature OFF and unload durably drain, clean subscriptions, and release once active work settles', async () => {
+    test.each([
+        ['feature OFF', 'resolve'],
+        ['feature OFF', 'reject'],
+        ['drain:true', 'resolve'],
+        ['drain:true', 'reject'],
+        ['drain:false', 'resolve'],
+        ['drain:false', 'reject'],
+        ['unload', 'resolve'],
+        ['unload', 'reject'],
+    ] as const)('%s cancels a non-cooperative provider and swallows late %s', async (initiator, late) => {
         const harness = makeHarness()
         const provider = deferred<unknown>()
-        harness.provider.mockImplementationOnce(async () => await provider.promise)
-        const listener = vi.fn()
-        await harness.bridge.rootMethods._ijSubscribe(listener)
-        expect(harness.wakeListeners.size).toBe(1)
+        let providerSignal: AbortSignal | undefined
+        harness.provider.mockImplementationOnce((_options, signal) => {
+            providerSignal = signal
+            return provider.promise
+        })
         const running = harness.bridge.runLLMModel({ mode: 'model', messages: [] })
         await flushMicrotasks()
-        await expect(harness.bridge.rootMethods._ijSetFeatureEnabled({
-            protocolVersion: 1,
-            enabled: false,
-        })).resolves.toEqual({ featureEnabled: false })
-        expect(harness.state.coordinator).toMatchObject({ draining: true, leaseId: 'coordinator-lease' })
-        expect(harness.releaseCoordinatorFinal).not.toHaveBeenCalled()
-        await harness.bridge.unload()
-        expect(harness.wakeListeners.size).toBe(0)
-        provider.resolve({ answer: 'late completion' })
-        await expect(running).resolves.toEqual({ answer: 'late completion' })
+        expect(harness.registry.getActiveCount(harness.runtimeId, 7)).toBe(1)
+
+        await initiateDrain(harness, initiator)
+        await expect(running).rejects.toThrow('[IJ:unavailable]')
+        expect(providerSignal?.aborted).toBe(true)
+        expect(harness.registry.getActiveCount(harness.runtimeId, 7)).toBe(0)
         expect(harness.releaseCoordinatorFinal).toHaveBeenCalledTimes(1)
-        expect(harness.state.coordinator?.leaseId).toBeNull()
+
+        if (late === 'resolve') provider.resolve({ result: 'detached late success' })
+        else provider.reject(new Error('detached late failure'))
+        await flushMicrotasks()
+        expect(harness.registry.getActiveCount(harness.runtimeId, 7)).toBe(0)
+        expect(harness.releaseCoordinatorFinal).toHaveBeenCalledTimes(1)
     })
 
-    test('drain:false with active work requires valid proof, drains, then final-releases exactly once', async () => {
+    test('does not abort until markCoordinatorDraining durably succeeds', async () => {
         const harness = makeHarness()
         const provider = deferred<unknown>()
-        harness.provider.mockImplementationOnce(async () => await provider.promise)
+        const durableEntered = deferred<void>()
+        const durableGate = deferred<void>()
+        let providerSignal: AbortSignal | undefined
+        harness.provider.mockImplementationOnce((_options, signal) => {
+            providerSignal = signal
+            return provider.promise
+        })
+        harness.markCoordinatorDraining.mockImplementationOnce(async (input) => {
+            durableEntered.resolve()
+            await durableGate.promise
+            const current = harness.state.coordinator
+            if (
+                !current
+                || current.leaseId !== input.leaseId
+                || current.version !== input.expectedVersion
+                || current.fence !== input.fence
+            ) throw coded('coordinator_mismatch')
+            harness.state.coordinator = {
+                ...current,
+                version: current.version + 1,
+                draining: true,
+            }
+            return structuredClone(harness.state.coordinator)
+        })
         const running = harness.bridge.runLLMModel({ mode: 'model', messages: [] })
         await flushMicrotasks()
-        await expect(harness.bridge.rootMethods._ijReleaseCoordinator({
-            protocolVersion: 1,
-            leaseId: 'stale-caller-lease',
-            expectedVersion: 1,
-            fence: 7,
-            drain: false,
-        })).rejects.toThrow('[IJ:coordinator_required]')
-        expect(harness.state.coordinator?.draining).toBe(false)
+        const draining = harness.bridge.rootMethods._ijReleaseCoordinator({
+            ...currentCoordinatorProof(harness),
+            drain: true,
+        })
+        await durableEntered.promise
+        expect(providerSignal?.aborted).toBe(false)
+        expect(harness.registry.getActiveCount(harness.runtimeId, 7)).toBe(1)
+
+        durableGate.resolve()
+        await expect(draining).resolves.toBeUndefined()
+        await expect(running).rejects.toThrow('[IJ:unavailable]')
+        expect(providerSignal?.aborted).toBe(true)
+        expect(harness.releaseCoordinatorFinal).toHaveBeenCalledTimes(1)
+    })
+
+    test('stale lease, version, and fence proofs do not touch an active stream', async () => {
+        const harness = makeHarness()
+        const read = deferred<ReadableStreamReadResult<unknown>>()
+        const cancel = vi.fn(async () => {})
+        const reader = { read: vi.fn(() => read.promise), cancel }
+        const stream = new ReadableStream<unknown>()
+        vi.spyOn(stream, 'getReader').mockReturnValue(reader as never)
+        let providerSignal: AbortSignal | undefined
+        harness.provider.mockImplementationOnce(async (_options, signal) => {
+            providerSignal = signal
+            return { type: 'streaming', result: stream, model: 'stream-model' }
+        })
+        const running = harness.bridge.runLLMModel({ mode: 'model', messages: [] })
+        await flushMicrotasks()
+        const proof = currentCoordinatorProof(harness)
 
         await expect(harness.bridge.rootMethods._ijReleaseCoordinator({
-            protocolVersion: 1,
-            leaseId: 'coordinator-lease',
-            expectedVersion: 1,
-            fence: 7,
-            drain: false,
-        })).rejects.toThrow('[IJ:coordinator_draining]')
-        expect(harness.markCoordinatorDraining).toHaveBeenCalledWith({
-            protocolVersion: 1,
-            leaseId: 'coordinator-lease',
-            expectedVersion: 1,
-            fence: 7,
+            ...proof,
+            leaseId: 'stale-lease',
+            drain: true,
+        })).rejects.toThrow('[IJ:coordinator_required]')
+        await expect(harness.bridge.rootMethods._ijReleaseCoordinator({
+            ...proof,
+            expectedVersion: proof.expectedVersion + 1,
+            drain: true,
+        })).rejects.toThrow('[IJ:version_conflict]')
+        await expect(harness.bridge.rootMethods._ijReleaseCoordinator({
+            ...proof,
+            fence: proof.fence + 1,
+            drain: true,
+        })).rejects.toThrow('[IJ:coordinator_required]')
+
+        expect(providerSignal?.aborted).toBe(false)
+        expect(cancel).not.toHaveBeenCalled()
+        expect(harness.registry.getActiveCount(harness.runtimeId, 7)).toBe(1)
+        expect(harness.state.coordinator?.draining).toBe(false)
+
+        await initiateDrain(harness, 'drain:true')
+        await expect(running).rejects.toThrow('[IJ:unavailable]')
+        expect(cancel).toHaveBeenCalledTimes(1)
+    })
+
+    test.each([
+        [[], ''],
+        [[{ '0': 'partial' }, { '0': 'complete text' }], 'complete text'],
+    ] as const)('normalizes an authorized provider stream at EOF (%#)', async (chunks, expected) => {
+        const harness = makeHarness()
+        const stream = new ReadableStream<Record<string, string>>({
+            start(controller) {
+                for (const chunk of chunks) controller.enqueue(chunk)
+                controller.close()
+            },
         })
-        expect(harness.releaseCoordinator).not.toHaveBeenCalled()
-        provider.resolve('done')
-        await expect(running).resolves.toBe('done')
+        harness.provider.mockResolvedValueOnce({
+            type: 'streaming',
+            result: stream,
+            model: 'stream-model',
+        })
+
+        await expect(harness.bridge.runLLMModel({ mode: 'model', messages: [] }))
+            .resolves.toEqual({ type: 'success', result: expected, model: 'stream-model' })
+        expect(harness.registry.getActiveCount(harness.runtimeId, 7)).toBe(0)
+    })
+
+    test.each(
+        (['feature OFF', 'drain:true', 'drain:false', 'unload'] as const).flatMap((initiator) => (
+            (['resolve', 'reject', 'throw', 'pending'] as const).map((cancelBehavior) => (
+                [initiator, cancelBehavior] as const
+            ))
+        )),
+    )('%s drains a non-cooperative stream when reader.cancel is %s', async (initiator, cancelBehavior) => {
+        const harness = makeHarness()
+        const controlled = controlledStream(cancelBehavior)
+        let providerSignal: AbortSignal | undefined
+        harness.provider.mockImplementationOnce(async (_options, signal) => {
+            providerSignal = signal
+            return {
+                type: 'streaming',
+                result: controlled.stream,
+                model: 'never-ending-model',
+            }
+        })
+        let hostSettled = false
+        const running = harness.bridge.runLLMModel({ mode: 'model', messages: [] })
+        void running.then(
+            () => { hostSettled = true },
+            () => { hostSettled = true },
+        )
+        await flushMicrotasks()
+
+        expect(controlled.getReader).toHaveBeenCalledTimes(1)
+        expect(controlled.reader.read).toHaveBeenCalledTimes(1)
+        expect(hostSettled).toBe(false)
+        expect(harness.registry.getActiveCount(harness.runtimeId, 7)).toBe(1)
+
+        await initiateDrain(harness, initiator)
+        await expect(running).rejects.toThrow('[IJ:unavailable]')
+        expect(providerSignal?.aborted).toBe(true)
+        expect(controlled.cancel).toHaveBeenCalledTimes(1)
+        expect(harness.registry.getActiveCount(harness.runtimeId, 7)).toBe(0)
         expect(harness.releaseCoordinatorFinal).toHaveBeenCalledTimes(1)
+
+        if (cancelBehavior === 'resolve') {
+            controlled.read.resolve({ done: false, value: { '0': 'late chunk' } })
+        } else if (cancelBehavior === 'reject') {
+            controlled.read.resolve({ done: true, value: undefined })
+        } else {
+            controlled.read.reject(new Error('late stream read failure'))
+        }
+        await flushMicrotasks()
+        expect(controlled.reader.read).toHaveBeenCalledTimes(1)
+        expect(harness.registry.getActiveCount(harness.runtimeId, 7)).toBe(0)
+        expect(harness.releaseCoordinatorFinal).toHaveBeenCalledTimes(1)
+    })
+
+    test('ignores a streaming wrapper that arrives after host cancellation', async () => {
+        const harness = makeHarness()
+        const provider = deferred<unknown>()
+        const controlled = controlledStream('resolve')
+        harness.provider.mockImplementationOnce(() => provider.promise)
+        const running = harness.bridge.runLLMModel({ mode: 'model', messages: [] })
+        await flushMicrotasks()
+
+        await initiateDrain(harness, 'drain:true')
+        await expect(running).rejects.toThrow('[IJ:unavailable]')
+        provider.resolve({ type: 'streaming', result: controlled.stream, model: 'late-stream' })
+        await flushMicrotasks()
+
+        expect(controlled.getReader).not.toHaveBeenCalled()
+        expect(controlled.cancel).not.toHaveBeenCalled()
+        expect(harness.releaseCoordinatorFinal).toHaveBeenCalledTimes(1)
+    })
+
+    test.each(['resolve', 'reject'] as const)(
+        'old-fence late %s cannot affect an immediately reacquired coordinator',
+        async (late) => {
+            const harness = makeHarness()
+            const oldProvider = deferred<unknown>()
+            let oldSignal: AbortSignal | undefined
+            harness.provider.mockImplementationOnce((_options, signal) => {
+                oldSignal = signal
+                return oldProvider.promise
+            })
+            const oldRunning = harness.bridge.runLLMModel({ mode: 'model', messages: [] })
+            await flushMicrotasks()
+
+            await initiateDrain(harness, 'drain:false')
+            const reclaim = harness.bridge.rootMethods._ijClaimCoordinator({
+                protocolVersion: 1,
+                leaseId: 'coordinator-lease-new',
+            }) as Promise<{ fence: number }>
+            await expect(reclaim).resolves.toMatchObject({ fence: 8, ownedByCaller: true })
+            await expect(oldRunning).rejects.toThrow('[IJ:unavailable]')
+            expect(oldSignal?.aborted).toBe(true)
+
+            const newProvider = deferred<unknown>()
+            let newSignal: AbortSignal | undefined
+            harness.provider.mockImplementationOnce((_options, signal) => {
+                newSignal = signal
+                return newProvider.promise
+            })
+            const newRunning = harness.bridge.runLLMModel({ mode: 'model', messages: [] })
+            await flushMicrotasks()
+            expect(harness.registry.getActiveCount(harness.runtimeId, 8)).toBe(1)
+
+            if (late === 'resolve') oldProvider.resolve('old late success')
+            else oldProvider.reject(new Error('old late failure'))
+            await flushMicrotasks()
+            expect(newSignal?.aborted).toBe(false)
+            expect(harness.registry.getActiveCount(harness.runtimeId, 8)).toBe(1)
+            expect(harness.releaseCoordinatorFinal).toHaveBeenCalledTimes(1)
+
+            newProvider.resolve('new fence success')
+            await expect(newRunning).resolves.toBe('new fence success')
+            expect(harness.registry.getActiveCount(harness.runtimeId, 8)).toBe(0)
+        },
+    )
+
+    test('unloading an old runtime never aborts a newer runtime or fence', async () => {
+        const harness = makeHarness('runtime-a')
+        const oldProvider = deferred<unknown>()
+        let oldSignal: AbortSignal | undefined
+        harness.provider.mockImplementationOnce((_options, signal) => {
+            oldSignal = signal
+            return oldProvider.promise
+        })
+        const oldRunning = harness.bridge.runLLMModel({ mode: 'model', messages: [] })
+        await flushMicrotasks()
+
+        harness.state.coordinator = {
+            version: 2,
+            fence: 8,
+            leaseId: 'coordinator-b',
+            holderRuntimeId: 'runtime-b',
+            expiresAt: 61_000,
+            draining: false,
+        }
+        const bridgeB = createAuthorizedIllustrationV3Bridge({
+            auth: AUTH,
+            runtimeId: 'runtime-b',
+            deps: harness.deps,
+            hostRegistry: harness.registry,
+        })
+        const newProvider = deferred<unknown>()
+        let newSignal: AbortSignal | undefined
+        harness.provider.mockImplementationOnce((_options, signal) => {
+            newSignal = signal
+            return newProvider.promise
+        })
+        const newRunning = bridgeB.runLLMModel({ mode: 'model', messages: [] })
+        await flushMicrotasks()
+        expect(harness.registry.getActiveCount('runtime-a', 7)).toBe(1)
+        expect(harness.registry.getActiveCount('runtime-b', 8)).toBe(1)
+
+        await expect(harness.bridge.unload()).resolves.toBeUndefined()
+        await expect(oldRunning).rejects.toThrow('[IJ:unavailable]')
+        expect(oldSignal?.aborted).toBe(true)
+        expect(newSignal?.aborted).toBe(false)
+        expect(harness.registry.getActiveCount('runtime-a', 7)).toBe(0)
+        expect(harness.registry.getActiveCount('runtime-b', 8)).toBe(1)
+
+        oldProvider.reject(new Error('old runtime late failure'))
+        await flushMicrotasks()
+        expect(newSignal?.aborted).toBe(false)
+        expect(harness.registry.getActiveCount('runtime-b', 8)).toBe(1)
+
+        newProvider.resolve('new runtime success')
+        await expect(newRunning).resolves.toBe('new runtime success')
+        await bridgeB.unload()
+    })
+
+    test('feature-disabled capability reconciliation cancels active work', async () => {
+        const harness = makeHarness()
+        const provider = deferred<unknown>()
+        harness.provider.mockImplementationOnce(() => provider.promise)
+        const running = harness.bridge.runLLMModel({ mode: 'model', messages: [] })
+        await flushMicrotasks()
+        harness.state.featureEnabled = false
+
+        await expect(harness.bridge.rootMethods._ijGetCapabilities())
+            .resolves.toMatchObject({ featureEnabled: false })
+        await expect(running).rejects.toThrow('[IJ:unavailable]')
+        expect(harness.markCoordinatorDraining).toHaveBeenCalledTimes(1)
+        expect(harness.releaseCoordinatorFinal).toHaveBeenCalledTimes(1)
+    })
+
+    test('feature-disabled post-claim discovery cancels active work', async () => {
+        const harness = makeHarness()
+        const provider = deferred<unknown>()
+        harness.provider.mockImplementationOnce(() => provider.promise)
+        const running = harness.bridge.runLLMModel({ mode: 'model', messages: [] })
+        await flushMicrotasks()
+        harness.state.disableFeatureAfterClaim = true
+
+        await expect(harness.bridge.rootMethods._ijClaimCoordinator({
+            protocolVersion: 1,
+            leaseId: 'claim-before-feature-off-discovery',
+        })).rejects.toThrow('[IJ:feature_disabled]')
+        await expect(running).rejects.toThrow('[IJ:unavailable]')
+        expect(harness.releaseCoordinatorFinal).toHaveBeenCalledTimes(1)
+    })
+
+    test('provider failure remains primary when drain cleanup also fails', async () => {
+        const harness = makeHarness()
+        const provider = deferred<unknown>()
+        harness.provider.mockImplementationOnce(() => provider.promise)
+        harness.releaseCoordinatorFinal.mockRejectedValueOnce(new Error('cleanup secret'))
+        const running = harness.bridge.runLLMModel({ mode: 'model', messages: [] })
+        await flushMicrotasks()
+        harness.state.coordinator = {
+            ...harness.state.coordinator!,
+            draining: true,
+        }
+        provider.reject(coded('validation'))
+
+        await expect(running).rejects.toThrow('[IJ:validation]')
+        expect(harness.registry.getActiveCount(harness.runtimeId, 7)).toBe(0)
     })
 
     test('keeps runtime bookkeeping until queued unload drain can final-release', async () => {

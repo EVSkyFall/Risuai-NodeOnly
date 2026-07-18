@@ -108,6 +108,7 @@ const bridgeDependencies: IllustrationV3BridgeDependencies = {
             staticModel: options.staticModel as string | undefined,
             blockPlugins: options.allowPlugins !== true,
             useStreaming: false,
+            hostOmitCallerGenerationCap: true,
         }, options.mode as Parameters<typeof requestChatDataMain>[1], signal)
     },
     subscribeWakeHints: subscribeIllustrationWakeHints,

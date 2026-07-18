@@ -347,7 +347,7 @@ export async function requestGoogleCloudVertex(arg:RequestDataArgumentExtended):
     let body: any = {
         contents: reformatedChat,
         generation_config: applyParameters({
-            "maxOutputTokens": maxTokens
+            ...(arg.hostOmitCallerGenerationCap ? {} : { "maxOutputTokens": maxTokens })
         }, para, {
             'top_p': "topP",
             'top_k': "topK",
