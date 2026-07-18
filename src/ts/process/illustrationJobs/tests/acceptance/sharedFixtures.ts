@@ -15,12 +15,12 @@ export const PRODUCTION_SLOT_TOKEN_RE = /^[0-9a-f]{32}$/
 
 export const PRODUCTION_PLUGIN = Object.freeze({
     name: 'lb_xnai_agent',
-    // 0.2.3 plugin-model/bulk-discard release bundle (244,854 bytes) — kept as the rollback window.
-    scriptSha256: 'd9dfc5ab4d0dc0e7691347de56958310232e42cf05bb8dd6296a129f94cfd121',
-    // 0.2.4 validation/submission stability release bundle (251,906 bytes) — digest
-    // independently recomputed from the root and dist bundles on 2026-07-18 during the
-    // repin request.
-    scriptSha256Next: '97b5f09b6512317a172937fabdb8765c5d07d1087bf1deb7a6ba5ca1dce7742b',
+    // 0.2.4 validation/submission stability release bundle (251,906 bytes) — kept as
+    // the rollback window.
+    scriptSha256: '97b5f09b6512317a172937fabdb8765c5d07d1087bf1deb7a6ba5ca1dce7742b',
+    // 0.2.5 JSON/poll stability release bundle (259,169 bytes) — digest independently
+    // recomputed from the root and dist bundles on 2026-07-19 during the repin request.
+    scriptSha256Next: '31e284ab4d55a65c9043ece4de59ff0f9489b2b683d4c528a99510d75e5b0ed7',
 })
 
 // Digests that must NEVER authorize: releases removed from the rotation window,
@@ -48,6 +48,9 @@ export const REJECTED_PLUGIN_SHA256S = Object.freeze([
     // 0.2.2 role-compat recovery release (239,175 bytes), removed from the window in the
     // 0.2.4 validation/submission stability rotation.
     '2c1af1a7032999b9f0bad10d50fb6b80006bf1eb4e859d8deb987629eb4896f9',
+    // 0.2.3 plugin-model/bulk-discard release (244,854 bytes), removed from the window
+    // in the 0.2.5 JSON/poll stability rotation.
+    'd9dfc5ab4d0dc0e7691347de56958310232e42cf05bb8dd6296a129f94cfd121',
 ])
 
 export type JobStateAcceptanceClassification = Readonly<{

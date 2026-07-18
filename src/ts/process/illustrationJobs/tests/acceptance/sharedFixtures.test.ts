@@ -107,13 +107,14 @@ describe('Gate 4d shared Core fixtures', () => {
     // 0.2.2 role-compat recovery repin: the [0.2.1, 0.2.2] rotation window authorizes
     // both releases while every rejected digest — retired 0.1.1, unapproved 0.1.2,
     // removed 0.1.3, the discarded pre-contract 0.2.0 snapshot, the two discarded
-    // 0.2.1 interim drafts, and the removed 0.2.0/0.2.1/0.2.2 releases — never authorizes.
-    test('pins the 0.2.4 validation/submission stability rotation window and rejects every superseded digest', async () => {
+    // 0.2.1 interim drafts, and the removed 0.2.0/0.2.1/0.2.2/0.2.3 releases — never
+    // authorizes.
+    test('pins the 0.2.5 JSON/poll stability rotation window and rejects every superseded digest', async () => {
         expect(PINNED_ILLUSTRATION_PLUGIN_DIGESTS).toEqual([
             PRODUCTION_PLUGIN.scriptSha256,
             PRODUCTION_PLUGIN.scriptSha256Next,
         ])
-        expect(REJECTED_PLUGIN_SHA256S).toHaveLength(9)
+        expect(REJECTED_PLUGIN_SHA256S).toHaveLength(10)
         expect(new Set(REJECTED_PLUGIN_SHA256S).size).toBe(REJECTED_PLUGIN_SHA256S.length)
 
         const authorize = (digest: string) => evaluateIllustrationV3Authorization({
