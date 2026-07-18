@@ -55,6 +55,128 @@ function applyCopilotTaskHeaders(headers: Record<string, string>, url: string, t
     return id
 }
 
+export interface ResolvedOpenAIRequestUrl {
+    url: string
+    risuIdentify: boolean
+}
+
+/**
+ * Single source of truth for the OpenAI-compatible chat/completions destination URL.
+ * Byte-identical to the inline logic the request builder uses at its send site (the send
+ * site now calls this too), so the provider-aware role normalizer resolves the SAME url and
+ * the "does this really land on OpenAI?" predicate can never diverge from where the request
+ * is actually sent. NOTE: the Mistral format has its OWN destination (api.mistral.ai) and
+ * never reaches this url — callers must not treat a Mistral request as OpenAI-official.
+ */
+export function resolveOpenAIRequestUrl(input: {
+    aiModel: string
+    customURL?: string
+    endpoint?: string
+    nanogptUseSubscriptionEndpoint?: boolean
+    autofillRequestUrl?: boolean
+}): ResolvedOpenAIRequestUrl {
+    const aiModel = input.aiModel
+    let url = aiModel === 'nanogpt' ? (input.nanogptUseSubscriptionEndpoint ? 'https://nano-gpt.com/api/subscription/v1/chat/completions' : 'https://nano-gpt.com/api/v1/chat/completions') :
+        aiModel === 'openrouter' ? "https://openrouter.ai/api/v1/chat/completions" :
+        aiModel === 'vercel' ? "https://ai-gateway.vercel.sh/v1/chat/completions" :
+        (input.customURL) ?? ('https://api.openai.com/v1/chat/completions')
+
+    if(input.endpoint){
+        url = input.endpoint
+    }
+
+    let risuIdentify = false
+    if(url.startsWith("risu::")){
+        risuIdentify = true
+        url = url.replace("risu::", '')
+    }
+
+    if(aiModel === 'reverse_proxy' && input.autofillRequestUrl){
+        if(url.endsWith('v1')){
+            url += '/chat/completions'
+        }
+        else if(url.endsWith('v1/')){
+            url += 'chat/completions'
+        }
+        else if(!(url.endsWith('completions') || url.endsWith('completions/'))){
+            if(url.endsWith('/')){
+                url += 'v1/chat/completions'
+            }
+            else{
+                url += '/v1/chat/completions'
+            }
+        }
+    }
+
+    return { url, risuIdentify }
+}
+
+/**
+ * True only when the resolved destination is OpenAI's own API host over https. Origin
+ * comparison (protocol+host+port) rejects look-alikes (api.openai.com.evil.tld), plain-http,
+ * and any proxy/custom host. Malformed urls fail closed.
+ */
+export function isOfficialOpenAIEndpoint(url: string): boolean {
+    try {
+        return new URL(url).origin === 'https://api.openai.com'
+    } catch {
+        return false
+    }
+}
+
+/**
+ * Provider-aware decision for the OpenAI `system`->`developer` role rewrite. The `developer`
+ * variant is only accepted by OpenAI's own endpoint; sending it to a custom/dynamic
+ * OpenAI-compatible endpoint (DeepSeek, reverse proxies, …) is a hard request-body
+ * deserialization failure. Convert ONLY when the flag is present AND either (a) the request
+ * truly lands on api.openai.com, or (b) the user explicitly declared DeveloperRole on this
+ * specific xcustom::: endpoint. Everything else — proxies, openrouter/vercel/nanogpt, endpoint
+ * overrides, and the global enableCustomFlags blanket on non-official routes — preserves
+ * `system` (fail-safe). No guessing from output/error strings; no role-fallback retry.
+ */
+export function shouldUseDeveloperRole(input: {
+    hasDeveloperRoleFlag: boolean
+    format: LLMFormat
+    aiModel: string
+    resolvedUrl: string
+    customModels?: { id: string, flags?: LLMFlags[] }[]
+}): boolean {
+    if(!input.hasDeveloperRoleFlag){
+        return false
+    }
+    // (a) request truly lands on OpenAI's own endpoint. Mistral has a separate destination
+    // (api.mistral.ai) that never reaches resolvedUrl, so it is never OpenAI-official.
+    if(input.format !== LLMFormat.Mistral && isOfficialOpenAIEndpoint(input.resolvedUrl)){
+        return true
+    }
+    // (b) explicit per-endpoint user declaration on an xcustom::: model — read the custom
+    // model's OWN flags, NOT modelInfo.flags (which the global blanket can override).
+    if(input.aiModel.startsWith('xcustom:::')){
+        const ownFlags = input.customModels?.find((m) => m.id === input.aiModel)?.flags
+        if(Array.isArray(ownFlags) && ownFlags.includes(LLMFlags.DeveloperRole)){
+            return true
+        }
+    }
+    return false
+}
+
+/**
+ * Immutable `system`->`developer` normalization. Returns NEW message objects for converted
+ * entries and preserves every other message (order, content, tool/assistant metadata) by
+ * reference — the input array and its objects are never mutated, so replay/cache identity and
+ * other adapters never observe a mutated role.
+ */
+export function normalizeDeveloperRole(messages: OpenAIChatExtra[], useDeveloperRole: boolean): OpenAIChatExtra[] {
+    if(!useDeveloperRole){
+        return messages
+    }
+    return messages.map((message) => (
+        message.role === 'system'
+            ? { ...message, role: 'developer' }
+            : message
+    ))
+}
+
 export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<requestDataResponse>{
     let formatedChat:OpenAIChatExtra[] = []
     const formated = arg.formated
@@ -240,14 +362,24 @@ export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<req
         openrouterRequestModel = await getFreeOpenRouterModels()
     }
 
-    if(arg.modelInfo.flags.includes(LLMFlags.DeveloperRole)){
-        formatedChat = formatedChat.map((v) => {
-            if(v.role === 'system'){
-                v.role = 'developer'
-            }
-            return v
-        })
-    }
+    // Provider-aware system->developer normalization. Resolve the ACTUAL destination first
+    // (same helper the send site below calls, so the predicate can never diverge from the real
+    // URL) and only rewrite when the wire provider is known to accept `developer`; otherwise
+    // preserve `system` (fail-safe). Immutable: converted entries become new objects.
+    const developerRoleDestination = resolveOpenAIRequestUrl({
+        aiModel,
+        customURL: arg.customURL,
+        endpoint: arg.modelInfo?.endpoint,
+        nanogptUseSubscriptionEndpoint: db.nanogptUseSubscriptionEndpoint,
+        autofillRequestUrl: db.autofillRequestUrl,
+    }).url
+    formatedChat = normalizeDeveloperRole(formatedChat, shouldUseDeveloperRole({
+        hasDeveloperRoleFlag: arg.modelInfo.flags.includes(LLMFlags.DeveloperRole),
+        format: arg.modelInfo.format,
+        aiModel,
+        resolvedUrl: developerRoleDestination,
+        customModels: db.customModels,
+    }))
 
     console.log(formatedChat)
     if(arg.modelInfo.format === LLMFormat.Mistral){
@@ -546,37 +678,16 @@ export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<req
         }
     }
 
-    let replacerURL = aiModel === 'nanogpt' ? (db.nanogptUseSubscriptionEndpoint ? 'https://nano-gpt.com/api/subscription/v1/chat/completions' : 'https://nano-gpt.com/api/v1/chat/completions') :
-        aiModel === 'openrouter' ? "https://openrouter.ai/api/v1/chat/completions" :
-        aiModel === 'vercel' ? "https://ai-gateway.vercel.sh/v1/chat/completions" :
-        (arg.customURL) ?? ('https://api.openai.com/v1/chat/completions')
-
-    if(arg.modelInfo?.endpoint){
-        replacerURL = arg.modelInfo.endpoint
-    }
-
-    let risuIdentify = false
-    if(replacerURL.startsWith("risu::")){
-        risuIdentify = true
-        replacerURL = replacerURL.replace("risu::", '')
-    }
-
-    if(aiModel === 'reverse_proxy' && db.autofillRequestUrl){
-        if(replacerURL.endsWith('v1')){
-            replacerURL += '/chat/completions'
-        }
-        else if(replacerURL.endsWith('v1/')){
-            replacerURL += 'chat/completions'
-        }
-        else if(!(replacerURL.endsWith('completions') || replacerURL.endsWith('completions/'))){
-            if(replacerURL.endsWith('/')){
-                replacerURL += 'v1/chat/completions'
-            }
-            else{
-                replacerURL += '/v1/chat/completions'
-            }
-        }
-    }
+    // Same single-source-of-truth helper the provider-aware role predicate above resolved.
+    const resolvedRequest = resolveOpenAIRequestUrl({
+        aiModel,
+        customURL: arg.customURL,
+        endpoint: arg.modelInfo?.endpoint,
+        nanogptUseSubscriptionEndpoint: db.nanogptUseSubscriptionEndpoint,
+        autofillRequestUrl: db.autofillRequestUrl,
+    })
+    let replacerURL = resolvedRequest.url
+    let risuIdentify = resolvedRequest.risuIdentify
 
     let headers = {
         "Authorization": "Bearer " + (arg.key ?? (aiModel === 'nanogpt' ? db.nanogptKey : aiModel === 'reverse_proxy' ?  db.proxyKey : (aiModel === 'openrouter' ? db.openrouterKey : (aiModel === 'vercel' ? db.vercelKey : db.openAIKey)))),
