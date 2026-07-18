@@ -1473,6 +1473,11 @@ export interface Database{
     dynamicModelRegistry?:boolean
     nodeOnlyScrollButtonType?:'four'|'two'|'off'
     nodeOnlyHideRecentChats?:boolean
+    // Route main-chat model-preset requests through server-side jobs
+    // (/api/model-jobs) so generation survives client disconnects.
+    // Default OFF (undefined is falsy) — no migration needed. Toggled in
+    // advanced settings (advancedSettingsData.ts).
+    nodeOnlyServerSideRequests?:boolean
     seperateParametersByModel?:boolean
     disableSeperateParameterChangeOnPresetChange?:boolean
     saveSignatures?:boolean
