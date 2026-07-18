@@ -29,6 +29,7 @@ import {
     checkCharOrder
 } from "./globalApi.svelte";
 import { registerModelDynamic } from "./model/modellist";
+import { recoverModelJobs } from "./process/request/jobRecovery";
 import { convertStubsToPlaceholders } from "./storage/chatStorage";
 import { isChatStub, purgeUnsupportedGroupChats } from "./storage/database.svelte";
 
@@ -175,6 +176,10 @@ export async function loadData() {
             }, 5_000)
             checkRisuUpdate()
             fetchPublicStats()
+            // Server-side model-job recovery (jobRecovery.ts): slot journaled
+            // responses from disconnected generations back into their chats.
+            // Fire-and-forget — runs once, never throws, no-op without jobs.
+            void recoverModelJobs()
             if (import.meta.env.VITE_RISU_TOS === 'TRUE') {
                 alertTOS().then((a) => {
                     if (a === false) {

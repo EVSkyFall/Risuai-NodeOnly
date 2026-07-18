@@ -1,0 +1,429 @@
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
+import { get } from 'svelte/store'
+
+// --- module mocks -----------------------------------------------------------
+//
+// jobRecovery touches the app through four seams; everything else (adapter
+// parsers, generationState, requestStatus) runs for real. The DB is a plain
+// mutable fixture handed out by the mocked getDatabase, mirroring how
+// util.test.ts stubs the database layer.
+
+const mocks = vi.hoisted(() => ({
+    db: { characters: [] as any[], inlayErrorResponse: true, showRequestStatus: true } as any,
+    notifyError: vi.fn(),
+    ensureChatHydrated: vi.fn(),
+}))
+
+vi.mock('src/ts/globalApi.svelte', () => ({
+    forageStorage: { createAuth: async () => 'test-auth' },
+}))
+vi.mock('src/ts/storage/database.svelte', () => ({
+    getDatabase: () => mocks.db,
+}))
+vi.mock('src/ts/storage/chatStorage', () => ({
+    ensureChatHydrated: mocks.ensureChatHydrated,
+}))
+vi.mock('src/ts/alert', () => ({
+    notifyError: mocks.notifyError,
+}))
+
+// Fresh module instances per test: recoverModelJobs is once-guarded, and the
+// keyed stores (generationState / requestStatus) must not leak across tests.
+async function loadModules() {
+    vi.resetModules()
+    const recovery = await import('./jobRecovery')
+    const genState = await import('src/ts/process/generationState')
+    const status = await import('src/ts/status/requestStatus')
+    return { recovery, genState, status }
+}
+
+// --- fixtures ---------------------------------------------------------------
+
+function makeChat(overrides: Record<string, unknown> = {}) {
+    return { id: 'chat-1', name: 'chat one', message: [] as any[], ...overrides }
+}
+
+function makeChar(chat: any) {
+    return { chaId: 'cha-1', name: 'Rina', type: 'character', chatPage: 0, reloadKeys: 0, chats: [chat] }
+}
+
+function makeJob(overrides: Record<string, unknown> = {}) {
+    return {
+        id: 'job-1',
+        chatId: 'chat-1',
+        generationId: 'gen-1',
+        adapterKind: 'openai-compatible',
+        streaming: true,
+        status: 'done',
+        upstreamStatus: 200,
+        ...overrides,
+    }
+}
+
+function sseStream(...chunks: string[]): ReadableStream<Uint8Array> {
+    const enc = new TextEncoder()
+    return new ReadableStream({
+        start(c) {
+            for (const chunk of chunks) c.enqueue(enc.encode(chunk))
+            c.close()
+        },
+    })
+}
+
+const OPENAI_SSE =
+    'data: {"choices":[{"delta":{"content":"Hel"}}]}\n\n'
+    + 'data: {"choices":[{"delta":{"content":"lo"}}]}\n\n'
+    + 'data: [DONE]\n\n'
+
+// --- fetch harness ----------------------------------------------------------
+
+interface ServerBehavior {
+    unclaimed?: any[]
+    active?: any[]
+    /** journal body per job id (string, replayed as one chunk) */
+    journals?: Record<string, string>
+    /** override the stream endpoint's HTTP status per job id */
+    streamStatus?: Record<string, number>
+    /** successive GET /api/model-jobs/:id responses (last one repeats) */
+    jobStates?: Record<string, any[]>
+    /** make GET /api/model-jobs/:id reject (status endpoint unreachable) */
+    jobStatusUnreachable?: boolean
+}
+
+function setupServer(behavior: ServerBehavior) {
+    const calls: { url: string, method: string }[] = []
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        const url = String(input)
+        const method = init?.method ?? 'GET'
+        calls.push({ url, method })
+        if (url === '/api/model-jobs?unclaimed=1') {
+            return new Response(JSON.stringify({ jobs: behavior.unclaimed ?? [] }), { status: 200 })
+        }
+        if (url === '/api/model-jobs?active=1') {
+            return new Response(JSON.stringify({ jobs: behavior.active ?? [] }), { status: 200 })
+        }
+        const streamMatch = url.match(/^\/api\/model-jobs\/([^/]+)\/stream$/)
+        if (streamMatch) {
+            const id = streamMatch[1]
+            const status = behavior.streamStatus?.[id] ?? 200
+            if (status !== 200) return new Response('down', { status })
+            return new Response(sseStream(behavior.journals?.[id] ?? ''), {
+                status: 200,
+                headers: { 'content-type': 'text/event-stream', 'x-model-job-upstream-status': '200' },
+            })
+        }
+        const claimMatch = url.match(/^\/api\/model-jobs\/([^/]+)\/claim$/)
+        if (claimMatch && method === 'POST') {
+            return new Response('{"success":true}', { status: 200 })
+        }
+        const jobMatch = url.match(/^\/api\/model-jobs\/([^/]+)$/)
+        if (jobMatch && method === 'DELETE') {
+            return new Response('{"success":true}', { status: 200 })
+        }
+        if (jobMatch && method === 'GET') {
+            if (behavior.jobStatusUnreachable) throw new TypeError('Failed to fetch')
+            const states = behavior.jobStates?.[jobMatch[1]]
+            if (!states || states.length === 0) return new Response('{"error":"Job not found"}', { status: 404 })
+            const next = states.length > 1 ? states.shift() : states[0]
+            return new Response(JSON.stringify(next), { status: 200 })
+        }
+        throw new Error(`unexpected fetch: ${method} ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const claims = () => calls.filter((c) => c.method === 'POST' && c.url.endsWith('/claim')).map((c) => c.url)
+    return { calls, claims }
+}
+
+beforeEach(() => {
+    mocks.db = { characters: [], inlayErrorResponse: true, showRequestStatus: true }
+    mocks.notifyError.mockReset()
+    mocks.ensureChatHydrated.mockReset()
+})
+
+afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.useRealTimers()
+})
+
+// --- journal decoding -------------------------------------------------------
+
+describe('journal decoding', () => {
+    test('openai-compatible SSE journal accumulates deltas and stops at [DONE]', async () => {
+        const { recovery } = await loadModules()
+        const text = await recovery.decodeStreamingJournal('openai-compatible', sseStream(OPENAI_SSE))
+        expect(text).toBe('Hello')
+    })
+
+    test('anthropic SSE journal wraps thinking deltas like a live run', async () => {
+        const { recovery } = await loadModules()
+        const journal =
+            'event: content_block_delta\ndata: {"delta":{"type":"thinking_delta","thinking":"hmm"}}\n\n'
+            + 'event: content_block_delta\ndata: {"delta":{"type":"text_delta","text":"Hi"}}\n\n'
+            + 'event: message_stop\ndata: {}\n\n'
+        const text = await recovery.decodeStreamingJournal('anthropic-messages', sseStream(journal))
+        expect(text).toBe('<Thoughts>\nhmm\n</Thoughts>\n\nHi')
+    })
+
+    test('gemini SSE journal splits thought parts from visible text', async () => {
+        const { recovery } = await loadModules()
+        const journal =
+            'data: {"candidates":[{"content":{"parts":[{"text":"pondering","thought":true}]}}]}\n\n'
+            + 'data: {"candidates":[{"content":{"parts":[{"text":"Ga"}]}}]}\n\n'
+            + 'data: {"candidates":[{"content":{"parts":[{"text":"to"}]}}]}\n\n'
+        const text = await recovery.decodeStreamingJournal('google-gemini', sseStream(journal))
+        expect(text).toBe('<Thoughts>\npondering\n</Thoughts>\n\nGato')
+    })
+
+    test('non-streaming JSON journals decode per kind', async () => {
+        const { recovery } = await loadModules()
+        expect(recovery.decodeJsonJournal(
+            'openai-compatible',
+            '{"choices":[{"message":{"content":"plain"}}]}',
+        )).toBe('plain')
+        expect(recovery.decodeJsonJournal(
+            'anthropic-messages',
+            '{"content":[{"type":"thinking","thinking":"deep"},{"type":"text","text":"claude says"}]}',
+        )).toBe('<Thoughts>\ndeep\n</Thoughts>\n\nclaude says')
+    })
+})
+
+// --- terminal job slot-in ---------------------------------------------------
+
+describe('recoverTerminalJob', () => {
+    test('done job slots exactly one char message with generationInfo, then claims', async () => {
+        const { recovery } = await loadModules()
+        const chat = makeChat()
+        const char = makeChar(chat)
+        mocks.db.characters = [char]
+        const { claims } = setupServer({ journals: { 'job-1': OPENAI_SSE } })
+
+        await recovery.recoverTerminalJob(makeJob() as any)
+
+        expect(chat.message).toHaveLength(1)
+        expect(chat.message[0]).toMatchObject({
+            role: 'char',
+            data: 'Hello',
+            saying: 'cha-1',
+            chatId: 'gen-1',
+            generationInfo: { generationId: 'gen-1' },
+        })
+        expect(typeof chat.message[0].time).toBe('number')
+        expect(char.reloadKeys).toBe(1)
+        expect(claims()).toEqual(['/api/model-jobs/job-1/claim'])
+    })
+
+    test('idempotent: existing generationId means claim only, no duplicate message', async () => {
+        const { recovery } = await loadModules()
+        const chat = makeChat({ message: [{ role: 'char', data: 'already saved', generationInfo: { generationId: 'gen-1' } }] })
+        mocks.db.characters = [makeChar(chat)]
+        const { claims, calls } = setupServer({})
+
+        await recovery.recoverTerminalJob(makeJob() as any)
+
+        expect(chat.message).toHaveLength(1)
+        expect(claims()).toEqual(['/api/model-jobs/job-1/claim'])
+        // journal never read
+        expect(calls.some((c) => c.url.endsWith('/stream'))).toBe(false)
+    })
+
+    test('failed job writes the risuerror block into the originating chat', async () => {
+        const { recovery } = await loadModules()
+        const chat = makeChat({ message: [{ role: 'user', data: 'hi' }] })
+        mocks.db.characters = [makeChar(chat)]
+        const { claims } = setupServer({})
+
+        await recovery.recoverTerminalJob(makeJob({ status: 'failed', error: 'upstream timeout' }) as any)
+
+        expect(chat.message).toHaveLength(2)
+        expect(chat.message[1].role).toBe('char')
+        expect(chat.message[1].data).toBe('```risuerror\nupstream timeout\n```')
+        expect(claims()).toEqual(['/api/model-jobs/job-1/claim'])
+    })
+
+    test('failed job never appends to an existing char message — always a new one', async () => {
+        const { recovery } = await loadModules()
+        const chat = makeChat({ message: [{ role: 'char', data: 'unrelated earlier reply' }] })
+        mocks.db.characters = [makeChar(chat)]
+        setupServer({})
+
+        await recovery.recoverTerminalJob(makeJob({ status: 'failed', error: 'boom' }) as any)
+
+        expect(chat.message).toHaveLength(2)
+        expect(chat.message[0].data).toBe('unrelated earlier reply') // untouched
+        expect(chat.message[1]).toMatchObject({
+            role: 'char',
+            data: '```risuerror\nboom\n```',
+            generationInfo: { generationId: 'gen-1' }, // future idempotency scans match it
+        })
+    })
+
+    test('failed job with inlayErrorResponse off falls back to a toast naming the character', async () => {
+        const { recovery } = await loadModules()
+        mocks.db.inlayErrorResponse = false
+        const chat = makeChat()
+        mocks.db.characters = [makeChar(chat)]
+        setupServer({})
+
+        await recovery.recoverTerminalJob(makeJob({ status: 'failed', error: 'boom' }) as any)
+
+        expect(chat.message).toHaveLength(0)
+        expect(mocks.notifyError).toHaveBeenCalledTimes(1)
+        expect(String(mocks.notifyError.mock.calls[0][0])).toContain('Rina')
+    })
+
+    test('missing chat claims and skips without touching anything', async () => {
+        const { recovery } = await loadModules()
+        mocks.db.characters = [makeChar(makeChat({ id: 'other-chat' }))]
+        const { claims } = setupServer({})
+
+        await recovery.recoverTerminalJob(makeJob() as any)
+
+        expect(mocks.db.characters[0].chats[0].message).toHaveLength(0)
+        expect(claims()).toEqual(['/api/model-jobs/job-1/claim'])
+    })
+
+    test('done job whose journal decode fails becomes a risuerror, not a message', async () => {
+        const { recovery } = await loadModules()
+        const chat = makeChat()
+        mocks.db.characters = [makeChar(chat)]
+        const { claims } = setupServer({ journals: { 'job-1': 'data: {not json\n\n' } })
+
+        await recovery.recoverTerminalJob(makeJob() as any)
+
+        expect(chat.message).toHaveLength(1)
+        expect(chat.message[0].data).toContain('```risuerror')
+        expect(claims()).toEqual(['/api/model-jobs/job-1/claim'])
+    })
+})
+
+// --- discovery --------------------------------------------------------------
+
+describe('recoverModelJobs', () => {
+    test('one failing job does not stop the rest; second call is a no-op', async () => {
+        const { recovery } = await loadModules()
+        const chat = makeChat()
+        mocks.db.characters = [makeChar(chat)]
+        const jobBroken = makeJob({ id: 'job-broken' })
+        const jobOk = makeJob({ id: 'job-ok', generationId: 'gen-ok' })
+        const { calls } = setupServer({
+            unclaimed: [jobBroken, jobOk],
+            journals: { 'job-ok': OPENAI_SSE },
+            streamStatus: { 'job-broken': 500 }, // journal unreachable → job left unclaimed
+        })
+
+        await recovery.recoverModelJobs()
+
+        expect(chat.message).toHaveLength(1)
+        expect(chat.message[0].generationInfo.generationId).toBe('gen-ok')
+
+        const callCount = calls.length
+        await recovery.recoverModelJobs()
+        expect(calls.length).toBe(callCount) // once-guarded
+    })
+
+    test('unreachable job API is a silent no-op', async () => {
+        const { recovery } = await loadModules()
+        vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('Failed to fetch') }))
+        await expect(recovery.recoverModelJobs()).resolves.toBeUndefined()
+    })
+})
+
+// --- running jobs -----------------------------------------------------------
+
+describe('attachRunningJob', () => {
+    test('holds the send guard, shows a background status, and slots in on poll completion', async () => {
+        vi.useFakeTimers()
+        const { recovery, genState, status } = await loadModules()
+        const chat = makeChat()
+        mocks.db.characters = [makeChar(chat)]
+        setupServer({
+            journals: { 'job-1': OPENAI_SSE },
+            jobStates: { 'job-1': [makeJob({ status: 'running' }), makeJob({ status: 'done' })] },
+        })
+
+        recovery.attachRunningJob(makeJob({ status: 'running' }) as any)
+
+        // Guard held + background status published immediately.
+        expect(genState.isChatGenerating('chat-1')).toBe(true)
+        expect(get(status.requestStatuses).get('gen-1')?.phase).toBe('background')
+
+        // First poll: still running.
+        await vi.advanceTimersByTimeAsync(recovery.JOB_POLL_INITIAL_MS + 50)
+        expect(genState.isChatGenerating('chat-1')).toBe(true)
+
+        // Second poll: done → slot-in, guard released, status terminal.
+        await vi.advanceTimersByTimeAsync(recovery.JOB_POLL_MAX_MS)
+        expect(chat.message).toHaveLength(1)
+        expect(chat.message[0].data).toBe('Hello')
+        expect(genState.isChatGenerating('chat-1')).toBe(false)
+        expect(get(status.requestStatuses).get('gen-1')?.phase).toBe('done')
+        status.stopStatusTimer()
+    })
+
+    test('a 404 during polling (job aborted elsewhere) releases the guard as aborted', async () => {
+        vi.useFakeTimers()
+        const { recovery, genState, status } = await loadModules()
+        mocks.db.characters = [makeChar(makeChat())]
+        setupServer({}) // no jobStates → GET /:id replies 404
+
+        recovery.attachRunningJob(makeJob({ status: 'running' }) as any)
+        await vi.advanceTimersByTimeAsync(recovery.JOB_POLL_INITIAL_MS + 50)
+
+        expect(genState.isChatGenerating('chat-1')).toBe(false)
+        expect(get(status.requestStatuses).get('gen-1')?.phase).toBe('aborted')
+        status.stopStatusTimer()
+    })
+
+    test('registers as background: doingChat stays false and endAllGenerations preserves the guard', async () => {
+        vi.useFakeTimers()
+        const { recovery, genState, status } = await loadModules()
+        mocks.db.characters = [makeChar(makeChat())]
+        setupServer({ jobStates: { 'job-1': [makeJob({ status: 'running' })] } })
+
+        recovery.attachRunningJob(makeJob({ status: 'running' }) as any)
+
+        expect(genState.isChatGenerating('chat-1')).toBe(true)
+        expect(get(genState.generationStates).get('chat-1')?.kind).toBe('background')
+        expect(get(genState.doingChat)).toBe(false) // must not lock the global send UI
+        genState.endAllGenerations() // DevTool/multisend cleanup writes
+        expect(genState.isChatGenerating('chat-1')).toBe(true) // guard survives
+        status.stopStatusTimer()
+    })
+
+    test('Stop on a reattached job DELETEs it and releases guard + status', async () => {
+        vi.useFakeTimers()
+        const { recovery, genState, status } = await loadModules()
+        mocks.db.characters = [makeChar(makeChat())]
+        const { calls } = setupServer({ jobStates: { 'job-1': [makeJob({ status: 'running' })] } })
+
+        recovery.attachRunningJob(makeJob({ status: 'running' }) as any)
+        expect(genState.abortGeneration('chat-1')).toBe(true)
+        await vi.advanceTimersByTimeAsync(0) // flush the fire-and-forget DELETE
+
+        expect(calls.some((c) => c.method === 'DELETE' && c.url === '/api/model-jobs/job-1')).toBe(true)
+        expect(genState.isChatGenerating('chat-1')).toBe(false)
+        expect(get(status.requestStatuses).get('gen-1')?.phase).toBe('aborted')
+
+        // Poll loop stopped: no further status GETs after the next interval.
+        const getsBefore = calls.filter((c) => c.method === 'GET' && c.url === '/api/model-jobs/job-1').length
+        await vi.advanceTimersByTimeAsync(recovery.JOB_POLL_MAX_MS * 2)
+        const getsAfter = calls.filter((c) => c.method === 'GET' && c.url === '/api/model-jobs/job-1').length
+        expect(getsAfter).toBe(getsBefore)
+        status.stopStatusTimer()
+    })
+
+    test('poll deadline with the status endpoint unreachable gives up silently', async () => {
+        vi.useFakeTimers()
+        const { recovery, genState, status } = await loadModules()
+        mocks.db.characters = [makeChar(makeChat())]
+        const { claims } = setupServer({ jobStatusUnreachable: true })
+
+        recovery.attachRunningJob(makeJob({ status: 'running' }) as any)
+        await vi.advanceTimersByTimeAsync(recovery.JOB_POLL_DEADLINE_MS + recovery.JOB_POLL_MAX_MS * 2)
+
+        expect(genState.isChatGenerating('chat-1')).toBe(false)          // guard released
+        expect(get(status.requestStatuses).has('gen-1')).toBe(false)     // entry dismissed, no failure toast
+        expect(claims()).toEqual([])                                      // not claimed → next boot recovers
+        status.stopStatusTimer()
+    })
+})

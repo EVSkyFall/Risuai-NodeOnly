@@ -317,7 +317,8 @@ function deriveStreamError(data: string): ModelPresetAdapterError {
     return new ModelPresetAdapterError('server', message)
 }
 
-function parseAnthropicMessage(raw: unknown): AdapterChatResponse {
+// Exported (pure) for job-journal recovery replay (process/request/jobRecovery.ts).
+export function parseAnthropicMessage(raw: unknown): AdapterChatResponse {
     if (!isPlainObject(raw)) {
         throw new ModelPresetAdapterError('parse', 'Anthropic response is not an object')
     }
@@ -363,7 +364,8 @@ function parseAnthropicMessage(raw: unknown): AdapterChatResponse {
     }
 }
 
-function parseAnthropicStreamDelta(eventName: string | undefined, raw: unknown): AdapterChatStreamDelta | null {
+// Exported (pure) for job-journal recovery replay (process/request/jobRecovery.ts).
+export function parseAnthropicStreamDelta(eventName: string | undefined, raw: unknown): AdapterChatStreamDelta | null {
     if (!isPlainObject(raw)) return null
     if (eventName === 'content_block_delta') {
         const delta = raw['delta']

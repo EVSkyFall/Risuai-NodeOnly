@@ -401,7 +401,8 @@ async function deriveHttpError(response: Response): Promise<ModelPresetAdapterEr
         ?? new ModelPresetAdapterError('unknown', message, { status: response.status })
 }
 
-function parseGeminiResponse(raw: unknown): AdapterChatResponse {
+// Exported (pure) for job-journal recovery replay (process/request/jobRecovery.ts).
+export function parseGeminiResponse(raw: unknown): AdapterChatResponse {
     if (!isPlainObject(raw)) {
         throw new ModelPresetAdapterError('parse', 'Gemini response is not an object')
     }
@@ -479,7 +480,8 @@ function parseGeminiParts(content: unknown): {
     return { text: text.join(''), toolCalls, reasoning }
 }
 
-function parseGeminiStreamDelta(raw: unknown): AdapterChatStreamDelta | null {
+// Exported (pure) for job-journal recovery replay (process/request/jobRecovery.ts).
+export function parseGeminiStreamDelta(raw: unknown): AdapterChatStreamDelta | null {
     if (!isPlainObject(raw)) return null
     // Surface stream-level prompt blocks the same way as non-stream so the
     // user sees a real error instead of an empty stream that ends silently.
