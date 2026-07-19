@@ -127,6 +127,13 @@ export const ILLUSTRATION_V3_ERROR_MESSAGES = Object.freeze({
     invalid_transition: 'The illustration state transition is not allowed.',
     idempotency_conflict: 'The illustration idempotency key conflicts with prior work.',
     corrupt: 'The illustration record is corrupt.',
+    // Terminal Submit Diagnostics: a submitPlan that durably terminal-closed the turn
+    // (turn + eligible jobs) for a stale/corrupt request. Distinct from generic
+    // request validation so a message-only caller can restore the terminal cause after
+    // the turn drops out of the pending snapshot. Fixed friendly strings only — no
+    // internal reason, source, marker/nonce, or identifier is ever echoed.
+    turn_terminal_stale: 'The illustration turn became stale before plan submission.',
+    turn_terminal_corrupt: 'The illustration turn was closed as corrupt before plan submission.',
     agent_llm_timeout: 'The illustration Agent LLM request timed out.',
     image_prompt_over_limit: 'The final image prompt exceeds the model token budget.',
     image_tokenizer_unavailable: 'The exact image prompt tokenizer is unavailable.',
@@ -180,6 +187,8 @@ function mappedErrorCode(error: unknown): IllustrationV3ErrorCode {
         case 'invalid_transition':
         case 'idempotency_conflict':
         case 'corrupt':
+        case 'turn_terminal_stale':
+        case 'turn_terminal_corrupt':
         case 'agent_llm_timeout':
         case 'image_prompt_over_limit':
         case 'image_tokenizer_unavailable':

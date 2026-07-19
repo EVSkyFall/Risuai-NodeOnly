@@ -715,6 +715,27 @@ describe('private V3 API shape and hygiene', () => {
         expect(supplied).not.toHaveProperty('leaseId')
         expect(supplied.lease.ownedByCaller).toBe(true)
     })
+
+    // Terminal Submit Diagnostics: a durable terminal close surfaces the stable
+    // turn_terminal_stale / turn_terminal_corrupt class code through the real
+    // _ijSubmitPlan alias, distinct from generic validation and stripped of internals.
+    test('surfaces terminal stale/corrupt close codes through _ijSubmitPlan without leaking internals', async () => {
+        const { bridge, deps } = makeHarness()
+        ;(deps.submitPlan as ReturnType<typeof vi.fn>).mockRejectedValueOnce(coded('turn_terminal_stale'))
+        await expect(bridge.rootMethods._ijSubmitPlan({ turnId: 'turn-1' })).rejects.toThrow(
+            '[IJ:turn_terminal_stale] The illustration turn became stale before plan submission.',
+        )
+
+        ;(deps.submitPlan as ReturnType<typeof vi.fn>).mockRejectedValueOnce(coded('turn_terminal_corrupt'))
+        const corrupt = await bridge.rootMethods._ijSubmitPlan({ turnId: 'turn-1' })
+            .then(() => { throw new Error('expected a terminal corrupt rejection') })
+            .catch((error: unknown) => error) as { code: string; message: string }
+        expect(corrupt.code).toBe('turn_terminal_corrupt')
+        expect(corrupt.message).toBe(
+            '[IJ:turn_terminal_corrupt] The illustration turn was closed as corrupt before plan submission.',
+        )
+        expect(corrupt.message).not.toContain('private payload')
+    })
 })
 
 describe('Coordinator Recovery Status V2 RPC surface (§5)', () => {

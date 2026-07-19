@@ -68,6 +68,23 @@ export class IllustrationLedgerValidationError extends IllustrationLedgerError {
     }
 }
 
+// Thrown by submitPlan ONLY after a durable terminal close (turn + eligible jobs)
+// completed for a stale/corrupt request. The public message is a fixed friendly
+// string — the internal marker/source reason is durably recorded on the turn/job
+// records and is never echoed here. The V3 bridge maps 'turn_terminal_stale' /
+// 'turn_terminal_corrupt' straight through so a message-only Sandbox caller can
+// distinguish a completed terminal close from generic request validation.
+export class IllustrationLedgerTerminalCloseError extends IllustrationLedgerError {
+    constructor(state: 'stale' | 'corrupt') {
+        super(
+            state === 'stale' ? 'turn_terminal_stale' : 'turn_terminal_corrupt',
+            state === 'stale'
+                ? 'The illustration turn became stale before plan submission.'
+                : 'The illustration turn was closed as corrupt before plan submission.',
+        )
+    }
+}
+
 export class IllustrationLedgerCorruptError extends IllustrationLedgerError {
     constructor(message: string) {
         super('corrupt', message)

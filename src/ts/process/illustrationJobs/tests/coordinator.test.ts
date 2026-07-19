@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import type { Chat, Message } from '../../../storage/database.svelte'
 import { buildRequestMarker } from '../controlNodes'
+import { IllustrationLedgerTerminalCloseError } from '../errors'
+import { toIllustrationV3RpcError } from '../v3Bridge'
 import {
     createImagePromptMeasurementService,
     createImagePromptTokenizerLoader,
@@ -695,6 +697,221 @@ describe('prompt handoff and cancellation', () => {
         })
 
         expect(cancelled).toMatchObject({ state: 'cancelled', cancelRequestedAt: BASE_TIME })
+    })
+})
+
+// Terminal Submit Diagnostics: a submitPlan that durably terminal-closes the turn for
+// a stale/corrupt request must return a stable, secret-safe class code (distinct from
+// generic request validation) and wake subscribers exactly once — only after the
+// durable close actually completed.
+describe('submitPlan terminal close diagnostics', () => {
+    const SENTINEL = 'SENTINEL9QZX'
+
+    function messageRecord(): Message {
+        return harness.database.characters[0].chats[0].message[0]
+    }
+
+    function currentMarker(): string {
+        const match = (messageRecord().data as string)
+            .match(/<!--risu-illustration-request:v1:[A-Za-z0-9_-]+-->/)
+        if (!match) throw new Error('expected an injected request marker')
+        return match[0]
+    }
+
+    async function collectWake<T>(
+        run: () => Promise<T>,
+    ): Promise<{ error?: unknown; hints: Array<{ kind: string; turnId: string }> }> {
+        const hints: Array<{ kind: string; turnId: string }> = []
+        const unsubscribe = subscribeIllustrationWakeHints((hint) => { hints.push(hint) })
+        let error: unknown
+        try { await run() } catch (thrown) { error = thrown }
+        for (let index = 0; index < 8; index += 1) await Promise.resolve()
+        unsubscribe()
+        return { error, hints }
+    }
+
+    // §3.1 / §3.9: a marker-missing stale close returns the stable turn_terminal_stale
+    // class code through the REAL v3 bridge sanitization and leaves the turn durably
+    // stale, while the internal marker reason stays on the record and is never echoed.
+    test('stale close returns turn_terminal_stale and keeps the durable reason internal', async () => {
+        const { claimed } = await registerAndClaim('A quiet scene.')
+        messageRecord().data = 'A quiet scene.' // strip the request marker -> marker_missing
+
+        let thrown: unknown
+        await submitPlanLedger(submitInput(claimed, [1])).catch((error) => { thrown = error })
+
+        expect(thrown).toBeInstanceOf(IllustrationLedgerTerminalCloseError)
+        expect((thrown as IllustrationLedgerTerminalCloseError).code).toBe('turn_terminal_stale')
+        const rpc = toIllustrationV3RpcError(thrown)
+        expect(rpc.message)
+            .toBe('[IJ:turn_terminal_stale] The illustration turn became stale before plan submission.')
+        expect(rpc.payload).toBeUndefined()
+        const turn = await illustrationJobStore.getTurn(claimed.turnId)
+        expect(turn?.state).toBe('stale')
+        expect(turn?.error?.code).toBe('marker_missing')
+        expect(rpc.message).not.toContain('marker_missing')
+    })
+
+    // §3.2 / §3.3: a duplicate-marker corrupt close returns turn_terminal_corrupt and
+    // the durable turn class is corrupt (state/code coherence).
+    test('corrupt close returns turn_terminal_corrupt with a coherent durable state', async () => {
+        const { claimed } = await registerAndClaim('Doubled marker.')
+        messageRecord().data = `${messageRecord().data}${currentMarker()}` // same-nonce duplicate
+
+        let thrown: unknown
+        await submitPlanLedger(submitInput(claimed, [1])).catch((error) => { thrown = error })
+
+        expect((thrown as IllustrationLedgerTerminalCloseError).code).toBe('turn_terminal_corrupt')
+        expect(toIllustrationV3RpcError(thrown).message).toBe(
+            '[IJ:turn_terminal_corrupt] The illustration turn was closed as corrupt before plan submission.',
+        )
+        const turn = await illustrationJobStore.getTurn(claimed.turnId)
+        expect(turn?.state).toBe('corrupt')
+        expect(turn?.error?.code).toBe('duplicate_marker')
+    })
+
+    // §3.11: a completed stale close emits exactly one turn_changed wake — the
+    // normal-submit wake in submitPlanLedger is never reached because the close throws.
+    test('emits exactly one turn_changed wake for a completed stale terminal close', async () => {
+        const { claimed } = await registerAndClaim('Wake once.')
+        messageRecord().data = 'Wake once.'
+
+        const { error, hints } = await collectWake(() => submitPlanLedger(submitInput(claimed, [1])))
+
+        expect((error as IllustrationLedgerTerminalCloseError).code).toBe('turn_terminal_stale')
+        expect(hints.filter((hint) => hint.turnId === claimed.turnId && hint.kind === 'turn_changed'))
+            .toHaveLength(1)
+    })
+
+    // §4 job-close: a source change discovered AFTER records exist closes the turn and
+    // its eligible jobs to stale, returns turn_terminal_stale, and wakes exactly once.
+    test('terminal-closes eligible jobs with the turn on a post-records source change', async () => {
+        const { claimed } = await registerAndClaim('Race then close')
+        const message = messageRecord()
+        let edited = false
+        harness.storageHook = (key) => {
+            if (!edited && key.startsWith('illustration:v1:job:')) {
+                edited = true
+                message.data = message.data.replace('Race then close', 'User edit')
+            }
+        }
+
+        const { error, hints } = await collectWake(() => submitPlanLedger(submitInput(claimed, [4])))
+        harness.storageHook = null
+
+        expect((error as IllustrationLedgerTerminalCloseError).code).toBe('turn_terminal_stale')
+        expect((await illustrationJobStore.getTurn(claimed.turnId))?.state).toBe('stale')
+        const jobs = await illustrationJobStore.listJobs({ turnId: claimed.turnId })
+        expect(jobs.length).toBeGreaterThan(0)
+        expect(jobs.every((job) => job.state === 'stale')).toBe(true)
+        expect(hints.filter((hint) => hint.turnId === claimed.turnId && hint.kind === 'turn_changed'))
+            .toHaveLength(1)
+    })
+
+    // §3.7 / §3.8: a terminal-closed turn is excluded from listPendingTurns and an
+    // idempotent replay of the same plan neither reopens the turn nor creates new work.
+    test('excludes a terminal-closed turn from the pending snapshot and never reopens on replay', async () => {
+        const { claimed } = await registerAndClaim('Excluded turn.')
+        messageRecord().data = 'Excluded turn.'
+        const input = submitInput(claimed, [1])
+
+        await expect(submitPlanLedger(input)).rejects.toBeInstanceOf(IllustrationLedgerTerminalCloseError)
+        expect(await illustrationJobStore.listPendingTurns()).toHaveLength(0)
+
+        harness.strictSave.mockClear()
+        await expect(submitPlanLedger(input)).rejects.toBeDefined()
+        expect(await illustrationJobStore.listJobs({ turnId: claimed.turnId })).toHaveLength(0)
+        expect((await illustrationJobStore.getTurn(claimed.turnId))?.state).toBe('stale')
+        expect(harness.strictSave).not.toHaveBeenCalled()
+    })
+
+    // §3.10 / §3.11: a storage failure BEFORE the durable close completes propagates the
+    // original error (never a terminal-complete code) and emits NO wake.
+    test('propagates the original error and emits no wake when the close write fails', async () => {
+        const { claimed } = await registerAndClaim('Close write fails.')
+        messageRecord().data = 'Close write fails.'
+        const turnKey = illustrationTurnKey(claimed.turnId)
+        harness.storageHook = (key) => {
+            if (key === turnKey) throw new Error('forced close write failure')
+        }
+
+        const { error, hints } = await collectWake(() => submitPlanLedger(submitInput(claimed, [1])))
+        harness.storageHook = null
+
+        expect(error).toBeInstanceOf(Error)
+        expect(error).not.toBeInstanceOf(IllustrationLedgerTerminalCloseError)
+        expect((error as Error).message).toContain('forced close write failure')
+        expect(toIllustrationV3RpcError(error).code).not.toContain('turn_terminal')
+        expect(hints).toHaveLength(0)
+        expect((await illustrationJobStore.getTurn(claimed.turnId))?.state).toBe('awaiting_plan')
+        expect(await illustrationJobStore.listPendingTurns()).toHaveLength(1)
+    })
+
+    async function withConsoleCapture<T>(
+        run: () => Promise<T>,
+    ): Promise<{ result: T; logs: unknown[] }> {
+        const logs: unknown[] = []
+        const log = vi.spyOn(console, 'log').mockImplementation((...args) => { logs.push(...args) })
+        const warn = vi.spyOn(console, 'warn').mockImplementation((...args) => { logs.push(...args) })
+        const errorSpy = vi.spyOn(console, 'error').mockImplementation((...args) => { logs.push(...args) })
+        try {
+            const result = await run()
+            return { result, logs }
+        } finally {
+            log.mockRestore()
+            warn.mockRestore()
+            errorSpy.mockRestore()
+        }
+    }
+
+    // §4 secret sentinel (a): a sentinel planted in the durable source and a stray
+    // marker nonce never appears in the sanitized error that crosses the sandbox, nor
+    // in any log argument the completed terminal close makes.
+    test('never leaks a secret sentinel through a completed stale terminal close', async () => {
+        const source = `A ${SENTINEL} scene.`
+        const { claimed } = await registerAndClaim(source)
+        // A stray marker carrying the sentinel as its nonce (a different nonce than the
+        // turn's) resolves as marker_missing -> stale close.
+        messageRecord().data = `${source}<!--risu-illustration-request:v1:${SENTINEL}-->`
+
+        const { result: thrown, logs } = await withConsoleCapture(async () => {
+            let error: unknown
+            await submitPlanLedger(submitInput(claimed, [1])).catch((e) => { error = e })
+            return error
+        })
+
+        expect((thrown as IllustrationLedgerTerminalCloseError).code).toBe('turn_terminal_stale')
+        const rpc = toIllustrationV3RpcError(thrown)
+        expect((thrown as Error).message).not.toContain(SENTINEL)
+        expect(rpc.message).not.toContain(SENTINEL)
+        expect(JSON.stringify(rpc.payload ?? null)).not.toContain(SENTINEL)
+        expect(logs.map((value) => JSON.stringify(value)).join('|')).not.toContain(SENTINEL)
+    })
+
+    // §4 secret sentinel (b): a forced internal exception carrying the sentinel is
+    // sanitized at the v3 bridge boundary to a non-terminal code without echoing the
+    // message or touching any log argument.
+    test('sanitizes a forced internal exception carrying the sentinel', async () => {
+        const source = `B ${SENTINEL} scene.`
+        const { claimed } = await registerAndClaim(source)
+        messageRecord().data = source // strip the marker -> marker_missing stale path
+        const turnKey = illustrationTurnKey(claimed.turnId)
+        harness.storageHook = (key) => {
+            if (key === turnKey) throw new Error(`forced internal failure ${SENTINEL}`)
+        }
+
+        const { result: thrown, logs } = await withConsoleCapture(async () => {
+            let error: unknown
+            await submitPlanLedger(submitInput(claimed, [1])).catch((e) => { error = e })
+            return error
+        })
+        harness.storageHook = null
+
+        expect(thrown).not.toBeInstanceOf(IllustrationLedgerTerminalCloseError)
+        const rpc = toIllustrationV3RpcError(thrown)
+        expect(rpc.code).not.toContain('turn_terminal')
+        expect(rpc.message).not.toContain(SENTINEL)
+        expect(logs.map((value) => JSON.stringify(value)).join('|')).not.toContain(SENTINEL)
     })
 })
 

@@ -18,6 +18,7 @@ import {
     IllustrationImagePromptContractError,
     IllustrationLedgerConfirmationRequiredError,
     IllustrationLedgerCorruptError,
+    IllustrationLedgerTerminalCloseError,
     IllustrationLedgerValidationError,
 } from './errors'
 import {
@@ -417,7 +418,14 @@ async function closeTurnBeforeProjection(
         })
         await illustrationJobStore.finalizeTurnAfterJobs(settled.turnId)
     }
-    throw new IllustrationLedgerValidationError(`Illustration turn is ${state}: ${code}`)
+    // The durable terminal close (turn + eligible jobs) is now complete. Emit exactly
+    // one turn_changed wake for this terminal mutation: the normal-submit wake in
+    // submitPlanLedger runs only on the non-throwing return, so it never duplicates
+    // this one. A storage/CAS failure in either close step above throws before this
+    // point, so no wake fires and the caller is never handed a terminal-complete code
+    // for a close that did not durably complete.
+    emitIllustrationWakeHint('turn_changed', turn.turnId)
+    throw new IllustrationLedgerTerminalCloseError(state)
 }
 
 async function planHashFor(input: SubmitPlanLedgerInput): Promise<string> {
