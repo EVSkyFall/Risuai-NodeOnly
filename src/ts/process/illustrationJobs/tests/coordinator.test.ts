@@ -196,6 +196,9 @@ beforeEach(async () => {
     vi.useFakeTimers()
     vi.setSystemTime(BASE_TIME)
     harness.storageMap.clear()
+    // The singleton store's in-memory pending mirror outlives storageMap.clear();
+    // drop it so a cleared durable index is not masked by a prior test's mirror.
+    illustrationJobStore.__resetPendingTurnIndexMirrorForTests()
     harness.storageEvents.length = 0
     harness.strictFailure = null
     harness.storageHook = null
@@ -847,6 +850,52 @@ describe('submitPlan terminal close diagnostics', () => {
         expect(await illustrationJobStore.listPendingTurns()).toHaveLength(1)
     })
 
+    // Sol #12 (B-3): closeTurnFromPlan persists the terminal turn (+ index) FIRST,
+    // then the caller settles jobs + wakes. If the post-write settlement tears, a
+    // retry must resume the close idempotently and throw the SAME stable terminal
+    // code — not die on holder/version validation against the now-terminal record.
+    test('resumes a torn terminal close on retry and throws the stable code', async () => {
+        const { claimed } = await registerAndClaim('Race then close')
+        const message = messageRecord()
+        const input = submitInput(claimed, [4])
+        // First job write = manifest projection (trigger the post-records source
+        // change → stale close); second job write = the settlement transition (tear
+        // it, so the turn is durably stale but its job never settles and no wake fires).
+        let jobWrites = 0
+        harness.storageHook = (key) => {
+            if (key.startsWith('illustration:v1:job:')) {
+                jobWrites += 1
+                if (jobWrites === 1) {
+                    message.data = message.data.replace('Race then close', 'User edit')
+                } else if (jobWrites === 2) {
+                    throw new Error('torn settlement write')
+                }
+            }
+        }
+
+        let firstError: unknown
+        await submitPlanLedger(input).catch((error) => { firstError = error })
+        harness.storageHook = null
+
+        // Torn state: turn durably stale, its job NOT settled.
+        expect((firstError as Error).message).toContain('torn settlement write')
+        expect(firstError).not.toBeInstanceOf(IllustrationLedgerTerminalCloseError)
+        expect((await illustrationJobStore.getTurn(claimed.turnId))?.state).toBe('stale')
+        const tornJobs = await illustrationJobStore.listJobs({ turnId: claimed.turnId })
+        expect(tornJobs.length).toBeGreaterThan(0)
+        expect(tornJobs.every((job) => job.state === 'stale')).toBe(false)
+
+        // Retry resumes the close: same stable code, settlement completes, one wake.
+        const { error, hints } = await collectWake(() => submitPlanLedger(input))
+        expect(error).toBeInstanceOf(IllustrationLedgerTerminalCloseError)
+        expect((error as IllustrationLedgerTerminalCloseError).code).toBe('turn_terminal_stale')
+        const settled = await illustrationJobStore.listJobs({ turnId: claimed.turnId })
+        expect(settled.every((job) => job.state === 'stale')).toBe(true)
+        expect((await illustrationJobStore.getTurn(claimed.turnId))?.state).toBe('stale')
+        expect(hints.filter((hint) => hint.turnId === claimed.turnId && hint.kind === 'turn_changed'))
+            .toHaveLength(1)
+    })
+
     async function withConsoleCapture<T>(
         run: () => Promise<T>,
     ): Promise<{ result: T; logs: unknown[] }> {
@@ -1036,6 +1085,57 @@ describe('registerTrustedTurn', () => {
         expect(harness.strictSave).not.toHaveBeenCalled()
         expect((harness.database.characters[0].chats[0].message[0].data.match(/risu-illustration-request/g) ?? []))
             .toHaveLength(1)
+    })
+
+    // Sol #11 (B-2): createTurn's two non-atomic writes (turn record, then pending
+    // index sync) can tear, stranding the turn in `prepared` with no index entry and
+    // no marker. A retry must re-drive the admission tail (marker + awaiting_plan +
+    // index + wake) exactly once, not short-circuit on the stranded prepared record.
+    test('re-drives the admission tail for a torn prepared turn on retry', async () => {
+        const pendingIndexKey = 'illustration:v1:pendingTurns'
+        // Fail only the pending-index write inside createTurn: the turn record lands
+        // in `prepared`, the index sync tears, and the marker tail is never reached.
+        harness.storageHook = (key) => {
+            if (key === pendingIndexKey) throw new Error('torn pending index sync')
+        }
+        await expect(registerTrustedTurn(registerInput())).rejects.toThrow('torn pending index sync')
+        harness.storageHook = null
+
+        const torn = (await illustrationJobStore.listTurns())[0]
+        expect(torn.state).toBe('prepared')
+        expect(harness.database.characters[0].chats[0].message[0].data)
+            .not.toContain('risu-illustration-request')
+
+        const hints: Array<{ kind: string; turnId: string }> = []
+        const unsubscribe = subscribeIllustrationWakeHints((hint) => hints.push(hint))
+        harness.strictSave.mockClear()
+
+        const retried = await registerTrustedTurn(registerInput())
+        await Promise.resolve()
+        unsubscribe()
+
+        expect(retried.turnId).toBe(torn.turnId)
+        expect(retried.state).toBe('awaiting_plan')
+        // Marker inserted exactly once, strict-flushed once.
+        expect(harness.strictSave).toHaveBeenCalledTimes(1)
+        expect((harness.database.characters[0].chats[0].message[0].data
+            .match(/risu-illustration-request/g) ?? [])).toHaveLength(1)
+        // Index restored (awaiting_plan is a listed pending state).
+        expect((await illustrationJobStore.listPendingTurns()).map((turn) => turn.turnId))
+            .toContain(retried.turnId)
+        // Wake emitted for the terminal admission advance.
+        expect(hints).toContainEqual(expect.objectContaining({
+            kind: 'turn_changed',
+            turnId: retried.turnId,
+        }))
+
+        // A fully-created turn now short-circuits unchanged.
+        harness.strictSave.mockClear()
+        const replay = await registerTrustedTurn(registerInput())
+        expect(replay).toEqual(retried)
+        expect(harness.strictSave).not.toHaveBeenCalled()
+        expect((harness.database.characters[0].chats[0].message[0].data
+            .match(/risu-illustration-request/g) ?? [])).toHaveLength(1)
     })
 
     // §20 feature flag OFF means capture is refused before any ledger/chat write.
@@ -1254,7 +1354,13 @@ describe('purgeAutomaticBacklog', () => {
         await makePendingTurn('manual-0', 'manual')
 
         const result = await purgeAutomaticBacklog({ protocolVersion: 1, confirm: true, maxTurns: 2 })
-        expect(result).toEqual({ protocolVersion: 1, scanned: 3, purged: 2, remaining: true })
+        expect(result).toEqual({
+            protocolVersion: 1,
+            scanned: 3,
+            purged: 2,
+            inFlightCancelled: 0,
+            remaining: true,
+        })
 
         const pending = await illustrationJobStore.listPendingTurns()
         expect(pending.filter((turn) => turn.origin === 'manual')).toHaveLength(1)
@@ -1266,10 +1372,94 @@ describe('purgeAutomaticBacklog', () => {
         await makePendingTurn('manual-0', 'manual')
 
         const result = await purgeAutomaticBacklog({ protocolVersion: 1, confirm: true, maxTurns: 50 })
-        expect(result).toEqual({ protocolVersion: 1, scanned: 3, purged: 3, remaining: false })
+        expect(result).toEqual({
+            protocolVersion: 1,
+            scanned: 3,
+            purged: 3,
+            inFlightCancelled: 0,
+            remaining: false,
+        })
 
         const pending = await illustrationJobStore.listPendingTurns()
         expect(pending.map((turn) => turn.origin)).toEqual(['manual'])
+    })
+
+    // Sol #9 (B-1): awaiting_prompt turns are in-flight — plan projected, jobs
+    // queued — and retained in the pending index, but never surfaced by the listing
+    // subset. The listing purge pass alone leaves their paid Tagger/image jobs
+    // running; the in-flight pass must reach and cancel them.
+    test('cancels queued jobs of automatic awaiting_prompt turns the listing pass cannot reach', async () => {
+        const { claimed } = await registerAndClaim('In-flight backlog')
+        const [projected] = await submitPlanLedger(
+            submitInput(claimed, ['In-flight backlog'.length]),
+        )
+        const claimedJob = await illustrationJobStore.claimJob({
+            ...coordinatorProof,
+            jobId: projected.jobId,
+            expectedVersion: projected.version,
+            leaseId: 'tagger-lease',
+        })
+        const queued = await supplyPromptLedger({
+            ...coordinatorProof,
+            jobId: claimedJob.jobId,
+            expectedVersion: claimedJob.version,
+            leaseId: 'tagger-lease',
+            fence: claimedJob.fence,
+            idempotencyKey: `prompt:${claimedJob.jobId}`,
+            positive: 'cinematic scene',
+            negative: '',
+        })
+        expect(queued.state).toBe('queued')
+        expect((await illustrationJobStore.getTurn(claimed.turnId))?.state).toBe('awaiting_prompt')
+        // The listing pass genuinely cannot see this turn.
+        expect(await illustrationJobStore.listPendingTurns()).toHaveLength(0)
+
+        const result = await purgeAutomaticBacklog({ protocolVersion: 1, confirm: true, maxTurns: 50 })
+        expect(result.inFlightCancelled).toBe(1)
+        expect(result.scanned).toBe(0)
+
+        // The paid job is cancelled and the turn has left the pending index.
+        expect((await illustrationJobStore.getJob(queued.jobId))?.state).toBe('cancelled')
+        expect(await illustrationJobStore.listAwaitingPromptTurns()).toHaveLength(0)
+    })
+
+    test('leaves a manual awaiting_prompt turn in-flight untouched', async () => {
+        // A manual turn advanced to awaiting_prompt with a queued job must survive
+        // the automatic-only in-flight purge pass.
+        installDatabase('Manual in-flight')
+        const registered = await registerTrustedTurn({
+            ...registerInput('Manual in-flight'),
+            origin: 'manual',
+        })
+        const claimed = await illustrationJobStore.claimTurn({
+            ...coordinatorProof,
+            turnId: registered!.turnId,
+            expectedVersion: registered!.version,
+            leaseId: 'planner-lease',
+        })
+        const [projected] = await submitPlanLedger(
+            submitInput(claimed, ['Manual in-flight'.length]),
+        )
+        const claimedJob = await illustrationJobStore.claimJob({
+            ...coordinatorProof,
+            jobId: projected.jobId,
+            expectedVersion: projected.version,
+            leaseId: 'tagger-lease',
+        })
+        const queued = await supplyPromptLedger({
+            ...coordinatorProof,
+            jobId: claimedJob.jobId,
+            expectedVersion: claimedJob.version,
+            leaseId: 'tagger-lease',
+            fence: claimedJob.fence,
+            idempotencyKey: `prompt:${claimedJob.jobId}`,
+            positive: 'cinematic scene',
+            negative: '',
+        })
+
+        const result = await purgeAutomaticBacklog({ protocolVersion: 1, confirm: true, maxTurns: 50 })
+        expect(result.inFlightCancelled).toBe(0)
+        expect((await illustrationJobStore.getJob(queued.jobId))?.state).toBe('queued')
     })
 
     test('requires confirmation and a positive bound', async () => {

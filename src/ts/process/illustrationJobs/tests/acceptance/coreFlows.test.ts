@@ -840,6 +840,23 @@ describe('authorized illustration host LLM single generation and structured outp
         expect(harness.requestLlm).toHaveBeenCalledTimes(1)
     })
 
+    // E-1 (Sol #19): the host must pin extractJson to '' so a user's global
+    // db.extractJson never post-processes (and can destroy) the structured-output
+    // response text. '' is non-nullish (wins request.ts's `?? db.extractJson`) yet
+    // falsy at the provider extract guards → no extraction.
+    test('pins extractJson to empty so db.extractJson cannot post-process the response', async () => {
+        const bridge = await readyBridge('llm-extractjson-pin')
+        harness.database.extractJson = 'foo.bar'
+        let capturedArg: Record<string, unknown> | undefined
+        harness.requestLlm.mockImplementationOnce(async (arg: Record<string, unknown>) => {
+            capturedArg = arg
+            return { type: 'success', result: '{"foo":"bar"}' }
+        })
+        await expect(bridge.runLLMModel({ mode: 'model', messages: [] }))
+            .resolves.toEqual({ type: 'success', result: '{"foo":"bar"}' })
+        expect(capturedArg?.extractJson).toBe('')
+    })
+
     // §5-3: a real multi-generation tuple fails closed with a stable validation code;
     // the ['char', ...] role strings and scene payloads never leak into the outcome.
     test('fails closed on a real multiline tuple without leaking role strings', async () => {
@@ -903,6 +920,22 @@ describe('authorized illustration host LLM single generation and structured outp
         ['a nested-null schema', '{"foo":null}'],
     ] as const)('rejects %s that breaks the Gemini converter before dispatching', async (_label, schema) => {
         const bridge = await readyBridge(`llm-primitive-schema-${schema.length}`)
+        await expect(bridge.runLLMModel({ mode: 'model', messages: [], schema }))
+            .rejects.toThrow('[IJ:validation]')
+        expect(harness.requestLlm).not.toHaveBeenCalled()
+    })
+
+    // E-2 (Sol #20): a schema string whose root parses to a primitive or an array
+    // does NOT throw in getGeneralJSONSchema ("42" → 42, "[]" → []), so it slips the
+    // pre-fix "doesn't throw" gate and reaches the provider as a structured-output
+    // request the provider cannot honor. Structured output requires an object root;
+    // reject non-object roots at the host boundary before any provider call.
+    test.each([
+        ['a numeric-primitive root', '42'],
+        ['an array root', '[]'],
+        ['a string-primitive root', '"hello"'],
+    ] as const)('rejects %s schema before dispatching to the provider', async (_label, schema) => {
+        const bridge = await readyBridge(`llm-nonobject-schema-${schema.length}-${schema.charCodeAt(0)}`)
         await expect(bridge.runLLMModel({ mode: 'model', messages: [], schema }))
             .rejects.toThrow('[IJ:validation]')
         expect(harness.requestLlm).not.toHaveBeenCalled()

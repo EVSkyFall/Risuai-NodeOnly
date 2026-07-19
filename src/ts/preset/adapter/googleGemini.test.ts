@@ -503,6 +503,41 @@ describe('sendGoogleChatRequest (non-stream)', () => {
             message: 'invalid argument',
         })
     })
+
+    // E-3 (Sol #21): the preset path threads a precomputed response schema so an
+    // accepted Plugin/structured-output schema reaches the Gemini body instead of
+    // silently vanishing (parity with the classic google builder).
+    test('folds structuredOutput into generationConfig (responseMimeType + responseSchema)', async () => {
+        const responseSchema = { type: 'object', properties: { foo: { type: 'string' } } }
+        const { fetchImpl, calls } = captureFetch(
+            jsonResponse({ candidates: [{ content: { parts: [{ text: 'ok' }] } }] }),
+        )
+        await sendGoogleChatRequest(
+            makePreset({ customBody: { generationConfig: { temperature: 0.5 } } }),
+            { messages: messagesWithSystem, fetchImpl, structuredOutput: { googleResponseSchema: responseSchema } },
+            { apiKey: 'k' },
+        )
+        // Merged into (not clobbering) the user/customBody generationConfig.
+        expect(calls[0].body.generationConfig).toEqual({
+            temperature: 0.5,
+            responseMimeType: 'application/json',
+            responseSchema,
+        })
+    })
+
+    test('emits no response schema when structuredOutput is absent', async () => {
+        const { fetchImpl, calls } = captureFetch(
+            jsonResponse({ candidates: [{ content: { parts: [{ text: 'ok' }] } }] }),
+        )
+        await sendGoogleChatRequest(
+            makePreset(),
+            { messages: messagesWithSystem, fetchImpl },
+            { apiKey: 'k' },
+        )
+        const serialized = JSON.stringify(calls[0].body)
+        expect(serialized).not.toContain('responseSchema')
+        expect(serialized).not.toContain('responseMimeType')
+    })
 })
 
 describe('streamGoogleChatRequest', () => {

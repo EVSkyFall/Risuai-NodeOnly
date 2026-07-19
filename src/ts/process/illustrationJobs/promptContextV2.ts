@@ -654,12 +654,16 @@ function electionAllowFlags(
 // key is stable per transport+endpoint so two targets on the same backend share a
 // queue while different backends run in parallel. It participates in the target
 // fingerprint (endpoint identity), but the mutable maxConcurrency/priorityPolicy
-// do not (request §4/§20).
-function transportConcurrencyKey(
+// do not (request §4/§20). The endpoint is HASHED rather than embedded verbatim: a
+// wellspring-style endpoint can carry userinfo or a ?token= secret, and the key is
+// persisted into the durable promptContext AND the sandbox-Plugin projection, so a
+// verbatim endpoint would leak credentials there. Hashing keeps the same-backend =>
+// same-key property while carrying no secret substring (Sol #7 / request §D5).
+async function transportConcurrencyKey(
     transportId: IllustrationPromptTransportId,
     endpoint: string,
-): string {
-    return `${transportId}:${endpoint}`
+): Promise<string> {
+    return `${transportId}:${await sha256Hex(endpoint)}`
 }
 
 async function finalizeTarget(
@@ -752,7 +756,7 @@ export async function resolveNaiCompatibleFlatTarget(
         measurement: measurementDescriptorFromElection(election.measurement),
         allowTransportOnly: flags.allowTransportOnly,
         allowUnmeasured: flags.allowUnmeasured,
-        concurrencyKey: transportConcurrencyKey('nai-compatible-flat', endpoint),
+        concurrencyKey: await transportConcurrencyKey('nai-compatible-flat', endpoint),
     }
     return await finalizeTarget(descriptor, {
         policyRevision: NAI_COMPATIBLE_FLAT_QUEUE_POLICY_REVISION,
@@ -797,7 +801,7 @@ export async function resolveWebuiFlatTarget(
         measurement: measurementDescriptorFromElection(election.measurement),
         allowTransportOnly: flags.allowTransportOnly,
         allowUnmeasured: flags.allowUnmeasured,
-        concurrencyKey: transportConcurrencyKey('webui-flat', endpoint),
+        concurrencyKey: await transportConcurrencyKey('webui-flat', endpoint),
     }
     return await finalizeTarget(descriptor, {
         policyRevision: WEBUI_FLAT_QUEUE_POLICY_REVISION,
@@ -829,7 +833,7 @@ export async function resolveComfyuiFlatTarget(
         measurement: measurementDescriptorFromElection(election.measurement),
         allowTransportOnly: flags.allowTransportOnly,
         allowUnmeasured: flags.allowUnmeasured,
-        concurrencyKey: transportConcurrencyKey('comfyui-flat', endpoint),
+        concurrencyKey: await transportConcurrencyKey('comfyui-flat', endpoint),
     }
     return await finalizeTarget(descriptor, {
         policyRevision: COMFYUI_FLAT_QUEUE_POLICY_REVISION,

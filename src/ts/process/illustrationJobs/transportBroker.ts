@@ -1,12 +1,15 @@
 // ---------------------------------------------------------------------------
 // Provider-wide illustration concurrency broker (request §8).
 //
-// A single broker instance serializes provider dispatch by CONCURRENCY KEY, shared
-// across the background executor AND interactive image requests. Distinct keys never
-// serialize against each other, so different backends run in parallel; jobs on the
-// same key honor that key's user-set maxConcurrency. Priority is interactive-first
-// (a queued interactive request is admitted ahead of any queued background job, so a
-// 15-job background batch cannot starve an interactive request) or FIFO. The CURRENT
+// A single broker instance serializes provider dispatch by CONCURRENCY KEY. The only
+// wired acquirer today is the V2 background executor (processQueuedV2Job); the queue
+// is process-wide across those executor dispatches rather than executor-internal.
+// Distinct keys never serialize against each other, so different backends run in
+// parallel; jobs on the same key honor that key's user-set maxConcurrency. The
+// interactive-first priority machinery below (and the 'interactive' BrokerPriority)
+// is in place for the eventual interactive stableDiff wiring, but that wiring was
+// deliberately deferred: no interactive image request acquires against this broker
+// yet, so today every acquirer is a 'background' executor dispatch. The CURRENT
 // policy for a key is applied per acquire (request §4: queue tuning is mutable and
 // never part of the target fingerprint), so a maxConcurrency/priority change alone
 // never invalidates an in-flight target.
@@ -152,7 +155,8 @@ export class ProviderConcurrencyBroker {
     }
 }
 
-// The process-wide broker shared by the background executor and interactive image
-// requests. A single instance is what makes the queue provider/target-WIDE rather
-// than executor-internal (request §8).
+// The process-wide broker for V2 executor dispatch. A single instance is what makes
+// the queue provider/target-WIDE rather than executor-internal (request §8). The
+// interactive stableDiff paths are NOT yet wired to it (deferred); until they are,
+// the V2 background executor is its sole acquirer.
 export const illustrationTransportBroker = new ProviderConcurrencyBroker()

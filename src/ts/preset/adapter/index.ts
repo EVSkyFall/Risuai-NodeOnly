@@ -13,6 +13,7 @@ export type {
     AdapterReasoningPart,
     AdapterRequestContext,
     AdapterStreamEvent,
+    AdapterStructuredOutput,
     AdapterToolCall,
     AdapterToolDef,
     AdapterUsage,

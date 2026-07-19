@@ -38,9 +38,9 @@ export const ILLUSTRATION_LINEAGE_PREFIX = 'illustration:v1:lineage:'
 export const ILLUSTRATION_REVISION_INTENT_PREFIX = 'illustration:v1:revintent:'
 export const ILLUSTRATION_REFERENCE_INDEX_KEY = 'illustration:v1:referenceIndex'
 
-// Bounded lineage history. When exceeded, the oldest entries are compacted away
-// but the current revision entry is always retained so restore of the live target
-// (and any recent target) stays reachable (§4.2 retention).
+// Bounded lineage history. When exceeded, the oldest entries are compacted out of
+// the live window but preserved as slim stubs in `archivedRevisions`, so every past
+// revision's asset stays restorable while the live window stays bounded (§4.2).
 export const MAX_LINEAGE_REVISIONS = 200
 export const DEFAULT_REVISION_PAGE_LIMIT = 50
 export const MAX_REVISION_PAGE_LIMIT = 200
@@ -124,7 +124,7 @@ async function listCommittedGenesisJobsUnlocked(filter: {
         && !record.revision
         && !!record.target
         && !!record.assetId
-        && !!record.prompt
+        && (!!record.prompt || isEnvelopeIdentityJob(record))
         && (filter.conversationId === undefined
             || record.target.conversationId === filter.conversationId)
         && (filter.messageId === undefined
@@ -132,12 +132,10 @@ async function listCommittedGenesisJobsUnlocked(filter: {
 }
 
 async function readIndexUnlocked(): Promise<string[]> {
-    let raw: unknown
-    try {
-        raw = await readPersistentJson<unknown>(ILLUSTRATION_REFERENCE_INDEX_KEY)
-    } catch {
-        return []
-    }
+    // A legitimately-absent index reads as null (return []); an IO/parse failure must
+    // propagate so a transient read error can never be mistaken for "empty" and cause
+    // add-to-index to persist a single-id list that wipes the durable references.
+    const raw = await readPersistentJson<unknown>(ILLUSTRATION_REFERENCE_INDEX_KEY)
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return []
     const parsed = raw as { schemaVersion?: unknown; referenceIds?: unknown }
     if (parsed.schemaVersion !== 1 || !Array.isArray(parsed.referenceIds)) return []
@@ -170,12 +168,25 @@ function compactLineage(
     record: IllustrationImageLineageRecordV1,
 ): IllustrationImageLineageRecordV1 {
     if (record.revisions.length <= MAX_LINEAGE_REVISIONS) return record
-    const reference = record.referenceId
-    // Preserve the newest window plus, defensively, ensure we never drop below the
-    // window; the current entry is always within the newest window because a commit
-    // appends it last. This keeps restore targets reachable for the recent history.
-    const kept = record.revisions.slice(record.revisions.length - MAX_LINEAGE_REVISIONS)
-    return { ...record, referenceId: reference, revisions: kept }
+    // Keep the newest window live; the current entry is always within it because a
+    // commit appends it last. Evicted entries become slim stubs so their assets stay
+    // restorable (the current entry is never evicted).
+    const overflow = record.revisions.length - MAX_LINEAGE_REVISIONS
+    const evicted = record.revisions.slice(0, overflow)
+    const kept = record.revisions.slice(overflow)
+    const seen = new Set((record.archivedRevisions ?? []).map((stub) => stub.revisionId))
+    const archivedRevisions = [...(record.archivedRevisions ?? [])]
+    for (const entry of evicted) {
+        if (seen.has(entry.revisionId)) continue
+        seen.add(entry.revisionId)
+        archivedRevisions.push({
+            revisionId: entry.revisionId,
+            assetId: entry.assetId,
+            promptHash: entry.promptHash,
+            createdAt: entry.createdAt,
+        })
+    }
+    return { ...record, revisions: kept, archivedRevisions }
 }
 
 export function revisionEntryToSummary(
@@ -231,19 +242,38 @@ export function referenceToSummary(
     }
 }
 
-// A committed job with a durable structured prompt and asset is genesis-eligible.
-// Physical-legacy prompts are not measurable/revisable, so they are skipped.
-function genesisEligible(job: IllustrationJobRecordV1): boolean {
+// True iff the committed job carries a V2 envelope-identity (promptEnvelope + a
+// receipt whose envelopeHash is the durable prompt-identity) instead of a V1 prompt.
+// V2 is the wellspring/nai-compatible-flat path where ALL committed images are V2.
+function isEnvelopeIdentityJob(job: IllustrationJobRecordV1): boolean {
     return (
-        job.state === 'committed'
-        && typeof job.assetId === 'string'
-        && job.assetId.length > 0
-        && !!job.target
-        && !!job.prompt
-        && !job.revision
+        job.prompt === undefined
+        && !!job.promptEnvelope
+        && !!job.promptReceipt
+        && typeof job.promptReceipt.envelopeHash === 'string'
+        && job.promptReceipt.envelopeHash.length > 0
+    )
+}
+
+// A committed job with a durable asset and a durable prompt-identity is genesis-
+// eligible: a V1 structured prompt, OR a V2 envelope-identity (Sol #8). Physical-
+// legacy prompts are not measurable/revisable, so they are skipped.
+function genesisEligible(job: IllustrationJobRecordV1): boolean {
+    if (
+        job.state !== 'committed'
+        || typeof job.assetId !== 'string'
+        || job.assetId.length === 0
+        || !job.target
+        || job.revision
+        || typeof job.settingsFingerprint !== 'string'
+        || job.settingsFingerprint.length === 0
+    ) {
+        return false
+    }
+    if (isEnvelopeIdentityJob(job)) return true
+    return (
+        !!job.prompt
         && typeof (job.prompt as { schemaVersion?: unknown }).schemaVersion === 'number'
-        && typeof job.settingsFingerprint === 'string'
-        && job.settingsFingerprint.length > 0
     )
 }
 
@@ -252,17 +282,25 @@ async function ensureGenesisReferenceUnlocked(
     now: number,
 ): Promise<IllustrationImageReferenceRecordV1 | null> {
     if (!genesisEligible(job)) return null
-    let prompt: IllustrationPromptV1
-    try {
-        prompt = parseIllustrationPromptV1(job.prompt)
-    } catch {
-        return null
+    // V2 envelope-identity jobs have no V1 prompt; their durable prompt-identity is
+    // the receipt's envelopeHash (Sol #8). V1 jobs derive it from the structured prompt.
+    const envelopeIdentity = isEnvelopeIdentityJob(job)
+    let prompt: IllustrationPromptV1 | undefined
+    let promptHash: string
+    if (envelopeIdentity) {
+        promptHash = job.promptReceipt!.envelopeHash
+    } else {
+        try {
+            prompt = parseIllustrationPromptV1(job.prompt)
+        } catch {
+            return null
+        }
+        promptHash = await promptHashFor(prompt)
     }
     const referenceId = await genesisReferenceId(job.jobId)
     const existing = await readReferenceUnlocked(referenceId)
     if (existing) return existing
 
-    const promptHash = await promptHashFor(prompt)
     const revisionId = `rev:genesis:${(await sha256Hex(`genesis-rev:${job.jobId}`)).slice(0, 40)}`
     const lineageId = `lineage:genesis:${(await sha256Hex(`genesis-lineage:${job.jobId}`)).slice(0, 40)}`
     const entry: IllustrationLineageRevisionEntryV1 = {
@@ -270,7 +308,7 @@ async function ensureGenesisReferenceUnlocked(
         parentRevisionId: null,
         jobId: job.jobId,
         assetId: job.assetId!,
-        prompt: cloneJson(prompt),
+        ...(prompt ? { prompt: cloneJson(prompt) } : {}),
         promptHash,
         mode: 'genesis',
         disposition: null,
@@ -294,7 +332,7 @@ async function ensureGenesisReferenceUnlocked(
         sourceJobId: job.jobId,
         currentAssetId: job.assetId!,
         currentRevisionId: revisionId,
-        currentPrompt: cloneJson(prompt),
+        ...(prompt ? { currentPrompt: cloneJson(prompt) } : {}),
         currentPromptHash: promptHash,
         settingsFingerprint: job.settingsFingerprint!,
         sceneId: job.sceneId,
@@ -395,7 +433,9 @@ export async function listImageReferences(
 export type GetImageRevisionTargetResult = {
     protocolVersion: 1
     identity: IllustrationRevisionIdentity
-    prompt: IllustrationPromptV1
+    // Absent for an envelope-identity (V2) reference; `promptHash` (the receipt
+    // envelopeHash) is then the sole prompt-identity (Sol #8).
+    prompt?: IllustrationPromptV1
     promptHash: string
     scenePayloadRef: string
     providerDispatched: boolean
@@ -451,7 +491,7 @@ export async function getImageRevisionTarget(
         return {
             protocolVersion: 1,
             identity: referenceIdentity(reference),
-            prompt: cloneJson(reference.currentPrompt),
+            ...(reference.currentPrompt ? { prompt: cloneJson(reference.currentPrompt) } : {}),
             promptHash: reference.currentPromptHash,
             scenePayloadRef: await scenePayloadRef(reference.scenePayload),
             providerDispatched: status.providerDispatched,
@@ -640,15 +680,40 @@ export async function admitRevisionChild(
                 )
             }
             const childJobId = receipt.childJobId!
-            const childJob = await readPersistentJson<IllustrationJobRecordV1>(
+            let childJob = await readPersistentJson<IllustrationJobRecordV1>(
                 illustrationJobKey(childJobId),
             )
-            if (!childJob) throw new IllustrationLedgerCorruptError('Admitted revision child is missing')
+            if (!childJob) {
+                // Torn admission: the receipt sealed but the child-job write failed
+                // afterwards. Re-materialize the child from the snapshot the receipt
+                // captured — the executable child becomes dispatchable only now, after
+                // the receipt is durable, preserving the no-orphan-charge order.
+                if (!receipt.childJobRecord) {
+                    throw new IllustrationLedgerCorruptError('Admitted revision child is missing')
+                }
+                childJob = cloneJson(receipt.childJobRecord)
+                await writePersistentJson(illustrationJobKey(childJobId), childJob)
+            }
             return { childJobId, childJob: cloneJson(childJob) }
         }
 
         const reference = await readReferenceUnlocked(input.referenceId)
         if (!reference) throw new IllustrationLedgerNotFoundError('reference', input.referenceId)
+        // Envelope-identity (V2) references have no V1 currentPrompt. The revision-CHILD
+        // pipeline (exact/edited copy the parent V1 prompt; retag re-runs the Tagger to
+        // produce a fresh V1 prompt; commit records a V1 lineage entry from the child's
+        // job.prompt) is structurally V1-bound end-to-end and cannot honor a V2 transport
+        // envelope. Reject a new-image revision on a V2 reference with a typed validation
+        // error rather than corrupting (dispatching a promptless/mismatched child). The
+        // no-charge RESTORE path (prepareRestore/commitRestore) is unaffected — it re-points
+        // to an existing asset and is V2-safe. The V2 revision-child pipeline is a
+        // documented joint follow-up (Sol #8).
+        if (reference.currentPrompt === undefined) {
+            throw new IllustrationLedgerValidationError(
+                'This image was produced by a V2 (envelope-identity) transport; new-image '
+                    + 'revisions (exact/edited/retag) are not yet supported for it — only no-charge restore is',
+            )
+        }
         assertReferenceCas(reference, input)
 
         const childJobId = makeOpaqueId('revjob')
@@ -745,6 +810,7 @@ export async function admitRevisionChild(
             bindingHash,
             admittedOperationVersion: reference.operationVersion + 1,
             childJobId,
+            childJobRecord: cloneJson(childJob),
             createdAt: now,
         }
         await writePersistentJson(receiptKey, nextReceipt)
@@ -819,11 +885,21 @@ export async function commitReplaceReference(
             chargeCertainty: input.chargeCertainty,
             createdAt: now,
         }
-        const nextLineage: IllustrationImageLineageRecordV1 = {
-            ...lineage,
-            revisions: [...lineage.revisions, entry],
-            updatedAt: now,
-        }
+        // The lineage append and the reference CAS are two non-atomic writes. If the
+        // append landed but the reference write failed, recovery re-runs this commit
+        // with the reference still at its pre-commit state (so the idempotent-replay
+        // and CAS guards above both pass). Skip the append when this revisionId is
+        // already present so replay never duplicates history / evicts genuine entries.
+        const alreadyAppended = lineage.revisions.some(
+            (existing) => existing.revisionId === revision.revisionId,
+        )
+        const nextLineage: IllustrationImageLineageRecordV1 = alreadyAppended
+            ? lineage
+            : {
+                ...lineage,
+                revisions: [...lineage.revisions, entry],
+                updatedAt: now,
+            }
         const nextReference: IllustrationImageReferenceRecordV1 = {
             ...reference,
             lineageVersion: reference.lineageVersion + 1,
@@ -937,10 +1013,35 @@ export async function prepareRestore(input: {
         const targetEntry = lineage.revisions.find(
             (entry) => entry.revisionId === input.targetRevisionId,
         )
-        if (!targetEntry) {
+        if (targetEntry) {
+            return { reference: cloneJson(reference), targetEntry: cloneJson(targetEntry) }
+        }
+        // The target fell out of the live window: fall back to its archived stub so its
+        // asset stays restorable. The stub dropped the full structured prompt, so the
+        // synthesized entry carries the reference's current prompt/hash pair — this
+        // re-points to the archived ASSET while keeping currentPrompt and
+        // currentPromptHash mutually consistent (§4.2 asset reachability).
+        const stub = lineage.archivedRevisions?.find(
+            (candidate) => candidate.revisionId === input.targetRevisionId,
+        )
+        if (!stub) {
             throw new IllustrationLedgerNotFoundError('revision', input.targetRevisionId)
         }
-        return { reference: cloneJson(reference), targetEntry: cloneJson(targetEntry) }
+        const archivedEntry: IllustrationLineageRevisionEntryV1 = {
+            revisionId: stub.revisionId,
+            parentRevisionId: null,
+            jobId: null,
+            assetId: stub.assetId,
+            // Envelope-identity references have no currentPrompt to carry; the stub's
+            // promptHash (the receipt envelopeHash) is the identity either way.
+            ...(reference.currentPrompt ? { prompt: cloneJson(reference.currentPrompt) } : {}),
+            promptHash: reference.currentPromptHash,
+            mode: 'genesis',
+            disposition: null,
+            chargeCertainty: 'charged',
+            createdAt: stub.createdAt,
+        }
+        return { reference: cloneJson(reference), targetEntry: archivedEntry }
     })
 }
 
@@ -975,10 +1076,16 @@ export async function commitRestore(input: {
             lineageVersion: reference.lineageVersion + 1,
             currentAssetId: input.targetEntry.assetId,
             currentRevisionId: input.targetEntry.revisionId,
-            currentPrompt: cloneJson(input.targetEntry.prompt),
             currentPromptHash: input.targetEntry.promptHash,
             sourceJobId: input.targetEntry.jobId ?? reference.sourceJobId,
             updatedAt: now,
+        }
+        // Restoring to an envelope-identity revision drops any prior V1 currentPrompt;
+        // a V1 target restores its exact structured prompt (Sol #8).
+        if (input.targetEntry.prompt) {
+            nextReference.currentPrompt = cloneJson(input.targetEntry.prompt)
+        } else {
+            delete nextReference.currentPrompt
         }
         await writeReferenceUnlocked(nextReference)
         const receiptKey = await intentKey(input.idempotencyKey)
@@ -1012,6 +1119,60 @@ export async function readRestoreReceipt(
             )
         }
         return receipt.restoredIdentity ?? null
+    })
+}
+
+// Reconcile a restore whose reference commit landed but whose receipt write tore
+// (the RPC then errored). A same-key retry has no receipt and fails the old
+// operationVersion CAS even though the restore already committed. If the live
+// reference already points at the requested target and no receipt exists, treat it
+// as an idempotent success and backfill the missing receipt so future replays are
+// clean. Returns null when the state is a genuine (unreconcilable) conflict.
+export async function reconcileCommittedRestore(input: {
+    referenceId: string
+    targetRevisionId: string
+    idempotencyKey: string
+    bindingHash: string
+}): Promise<IllustrationRevisionIdentity | null> {
+    return await withIllustrationLedgerLock(async () => {
+        const reference = await readReferenceUnlocked(input.referenceId)
+        if (!reference) return null
+        // The reference must already point at the requested target for this to be our
+        // own committed restore rather than someone else's concurrent commit.
+        if (reference.currentRevisionId !== input.targetRevisionId) return null
+        const lineage = await readLineageUnlocked(reference.lineageId)
+        const liveEntry = lineage?.revisions.find(
+            (entry) => entry.revisionId === input.targetRevisionId,
+        )
+        const archivedStub = lineage?.archivedRevisions?.find(
+            (stub) => stub.revisionId === input.targetRevisionId,
+        )
+        const targetAssetId = liveEntry?.assetId ?? archivedStub?.assetId
+        if (targetAssetId === undefined || reference.currentAssetId !== targetAssetId) return null
+
+        const receiptKey = await intentKey(input.idempotencyKey)
+        const existing = await readPersistentJson<IllustrationRevisionIntentReceiptV1>(receiptKey)
+        if (existing) {
+            if (existing.kind !== 'restore' || existing.bindingHash !== input.bindingHash) {
+                throw new IllustrationLedgerIdempotencyConflictError(
+                    'Restore idempotencyKey is bound to a different intent',
+                )
+            }
+            return existing.restoredIdentity ?? referenceIdentity(reference)
+        }
+        const identity = referenceIdentity(reference)
+        const receipt: IllustrationRevisionIntentReceiptV1 = {
+            schemaVersion: 1,
+            idempotencyKey: input.idempotencyKey,
+            referenceId: input.referenceId,
+            kind: 'restore',
+            bindingHash: input.bindingHash,
+            admittedOperationVersion: reference.operationVersion,
+            restoredIdentity: identity,
+            createdAt: Date.now(),
+        }
+        await writePersistentJson(receiptKey, receipt)
+        return identity
     })
 }
 

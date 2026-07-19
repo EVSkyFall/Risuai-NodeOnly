@@ -68,7 +68,7 @@ import {
 import { withIllustrationOperationLock } from './operationLock'
 import { computeNaiSettingsFingerprint } from './settingsFingerprint'
 import { computeSourceRevisionHash, hashesMatch, sha256Hex } from './sourceHash'
-import { canTransition, isTerminalJobState } from './stateMachine'
+import { canTransition, isTerminalJobState, isTerminalTurnState } from './stateMachine'
 import {
     MAX_JOBS_PER_TURN,
     illustrationJobStore,
@@ -416,7 +416,24 @@ async function closeTurnBeforeProjection(
         code,
         idempotencyKey: `plan-close:${input.idempotencyKey}:${state}:${code}`,
     })
-    const jobs = await illustrationJobStore.listJobRecords({ turnId: turn.turnId })
+    return await settleTerminalCloseTail(turn.turnId, state, code)
+}
+
+/**
+ * The idempotent tail of a plan-driven terminal close: settle eligible jobs to the
+ * turn's terminal class, emit exactly one turn_changed wake, and throw the stable
+ * terminal code. Re-runnable — the settlement filters on non-terminal job states and
+ * finalizeTurnAfterJobs is idempotent — so a close whose durable turn write landed
+ * but whose settlement/wake tore (Sol #12) can resume by calling this again. A
+ * storage/CAS failure in a settlement step throws before the wake, so no wake fires
+ * and no terminal-complete code is handed back for a close that did not complete.
+ */
+async function settleTerminalCloseTail(
+    turnId: string,
+    state: 'stale' | 'corrupt',
+    code: string,
+): Promise<never> {
+    const jobs = await illustrationJobStore.listJobRecords({ turnId })
     for (const job of jobs) {
         if (![
             'prepared',
@@ -431,19 +448,15 @@ async function closeTurnBeforeProjection(
             expectedVersion: job.version,
             to: state,
             patch: {
-                idempotencyKey: `turn-${state}:${turn.turnId}:${job.jobId}:${job.version}`,
+                idempotencyKey: `turn-${state}:${turnId}:${job.jobId}:${job.version}`,
                 error: { code },
             },
         })
         await illustrationJobStore.finalizeTurnAfterJobs(settled.turnId)
     }
-    // The durable terminal close (turn + eligible jobs) is now complete. Emit exactly
-    // one turn_changed wake for this terminal mutation: the normal-submit wake in
-    // submitPlanLedger runs only on the non-throwing return, so it never duplicates
-    // this one. A storage/CAS failure in either close step above throws before this
-    // point, so no wake fires and the caller is never handed a terminal-complete code
-    // for a close that did not durably complete.
-    emitIllustrationWakeHint('turn_changed', turn.turnId)
+    // The normal-submit wake in submitPlanLedger runs only on the non-throwing
+    // return, so it never duplicates this one.
+    emitIllustrationWakeHint('turn_changed', turnId)
     throw new IllustrationLedgerTerminalCloseError(state)
 }
 
@@ -524,6 +537,22 @@ async function submitPlanLedgerLocked(
         || !turn.sourceRevisionHash || !turn.settingsFingerprint) {
         throw new IllustrationLedgerValidationError('Illustration turn capture is incomplete')
     }
+
+    // Sol #12 (B-3): a prior submitPlan attempt terminally closed this turn (durable
+    // turn write + index sync landed) but its post-write settlement/wake tore. The
+    // turn is now terminal with a plan-close receipt bound to THIS submitPlan; a
+    // naive retry would die on version/holder validation (the terminal record's
+    // lease is cleared) instead of finishing the close. Resume the idempotent tail
+    // and throw the same stable terminal code before any such validation runs.
+    const closureReceipt = turn.lastPlanClosureWrite
+    if (
+        closureReceipt !== undefined
+        && isTerminalTurnState(turn.state)
+        && closureReceipt.idempotencyKey.startsWith(`plan-close:${input.idempotencyKey}:`)
+    ) {
+        return await settleTerminalCloseTail(turn.turnId, closureReceipt.state, closureReceipt.code)
+    }
+
     if (input.sourceRevisionHash !== turn.sourceRevisionHash) {
         throw new IllustrationLedgerValidationError('sourceRevisionHash does not match the captured turn')
     }
@@ -1164,6 +1193,28 @@ export async function preparePromptContext(
     )
     const assetCatalogDigest = validateOpaquePromptRef(input.assetCatalogDigest, 'assetCatalogDigest')
 
+    // Prompt Target V2 mode fence (request §D1 / Sol #5): a turn's V1/V2 mode is
+    // locked before the first prompt supply. Refuse to (re-)bind a fresh V2 context
+    // once the turn is closed, or once any non-revision job on it has already been
+    // supplied/queued — either would split the turn across modes mid-flight. The
+    // store keeps the atomic rebind + version CAS backstop; this is the coordinator
+    // fence. A clean pre-plan / post-plan-unsupplied turn still prepares normally.
+    const fenceTurn = await illustrationJobStore.getTurn(input.turnId)
+    if (fenceTurn) {
+        if (isTerminalTurnState(fenceTurn.state)) {
+            throw new IllustrationPromptV2ContractError(
+                'prompt_supply_mode_mismatch',
+                'This illustration turn is already closed and cannot be bound to a prompt context',
+            )
+        }
+        if (await illustrationJobStore.turnHasNonRevisionPromptSupply(input.turnId)) {
+            throw new IllustrationPromptV2ContractError(
+                'prompt_supply_mode_mismatch',
+                'This illustration turn already has a supplied/queued job; its prompt mode is locked and cannot be re-bound',
+            )
+        }
+    }
+
     // Snapshot the current provider target. The durable transport election (set by
     // the Plugin via setTransportConfig) is authoritative for the non-native
     // transports; without one, only novelai-native auto-resolves. A typed
@@ -1535,6 +1586,17 @@ export async function supplyPromptEnvelope(
                 'This job did not accept a V2 prompt envelope and cannot replay one',
             )
         }
+        // Lost-ACK replay must be content-identical (Sol #6). The stored receipt binds
+        // envelope A's hash; a same-key retry carrying a content-different envelope B
+        // must NOT silently replay A and report B accepted. Mirror V1's patchMatchesRecord
+        // conflicting-replay guard (IllustrationLedgerCorruptError) instead — the durable
+        // envelope/receipt stay untouched. A byte-identical replay keeps the no-re-measure
+        // fast path below.
+        if (job.promptReceipt.envelopeHash !== envelopeHash) {
+            throw new IllustrationLedgerCorruptError(
+                'A repeated prompt-envelope supply idempotencyKey carries a content-different envelope',
+            )
+        }
         const replay = await illustrationJobStore.transitionJob({
             jobId: job.jobId,
             expectedVersion: input.expectedVersion,
@@ -1711,9 +1773,13 @@ export async function registerTrustedTurn(
 
     const turnId = await requestKeyFor(input)
     const existing = await illustrationJobStore.getTurn(turnId)
-    // An already-admitted turn is always returned, regardless of a later mode
-    // switch: idempotency wins over the admission gate.
-    if (existing) return existing
+    // A fully-admitted turn is always returned, regardless of a later mode switch:
+    // idempotency wins over the admission gate. A turn stranded in `prepared` is a
+    // torn admission — createTurn's record+index writes tore, or the marker/
+    // awaiting_plan tail failed before it advanced — so fall through and re-drive
+    // the tail idempotently rather than returning a permanently unreachable turn.
+    // (Sol #11)
+    if (existing && existing.state !== 'prepared') return existing
 
     const loaded = await loadChat(input.chaId, input.conversationId)
     const location = resolveCaptureVariant(
@@ -1721,44 +1787,55 @@ export async function registerTrustedTurn(
         input.expectedMessageId,
         input.sourceVariantText,
     )
-    const requestNonce = secureIdentifier()
-    const sourceTextUtf16 = stripIllustrationControlNodes(input.sourceVariantText)
-    const sourceRevisionHash = await computeSourceRevisionHash(sourceTextUtf16, {
-        requestNonce,
-        slotTokens: [],
-        committedAssetIds: [],
-    })
-    const settingsFingerprint = await computeNaiSettingsFingerprint(getDatabase())
-
-    // Admission-time recheck for the automatic seam, placed immediately before the
-    // first durable write. The prior reads (loadChat/resolveCaptureVariant) are
-    // side-effect free, so suppressing here leaves zero illustration residue: no
-    // turn record, no ledger mint, no marker mutation, no extra strict save.
-    if (input.enforceCaptureMode && !(await isAutomaticCaptureAdmitted())) return null
+    // Re-drive reuses the stranded record's admitted request nonce so the marker,
+    // durable target, and downstream marker resolution all agree.
+    const requestNonce = existing?.target?.requestNonce ?? secureIdentifier()
 
     let prepared: IllustrationTurnRecordV1
-    try {
-        prepared = await illustrationJobStore.createTurn({
-            turnId,
-            idempotencyKey: `capture:${turnId}`,
-            origin,
-            target: {
-                chaId: input.chaId,
-                conversationId: input.conversationId,
-                expectedMessageId: input.expectedMessageId,
-                rootTurnId: input.rootTurnId,
-                requestNonce,
-            },
-            sourceTextUtf16,
-            sourceRevisionHash,
-            settingsFingerprint,
+    if (existing) {
+        // The prepared record already carries the admitted identity (nonce, source,
+        // fingerprint). Skip createTurn AND the admission recheck: the turn was
+        // already admitted when it was first prepared, so re-applying the mode gate
+        // could strand it a second time.
+        prepared = existing
+    } else {
+        const sourceTextUtf16 = stripIllustrationControlNodes(input.sourceVariantText)
+        const sourceRevisionHash = await computeSourceRevisionHash(sourceTextUtf16, {
+            requestNonce,
+            slotTokens: [],
+            committedAssetIds: [],
         })
-    } catch (error) {
-        if (error instanceof IllustrationLedgerCorruptError) {
-            const winner = await illustrationJobStore.getTurn(turnId)
-            if (winner) return winner
+        const settingsFingerprint = await computeNaiSettingsFingerprint(getDatabase())
+
+        // Admission-time recheck for the automatic seam, placed immediately before the
+        // first durable write. The prior reads (loadChat/resolveCaptureVariant) are
+        // side-effect free, so suppressing here leaves zero illustration residue: no
+        // turn record, no ledger mint, no marker mutation, no extra strict save.
+        if (input.enforceCaptureMode && !(await isAutomaticCaptureAdmitted())) return null
+
+        try {
+            prepared = await illustrationJobStore.createTurn({
+                turnId,
+                idempotencyKey: `capture:${turnId}`,
+                origin,
+                target: {
+                    chaId: input.chaId,
+                    conversationId: input.conversationId,
+                    expectedMessageId: input.expectedMessageId,
+                    rootTurnId: input.rootTurnId,
+                    requestNonce,
+                },
+                sourceTextUtf16,
+                sourceRevisionHash,
+                settingsFingerprint,
+            })
+        } catch (error) {
+            if (error instanceof IllustrationLedgerCorruptError) {
+                const winner = await illustrationJobStore.getTurn(turnId)
+                if (winner) return winner
+            }
+            throw error
         }
-        throw error
     }
 
     let currentLocation: VariantLocation
@@ -1787,7 +1864,13 @@ export async function registerTrustedTurn(
         })
         throw error
     }
-    currentLocation.setText(appendRequestMarkerAtLineBoundary(currentLocation.getText(), requestNonce))
+    // Idempotent on re-drive: if a prior torn attempt already inserted this nonce's
+    // marker (tear after the strict flush but before awaiting_plan), skip the append
+    // so the retry never double-marks. A fresh admission never has the marker yet.
+    const currentText = currentLocation.getText()
+    if (!findRequestMarkers(currentText).some((marker) => marker.nonce === requestNonce)) {
+        currentLocation.setText(appendRequestMarkerAtLineBoundary(currentText, requestNonce))
+    }
 
     try {
         await saveChatToServerStrict(input.chaId, currentIndex, input.conversationId, loaded.chat)
@@ -1975,6 +2058,9 @@ export type PurgeAutomaticBacklogResult = {
     protocolVersion: 1
     scanned: number
     purged: number
+    // Sol #9: automatic in-flight (awaiting_prompt) turns whose paid jobs were
+    // cancelled. Additive to `scanned`/`purged`, which count the listing subset.
+    inFlightCancelled: number
     remaining: boolean
 }
 
@@ -2012,10 +2098,44 @@ export async function purgeAutomaticBacklog(
             // a subsequent explicit purge picks up whatever remains pending.
         }
     }
+
+    // Sol #9: awaiting_prompt turns are in-flight — plan projected, jobs queued —
+    // and retained in the pending index, but the listing subset above never
+    // surfaces them, so their paid Tagger/image jobs keep running. Cancel each
+    // automatic in-flight turn's non-terminal jobs through the existing per-job
+    // cancel flow; that stops the paid work and (once the jobs settle terminal)
+    // drives the turn to its terminal via the shared finalize path. NOTE: the turn
+    // state machine has no awaiting_prompt -> cancelled edge, so the turn's terminal
+    // is completed/stale/corrupt (per job outcomes), not a literal 'cancelled' — the
+    // cancellation lives on the jobs. The in-flight pass shares the maxTurns budget.
+    let inFlightCancelled = 0
+    let inFlightRemaining = false
+    const inFlight = await illustrationJobStore.listAwaitingPromptTurns()
+    for (const turn of inFlight) {
+        if (turn.origin !== 'automatic') continue
+        if (purged + inFlightCancelled >= input.maxTurns) {
+            inFlightRemaining = true
+            break
+        }
+        try {
+            const jobs = await illustrationJobStore.listJobRecords({ turnId: turn.turnId })
+            let cancelledAny = false
+            for (const job of jobs) {
+                if (isTerminalJobState(job.state)) continue
+                await cancelLedger({ jobId: job.jobId, expectedVersion: job.version })
+                cancelledAny = true
+            }
+            if (cancelledAny) inFlightCancelled += 1
+        } catch {
+            // Raced version or concurrent settlement. Skip; a later purge retries.
+        }
+    }
+
     return {
         protocolVersion: 1,
         scanned: automatic.length,
         purged,
-        remaining: automatic.length > purged,
+        inFlightCancelled,
+        remaining: automatic.length > purged || inFlightRemaining,
     }
 }

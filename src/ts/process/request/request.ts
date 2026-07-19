@@ -29,8 +29,9 @@ import {
     type AdapterCacheContext,
     type AdapterChatMessage, type AdapterChatOptions, type AdapterChatResponse,
     type AdapterChatStreamDelta, type AdapterCredential,
-    type AdapterReasoningPart, type AdapterToolCall, type AdapterToolDef,
+    type AdapterReasoningPart, type AdapterStructuredOutput, type AdapterToolCall, type AdapterToolDef,
 } from "src/ts/preset/adapter";
+import { getGeneralJSONSchema, getOpenAIJSONSchema } from "../templates/jsonSchema";
 import { TOOL_CAPABLE_ADAPTER_KINDS, VISION_CAPABLE_ADAPTER_KINDS, type AdapterKind, type ModelPreset } from "src/ts/preset/types";
 import { pumpPresetStream } from "./presetStreamPump";
 import { stageMainRequestSnapshot } from "./requestReplay";
@@ -591,6 +592,25 @@ export async function requestChatDataMain(arg:requestDataArgument, model:ModelMo
 }
 
 
+// Build the structured-output payload for a preset request, mirroring the classic
+// path's emission condition (db.jsonSchemaEnabled || an explicit schema) and its
+// converters. Only the two adapter families that natively support structured
+// output are shaped here; every other kind returns undefined so its request stays
+// byte-identical to before. getOpenAIJSONSchema / getGeneralJSONSchema both fall
+// back to db.jsonSchema when schema is undefined, matching the classic builders.
+function buildPresetStructuredOutput(kind: AdapterKind, schema: string | undefined): AdapterStructuredOutput | undefined {
+    if (!(getDatabase().jsonSchemaEnabled || schema)) {
+        return undefined
+    }
+    if (kind === 'openai-compatible') {
+        return { openaiJsonSchema: getOpenAIJSONSchema(schema) }
+    }
+    if (kind === 'google-gemini') {
+        return { googleResponseSchema: getGeneralJSONSchema(schema, ['$schema', 'additionalProperties']) }
+    }
+    return undefined
+}
+
 function sendModelPreset(
     kind: AdapterKind,
     preset: ModelPreset,
@@ -894,6 +914,18 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
         ? await expandAdapterMessages(arg.formated, decodeToolCall, supportsVision)
         : arg.formated.map((m) => toAdapterMessage(m, supportsVision))
 
+    // Structured-output (JSON schema) parity with the classic path. The classic
+    // openAI/google builders emit a response schema when db.jsonSchemaEnabled or an
+    // explicit arg.schema is present (openAI/requests.ts:562, google.ts:566); the
+    // preset path silently dropped it, so an accepted Plugin schema vanished on a
+    // protocol that supports it. Precompute the provider-shaped payload here
+    // (request.ts owns the schema conversion + db.strictJsonSchema read) so the
+    // adapter layer stays free of the jsonSchema/database import cycle. Only the two
+    // adapter families the classic path supports receive a payload; other kinds get
+    // undefined and behave byte-identically to before. Threaded into both the
+    // preview envelope and the live request so previewBody mirrors the real body.
+    const structuredOutput = buildPresetStructuredOutput(kind, arg.schema)
+
     // previewBody never calls the chat endpoint and never runs tools — it just
     // builds and returns the prepared request. (One caveat: a google-service-
     // account profile may still perform an OAuth token exchange during credential
@@ -902,7 +934,7 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
     // classic adapters' previewBody handling.
     if (arg.previewBody) {
         try {
-            const prepared = await previewModelPreset(kind, preset, { messages, tools, fetchImpl }, credential)
+            const prepared = await previewModelPreset(kind, preset, { messages, tools, fetchImpl, structuredOutput }, credential)
             return {
                 type: 'success',
                 result: JSON.stringify({ url: prepared.url, body: prepared.body, headers: prepared.headers }),
@@ -924,7 +956,7 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
         }
 
         const useStreaming = resolvePresetStreaming(preset, arg)
-        const options: AdapterChatOptions = { messages, abortSignal: abortSignal ?? undefined, fetchImpl, generationId: genId, cache }
+        const options: AdapterChatOptions = { messages, abortSignal: abortSignal ?? undefined, fetchImpl, generationId: genId, cache, structuredOutput }
         if (reportStatus) {
             safeStatus(() => startStatus(genId, { kind: statusKind, label: preset.name, chatId: arg.chatId, phase: 'connecting', now: Date.now() }))
         }

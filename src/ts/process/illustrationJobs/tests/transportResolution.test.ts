@@ -237,3 +237,44 @@ describe('transport config validation is strict + credential-free (request §D5)
             .toEqual({ schemaVersion: 1, election: null })
     })
 })
+
+describe('concurrencyKey is credential-free (Sol #7 / request §D5)', () => {
+    const secretEndpoint = 'https://user:SUPERSECRET@wellspring.example/ai/generate-image?token=TOPSECRET'
+    const naiFlat: IllustrationTransportElection = {
+        transportId: 'nai-compatible-flat',
+        layout: 'flat',
+        measurement: transportOnly,
+        maxConcurrency: 2,
+        priorityPolicy: 'interactive-first',
+    }
+
+    test('a wellspring endpoint with userinfo/query secrets never reaches the durable/projected concurrencyKey', async () => {
+        const target = await resolvePromptTargetV2(
+            db({ sdProvider: 'novelai', NAIImgUrl: secretEndpoint }),
+            config(naiFlat),
+        )
+        // The public target (durable promptContext AND the sandbox-Plugin projection)
+        // carries the concurrencyKey verbatim, so it must be credential-free.
+        expect(target.queue.concurrencyKey).not.toContain('SUPERSECRET')
+        expect(target.queue.concurrencyKey).not.toContain('TOPSECRET')
+        expect(target.queue.concurrencyKey).toMatch(/^nai-compatible-flat:[0-9a-f]{64}$/)
+    })
+
+    test('two configs on the SAME endpoint still share a concurrencyKey (same backend => same queue)', async () => {
+        const flat = await resolvePromptTargetV2(
+            db({ sdProvider: 'novelai', NAIImgUrl: secretEndpoint }),
+            config(naiFlat),
+        )
+        const pipe = await resolvePromptTargetV2(
+            db({ sdProvider: 'novelai', NAIImgUrl: secretEndpoint }),
+            config({
+                ...naiFlat,
+                layout: 'pipe-slots',
+                pipe: { revision: 'pipe-1', maxSubjects: 6, negative: 'base-then-subjects' },
+                maxConcurrency: 8,
+                priorityPolicy: 'fifo',
+            }),
+        )
+        expect(pipe.queue.concurrencyKey).toBe(flat.queue.concurrencyKey)
+    })
+})

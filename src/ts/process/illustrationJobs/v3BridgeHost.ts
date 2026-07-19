@@ -187,9 +187,17 @@ const bridgeDependencies: IllustrationV3BridgeDependencies = {
             // cannot fail, so such payloads fail closed with a stable validation error
             // instead of surfacing an unmapped TypeError from the request builder.
             schema = options.schema
+            let converted: unknown
             try {
-                getGeneralJSONSchema(schema, ['$schema', 'additionalProperties'])
+                converted = getGeneralJSONSchema(schema, ['$schema', 'additionalProperties'])
             } catch {
+                throw new IllustrationLedgerValidationError('runLLMModel schema is not a valid structured-output schema')
+            }
+            // Structured output requires an object root. A primitive/array root
+            // ("42" → 42, "[]" → []) parses without throwing above, so it would
+            // otherwise slip through as a structured-output request the provider
+            // cannot honor. Reject it here, before any provider dispatch.
+            if (typeof converted !== 'object' || converted === null || Array.isArray(converted)) {
                 throw new IllustrationLedgerValidationError('runLLMModel schema is not a valid structured-output schema')
             }
         }
@@ -204,6 +212,11 @@ const bridgeDependencies: IllustrationV3BridgeDependencies = {
             // plugin calls are unaffected.
             noMultiGen: true,
             schema,
+            // Pin extractJson off so a user's global db.extractJson can never
+            // post-process (and destroy) the plugin's structured-output response.
+            // '' is non-nullish → wins request.ts's `?? db.extractJson`, yet falsy
+            // at the openAI/google extract guards → no extraction runs.
+            extractJson: '',
             hostOmitCallerGenerationCap: true,
         }, options.mode as Parameters<typeof requestChatDataMain>[1], signal)
         // Fail-closed if a provider ignores noMultiGen and returns a multi-generation

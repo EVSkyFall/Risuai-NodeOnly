@@ -183,6 +183,15 @@ async function prepareOpenAiBody(
         delete prepared.body.parallel_tool_calls
         delete prepared.body.tool_choice
     }
+    // Structured output (JSON schema). request.ts precomputed the exact
+    // response_format.json_schema payload; emit it as a wire field so a customBody
+    // response_format cannot override it. Absent => unchanged body.
+    if (options.structuredOutput?.openaiJsonSchema) {
+        prepared.body.response_format = {
+            type: 'json_schema',
+            json_schema: options.structuredOutput.openaiJsonSchema,
+        }
+    }
     return prepared
 }
 

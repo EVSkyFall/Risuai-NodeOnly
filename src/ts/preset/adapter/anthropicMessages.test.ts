@@ -150,6 +150,30 @@ describe('sendAnthropicChatRequest (non-stream)', () => {
         expect(calls[0].body.max_tokens).toBe(4096)
     })
 
+    // E-3 (Sol #21): anthropic-messages has no native structured-output wire, so it
+    // ignores options.structuredOutput entirely — the body carries no schema fields
+    // (matching the classic non-preset behavior where schema only applies on the
+    // openai/google routes).
+    test('ignores structuredOutput (no schema fields on an unsupported adapter)', async () => {
+        const { fetchImpl, calls } = captureFetch(
+            jsonResponse({ content: [{ type: 'text', text: 'ok' }] }),
+        )
+        await sendAnthropicChatRequest(
+            makePreset(),
+            {
+                messages: messagesWithSystem,
+                fetchImpl,
+                structuredOutput: { openaiJsonSchema: { name: 'format', strict: true, schema: {} }, googleResponseSchema: { type: 'object' } },
+            },
+            { apiKey: 'ant-test' },
+        )
+        const serialized = JSON.stringify(calls[0].body)
+        expect(serialized).not.toContain('response_format')
+        expect(serialized).not.toContain('response_schema')
+        expect(serialized).not.toContain('responseSchema')
+        expect(serialized).not.toContain('json_schema')
+    })
+
     test('joins multiple system messages with double newline', async () => {
         const { fetchImpl, calls } = captureFetch(
             jsonResponse({ content: [{ type: 'text', text: 'ok' }] }),

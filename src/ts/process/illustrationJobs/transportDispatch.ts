@@ -258,20 +258,21 @@ export type WebuiDispatchInput = {
     params: WebuiDispatchParams
     pinnedCheckpoint: string | null
     fetchImpl: TransportFetch
-    priorityClass: 'interactive' | 'background'
 }
 
 export async function dispatchWebuiFlat(input: WebuiDispatchInput): Promise<ImageGenerationResult> {
     const policy = certaintyPolicyForTransport(input.target)
     let response: TransportFetchResult
     try {
+        // No `risu-image-class` proxy header: that marker forces the SERVER NovelAI broker
+        // to validate the request as NAI-class (https + Bearer/NAI body shape), which a
+        // local webui backend is not. Only the genuinely NAI-class transports carry it.
         response = await input.fetchImpl(webuiTxt2ImgUrl(input.endpoint), {
             method: 'POST',
             body: buildWebuiTxt2ImgBody(input.positive, input.negative, input.params, input.pinnedCheckpoint),
             headers: { 'Content-Type': 'application/json' },
             plainFetchDeforce: true,
             redactRequestLog: true,
-            proxyRequestHeaders: { 'risu-image-class': input.priorityClass },
         })
     } catch (error) {
         return thrownResult(error)

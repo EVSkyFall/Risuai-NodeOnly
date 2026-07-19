@@ -835,4 +835,26 @@ describe('previewChatRequest (no network)', () => {
         expect(prepared.url).toBe('https://demo.test/v1/chat/completions')
         expect((prepared.body.tools as unknown[]).length).toBe(1)
     })
+
+    // E-3 (Sol #21): the preset path threads a precomputed json_schema payload so an
+    // accepted Plugin/structured-output schema reaches the OpenAI-compatible body
+    // instead of silently vanishing (parity with the classic openAI builder).
+    test('emits response_format json_schema from options.structuredOutput', async () => {
+        const jsonSchema = { name: 'format', strict: true, schema: { type: 'object', properties: { foo: { type: 'string' } } } }
+        const prepared = await previewChatRequest(
+            makePreset(),
+            { messages: userMessages, structuredOutput: { openaiJsonSchema: jsonSchema } },
+            { apiKey: 'sk' },
+        )
+        expect(prepared.body.response_format).toEqual({ type: 'json_schema', json_schema: jsonSchema })
+    })
+
+    test('emits no response_format when structuredOutput is absent', async () => {
+        const prepared = await previewChatRequest(
+            makePreset(),
+            { messages: userMessages },
+            { apiKey: 'sk' },
+        )
+        expect(Object.hasOwn(prepared.body, 'response_format')).toBe(false)
+    })
 })

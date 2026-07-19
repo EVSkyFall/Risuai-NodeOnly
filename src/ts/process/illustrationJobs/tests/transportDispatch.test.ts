@@ -4,9 +4,11 @@ import {
     buildNaiCompatibleBody,
     buildWebuiTxt2ImgBody,
     dispatchComfyuiFlat,
+    dispatchNaiCompatibleFlat,
     dispatchWebuiFlat,
     webuiTxt2ImgUrl,
     type TransportFetch,
+    type TransportFetchArg,
     type TransportFetchResult,
     type WebuiDispatchParams,
 } from '../transportDispatch'
@@ -35,6 +37,9 @@ function webuiTarget(): IllustrationPromptTargetV2 {
 }
 function comfyTarget(): IllustrationPromptTargetV2 {
     return { transportId: 'comfyui-flat' } as IllustrationPromptTargetV2
+}
+function naiCompatibleTarget(): IllustrationPromptTargetV2 {
+    return { transportId: 'nai-compatible-flat' } as IllustrationPromptTargetV2
 }
 
 describe('webui-flat request building (request §7.3 / §10-3)', () => {
@@ -68,7 +73,7 @@ describe('webui-flat dispatch certainty (request §8)', () => {
         const result = await dispatchWebuiFlat({
             target: webuiTarget(), endpoint: 'http://127.0.0.1:7860/',
             positive: 'p', negative: 'n', params: WEBUI_PARAMS, pinnedCheckpoint: null,
-            fetchImpl, priorityClass: 'background',
+            fetchImpl,
         })
         expect(result).toMatchObject({ ok: false, certainty: 'uncertain' })
     })
@@ -78,7 +83,7 @@ describe('webui-flat dispatch certainty (request §8)', () => {
         const result = await dispatchWebuiFlat({
             target: webuiTarget(), endpoint: 'http://127.0.0.1:7860/',
             positive: 'p', negative: 'n', params: WEBUI_PARAMS, pinnedCheckpoint: null,
-            fetchImpl, priorityClass: 'background',
+            fetchImpl,
         })
         expect(result).toMatchObject({ ok: false, certainty: 'definite', providerStatus: 500 })
     })
@@ -88,9 +93,51 @@ describe('webui-flat dispatch certainty (request §8)', () => {
         const result = await dispatchWebuiFlat({
             target: webuiTarget(), endpoint: 'http://127.0.0.1:7860/',
             positive: 'p', negative: 'n', params: WEBUI_PARAMS, pinnedCheckpoint: null,
-            fetchImpl, priorityClass: 'background',
+            fetchImpl,
         })
         expect(result).toEqual({ ok: true, bytesOrDataUrl: 'data:image/png;base64,AAAA', providerStatus: 200 })
+    })
+})
+
+describe('broker-marker header attachment (A-1: NAI-class classification only)', () => {
+    test('webui-flat dispatch carries NO risu-image-class broker marker', async () => {
+        // The server NovelAI broker forces any risu-image-class-marked request through
+        // NAI-only validation (https + Bearer/NAI body shape); a webui-flat request would
+        // die at the proxy before reaching the local backend. webui-flat is not NAI-class.
+        let captured: TransportFetchArg | null = null
+        const fetchImpl: TransportFetch = async (_url, arg) => {
+            captured = arg
+            return { ok: true, status: 200, data: { images: ['AAAA'] }, headers: {} }
+        }
+        const result = await dispatchWebuiFlat({
+            target: webuiTarget(), endpoint: 'http://127.0.0.1:7860/',
+            positive: 'p', negative: 'n', params: WEBUI_PARAMS, pinnedCheckpoint: null,
+            fetchImpl,
+        })
+        expect(result).toMatchObject({ ok: true })
+        // The marker KEY must be entirely absent — not merely present with an undefined
+        // value (which the server broker would still classify as NAI-class).
+        const hasMarker = captured!.proxyRequestHeaders != null
+            && 'risu-image-class' in captured!.proxyRequestHeaders
+        expect(hasMarker).toBe(false)
+    })
+
+    test('nai-compatible-flat dispatch STILL carries the risu-image-class broker marker', async () => {
+        // nai-compatible-flat is genuinely NAI-class; the server broker must stay
+        // authoritative for it, so the classification marker remains.
+        let captured: TransportFetchArg | null = null
+        const fetchImpl: TransportFetch = async (_url, arg) => {
+            captured = arg
+            return { ok: true, status: 200, data: new Uint8Array(), headers: {} }
+        }
+        const result = await dispatchNaiCompatibleFlat({
+            target: naiCompatibleTarget(), endpoint: 'https://wellspring.example/ai/generate-image',
+            positive: 'p', negative: 'n', modelId: 'nai-diffusion', apiKey: 'secret',
+            fetchImpl, priorityClass: 'background',
+            extractImage: async () => 'IMG',
+        })
+        expect(result).toMatchObject({ ok: true })
+        expect(captured!.proxyRequestHeaders?.['risu-image-class']).toBe('background')
     })
 })
 

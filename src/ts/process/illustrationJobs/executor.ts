@@ -1937,7 +1937,6 @@ async function dispatchIllustrationEnvelopeV2(
             params: webuiDispatchParamsFromDb(db),
             pinnedCheckpoint,
             fetchImpl: fetchers.fetchImpl,
-            priorityClass,
         })
     }
 
@@ -2164,6 +2163,36 @@ async function processQueuedV2Job(job: IllustrationJobRecordV1, epoch: number): 
     )
     let result: ImageGenerationResult
     try {
+        // The broker slot may have been awaited for a long time. Re-read the job and
+        // re-run the dispatch gate BEFORE the paid provider call so a cancellation or a
+        // config change that landed DURING the wait yields provider-call-0 (request §4/§8).
+        const postWait = await illustrationJobStore.getJob(job.jobId)
+        if (!postWait
+            || postWait.attemptId !== generating.attemptId
+            || postWait.assetId !== generating.assetId
+            || (postWait.state !== 'generating' && postWait.state !== 'cancel_requested')) return
+        if (postWait.state === 'cancel_requested') {
+            await transitionExecutorJob({
+                jobId: postWait.jobId,
+                expectedVersion: postWait.version,
+                to: 'cancelled',
+                patch: {
+                    idempotencyKey: transitionKey(epoch, postWait, 'cancelled-post-broker-wait'),
+                    workerEpoch: epoch,
+                    error: null,
+                },
+            })
+            return
+        }
+        const postWaitGate = await evaluateV2DispatchGate(postWait, envelope, receipt)
+        if (postWaitGate.kind === 'drift') {
+            await settleDispatchConfigurationBlock(postWait, epoch, postWaitGate.code, `v2-postwait-${postWaitGate.code}`)
+            return
+        }
+        if (postWaitGate.kind === 'rebind') {
+            await settleV2ReceiptRebindFailure(postWait, epoch, postWaitGate.error, 'v2-postwait-receipt-rebind')
+            return
+        }
         result = await dispatchIllustrationEnvelopeV2(
             finalGate.target,
             finalGate.transportConfig,

@@ -1,5 +1,9 @@
 import { inspectInlayAssetIntegrity } from '../files/inlays'
-import { IllustrationLedgerCorruptError, IllustrationLedgerValidationError } from './errors'
+import {
+    IllustrationLedgerCorruptError,
+    IllustrationLedgerValidationError,
+    IllustrationLedgerVersionConflictError,
+} from './errors'
 import { emitIllustrationWakeHint } from './illustrationEvents'
 import { signalIllustrationExecutor } from './executorSignal'
 import { applyRestoreInlaySwap, revertRestoreInlaySwap } from './executor'
@@ -15,6 +19,7 @@ import {
     promptHashFor,
     readImageReference,
     readRestoreReceipt,
+    reconcileCommittedRestore,
     restoreBindingHash,
     type GetImageRevisionTargetResult,
     type ListImageReferencesResult,
@@ -196,13 +201,31 @@ export async function restoreImageRevision(
     const replayed = await readRestoreReceipt(input.idempotencyKey, bindingHash)
     if (replayed) return replayed
 
-    const prepared = await prepareRestore({
-        referenceId: input.referenceId,
-        expectedOperationVersion: input.expectedOperationVersion,
-        expectedLineageVersion: input.expectedLineageVersion,
-        expectedCurrentAssetId: input.expectedCurrentAssetId,
-        targetRevisionId: input.targetRevisionId,
-    })
+    let prepared
+    try {
+        prepared = await prepareRestore({
+            referenceId: input.referenceId,
+            expectedOperationVersion: input.expectedOperationVersion,
+            expectedLineageVersion: input.expectedLineageVersion,
+            expectedCurrentAssetId: input.expectedCurrentAssetId,
+            targetRevisionId: input.targetRevisionId,
+        })
+    } catch (error) {
+        // A same-key retry of a restore whose reference commit landed but whose receipt
+        // write tore fails the old-version CAS here even though it already committed.
+        // If the live reference already points at the requested target, reconcile it as
+        // an idempotent success and backfill the missing receipt.
+        if (error instanceof IllustrationLedgerVersionConflictError) {
+            const reconciled = await reconcileCommittedRestore({
+                referenceId: input.referenceId,
+                targetRevisionId: input.targetRevisionId,
+                idempotencyKey: input.idempotencyKey,
+                bindingHash,
+            })
+            if (reconciled) return reconciled
+        }
+        throw error
+    }
     // The restore target asset must still be durably present (retention keeps
     // referenced assets); restoring to a missing asset fails closed with no chat
     // mutation and no charge (§4.1: restore is provider 0).
@@ -219,14 +242,29 @@ export async function restoreImageRevision(
         throw new IllustrationLedgerCorruptError('Restore target inlay is ambiguous')
     }
 
-    const result = await commitRestore({
-        referenceId: input.referenceId,
-        expectedOperationVersion: input.expectedOperationVersion,
-        expectedLineageVersion: input.expectedLineageVersion,
-        targetEntry: prepared.targetEntry,
-        idempotencyKey: input.idempotencyKey,
-        bindingHash,
-    })
+    let result
+    try {
+        result = await commitRestore({
+            referenceId: input.referenceId,
+            expectedOperationVersion: input.expectedOperationVersion,
+            expectedLineageVersion: input.expectedLineageVersion,
+            targetEntry: prepared.targetEntry,
+            idempotencyKey: input.idempotencyKey,
+            bindingHash,
+        })
+    } catch (error) {
+        // A THROWN commit (durable storage failure) may leave the chat already flushed
+        // to the restored asset while the ledger commit did not durably complete. Revert
+        // the chat to the ledger's authoritative current asset before propagating, so
+        // chat and ledger never diverge — mirroring the lost-CAS revert below. When the
+        // reference write itself landed before the throw, the authoritative asset equals
+        // the restored one and the revert is a no-op.
+        const authoritative = await readImageReference(input.referenceId)
+        if (authoritative) {
+            await revertRestoreInlaySwap(authoritative, prepared.targetEntry.assetId)
+        }
+        throw error
+    }
     if (!result.applied) {
         // Lost the lineage/operation CAS: a concurrent replace/restore committed in
         // the window between prepareRestore and commitRestore. applyRestoreInlaySwap

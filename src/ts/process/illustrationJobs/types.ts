@@ -295,8 +295,12 @@ export type IllustrationLineageRevisionEntryV1 = {
     jobId: string | null
     assetId: string
     // Full structured prompt is retained so a no-charge restore can re-point the
-    // reference to any past revision's exact prompt (getImageRevisionTarget).
-    prompt: IllustrationPromptV1
+    // reference to any past revision's exact prompt (getImageRevisionTarget). It is
+    // ABSENT for an envelope-identity (V2) entry — a V2 job never stores a V1 prompt,
+    // so the entry's prompt-identity is the receipt's envelopeHash carried in
+    // `promptHash` instead (Sol #8). Absence of `prompt` is the envelope-identity
+    // discriminant.
+    prompt?: IllustrationPromptV1
     promptHash: string
     mode: IllustrationLineageEntryMode
     disposition: IllustrationRevisionDisposition | null
@@ -313,7 +317,9 @@ export type IllustrationImageReferenceRecordV1 = {
     sourceJobId: string
     currentAssetId: string
     currentRevisionId: string
-    currentPrompt: IllustrationPromptV1
+    // Absent for an envelope-identity (V2) reference — mirrors the lineage entry's
+    // `prompt`; the identity is `currentPromptHash` (the receipt envelopeHash) (Sol #8).
+    currentPrompt?: IllustrationPromptV1
     currentPromptHash: string
     settingsFingerprint: string
     sceneId: string
@@ -326,11 +332,24 @@ export type IllustrationImageReferenceRecordV1 = {
     updatedAt: number
 }
 
+// Slim stub of a revision evicted from the bounded live window. Retains only the
+// identity needed to keep the revision's asset restorable (§4.2 reachability); the
+// full structured prompt is intentionally dropped to keep the archive bounded.
+export type IllustrationLineageRevisionStubV1 = {
+    revisionId: string
+    assetId: string
+    promptHash: string
+    createdAt: number
+}
+
 export type IllustrationImageLineageRecordV1 = {
     schemaVersion: 1
     lineageId: string
     referenceId: string
     revisions: IllustrationLineageRevisionEntryV1[]
+    // Slim stubs of revisions compacted out of the live window; a restore falls back
+    // to these so an evicted revision's asset stays reachable.
+    archivedRevisions?: IllustrationLineageRevisionStubV1[]
     createdAt: number
     updatedAt: number
 }
@@ -346,6 +365,10 @@ export type IllustrationRevisionIntentReceiptV1 = {
     bindingHash: string
     admittedOperationVersion: number
     childJobId?: string
+    // The admitted child job record, sealed alongside the receipt so a same-key retry
+    // can re-materialize the child idempotently if the child-job write tore after the
+    // receipt became durable (receipt-before-child order, §4).
+    childJobRecord?: IllustrationJobRecordV1
     restoredIdentity?: IllustrationRevisionIdentity
     createdAt: number
 }

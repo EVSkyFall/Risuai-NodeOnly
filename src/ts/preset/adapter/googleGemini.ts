@@ -244,6 +244,19 @@ async function prepareGeminiBody(
         delete prepared.body.toolConfig
     }
 
+    // Structured output (JSON schema). request.ts precomputed the response schema
+    // object (excludes already stripped); fold it into generationConfig alongside
+    // responseMimeType, merging into any customBody/user-mapped generationConfig
+    // rather than clobbering it. Absent => unchanged body.
+    if (options.structuredOutput?.googleResponseSchema) {
+        const generationConfig: Record<string, unknown> = isPlainObject(prepared.body.generationConfig)
+            ? prepared.body.generationConfig
+            : {}
+        generationConfig.responseMimeType = 'application/json'
+        generationConfig.responseSchema = options.structuredOutput.googleResponseSchema
+        prepared.body.generationConfig = generationConfig
+    }
+
     const suffix = stream ? ':streamGenerateContent?alt=sse' : ':generateContent'
     prepared.url = `${prepared.url}/${encodeURIComponent(modelId)}${suffix}`
     return { ...prepared, modelId, cacheBoundary: resolvedBoundary }

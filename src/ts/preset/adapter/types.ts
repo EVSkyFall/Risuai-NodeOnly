@@ -171,11 +171,31 @@ export interface AdapterCacheContext {
     generationId?: string
 }
 
+// Structured-output (JSON schema) request payload, precomputed by request.ts.
+// The classic (non-preset) path emits a response schema on the openai-compatible
+// and google routes; the preset path threads the same intent here. request.ts
+// owns the schema conversion and the db.strictJsonSchema read so the adapter layer
+// stays free of the jsonSchema/database import cycle it deliberately avoids — each
+// adapter only reshapes the envelope around its precomputed field. An adapter
+// family with no structured-output support ignores this entirely.
+export interface AdapterStructuredOutput {
+    // OpenAI-compatible `response_format.json_schema` payload ({name,strict,schema}).
+    // Consumed by the openai-compatible adapter only.
+    openaiJsonSchema?: Record<string, unknown>
+    // Gemini `generationConfig.responseSchema` object (schema with the
+    // $schema/additionalProperties keys stripped). Consumed by the google-gemini
+    // adapter only, paired with responseMimeType: 'application/json'.
+    googleResponseSchema?: Record<string, unknown>
+}
+
 export interface AdapterChatOptions {
     messages: AdapterChatMessage[]
     tools?: AdapterToolDef[]             // when present, enables tool use on the request
     abortSignal?: AbortSignal
     fetchImpl?: typeof fetch
+    // Structured-output request (see AdapterStructuredOutput). Absent => no schema
+    // is emitted, byte-identical to before.
+    structuredOutput?: AdapterStructuredOutput
     // Per-request identifier (= the message generationId issued in sendChat).
     // Threaded through so request-status / context-cache consumers can key
     // status and badges to this exact request. Optional and side-effect free:

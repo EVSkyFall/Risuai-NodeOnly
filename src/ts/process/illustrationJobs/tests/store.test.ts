@@ -26,6 +26,9 @@ const { storageMap, storageControl, storageCounters } = vi.hoisted(() => ({
         getItem: 0,
         getItems: 0,
         bulkReadKeyCounts: [] as number[],
+        // Sol #25 (B-4): single-record reads of the durable pending-turn index,
+        // so a test can prove the write path serves membership from the mirror.
+        pendingIndexReads: 0,
     },
 }))
 
@@ -37,6 +40,7 @@ vi.mock('src/ts/globalApi.svelte', () => ({
         },
         async getItem(key: string) {
             storageCounters.getItem += 1
+            if (key === 'illustration:v1:pendingTurns') storageCounters.pendingIndexReads += 1
             return storageMap.get(key) ?? null
         },
         async getItems(keys: string[]) {
@@ -342,6 +346,10 @@ beforeEach(async () => {
     storageCounters.getItem = 0
     storageCounters.getItems = 0
     storageCounters.bulkReadKeyCounts = []
+    storageCounters.pendingIndexReads = 0
+    // The store instance outlives storageMap.clear(); drop its in-memory pending
+    // mirror so out-of-band durable manipulation in a test is observed freshly.
+    store.__resetPendingTurnIndexMirrorForTests()
     transitionSequence = 0
     vi.useFakeTimers()
     vi.setSystemTime(BASE_TIME)
@@ -2093,6 +2101,34 @@ describe('pending turn index and origin', () => {
         const turn = await store.getTurn('t1')
         await store.requestCancelTurn({ turnId: 't1', expectedVersion: turn!.version })
         expect(pendingIndexTurnIds()).toEqual([])
+    })
+
+    // Sol #25 (B-4): once the mirror is warm, repeated same-membership turn writes
+    // serve their pending-index membership check from memory — the durable index is
+    // never re-read (it was ~quadratic per accumulated write) — while membership and
+    // the durable index stay exactly as before.
+    test('updateTurn serves pending membership from the mirror without re-reading the durable index', async () => {
+        await store.createTurn({ turnId: 't1', idempotencyKey: 'i1' })
+        let turn = await store.updateTurn({
+            turnId: 't1',
+            expectedVersion: (await store.getTurn('t1'))!.version,
+            mutate: (draft) => { draft.state = 'awaiting_plan' },
+        })
+
+        // Measure only the repeated same-membership writes; the mirror is warm now.
+        storageCounters.pendingIndexReads = 0
+        for (let index = 0; index < 5; index += 1) {
+            turn = await store.updateTurn({
+                turnId: 't1',
+                expectedVersion: turn.version,
+                mutate: () => { /* no membership change; the turn stays awaiting_plan */ },
+            })
+        }
+
+        expect(storageCounters.pendingIndexReads).toBe(0)
+        expect(turn.version).toBe(7)
+        // Membership behavior is unchanged: the durable index still lists the turn.
+        expect(pendingIndexTurnIds()).toEqual(['t1'])
     })
 
     test('rebuilds the index from a full scan when it is missing', async () => {

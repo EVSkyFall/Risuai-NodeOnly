@@ -87,7 +87,15 @@ const {
     listImageRevisions,
     restoreImageRevision,
 } = revisionModule
-const { readImageReference, readImageLineage } = revisionLedgerModule
+const {
+    readImageReference,
+    readImageLineage,
+    illustrationReferenceKey,
+    illustrationLineageKey,
+    prepareRestore,
+    commitRestore,
+    restoreBindingHash,
+} = revisionLedgerModule
 const {
     pokeExecutor,
     resetIllustrationWorkerLockManagerAccessorForTests,
@@ -212,6 +220,94 @@ async function seedGenesis(options: {
     )
     harness.integrity.set(genesisAssetId, 'complete')
     return { jobId, genesisAssetId, prompt, fingerprint, message, chat }
+}
+
+// Seed a committed V2 (envelope-identity) genesis job: it carries promptEnvelope +
+// promptReceipt instead of a V1 `prompt`, mirroring the wellspring/nai-compatible-flat
+// path where ALL committed images are V2. The prompt-identity is the receipt's
+// envelopeHash (Sol #8).
+async function seedGenesisV2(options: {
+    genesisAssetId?: string
+    source?: string
+    envelopeHash?: string
+} = {}): Promise<{
+    jobId: string
+    genesisAssetId: string
+    envelopeHash: string
+    fingerprint: string
+}> {
+    const source = options.source ?? 'Genesis V2 body'
+    const genesisAssetId = options.genesisAssetId ?? 'asset:genesisv2000000000000000000000'
+    const envelopeHash = options.envelopeHash
+        ?? 'v2envelopehash000000000000000000000000000000000000000000000000aa'
+    installDatabase(`${source}\n{{inlay::${genesisAssetId}}}`)
+    const fingerprint = await computeNaiSettingsFingerprint(harness.database)
+    const now = Date.now()
+    const jobId = 'genesisjobv2-1'
+    const record = {
+        schemaVersion: 1,
+        turnId: 'genesis-turn-v2',
+        jobId,
+        slotToken: 'genesis-slot-v2',
+        insertAfterUtf16: source.length,
+        sceneId: 'scene-1',
+        scenePayload: { schemaVersion: 1, data: { description: 'genesis v2 scene' } },
+        sourceRevisionHash: 'genesis-hash-v2',
+        slotOrdinal: 0,
+        createdAt: now,
+        state: 'committed',
+        version: 7,
+        leaseId: null,
+        leaseExpiresAt: 0,
+        fence: 0,
+        workerEpoch: 0,
+        updatedAt: now,
+        idempotencyKey: 'genesis-commit-v2',
+        agentAttemptCount: 0,
+        creationIdempotencyKey: 'genesis-create-v2',
+        target: {
+            chaId: 'character-1',
+            conversationId: 'conversation-1',
+            expectedMessageId: 'message-1',
+            rootTurnId: 'root-v2',
+            requestNonce: 'genesis-nonce-v2',
+            slotToken: 'genesis-slot-v2',
+            capturedSwipeHint: 0,
+            sourceRevisionHash: 'genesis-hash-v2',
+        },
+        promptEnvelope: {
+            schemaVersion: 2,
+            tagProfileId: 'tp',
+            tagProfileRevision: '1',
+            profileConfigRevision: 'cfg',
+            assetCatalogDigest: 'cat',
+            layout: 'flat',
+            basePositive: 'v2 base positive',
+            subjectPositives: [],
+            baseNegative: 'v2 base negative',
+            subjectNegatives: [],
+        },
+        promptReceipt: {
+            schemaVersion: 2,
+            targetFingerprint: 'tfp-v2',
+            envelopeHash,
+            measurementMode: 'transport_only',
+            measurementRevision: 'transport-only/1',
+            dimensions: [],
+            modelVerdict: 'within_limit',
+            dispatchEligible: true,
+            eligibilityBasis: 'transport_only',
+        },
+        settingsFingerprint: fingerprint,
+        attemptId: 'genesis-attempt-v2',
+        assetId: genesisAssetId,
+    } as unknown as IllustrationJobRecordV1
+    harness.storageMap.set(
+        `illustration:v1:job:${jobId}`,
+        new TextEncoder().encode(JSON.stringify(record)),
+    )
+    harness.integrity.set(genesisAssetId, 'complete')
+    return { jobId, genesisAssetId, envelopeHash, fingerprint }
 }
 
 async function resolveReference(): Promise<{
@@ -949,6 +1045,525 @@ describe('Image Revision V1 — contract §7 acceptance', () => {
         const records = jobKeys.map((k) => JSON.parse(new TextDecoder().decode(harness.storageMap.get(k)!)))
         const queuedRevisionChildren = records.filter((r) => r.revision && r.state === 'queued')
         expect(queuedRevisionChildren).toHaveLength(0)
+    })
+})
+
+describe('Cluster C — revision ledger integrity', () => {
+    // C-1: a transient index READ failure must abort the add, never overwrite the
+    // durable reference index with a single-id list (which would vanish references).
+    test('C-1: an index read IO failure aborts add-to-index and never clobbers the index', async () => {
+        await seedGenesis()
+        const first = await resolveReference()
+        const indexKey = revisionLedgerModule.ILLUSTRATION_REFERENCE_INDEX_KEY
+        const beforeRaw = harness.storageMap.get(indexKey)!
+        const before = JSON.parse(new TextDecoder().decode(beforeRaw))
+        expect(before.referenceIds).toContain(first.referenceId)
+
+        // A second committed genesis job in the same message -> a fresh list backfills
+        // a new reference and calls addToIndex, which reads the index first.
+        const rawA = JSON.parse(new TextDecoder().decode(
+            harness.storageMap.get('illustration:v1:job:genesisjob-1')!,
+        ))
+        const jobB = { ...rawA, jobId: 'genesisjob-2', assetId: 'asset:second00000000000000000000000000' }
+        harness.storageMap.set(
+            'illustration:v1:job:genesisjob-2',
+            new TextEncoder().encode(JSON.stringify(jobB)),
+        )
+        harness.integrity.set(jobB.assetId, 'complete')
+
+        const globalApi = await import('src/ts/globalApi.svelte')
+        const forage = globalApi.forageStorage
+        const original = forage.getItem.bind(forage)
+        let thrown = false
+        const spy = vi.spyOn(forage, 'getItem').mockImplementation(async (key: string) => {
+            if (key === indexKey && !thrown) {
+                thrown = true
+                throw new Error('simulated index read IO failure')
+            }
+            return original(key)
+        })
+
+        await expect(listImageReferences({
+            protocolVersion: 1,
+            conversationId: 'conversation-1',
+            messageId: 'message-1',
+            limit: 10,
+        })).rejects.toThrow(/simulated index read/)
+        spy.mockRestore()
+
+        // The durable index still holds the original reference; it was NOT overwritten
+        // with a single-id list.
+        const after = JSON.parse(new TextDecoder().decode(harness.storageMap.get(indexKey)!))
+        expect(after.referenceIds).toContain(first.referenceId)
+    })
+
+    // C-2: a THROWN commitRestore (durable storage failure) must revert the chat swap
+    // back to the ledger's authoritative asset before propagating — no chat/ledger
+    // divergence.
+    test('C-2: a thrown commitRestore reverts the chat to the authoritative asset', async () => {
+        const genesis = await seedGenesis()
+        const ref = await resolveReference()
+        await createImageRevision({
+            protocolVersion: 1,
+            idempotencyKey: 'c2-replace',
+            referenceId: ref.referenceId,
+            expectedOperationVersion: ref.operationVersion,
+            sourceJobId: ref.sourceJobId,
+            expectedLineageVersion: ref.lineageVersion,
+            expectedCurrentAssetId: ref.currentAssetId,
+            mode: 'exact-prompt',
+            disposition: 'replace',
+            confirmNewImageCharge: true,
+            confirmNewLlmCharge: false,
+        })
+        await drainExecutor()
+        const replaced = await illustrationJobStore.getJob(
+            (await revisionLedgerModule.readImageReference(ref.referenceId))!.sourceJobId,
+        )
+        const afterReplace = await readImageReference(ref.referenceId)
+        const replaceAsset = afterReplace!.currentAssetId
+        expect(replaceAsset).not.toBe(genesis.genesisAssetId)
+        const lineage = await readImageLineage(afterReplace!.lineageId)
+        const genesisRevision = lineage!.revisions.find((entry) => entry.mode === 'genesis')!
+
+        // Make the restore's ledger reference write throw once (durable failure). The
+        // reference does NOT commit, so the authoritative asset stays the replace asset.
+        const globalApi = await import('src/ts/globalApi.svelte')
+        const forage = globalApi.forageStorage
+        const original = forage.setItem.bind(forage)
+        const refKey = revisionLedgerModule.illustrationReferenceKey(ref.referenceId)
+        let armed = true
+        const spy = vi.spyOn(forage, 'setItem').mockImplementation(
+            async (key: string, value: Uint8Array, etag?: string) => {
+                if (key === refKey && armed) {
+                    armed = false
+                    throw new Error('simulated ledger reference write failure')
+                }
+                return original(key, value, etag)
+            },
+        )
+
+        await expect(restoreImageRevision({
+            protocolVersion: 1,
+            idempotencyKey: 'c2-restore',
+            referenceId: ref.referenceId,
+            expectedOperationVersion: afterReplace!.operationVersion,
+            expectedLineageVersion: afterReplace!.lineageVersion,
+            expectedCurrentAssetId: afterReplace!.currentAssetId,
+            targetRevisionId: genesisRevision.revisionId,
+            confirmNoCharge: true,
+        })).rejects.toThrow(/simulated ledger reference write failure/)
+        spy.mockRestore()
+
+        // Fail-closed: chat reverted to the authoritative (replace) asset, not left on
+        // the restored genesis asset.
+        const data = harness.database.characters[0].chats[0].message[0].data
+        expect(occurrences(data, `{{inlay::${replaceAsset}}}`)).toBe(1)
+        expect(occurrences(data, `{{inlay::${genesis.genesisAssetId}}}`)).toBe(0)
+        const finalRef = await readImageReference(ref.referenceId)
+        expect(finalRef!.currentAssetId).toBe(replaceAsset)
+        expect(replaced).toBeTruthy()
+    })
+
+    // C-3: a restore whose reference committed but whose receipt write failed must, on
+    // same-key retry, recognize its already-committed state, backfill the receipt, and
+    // succeed with no double version bump.
+    test('C-3: torn restore (reference committed, receipt lost) retries idempotently', async () => {
+        const genesis = await seedGenesis()
+        const ref = await resolveReference()
+        await createImageRevision({
+            protocolVersion: 1,
+            idempotencyKey: 'c3-replace',
+            referenceId: ref.referenceId,
+            expectedOperationVersion: ref.operationVersion,
+            sourceJobId: ref.sourceJobId,
+            expectedLineageVersion: ref.lineageVersion,
+            expectedCurrentAssetId: ref.currentAssetId,
+            mode: 'exact-prompt',
+            disposition: 'replace',
+            confirmNewImageCharge: true,
+            confirmNewLlmCharge: false,
+        })
+        await drainExecutor()
+        const afterReplace = await readImageReference(ref.referenceId)
+        const lineage = await readImageLineage(afterReplace!.lineageId)
+        const genesisRevision = lineage!.revisions.find((entry) => entry.mode === 'genesis')!
+
+        // Make the restore's receipt (revintent) write throw once; the reference commit
+        // has already landed by then.
+        const globalApi = await import('src/ts/globalApi.svelte')
+        const forage = globalApi.forageStorage
+        const original = forage.setItem.bind(forage)
+        let armed = true
+        const spy = vi.spyOn(forage, 'setItem').mockImplementation(
+            async (key: string, value: Uint8Array, etag?: string) => {
+                if (key.startsWith('illustration:v1:revintent:') && armed) {
+                    armed = false
+                    throw new Error('simulated receipt write failure')
+                }
+                return original(key, value, etag)
+            },
+        )
+        const restoreArgs = {
+            protocolVersion: 1 as const,
+            idempotencyKey: 'c3-restore',
+            referenceId: ref.referenceId,
+            expectedOperationVersion: afterReplace!.operationVersion,
+            expectedLineageVersion: afterReplace!.lineageVersion,
+            expectedCurrentAssetId: afterReplace!.currentAssetId,
+            targetRevisionId: genesisRevision.revisionId,
+            confirmNoCharge: true as const,
+        }
+        await expect(restoreImageRevision(restoreArgs)).rejects.toThrow()
+        spy.mockRestore()
+
+        const committedRef = await readImageReference(ref.referenceId)
+        const opAfterFirst = committedRef!.operationVersion
+
+        // Same-key retry: no receipt exists, the CAS would conflict, but the restore is
+        // already committed -> idempotent success, receipt backfilled, no extra bump.
+        const retried = await restoreImageRevision(restoreArgs)
+        expect(retried.currentAssetId).toBe(genesis.genesisAssetId)
+        const finalRef = await readImageReference(ref.referenceId)
+        expect(finalRef!.operationVersion).toBe(opAfterFirst)
+        expect(finalRef!.currentAssetId).toBe(genesis.genesisAssetId)
+        expect(harness.provider).not.toHaveBeenCalledTimes(2)
+    })
+
+    // C-4: an admission whose receipt persisted but whose child-job write failed must,
+    // on same-key retry, re-materialize the child instead of throwing corrupt forever.
+    test('C-4: torn admission (receipt durable, child lost) re-materializes the child', async () => {
+        await seedGenesis()
+        const ref = await resolveReference()
+        const globalApi = await import('src/ts/globalApi.svelte')
+        const forage = globalApi.forageStorage
+        const original = forage.setItem.bind(forage)
+        let armed = true
+        const spy = vi.spyOn(forage, 'setItem').mockImplementation(
+            async (key: string, value: Uint8Array, etag?: string) => {
+                // Crash exactly on the child job write (after the receipt is durable).
+                if (key.startsWith('illustration:v1:job:') && armed) {
+                    armed = false
+                    throw new Error('simulated child write failure')
+                }
+                return original(key, value, etag)
+            },
+        )
+        const admitArgs = {
+            protocolVersion: 1 as const,
+            idempotencyKey: 'c4-key',
+            referenceId: ref.referenceId,
+            expectedOperationVersion: ref.operationVersion,
+            sourceJobId: ref.sourceJobId,
+            expectedLineageVersion: ref.lineageVersion,
+            expectedCurrentAssetId: ref.currentAssetId,
+            mode: 'exact-prompt' as const,
+            disposition: 'replace' as const,
+            confirmNewImageCharge: true,
+            confirmNewLlmCharge: false,
+        }
+        await expect(createImageRevision(admitArgs)).rejects.toThrow(/simulated child write failure/)
+        spy.mockRestore()
+
+        // Same-key retry re-materializes the durable-receipt child.
+        const retried = await createImageRevision(admitArgs)
+        expect(retried.state).toBe('queued')
+        const record = await illustrationJobStore.getJob(retried.jobId)
+        expect(record).toBeTruthy()
+        expect(record!.revision?.referenceId).toBe(ref.referenceId)
+
+        // The re-materialized child dispatches exactly once and commits.
+        await drainExecutor()
+        expect(harness.provider).toHaveBeenCalledTimes(1)
+        expect((await illustrationJobStore.getJob(retried.jobId))?.state).toBe('committed')
+    })
+
+    // C-5: a replace whose lineage append landed but whose reference CAS failed must,
+    // on recovery re-run, NOT duplicate the lineage entry.
+    test('C-5: replace commit dedups the lineage entry on replay', async () => {
+        const genesis = await seedGenesis()
+        const ref = await resolveReference()
+        const lineageBefore = await readImageLineage(ref.lineageId)
+        const genesisRevision = lineageBefore!.revisions.find((entry) => entry.mode === 'genesis')!
+
+        const dupRevisionId = 'rev:c5-dup'
+        const newAssetId = 'asset:c5new000000000000000000000000000'
+        const childPrompt = flatPrompt('c5 positive', 'c5 negative')
+        const promptHash = await revisionLedgerModule.promptHashFor(childPrompt)
+
+        // Simulate the torn state: the lineage append already landed (recovery re-run),
+        // but the reference CAS has NOT (reference still at genesis / lineageVersion 1).
+        const lineageKey = revisionLedgerModule.illustrationLineageKey(ref.lineageId)
+        const rawLineage = JSON.parse(new TextDecoder().decode(harness.storageMap.get(lineageKey)!))
+        rawLineage.revisions.push({
+            revisionId: dupRevisionId,
+            parentRevisionId: genesisRevision.revisionId,
+            jobId: 'c5-child',
+            assetId: newAssetId,
+            prompt: childPrompt,
+            promptHash,
+            mode: 'exact-prompt',
+            disposition: 'replace',
+            chargeCertainty: 'charged',
+            createdAt: Date.now(),
+        })
+        harness.storageMap.set(lineageKey, new TextEncoder().encode(JSON.stringify(rawLineage)))
+
+        const revision: any = {
+            referenceId: ref.referenceId,
+            lineageId: ref.lineageId,
+            parentRevisionId: genesisRevision.revisionId,
+            revisionId: dupRevisionId,
+            mode: 'exact-prompt',
+            disposition: 'replace',
+            admittedOperationVersion: 1,
+            expectedLineageVersion: ref.lineageVersion,
+            expectedCurrentAssetId: ref.currentAssetId,
+            promptHash,
+        }
+        const result = await revisionLedgerModule.commitReplaceReference({
+            revision,
+            childJobId: 'c5-child',
+            newAssetId,
+            childPrompt,
+            chargeCertainty: 'charged',
+        })
+        expect(result.applied).toBe(true)
+
+        const lineageAfter = await readImageLineage(ref.lineageId)
+        const dupCount = lineageAfter!.revisions.filter((e) => e.revisionId === dupRevisionId).length
+        expect(dupCount).toBe(1)
+        const finalRef = await readImageReference(ref.referenceId)
+        expect(finalRef!.currentRevisionId).toBe(dupRevisionId)
+        expect(finalRef!.currentAssetId).toBe(newAssetId)
+        expect(finalRef!.lineageVersion).toBe(2)
+        expect(genesis.genesisAssetId).toBeTruthy()
+    })
+
+    // C-6: compaction beyond the live cap must archive slim stubs so an evicted
+    // revision stays restorable, while the live window stays bounded.
+    test('C-6: compaction archives evicted revisions and keeps them restorable', async () => {
+        const genesis = await seedGenesis()
+        const ref = await resolveReference()
+
+        // Pad the live lineage up to the cap (genesis + 199 synthetic = 200), reference
+        // untouched so the next replace's CAS still matches.
+        const lineageKey = revisionLedgerModule.illustrationLineageKey(ref.lineageId)
+        const rawLineage = JSON.parse(new TextDecoder().decode(harness.storageMap.get(lineageKey)!))
+        const genesisRevisionId = rawLineage.revisions[0].revisionId
+        for (let i = 0; i < 199; i += 1) {
+            rawLineage.revisions.push({
+                revisionId: `rev:pad-${i}`,
+                parentRevisionId: genesisRevisionId,
+                jobId: `pad-${i}`,
+                assetId: `asset:pad-${i}`,
+                prompt: flatPrompt(`pad ${i}`),
+                promptHash: `hash-pad-${i}`,
+                mode: 'exact-prompt',
+                disposition: 'replace',
+                chargeCertainty: 'charged',
+                createdAt: BASE_TIME + i + 1,
+            })
+        }
+        expect(rawLineage.revisions.length).toBe(200)
+        harness.storageMap.set(lineageKey, new TextEncoder().encode(JSON.stringify(rawLineage)))
+
+        // One real replace appends the 201st entry -> compaction evicts genesis (oldest
+        // by array order) into the archive.
+        await createImageRevision({
+            protocolVersion: 1,
+            idempotencyKey: 'c6-replace',
+            referenceId: ref.referenceId,
+            expectedOperationVersion: ref.operationVersion,
+            sourceJobId: ref.sourceJobId,
+            expectedLineageVersion: ref.lineageVersion,
+            expectedCurrentAssetId: ref.currentAssetId,
+            mode: 'exact-prompt',
+            disposition: 'replace',
+            confirmNewImageCharge: true,
+            confirmNewLlmCharge: false,
+        })
+        await drainExecutor()
+
+        const afterReplace = await readImageReference(ref.referenceId)
+        const newAsset = afterReplace!.currentAssetId
+        expect(newAsset).not.toBe(genesis.genesisAssetId)
+        const compacted = await readImageLineage(afterReplace!.lineageId)
+        // Live window bounded; genesis no longer live but archived as a slim stub.
+        expect(compacted!.revisions.length).toBe(200)
+        expect(compacted!.revisions.some((e) => e.revisionId === genesisRevisionId)).toBe(false)
+        expect(compacted!.archivedRevisions?.some((s: any) => s.revisionId === genesisRevisionId)).toBe(true)
+
+        // The evicted genesis revision is still restorable via its archived stub.
+        const restored = await restoreImageRevision({
+            protocolVersion: 1,
+            idempotencyKey: 'c6-restore',
+            referenceId: ref.referenceId,
+            expectedOperationVersion: afterReplace!.operationVersion,
+            expectedLineageVersion: afterReplace!.lineageVersion,
+            expectedCurrentAssetId: afterReplace!.currentAssetId,
+            targetRevisionId: genesisRevisionId,
+            confirmNoCharge: true,
+        })
+        expect(restored.currentAssetId).toBe(genesis.genesisAssetId)
+        const data = harness.database.characters[0].chats[0].message[0].data
+        expect(occurrences(data, `{{inlay::${genesis.genesisAssetId}}}`)).toBe(1)
+        expect(occurrences(data, `{{inlay::${newAsset}}}`)).toBe(0)
+    })
+})
+
+describe('D-4: committed V2 (envelope-identity) images are revision-eligible (Sol #8)', () => {
+    test('a committed V2 job backfills a genesis reference + lineage keyed by the receipt envelopeHash', async () => {
+        const g = await seedGenesisV2()
+        const listed = await listImageReferences({
+            protocolVersion: 1,
+            conversationId: 'conversation-1',
+            messageId: 'message-1',
+            limit: 10,
+        })
+        expect(listed.items).toHaveLength(1)
+        const reference = await readImageReference(listed.items[0].referenceId)
+        expect(reference).toBeTruthy()
+        // Envelope-identity: NO fabricated V1 prompt; identity is the receipt envelopeHash.
+        expect(reference?.currentPrompt).toBeUndefined()
+        expect(reference?.currentPromptHash).toBe(g.envelopeHash)
+        expect(reference?.currentAssetId).toBe(g.genesisAssetId)
+        const lineage = await readImageLineage(reference!.lineageId)
+        expect(lineage?.revisions).toHaveLength(1)
+        expect(lineage?.revisions[0].prompt).toBeUndefined()
+        expect(lineage?.revisions[0].promptHash).toBe(g.envelopeHash)
+        expect(lineage?.revisions[0].assetId).toBe(g.genesisAssetId)
+        expect(lineage?.revisions[0].mode).toBe('genesis')
+    })
+
+    test('getImageRevisionTarget on a V2 reference returns the envelopeHash identity, no fabricated prompt', async () => {
+        const g = await seedGenesisV2()
+        const ref = await resolveReference()
+        const target = await getImageRevisionTarget({ protocolVersion: 1, referenceId: ref.referenceId })
+        expect(target.promptHash).toBe(g.envelopeHash)
+        expect(target.prompt).toBeUndefined()
+    })
+
+    test('retag on an envelope-identity reference is a typed validation rejection (documented follow-up, provider 0)', async () => {
+        await seedGenesisV2()
+        const ref = await resolveReference()
+        await expect(createImageRevision({
+            protocolVersion: 1,
+            idempotencyKey: 'v2-retag',
+            referenceId: ref.referenceId,
+            expectedOperationVersion: ref.operationVersion,
+            sourceJobId: ref.sourceJobId,
+            expectedLineageVersion: ref.lineageVersion,
+            expectedCurrentAssetId: ref.currentAssetId,
+            mode: 'retag',
+            disposition: 'replace',
+            confirmNewImageCharge: false,
+            confirmNewLlmCharge: true,
+        })).rejects.toMatchObject({ code: 'validation_failed' })
+        // The admission CAS was never consumed and no provider ran.
+        const after = await readImageReference(ref.referenceId)
+        expect(after?.operationVersion).toBe(ref.operationVersion)
+        expect(harness.provider).not.toHaveBeenCalled()
+    })
+
+    test('an exact-prompt/edited-prompt revision on a V2 reference is a typed validation rejection (documented follow-up)', async () => {
+        await seedGenesisV2()
+        const ref = await resolveReference()
+        await expect(createImageRevision({
+            protocolVersion: 1,
+            idempotencyKey: 'v2-exact',
+            referenceId: ref.referenceId,
+            expectedOperationVersion: ref.operationVersion,
+            sourceJobId: ref.sourceJobId,
+            expectedLineageVersion: ref.lineageVersion,
+            expectedCurrentAssetId: ref.currentAssetId,
+            mode: 'exact-prompt',
+            disposition: 'replace',
+            confirmNewImageCharge: true,
+            confirmNewLlmCharge: false,
+        })).rejects.toMatchObject({ code: 'validation_failed' })
+    })
+
+    test('restore across two V2 (envelope-identity) revisions re-points the reference asset with no fabricated prompt', async () => {
+        const g = await seedGenesisV2()
+        const ref0 = await resolveReference()
+        // Simulate a SECOND committed V2 revision (the V2 revision-child pipeline is a
+        // documented joint follow-up): append a second envelope-identity entry to the
+        // lineage and advance the reference to it, directly in storage.
+        const reference = await readImageReference(ref0.referenceId)
+        const lineage = await readImageLineage(ref0.lineageId)
+        const genesisEntry = lineage!.revisions[0]
+        const asset2 = 'asset:v2rev2000000000000000000000000'
+        const rev2Hash = 'v2envelopehash2222222222222222222222222222222222222222222222bb00'
+        const secondEntry = {
+            revisionId: 'rev:v2:second',
+            parentRevisionId: genesisEntry.revisionId,
+            jobId: 'genesisjobv2-1',
+            assetId: asset2,
+            promptHash: rev2Hash,
+            mode: 'replace' as const,
+            disposition: 'replace' as const,
+            chargeCertainty: 'charged' as const,
+            createdAt: Date.now(),
+        }
+        const nextLineage = {
+            ...lineage!,
+            revisions: [...lineage!.revisions, secondEntry],
+            updatedAt: Date.now(),
+        }
+        const nextReference = {
+            ...reference!,
+            operationVersion: reference!.operationVersion + 1,
+            lineageVersion: reference!.lineageVersion + 1,
+            currentAssetId: asset2,
+            currentRevisionId: secondEntry.revisionId,
+            currentPromptHash: rev2Hash,
+            updatedAt: Date.now(),
+        }
+        // currentPrompt intentionally stays absent (envelope-identity).
+        delete (nextReference as { currentPrompt?: unknown }).currentPrompt
+        harness.storageMap.set(
+            illustrationLineageKey(reference!.lineageId),
+            new TextEncoder().encode(JSON.stringify(nextLineage)),
+        )
+        harness.storageMap.set(
+            illustrationReferenceKey(reference!.referenceId),
+            new TextEncoder().encode(JSON.stringify(nextReference)),
+        )
+        harness.integrity.set(asset2, 'complete')
+
+        // Restore back to the genesis revision at the ledger level (prepareRestore +
+        // commitRestore is the restore code path; it must handle the absent V1 prompt).
+        const prepared = await prepareRestore({
+            referenceId: reference!.referenceId,
+            expectedOperationVersion: nextReference.operationVersion,
+            expectedLineageVersion: nextReference.lineageVersion,
+            expectedCurrentAssetId: asset2,
+            targetRevisionId: genesisEntry.revisionId,
+        })
+        expect(prepared.targetEntry.prompt).toBeUndefined()
+        expect(prepared.targetEntry.assetId).toBe(g.genesisAssetId)
+        const bindingHash = await restoreBindingHash({
+            referenceId: reference!.referenceId,
+            expectedOperationVersion: nextReference.operationVersion,
+            expectedLineageVersion: nextReference.lineageVersion,
+            expectedCurrentAssetId: asset2,
+            targetRevisionId: genesisEntry.revisionId,
+        })
+        const committed = await commitRestore({
+            referenceId: reference!.referenceId,
+            expectedOperationVersion: nextReference.operationVersion,
+            expectedLineageVersion: nextReference.lineageVersion,
+            targetEntry: prepared.targetEntry,
+            idempotencyKey: 'v2-restore',
+            bindingHash,
+        })
+        expect(committed.applied).toBe(true)
+        const restored = await readImageReference(reference!.referenceId)
+        expect(restored?.currentAssetId).toBe(g.genesisAssetId)
+        expect(restored?.currentRevisionId).toBe(genesisEntry.revisionId)
+        expect(restored?.currentPromptHash).toBe(g.envelopeHash)
+        expect(restored?.currentPrompt).toBeUndefined()
     })
 })
 

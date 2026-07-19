@@ -833,6 +833,22 @@ export class IllustrationJobStore {
             })
     }
 
+    // Sol #25 (B-4): in-memory mirror of the durable pending-turn set. syncPending-
+    // IndexUnlocked runs on every turn write; re-reading + parsing the whole durable
+    // index each time is ~quadratic in accumulated pending traffic. The mirror is
+    // seeded lazily from durable and kept write-through, so the per-write membership
+    // check never touches storage after the first. All pending-index access is
+    // serialized under withIllustrationLedgerLock, so the mirror is race-safe. The
+    // durable writes are unchanged (only the redundant reads are elided); listing and
+    // rebuild paths read durable and refresh the mirror to the durable truth.
+    private pendingTurnMirror: Set<string> | null = null
+
+    // Test-only: drop the mirror so a test that mutates durable storage out-of-band
+    // (or clears it between cases) is observed on the next access.
+    __resetPendingTurnIndexMirrorForTests(): void {
+        this.pendingTurnMirror = null
+    }
+
     private async readPendingIndexUnlocked(): Promise<string[] | null> {
         let raw: unknown
         try {
@@ -852,6 +868,8 @@ export class IllustrationJobStore {
     private async writePendingIndexUnlocked(turnIds: readonly string[]): Promise<void> {
         const unique = [...new Set(turnIds)].sort()
         await writePersistentJson(ILLUSTRATION_PENDING_TURNS_KEY, { schemaVersion: 1, turnIds: unique })
+        // Write-through: durable and mirror never diverge in-process after a write.
+        this.pendingTurnMirror = new Set(unique)
     }
 
     private async rebuildPendingIndexUnlocked(): Promise<string[]> {
@@ -866,8 +884,24 @@ export class IllustrationJobStore {
         return unique
     }
 
+    // Listing/recovery path: read the durable index (rebuilding once from a full
+    // scan when missing/corrupt) and refresh the mirror to that durable truth. This
+    // keeps out-of-band durable changes authoritative for reads, and re-anchors the
+    // mirror so the next write path sees the real set.
     private async ensurePendingIndexUnlocked(): Promise<string[]> {
-        return (await this.readPendingIndexUnlocked()) ?? (await this.rebuildPendingIndexUnlocked())
+        const ids = (await this.readPendingIndexUnlocked()) ?? (await this.rebuildPendingIndexUnlocked())
+        this.pendingTurnMirror = new Set(ids)
+        return ids
+    }
+
+    // Write path (Sol #25): the mirror-backed membership set. Seeds lazily from the
+    // durable index on first use, then serves the per-write membership check from
+    // memory so syncPendingIndexUnlocked never re-reads the whole index.
+    private async ensurePendingIndexMirrorUnlocked(): Promise<Set<string>> {
+        if (this.pendingTurnMirror !== null) return this.pendingTurnMirror
+        const ids = (await this.readPendingIndexUnlocked()) ?? (await this.rebuildPendingIndexUnlocked())
+        this.pendingTurnMirror = new Set(ids)
+        return this.pendingTurnMirror
     }
 
     // Called within the ledger lock after every turn-state write. Membership tracks
@@ -878,13 +912,13 @@ export class IllustrationJobStore {
         turnId: string,
         state: IllustrationTurnState,
     ): Promise<void> {
-        const ids = await this.ensurePendingIndexUnlocked()
+        const mirror = await this.ensurePendingIndexMirrorUnlocked()
         const shouldBePending = !isTerminalTurnState(state)
-        const has = ids.includes(turnId)
+        const has = mirror.has(turnId)
         if (shouldBePending && !has) {
-            await this.writePendingIndexUnlocked([...ids, turnId])
+            await this.writePendingIndexUnlocked([...mirror, turnId])
         } else if (!shouldBePending && has) {
-            await this.writePendingIndexUnlocked(ids.filter((id) => id !== turnId))
+            await this.writePendingIndexUnlocked([...mirror].filter((id) => id !== turnId))
         }
     }
 
@@ -1101,6 +1135,21 @@ export class IllustrationJobStore {
                 }
                 draft.promptContext = input.promptContext
             },
+        })
+    }
+
+    // True iff any NON-revision job on the turn has already begun prompt supply — a
+    // durable V1 `prompt` or a V2 `promptEnvelope` was written (Sol #5). Once that
+    // happens the turn's V1/V2 mode is locked; the coordinator's preparePromptContext
+    // fence uses this to refuse (re-)binding a fresh context mid-flight, which would
+    // split the turn across modes. Revision children ride the V1 supply path on their
+    // own committed target and never gate a turn's genesis mode.
+    async turnHasNonRevisionPromptSupply(turnId: string): Promise<boolean> {
+        return await withIllustrationLedgerLock(async () => {
+            assertNonEmptyString(turnId, 'turnId')
+            const jobs = await this.listTurnJobRecordsUnlocked(turnId)
+            return jobs.some((job) =>
+                !job.revision && (job.prompt !== undefined || job.promptEnvelope !== undefined))
         })
     }
 
@@ -1408,6 +1457,26 @@ export class IllustrationJobStore {
             }
             if (indexChanged) await this.writePendingIndexUnlocked(healthy)
             return listing
+                .sort((left, right) =>
+                    left.updatedAt - right.updatedAt || left.turnId.localeCompare(right.turnId))
+                .map((record) => projectTurnSnapshot(record))
+        })
+    }
+
+    // Purge support (Sol #9): the pending-index turns that are in-flight in the
+    // job-bearing `awaiting_prompt` state. listPendingTurns' listing subset never
+    // surfaces these, so the automatic-backlog purge needs a dedicated enumerator
+    // to reach and cancel their queued (paid) jobs. Absent/non-awaiting_prompt
+    // indexed IDs are skipped (never fabricated); the pending index is not mutated.
+    async listAwaitingPromptTurns(): Promise<IllustrationTurnSnapshotV1[]> {
+        return await withIllustrationLedgerLock(async () => {
+            const ids = await this.ensurePendingIndexUnlocked()
+            const records = await readManyPersistentJson<IllustrationTurnRecordV1>(
+                ids.map((turnId) => illustrationTurnKey(turnId)),
+            )
+            return records
+                .filter((record): record is IllustrationTurnRecordV1 =>
+                    record !== null && record.state === 'awaiting_prompt')
                 .sort((left, right) =>
                     left.updatedAt - right.updatedAt || left.turnId.localeCompare(right.turnId))
                 .map((record) => projectTurnSnapshot(record))

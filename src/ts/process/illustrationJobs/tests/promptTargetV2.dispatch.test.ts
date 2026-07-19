@@ -74,6 +74,7 @@ const operationLockModule = await import('../operationLock')
 const storeModule = await import('../store')
 const brokerModule = await import('../transportBroker')
 const promptContextModule = await import('../promptContextV2')
+const { sha256Hex } = await import('../sourceHash')
 
 const {
     preparePromptContext,
@@ -401,7 +402,9 @@ describe('webui-flat V2 dispatch through broker + serializer (request §D2/§7.3
         expect((await illustrationJobStore.getJob(jobId))?.state).toBe('committed')
         expect(harness.provider).not.toHaveBeenCalled() // NAI native path unused for webui
         expect(acquireSpy).toHaveBeenCalledTimes(1)
-        expect(acquireSpy.mock.calls[0][0]).toBe('webui-flat:http://127.0.0.1:7860/')
+        // The broker key hashes the endpoint so a wellspring-style credentialed URL
+        // never lands in the durable/projected concurrencyKey (Sol #7).
+        expect(acquireSpy.mock.calls[0][0]).toBe(`webui-flat:${await sha256Hex('http://127.0.0.1:7860/')}`)
         expect(capture.calls).toHaveLength(1)
         expect(capture.calls[0].url).toBe('http://127.0.0.1:7860/sdapi/v1/txt2img')
         // EXACT opaque text, code-unit-for-code-unit, no NAI bracket remap / trim.
@@ -588,6 +591,67 @@ describe('dispatch-time drift + rebind + probe are provider-call-0 (request §D2
     })
 })
 
+describe('A-2: re-read job state after broker wait, before paid dispatch', () => {
+    // The broker slot can be awaited for a long time; a cancel or a config change that
+    // lands DURING the wait must be observed after acquire() and BEFORE any paid provider
+    // call. We inject the change inside a spy on acquire() that calls through to the real
+    // broker (so the slot is genuinely held) and then mutates durable/db state.
+    function spyBrokerMutatingDuringWait(
+        mutate: () => Promise<void> | void,
+    ): { released: () => boolean; restore: () => void } {
+        const original = illustrationTransportBroker.acquire.bind(illustrationTransportBroker)
+        let released = false
+        const spy = vi.spyOn(illustrationTransportBroker, 'acquire').mockImplementation(async (key, policy, priority) => {
+            const realRelease = await original(key, policy, priority)
+            await mutate()
+            return () => { released = true; realRelease() }
+        })
+        return { released: () => released, restore: () => spy.mockRestore() }
+    }
+
+    test('cancel_requested landing during the broker wait yields provider-call-0 and a released slot', async () => {
+        installDatabase('webui')
+        const capture = makeCapturingWebuiFetch()
+        setIllustrationV2TransportFetchersForTests(capture.fetchers)
+        const { jobId } = await prepareAndSupplyV2(webuiRequestPinnedElection, webuiEnvelope())
+
+        const slot = spyBrokerMutatingDuringWait(async () => {
+            const generating = await illustrationJobStore.getJob(jobId)
+            await illustrationJobStore.requestCancel({ jobId, expectedVersion: generating!.version })
+        })
+
+        await runExecutorOnce()
+        slot.restore() // do NOT leak the acquire spy into later tests
+
+        const job = await illustrationJobStore.getJob(jobId)
+        expect(job?.state).toBe('cancelled')
+        expect(capture.calls).toHaveLength(0) // no paid provider call after cancel
+        expect(slot.released()).toBe(true)
+    })
+
+    test('transport config drift during the broker wait yields blocked_config, provider-call-0', async () => {
+        installDatabase('webui')
+        const capture = makeCapturingWebuiFetch()
+        setIllustrationV2TransportFetchersForTests(capture.fetchers)
+        const { jobId } = await prepareAndSupplyV2(webuiRequestPinnedElection, webuiEnvelope())
+
+        const slot = spyBrokerMutatingDuringWait(() => {
+            // The user re-points the webui endpoint while the slot is held -> the re-resolved
+            // target fingerprint no longer matches the captured one.
+            harness.database.webUiUrl = 'http://127.0.0.1:9999/'
+        })
+
+        await runExecutorOnce()
+        slot.restore() // do NOT leak the acquire spy into later tests
+
+        const job = await illustrationJobStore.getJob(jobId)
+        expect(job?.state).toBe('blocked_config')
+        expect(job?.error?.code).toBe('prompt_target_fingerprint_mismatch')
+        expect(capture.calls).toHaveLength(0) // no paid provider call after drift
+        expect(slot.released()).toBe(true)
+    })
+})
+
 describe('supply cross-mode + dispatch-eligibility (request §D1/§6)', () => {
     test('a V2-prepared turn rejects a V1 supplyPrompt', async () => {
         installDatabase('webui')
@@ -666,6 +730,88 @@ describe('supply cross-mode + dispatch-eligibility (request §D1/§6)', () => {
             envelope: webuiEnvelope(),
         })).rejects.toMatchObject({ code: 'prompt_dispatch_ineligible' })
         expect(decodeJob(jobId)?.state).toBe('awaiting_prompt')
+    })
+})
+
+describe('D-2: lost-ACK envelope replay must reject a content-different envelope (Sol #6)', () => {
+    test('same key + differing envelope is rejected; stored envelope/receipt untouched; identical replay still succeeds', async () => {
+        installDatabase('webui')
+        await setTransportConfig({ schemaVersion: 1, election: webuiRequestPinnedElection })
+        const { turnId, jobId, jobVersion } = await registerAndPlan('lost-ack replay')
+        const turnNow = await illustrationJobStore.getTurn(turnId)
+        await preparePromptContext({ turnId, expectedVersion: turnNow!.version, ...REFS })
+        const claimedJob = await illustrationJobStore.claimJob({
+            ...coordinatorProof,
+            jobId,
+            expectedVersion: jobVersion,
+            leaseId: 'tagger',
+        })
+        const supplyArgs = {
+            ...coordinatorProof,
+            jobId,
+            expectedVersion: claimedJob.version,
+            leaseId: 'tagger',
+            fence: claimedJob.fence,
+            idempotencyKey: `env:${jobId}`,
+        }
+        const envA = webuiEnvelope({ basePositive: 'A prompt, masterpiece, 1girl' })
+        await supplyPromptEnvelope({ ...supplyArgs, envelope: envA })
+        const afterFirst = decodeJob(jobId)
+        expect(afterFirst?.state).toBe('queued')
+
+        // Lost-ACK retry with the SAME key but a DIFFERENT envelope B: the receipt binds
+        // envelope A's hash, so B must not be silently reported accepted.
+        const envB = webuiEnvelope({ basePositive: 'B prompt, masterpiece, 2girls' })
+        await expect(supplyPromptEnvelope({ ...supplyArgs, envelope: envB }))
+            .rejects.toMatchObject({ code: 'corrupt' })
+        // The durable envelope/receipt are exactly what A wrote — B never landed.
+        const afterReject = decodeJob(jobId)
+        expect(afterReject?.promptEnvelope).toEqual(afterFirst.promptEnvelope)
+        expect(afterReject?.promptReceipt).toEqual(afterFirst.promptReceipt)
+
+        // A byte-identical replay of A still succeeds unchanged.
+        const replay = await supplyPromptEnvelope({ ...supplyArgs, envelope: envA })
+        expect(replay.state).toBe('queued')
+    })
+})
+
+describe('D-1: prepare mode fence — a turn locks V1/V2 before first prompt supply (Sol #5)', () => {
+    test('preparing a V2 context on a turn with a V1 job already supplied/queued is rejected', async () => {
+        installDatabase('webui')
+        await setTransportConfig({ schemaVersion: 1, election: webuiRequestPinnedElection })
+        const { turnId, jobId, jobVersion } = await registerAndPlan('mode-fence v1-then-prepare')
+        // Supply the V1 prompt FIRST (no prepare) -> the job queues in V1 mode.
+        const claimedJob = await illustrationJobStore.claimJob({
+            ...coordinatorProof,
+            jobId,
+            expectedVersion: jobVersion,
+            leaseId: 'tagger',
+        })
+        await supplyPromptLedger({
+            ...coordinatorProof,
+            jobId,
+            expectedVersion: claimedJob.version,
+            leaseId: 'tagger',
+            fence: claimedJob.fence,
+            idempotencyKey: `prompt:${jobId}`,
+            positive: 'v1 positive',
+            negative: '',
+        })
+        expect(decodeJob(jobId)?.state).toBe('queued')
+        // A V2 prepare now would split the turn across modes -> typed rejection, no bind.
+        const turnNow = await illustrationJobStore.getTurn(turnId)
+        await expect(preparePromptContext({ turnId, expectedVersion: turnNow!.version, ...REFS }))
+            .rejects.toMatchObject({ code: 'prompt_supply_mode_mismatch' })
+        expect((await illustrationJobStore.getTurn(turnId))?.promptContext).toBeUndefined()
+    })
+
+    test('a clean post-plan turn (no job supplied yet) still prepares fine', async () => {
+        installDatabase('webui')
+        await setTransportConfig({ schemaVersion: 1, election: webuiRequestPinnedElection })
+        const { turnId } = await registerAndPlan('mode-fence clean-prepare')
+        const turnNow = await illustrationJobStore.getTurn(turnId)
+        const snapshot = await preparePromptContext({ turnId, expectedVersion: turnNow!.version, ...REFS })
+        expect(snapshot.promptContext?.target.transportId).toBe('webui-flat')
     })
 })
 
