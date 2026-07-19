@@ -1,3 +1,5 @@
+import type { IllustrationPromptContextV2 } from './promptContextV2'
+
 export type ScenePayloadV1 = {
     schemaVersion: number
     data: unknown
@@ -177,6 +179,10 @@ export type IllustrationTurnRecordV1 = IllustrationLeaseRecordFields & {
     sourceTextUtf16?: string
     sourceRevisionHash?: string
     settingsFingerprint?: string
+    // Prompt Target V2 (request §4): the durable PromptContext captured by
+    // preparePromptContext. Once set it is immutable — a re-prepare is rejected.
+    // Absent on legacy/V1-only turns.
+    promptContext?: IllustrationPromptContextV2
     error?: IllustrationRecordErrorV1
     lastPlanClosureWrite?: IllustrationPlanClosureReceiptV1
 }
@@ -472,6 +478,9 @@ export type IllustrationTurnSnapshotV1 = {
     sourceRevisionHash?: string
     offsetEncoding: 'utf-16'
     settingsFingerprint?: string
+    // Prompt Target V2: the prepared PromptContext, projected so a reloading
+    // Plugin can restore target/profile/config/catalog identity (request §10-21/23).
+    promptContext?: IllustrationPromptContextV2
     agentAttemptCount: number
     updatedAt: number
     error?: IllustrationRecordErrorV1

@@ -11,6 +11,7 @@ import {
     listJobsLedger,
     listPendingTurnsLedger,
     markCoordinatorDrainingLedger,
+    preparePromptContext,
     purgeAutomaticBacklog,
     releaseCoordinatorFinalLedger,
     releaseCoordinatorLedger,
@@ -93,6 +94,9 @@ const bridgeDependencies: IllustrationV3BridgeDependencies = {
     ),
     supplyPrompt: async (input) => await supplyPromptLedger(
         input as Parameters<typeof supplyPromptLedger>[0],
+    ),
+    preparePromptContext: async (input) => await preparePromptContext(
+        input as Parameters<typeof preparePromptContext>[0],
     ),
     measureImagePrompt: async (input) => await measureImagePrompt(input),
     cancelJob: cancelLedger,

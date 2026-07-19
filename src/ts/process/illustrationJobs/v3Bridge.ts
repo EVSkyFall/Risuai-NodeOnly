@@ -110,6 +110,9 @@ export const ILLUSTRATION_V3_CONTRACT_IMPLEMENTATION = Object.freeze({
     agentFailure: true,
     agentLlmDrain: true,
     imagePrompt: true,
+    // Provider-neutral Prompt Target V2 (Slice D): preparePromptContext + durable
+    // PromptContext capture. novelai-native is the only resolvable transport yet.
+    promptTargetV2: true,
 } as const)
 
 export const ILLUSTRATION_V3_ERROR_MESSAGES = Object.freeze({
@@ -140,6 +143,9 @@ export const ILLUSTRATION_V3_ERROR_MESSAGES = Object.freeze({
     image_prompt_measurement_unsupported: 'Exact image prompt measurement is unsupported for these settings.',
     image_prompt_invalid: 'The structured image prompt is invalid.',
     settings_fingerprint_mismatch: 'The captured image settings no longer match the current settings.',
+    // Prompt Target V2: the current provider settings do not resolve a durable
+    // transport target (Slice D resolves only novelai-native).
+    prompt_target_unavailable: 'No illustration prompt target is available for the current provider settings.',
 } as const)
 
 export type IllustrationV3ErrorCode = keyof typeof ILLUSTRATION_V3_ERROR_MESSAGES
@@ -195,6 +201,7 @@ function mappedErrorCode(error: unknown): IllustrationV3ErrorCode {
         case 'image_prompt_measurement_unsupported':
         case 'image_prompt_invalid':
         case 'settings_fingerprint_mismatch':
+        case 'prompt_target_unavailable':
             return rawCode
         case 'validation_failed':
             return 'validation'
@@ -346,6 +353,9 @@ export type IllustrationV3BridgeDependencies = {
     claimJob(input: Record<string, unknown>): Promise<unknown>
     submitPlan(input: Record<string, unknown>): Promise<BridgeRecord[]>
     supplyPrompt(input: Record<string, unknown>): Promise<BridgeRecord>
+    // Prompt Target V2 (Slice D). Optional so existing dependency literals keep
+    // type-checking; when absent the RPC surfaces 'unavailable'.
+    preparePromptContext?(input: Record<string, unknown>): Promise<unknown>
     measureImagePrompt(input: MeasureImagePromptInputV1): Promise<IllustrationImagePromptMeasurementV1>
     cancelJob(input: { jobId: string; expectedVersion: number }): Promise<BridgeRecord>
     cancelTurn(input: { turnId: string; expectedVersion: number }): Promise<unknown>
@@ -867,6 +877,7 @@ export const ILLUSTRATION_JOBS_ALIAS = Object.freeze({
     claimJob: '_ijClaimJob',
     submitPlan: '_ijSubmitPlan',
     supplyPrompt: '_ijSupplyPrompt',
+    preparePromptContext: '_ijPreparePromptContext',
     measureImagePrompt: '_ijMeasureImagePrompt',
     listJobs: '_ijListJobs',
     cancel: '_ijCancel',
@@ -965,6 +976,13 @@ export function createAuthorizedIllustrationV3Bridge(input: {
                 imagePromptOwnership: 'plugin-final-structured',
                 imagePromptMeasurement: 'core-provider-model-exact',
                 supportsNaiV4CharacterCaptions: true,
+                // Provider-neutral Prompt Target V2 (Slice D). Additive: it does
+                // not bump imagePromptContractVersion and keeps every V1 field.
+                // preparePromptContext captures a durable PromptContext; only the
+                // novelai-native transport resolves so far (others report
+                // prompt_target_unavailable until Slice E).
+                promptTargetContractVersion: ILLUSTRATION_V3_CONTRACT_IMPLEMENTATION.promptTargetV2 ? 2 : 0,
+                promptTargetResolvableTransports: ['novelai-native'],
                 // Capture Policy V1: durable manual/automatic capture mode, manual
                 // per-response capture, and the pending-only backlog controls. Additive.
                 capturePolicyContractVersion: 1,
@@ -1121,6 +1139,22 @@ export function createAuthorizedIllustrationV3Bridge(input: {
                 async () => await deps.supplyPrompt(request),
             )
             return deps.projectJobSnapshot(record, request.leaseId as string)
+        }),
+        _ijPreparePromptContext: async (value) => await invokeRpc(async () => {
+            ensureLive()
+            const request = sanitizedInput(value)
+            // Prompt Target V2 uses protocolVersion 2 for THIS method only; the
+            // rest of the bridge stays on protocolVersion 1.
+            if (request.protocolVersion !== 2) throw codedError('validation')
+            const prepare = deps.preparePromptContext
+            if (!prepare) throw codedError('unavailable')
+            // Coordinator ownership is required, matching every other durable
+            // turn mutation (claimTurn/submitPlan/supplyPrompt).
+            return await hostRegistry.runOwned(
+                auth.runtimeId,
+                {},
+                async () => await prepare(request),
+            )
         }),
         _ijListJobs: async (value) => await invokeRpc(async () => {
             ensureLive()

@@ -46,6 +46,12 @@ import {
 import {
     measureAndEnforceImagePromptForDispatch,
 } from './imagePromptMeasurement'
+import {
+    resolvePromptTargetV2,
+    validateOpaquePromptRef,
+    validateTagProfileRef,
+    type IllustrationPromptContextV2,
+} from './promptContextV2'
 import { withIllustrationOperationLock } from './operationLock'
 import { computeNaiSettingsFingerprint } from './settingsFingerprint'
 import { computeSourceRevisionHash, hashesMatch, sha256Hex } from './sourceHash'
@@ -1112,6 +1118,56 @@ export async function recoverIllustrationProjection(
 }
 
 export { MAX_ILLUSTRATION_PROMPT_BYTES } from './imagePrompt'
+
+// ---------------------------------------------------------------------------
+// Prompt Target V2 preparation (request §4). Called by the Plugin BEFORE its
+// Planner/Tagger LLM. In one ledger transaction Core captures the current
+// provider target (Slice D: novelai-native only), stores the Plugin-supplied
+// opaque tag-profile/config/catalog refs verbatim, CAS-bumps the turn version,
+// and persists the durable PromptContext. A prepared turn rejects re-binding.
+// ---------------------------------------------------------------------------
+
+export type PreparePromptContextInput = {
+    turnId: string
+    expectedVersion: number
+    tagProfile: unknown
+    profileConfigRevision: unknown
+    assetCatalogDigest: unknown
+}
+
+export async function preparePromptContext(
+    input: PreparePromptContextInput,
+): Promise<IllustrationTurnSnapshotV1> {
+    requireNonEmpty(input.turnId, 'turnId')
+    if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 0) {
+        throw new IllustrationLedgerValidationError('expectedVersion must be a non-negative integer')
+    }
+    // Opaque Plugin-owned refs: validated as bounded non-empty strings only. Core
+    // never interprets their meaning (request §3/§4).
+    const tagProfile = validateTagProfileRef(input.tagProfile)
+    const profileConfigRevision = validateOpaquePromptRef(
+        input.profileConfigRevision,
+        'profileConfigRevision',
+    )
+    const assetCatalogDigest = validateOpaquePromptRef(input.assetCatalogDigest, 'assetCatalogDigest')
+
+    // Snapshot the current provider target. resolvePromptTargetV2 raises a typed
+    // prompt_target_unavailable failure for the not-yet-implemented transports.
+    const target = await resolvePromptTargetV2(getDatabase())
+
+    const promptContext: IllustrationPromptContextV2 = {
+        target,
+        tagProfile,
+        profileConfigRevision,
+        assetCatalogDigest,
+    }
+    const record = await illustrationJobStore.prepareTurnPromptContext({
+        turnId: input.turnId,
+        expectedVersion: input.expectedVersion,
+        promptContext,
+    })
+    return projectTurnSnapshot(record)
+}
 
 type SupplyPromptLedgerBaseInput = IllustrationHolderWrite & IllustrationCoordinatorProof & {
     jobId: string

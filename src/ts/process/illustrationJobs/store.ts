@@ -14,7 +14,9 @@ import {
     IllustrationLedgerNotFoundError,
     IllustrationLedgerValidationError,
     IllustrationLedgerVersionConflictError,
+    IllustrationPromptContextRebindError,
 } from './errors'
+import type { IllustrationPromptContextV2 } from './promptContextV2'
 import { validateCoordinatorProofUnlocked } from './coordinatorRecord'
 import {
     isLegacyIllustrationStoredPrompt,
@@ -107,6 +109,12 @@ export type UpdateTurnInput = {
     mutate: (
         draft: IllustrationTurnRecordV1,
     ) => Awaitable<void | IllustrationTurnRecordV1>
+}
+
+export type PrepareTurnPromptContextInput = {
+    turnId: string
+    expectedVersion: number
+    promptContext: IllustrationPromptContextV2
 }
 
 export type CreateManifestPreparedInput = {
@@ -416,6 +424,9 @@ export function projectTurnSnapshot(
         offsetEncoding: 'utf-16',
         ...(record.settingsFingerprint === undefined ? {} : {
             settingsFingerprint: record.settingsFingerprint,
+        }),
+        ...(record.promptContext === undefined ? {} : {
+            promptContext: cloneJson(record.promptContext),
         }),
         agentAttemptCount: record.agentAttemptCount ?? 0,
         updatedAt: record.updatedAt,
@@ -1051,6 +1062,24 @@ export class IllustrationJobStore {
             await writePersistentJson(illustrationTurnKey(current.turnId), candidate)
             await this.syncPendingIndexUnlocked(candidate.turnId, candidate.state)
             return cloneJson(candidate)
+        })
+    }
+
+    // Prompt Target V2 (request §4): atomically bind a durable PromptContext to a
+    // turn under version CAS. A turn that already carries a context REJECTS the
+    // re-bind with a stable validation-family error — prepared targets never drift.
+    async prepareTurnPromptContext(
+        input: PrepareTurnPromptContextInput,
+    ): Promise<IllustrationTurnRecordV1> {
+        return await this.updateTurn({
+            turnId: input.turnId,
+            expectedVersion: input.expectedVersion,
+            mutate: (draft) => {
+                if (draft.promptContext !== undefined) {
+                    throw new IllustrationPromptContextRebindError()
+                }
+                draft.promptContext = input.promptContext
+            },
         })
     }
 

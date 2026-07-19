@@ -144,3 +144,56 @@ export class IllustrationLedgerConfirmationRequiredError extends IllustrationLed
         super('confirmation_required', message)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Provider-neutral Prompt Target V2 (Slice D). These errors sit on the new V2
+// preparation/envelope/receipt surface and never touch the V1 legacy drain path.
+// ---------------------------------------------------------------------------
+
+// Re-binding a turn that already carries a durable PromptContext. It extends the
+// validation family (code 'validation_failed', surfaced through the V3 bridge as
+// 'validation') so a repeated prepare is a stable, definite request rejection —
+// never an uncertain provider outcome. The `reason` disambiguates it in tests.
+export class IllustrationPromptContextRebindError extends IllustrationLedgerValidationError {
+    readonly reason = 'prompt_context_already_bound' as const
+
+    constructor() {
+        super('The illustration turn prompt context is already prepared and cannot be re-bound')
+    }
+}
+
+// A transport whose durable target cannot be resolved yet. In Slice D only
+// 'novelai-native' resolves; the other three transports (nai-compatible-flat,
+// webui-flat, comfyui-flat) surface this typed preparation failure until Slice E.
+export class IllustrationPromptTargetUnavailableError extends IllustrationLedgerError {
+    readonly transportId: string
+    readonly detail: string
+
+    constructor(transportId: string, detail: string) {
+        super(
+            'prompt_target_unavailable',
+            `The illustration prompt target for transport "${transportId}" is unavailable: ${detail}`,
+        )
+        this.transportId = transportId
+        this.detail = detail
+    }
+}
+
+export type IllustrationPromptV2ContractErrorCode =
+    | 'prompt_envelope_invalid'
+    | 'prompt_layout_unsupported'
+    | 'prompt_negative_channel_unsupported'
+    | 'prompt_pipe_conflict'
+    | 'prompt_pipe_serialization_unsupported'
+    | 'prompt_measurement_mode_unsupported'
+    | 'prompt_receipt_binding_mismatch'
+    | 'prompt_target_fingerprint_mismatch'
+    | 'prompt_dispatch_ineligible'
+
+// Envelope validation, measurement-receipt binding, and dispatch-eligibility
+// failures on the V2 surface. All are definite validation-family rejections.
+export class IllustrationPromptV2ContractError extends IllustrationLedgerError {
+    constructor(code: IllustrationPromptV2ContractErrorCode, message: string) {
+        super(code, message)
+    }
+}
