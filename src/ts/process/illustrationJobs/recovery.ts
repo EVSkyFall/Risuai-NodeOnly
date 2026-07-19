@@ -12,6 +12,7 @@ import {
 import {
     commitIllustrationAssetReadyJob,
     reconcileIllustrationCommittingJob,
+    recoverRevisionJob,
     withIllustrationWorkerEpoch,
 } from './executor'
 import { isIllustrationFeatureEnabled } from './featureFlag'
@@ -203,6 +204,14 @@ async function recoverPreDispatchJob(job: IllustrationJobRecordV1, epoch: number
 
 async function recoverJob(job: IllustrationJobRecordV1, epoch: number): Promise<void> {
     if (isTerminalJobState(job.state)) return
+    // Image Revision V1: revision child jobs use a dedicated recovery path (inlay
+    // swap/insert + reference CAS). prompt_ready children are stable — they await an
+    // explicit user image confirmation and need no recovery action.
+    if (job.revision) {
+        if (job.state === 'prompt_ready' || job.state === 'awaiting_prompt') return
+        await recoverRevisionJob(job, epoch)
+        return
+    }
     if (['prepared', 'awaiting_prompt', 'queued', 'blocked_config'].includes(job.state)) {
         await recoverPreDispatchJob(job, epoch)
         return

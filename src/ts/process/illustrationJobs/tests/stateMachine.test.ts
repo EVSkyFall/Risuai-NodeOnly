@@ -16,10 +16,15 @@ const allowedJobEdges: Array<[IllustrationJobState, IllustrationJobState]> = [
     ['prepared', 'stale'],
     ['prepared', 'corrupt'],
     ['awaiting_prompt', 'queued'],
+    ['awaiting_prompt', 'prompt_ready'], // Image Revision V1: retag child Tagger supply.
     ['awaiting_prompt', 'agent_blocked_retryable'], // Report §8: retryable Tagger failure.
     ['awaiting_prompt', 'agent_blocked'], // Report §8: hard/exhausted Tagger failure.
     ['awaiting_prompt', 'stale'],
     ['awaiting_prompt', 'corrupt'],
+    ['prompt_ready', 'queued'], // Image Revision V1: enqueueRevisionImage only.
+    ['prompt_ready', 'cancelled'],
+    ['prompt_ready', 'stale'],
+    ['prompt_ready', 'corrupt'],
     ['agent_blocked_retryable', 'awaiting_prompt'], // Report §8: retryAgentFailure only.
     ['agent_blocked_retryable', 'cancelled'], // Report §8: blocked work is cancellable.
     ['agent_blocked_retryable', 'stale'], // Report §8: edit-staleness closure.
@@ -82,10 +87,10 @@ describe('illustration job transition matrix', () => {
         expect(() => assertTransition('job', from, to)).toThrow(IllustrationLedgerTransitionError)
     })
 
-    test('pins the complete set of 48 allowed general transitions', () => {
+    test('pins the complete set of 53 allowed general transitions', () => {
         const allStates = Object.keys(JOB_TRANSITIONS) as IllustrationJobState[]
         const expected = new Set(allowedJobEdges.map(([from, to]) => `${from}->${to}`))
-        expect(expected.size).toBe(48)
+        expect(expected.size).toBe(53)
 
         for (const from of allStates) {
             for (const to of allStates) {

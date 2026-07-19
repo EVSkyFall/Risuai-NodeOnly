@@ -313,6 +313,12 @@ export type IllustrationV3BridgeDependencies = {
     measureImagePrompt(input: MeasureImagePromptInputV1): Promise<IllustrationImagePromptMeasurementV1>
     cancelJob(input: { jobId: string; expectedVersion: number }): Promise<BridgeRecord>
     cancelTurn(input: { turnId: string; expectedVersion: number }): Promise<unknown>
+    createImageRevision(input: Record<string, unknown>): Promise<unknown>
+    getImageRevisionTarget(input: Record<string, unknown>): Promise<unknown>
+    listImageRevisions(input: Record<string, unknown>): Promise<unknown>
+    restoreImageRevision(input: Record<string, unknown>): Promise<unknown>
+    enqueueRevisionImage(input: Record<string, unknown>): Promise<unknown>
+    listImageReferences(input: Record<string, unknown>): Promise<unknown>
     retryUncertain(input: Record<string, unknown>): Promise<BridgeRecord>
     reportAgentFailure(input: Record<string, unknown>): Promise<unknown>
     retryAgentFailure(input: Record<string, unknown>): Promise<unknown>
@@ -784,6 +790,13 @@ export const ILLUSTRATION_JOBS_ALIAS = Object.freeze({
     retryUncertain: '_ijRetryUncertain',
     reportAgentFailure: '_ijReportAgentFailure',
     retryAgentFailure: '_ijRetryAgentFailure',
+    // Image Revision V1 (§4/§6): private-bridge revision surface.
+    createImageRevision: '_ijCreateImageRevision',
+    getImageRevisionTarget: '_ijGetImageRevisionTarget',
+    listImageRevisions: '_ijListImageRevisions',
+    restoreImageRevision: '_ijRestoreImageRevision',
+    enqueueRevisionImage: '_ijEnqueueRevisionImage',
+    listImageReferences: '_ijListImageReferences',
     subscribe: '_ijSubscribe',
     unsubscribe: '_ijUnsubscribe',
 } as const)
@@ -872,6 +885,10 @@ export function createAuthorizedIllustrationV3Bridge(input: {
                 // Capture Policy V1: durable manual/automatic capture mode, manual
                 // per-response capture, and the pending-only backlog controls. Additive.
                 capturePolicyContractVersion: 1,
+                // Image Revision V1: reference/lineage ledger, exact/edited/retag
+                // revision children, replace/retain dispositions, no-charge restore,
+                // and bounded revision/reference projections. Additive.
+                imageRevisionContractVersion: 1,
                 // Additive capabilities. The host always forces a single generation
                 // (noMultiGen) and, on supported providers only, forwards a validated
                 // structured-output schema to native JSON schema / response format;
@@ -1051,6 +1068,57 @@ export function createAuthorizedIllustrationV3Bridge(input: {
                 auth.runtimeId,
                 {},
                 async () => await deps.retryAgentFailure(request),
+            )
+        }),
+        // Image Revision V1: mutating revision RPCs run under coordinator ownership
+        // (they admit executor work, charge, or mutate chat). Read-only projections
+        // are available without ownership so a reloading dashboard can render.
+        _ijCreateImageRevision: async (value) => await invokeRpc(async () => {
+            ensureLive()
+            const request = sanitizedInput(value)
+            assertProtocol(request)
+            return await hostRegistry.runOwned(
+                auth.runtimeId,
+                {},
+                async () => await deps.createImageRevision(request),
+            )
+        }),
+        _ijGetImageRevisionTarget: async (value) => await invokeRpc(async () => {
+            ensureLive()
+            const request = sanitizedInput(value)
+            assertProtocol(request)
+            return await deps.getImageRevisionTarget(request)
+        }),
+        _ijListImageRevisions: async (value) => await invokeRpc(async () => {
+            ensureLive()
+            const request = sanitizedInput(value)
+            assertProtocol(request)
+            return await deps.listImageRevisions(request)
+        }),
+        _ijListImageReferences: async (value) => await invokeRpc(async () => {
+            ensureLive()
+            const request = sanitizedInput(value)
+            assertProtocol(request)
+            return await deps.listImageReferences(request)
+        }),
+        _ijRestoreImageRevision: async (value) => await invokeRpc(async () => {
+            ensureLive()
+            const request = sanitizedInput(value)
+            assertProtocol(request)
+            return await hostRegistry.runOwned(
+                auth.runtimeId,
+                {},
+                async () => await deps.restoreImageRevision(request),
+            )
+        }),
+        _ijEnqueueRevisionImage: async (value) => await invokeRpc(async () => {
+            ensureLive()
+            const request = sanitizedInput(value)
+            assertProtocol(request)
+            return await hostRegistry.runOwned(
+                auth.runtimeId,
+                {},
+                async () => await deps.enqueueRevisionImage(request),
             )
         }),
         _ijSubscribe: async (value) => await invokeRpc(async () => {

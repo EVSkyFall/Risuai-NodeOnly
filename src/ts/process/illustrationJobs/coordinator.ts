@@ -1256,6 +1256,31 @@ export async function supplyPromptLedger(
     const supplied = supplyPromptValue(input)
     const job = await illustrationJobStore.getJob(input.jobId)
     if (!job) throw new IllustrationLedgerValidationError('Illustration job was not found')
+    // Image Revision V1: a retag revision child's Tagger supply stops at
+    // prompt_ready (never queued). It requires an explicit enqueueRevisionImage
+    // image-charge confirmation before the provider runs. Its target is a committed
+    // inlay resolved at commit time, so there is no slot context to resolve here.
+    if (job.revision?.mode === 'retag') {
+        if (job.state === 'awaiting_prompt') {
+            validateHolderWrite(job, input)
+            await enforceSupplyPromptMeasurement(job, supplied.prompt)
+        }
+        const ready = await illustrationJobStore.transitionJob({
+            jobId: job.jobId,
+            expectedVersion: input.expectedVersion,
+            to: 'prompt_ready',
+            leaseId: input.leaseId,
+            fence: input.fence,
+            coordinatorLeaseId: input.coordinatorLeaseId,
+            coordinatorFence: input.coordinatorFence,
+            patch: {
+                idempotencyKey: input.idempotencyKey,
+                prompt: supplied.prompt,
+            },
+        })
+        emitIllustrationWakeHint('job_changed', ready.turnId, ready.jobId)
+        return ready
+    }
     if (job.state !== 'awaiting_prompt') {
         const crossUpgradeLegacyReplay = isLegacyIllustrationStoredPrompt(job.prompt)
             && supplied.legacyInput

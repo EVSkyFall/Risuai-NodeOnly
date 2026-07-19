@@ -22,6 +22,14 @@ import {
 } from './coordinator'
 import { getCapturePolicy, setCaptureMode } from './capturePolicy'
 import {
+    createImageRevision,
+    enqueueRevisionImage,
+    getImageRevisionTarget,
+    listImageReferences,
+    listImageRevisions,
+    restoreImageRevision,
+} from './revision'
+import {
     admitIllustrationCoordinatorLlm,
     getCoordinatorRecord,
     setIllustrationFeatureEnabledWithCoordinatorDrain,
@@ -87,6 +95,24 @@ const bridgeDependencies: IllustrationV3BridgeDependencies = {
     measureImagePrompt: async (input) => await measureImagePrompt(input),
     cancelJob: cancelLedger,
     cancelTurn: cancelTurnLedger,
+    createImageRevision: async (input) => await createImageRevision(
+        input as Parameters<typeof createImageRevision>[0],
+    ),
+    getImageRevisionTarget: async (input) => await getImageRevisionTarget(
+        input as Parameters<typeof getImageRevisionTarget>[0],
+    ),
+    listImageRevisions: async (input) => await listImageRevisions(
+        input as Parameters<typeof listImageRevisions>[0],
+    ),
+    restoreImageRevision: async (input) => await restoreImageRevision(
+        input as Parameters<typeof restoreImageRevision>[0],
+    ),
+    enqueueRevisionImage: async (input) => await enqueueRevisionImage(
+        input as Parameters<typeof enqueueRevisionImage>[0],
+    ),
+    listImageReferences: async (input) => await listImageReferences(
+        input as Parameters<typeof listImageReferences>[0],
+    ),
     retryUncertain: async (input) => await retryUncertainLedger(
         input as Parameters<typeof retryUncertainLedger>[0],
     ),

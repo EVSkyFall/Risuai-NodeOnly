@@ -62,6 +62,8 @@ export type JobStateAcceptanceClassification = Readonly<{
 export const JOB_STATE_ACCEPTANCE = Object.freeze({
     prepared: { terminal: false, dashboardOutstanding: true, prunable: false },
     awaiting_prompt: { terminal: false, dashboardOutstanding: true, prunable: false },
+    // Image Revision V1: a retag child awaiting the forced image-charge confirmation.
+    prompt_ready: { terminal: false, dashboardOutstanding: true, prunable: false },
     agent_blocked_retryable: { terminal: false, dashboardOutstanding: true, prunable: false },
     agent_blocked: { terminal: false, dashboardOutstanding: true, prunable: false },
     queued: { terminal: false, dashboardOutstanding: true, prunable: false },

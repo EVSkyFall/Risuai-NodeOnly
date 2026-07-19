@@ -10,11 +10,18 @@ export const JOB_TRANSITIONS: Readonly<Record<IllustrationJobState, readonly Ill
     ],
     awaiting_prompt: [
         'queued',
+        'prompt_ready', // Image Revision V1: retag child stops here after Tagger supply.
         'agent_blocked_retryable', // Report §8: retryable Tagger failure is durably blocked.
         'agent_blocked', // Report §8: non-retryable/exhausted Tagger failure is durably blocked.
         'cancelled',
         'stale', // §5-8 / §8.3 / §13: edited or moved target before dispatch.
         'corrupt', // §7.3 / §8.2: broken projection or duplicate anchor before dispatch.
+    ],
+    prompt_ready: [
+        'queued', // Image Revision V1: only enqueueRevisionImage(confirmNewImageCharge) may advance.
+        'cancelled',
+        'stale', // Target moved before the user confirms the image charge.
+        'corrupt', // Broken projection/duplicate anchor before the confirmed charge.
     ],
     agent_blocked_retryable: [
         'awaiting_prompt', // Report §8: only retryAgentFailure may reopen the Tagger.

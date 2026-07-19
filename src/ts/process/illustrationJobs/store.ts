@@ -39,6 +39,7 @@ import type {
     IllustrationJobTerminalSummaryV1,
     IllustrationJobTransitionPatch,
     IllustrationLeaseRecordFields,
+    IllustrationRevisionChargeCertainty,
     IllustrationTargetV1,
     IllustrationTurnRecordV1,
     IllustrationTurnState,
@@ -172,6 +173,12 @@ export type RetryUncertainJobInput = {
     jobId: string
     expectedVersion: number
     confirmNewCharge: true
+}
+
+export type EnqueueRevisionImageInput = {
+    jobId: string
+    expectedVersion: number
+    confirmNewImageCharge: true
 }
 
 export type PruneTerminalRecordsInput = {
@@ -445,6 +452,60 @@ export function projectFullJobSnapshot(
         updatedAt: record.updatedAt,
         agentAttemptCount: record.agentAttemptCount ?? 0,
         ...(record.error ? { error: cloneJson(record.error) } : {}),
+        ...(record.revision ? { revision: projectRevisionDescriptor(record) } : {}),
+    }
+}
+
+// Image Revision V1: the private-bridge projection of a revision child's descriptor,
+// enriched with the provider-dispatch/charge status derived from the current state.
+function projectRevisionDescriptor(
+    record: IllustrationJobRecordV1,
+): NonNullable<IllustrationJobFullSnapshotV1['revision']> {
+    const revision = record.revision!
+    const status = revisionJobChargeStatus(record.state, record.error?.code)
+    return {
+        referenceId: revision.referenceId,
+        lineageId: revision.lineageId,
+        revisionId: revision.revisionId,
+        parentRevisionId: revision.parentRevisionId,
+        mode: revision.mode,
+        disposition: revision.disposition,
+        operationVersion: revision.admittedOperationVersion,
+        providerDispatched: status.providerDispatched,
+        chargeCertainty: status.chargeCertainty,
+    }
+}
+
+// Kept in sync with revisionLedger.jobChargeStatus; duplicated here to avoid a
+// store<->revisionLedger import cycle (revisionLedger imports store).
+function revisionJobChargeStatus(
+    state: IllustrationJobState,
+    errorCode: string | undefined,
+): { providerDispatched: boolean; chargeCertainty: IllustrationRevisionChargeCertainty } {
+    switch (state) {
+        case 'prepared':
+        case 'awaiting_prompt':
+        case 'prompt_ready':
+        case 'agent_blocked_retryable':
+        case 'agent_blocked':
+        case 'queued':
+        case 'blocked_config':
+            return { providerDispatched: false, chargeCertainty: 'not-started' }
+        case 'generating':
+        case 'cancel_requested':
+        case 'asset_writing':
+        case 'asset_ready':
+        case 'committing':
+        case 'committed':
+            return { providerDispatched: true, chargeCertainty: 'charged' }
+        case 'uncertain':
+            return { providerDispatched: true, chargeCertainty: 'uncertain' }
+        case 'failed':
+            return errorCode?.startsWith('provider')
+                ? { providerDispatched: true, chargeCertainty: 'not-charged' }
+                : { providerDispatched: false, chargeCertainty: 'not-charged' }
+        default:
+            return { providerDispatched: false, chargeCertainty: 'not-started' }
     }
 }
 
@@ -797,8 +858,12 @@ export class IllustrationJobStore {
 
     private async finalizeTurnAfterJobsUnlocked(
         turnId: string,
-    ): Promise<IllustrationTurnRecordV1> {
-        const observed = await this.requireTurnUnlocked(turnId)
+    ): Promise<IllustrationTurnRecordV1 | null> {
+        // Image Revision V1: revision child jobs carry a synthetic turnId with no
+        // turn record. There is nothing to finalize; return null rather than throw
+        // so the shared terminal-transition/cancel paths tolerate revision children.
+        const observed = await this.readTurnUnlocked(turnId)
+        if (!observed) return null
         if (observed.state !== 'awaiting_prompt') return cloneJson(observed)
 
         const jobs = await this.listTurnJobRecordsUnlocked(turnId)
@@ -1233,7 +1298,7 @@ export class IllustrationJobStore {
         })
     }
 
-    async finalizeTurnAfterJobs(turnId: string): Promise<IllustrationTurnRecordV1> {
+    async finalizeTurnAfterJobs(turnId: string): Promise<IllustrationTurnRecordV1 | null> {
         return await withIllustrationLedgerLock(async () => {
             assertNonEmptyString(turnId, 'turnId')
             return await this.finalizeTurnAfterJobsUnlocked(turnId)
@@ -1313,7 +1378,11 @@ export class IllustrationJobStore {
             // Holder/coordinator fields identify Plugin Agent pipeline writes.
             // Executor-owned NAI/asset transitions intentionally omit them: the
             // coordinator governs Agent LLM work, not Core's NAI worker.
-            const promptSupply = current.state === 'awaiting_prompt' && input.to === 'queued'
+            // Image Revision V1: a retag revision child's Tagger supply stops at
+            // prompt_ready instead of queued, but it is the same durable-prompt
+            // Plugin Agent write and requires the same holder+coordinator proof.
+            const promptSupply = current.state === 'awaiting_prompt'
+                && (input.to === 'queued' || input.to === 'prompt_ready')
             const pluginAgentWrite = promptSupply
                 || input.leaseId !== undefined
                 || input.fence !== undefined
@@ -1377,7 +1446,10 @@ export class IllustrationJobStore {
             } else {
                 delete next.lastHolderWrite
             }
-            if (current.state === 'awaiting_prompt' && input.to === 'queued') {
+            if (
+                current.state === 'awaiting_prompt'
+                && (input.to === 'queued' || input.to === 'prompt_ready')
+            ) {
                 // Gate 4a decision 2A: a durable prompt is the Tagger success
                 // boundary that resets the cumulative Agent failure count.
                 next.agentAttemptCount = 0
@@ -1439,7 +1511,11 @@ export class IllustrationJobStore {
                 next.cancelRequestedAt = current.cancelRequestedAt
             }
 
-            if (current.state === 'awaiting_prompt' && input.to === 'queued' && !next.prompt) {
+            if (
+                current.state === 'awaiting_prompt'
+                && (input.to === 'queued' || input.to === 'prompt_ready')
+                && !next.prompt
+            ) {
                 throw new IllustrationLedgerValidationError('Final prompts must be durable before queuing')
             }
             if (current.state === 'queued' && input.to === 'generating') {
@@ -1500,6 +1576,7 @@ export class IllustrationJobStore {
             switch (current.state) {
                 case 'prepared':
                 case 'awaiting_prompt':
+                case 'prompt_ready':
                 case 'agent_blocked_retryable':
                 case 'agent_blocked':
                 case 'queued':
@@ -1911,6 +1988,60 @@ export class IllustrationJobStore {
             // uncertain is a terminal boundary; the explicit paid retry starts a
             // fresh attempt and does not inherit a prior attempt's cancel intent.
             delete next.cancelRequestedAt
+            await writePersistentJson(illustrationJobKey(current.jobId), next)
+            return cloneJson(next)
+        })
+    }
+
+    // Image Revision V1: the forced second charge-confirmation step for a retag
+    // revision child. Transitions prompt_ready -> queued only with an explicit
+    // confirmNewImageCharge, so the Tagger (LLM) and the image are two distinct
+    // confirmations. Idempotent for double click / ACK loss / reload.
+    async enqueueRevisionImageJob(
+        input: EnqueueRevisionImageInput,
+    ): Promise<IllustrationJobRecordV1> {
+        return await withIllustrationLedgerLock(async () => {
+            if (input.confirmNewImageCharge !== true) {
+                throw new IllustrationLedgerConfirmationRequiredError(
+                    'Enqueuing a retag revision image requires confirmNewImageCharge: true',
+                )
+            }
+            const current = await this.requireJobUnlocked(input.jobId)
+            const enqueueKey = `enqueue:${input.jobId}:${input.expectedVersion}`
+            if (current.version !== input.expectedVersion) {
+                if (
+                    current.version === input.expectedVersion + 1
+                    && current.state === 'queued'
+                    && current.idempotencyKey === enqueueKey
+                ) return cloneJson(current)
+                throw new IllustrationLedgerVersionConflictError(input.expectedVersion, current.version)
+            }
+            if (!current.revision || current.revision.mode !== 'retag') {
+                throw new IllustrationLedgerValidationError(
+                    'Only retag revision children may be enqueued for an image',
+                )
+            }
+            if (current.state !== 'prompt_ready') {
+                throw new IllustrationLedgerValidationError(
+                    'Only a prompt_ready revision child may be enqueued for an image',
+                )
+            }
+            if (!current.prompt) {
+                throw new IllustrationLedgerValidationError(
+                    'A prompt_ready revision child must carry a durable prompt',
+                )
+            }
+            assertTransition('job', current.state, 'queued')
+            const now = Date.now()
+            const next: IllustrationJobRecordV1 = {
+                ...current,
+                state: 'queued',
+                idempotencyKey: enqueueKey,
+                version: current.version + 1,
+                updatedAt: now,
+            }
+            delete next.lastHolderWrite
+            delete next.lastRetryWrite
             await writePersistentJson(illustrationJobKey(current.jobId), next)
             return cloneJson(next)
         })

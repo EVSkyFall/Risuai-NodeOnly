@@ -83,6 +83,11 @@ export type IllustrationJobState =
     | 'awaiting_prompt'
     | 'agent_blocked_retryable'
     | 'agent_blocked'
+    // Image Revision V1: a retag revision child stops here after the Tagger
+    // supplies a durable prompt. It is NON-terminal and reached ONLY from
+    // awaiting_prompt on a retag child; the sole exit is enqueueRevisionImage
+    // (prompt_ready -> queued), the forced second charge-confirmation step.
+    | 'prompt_ready'
     | 'queued'
     | 'generating'
     | 'cancel_requested'
@@ -206,6 +211,170 @@ export type IllustrationJobRecordV1 = IllustrationLeaseRecordFields & {
     assetId?: string
     error?: IllustrationRecordErrorV1
     cancelRequestedAt?: number
+    // Image Revision V1: present only on revision child jobs. Immutable once set;
+    // it never appears on manifest-projected (genesis) jobs. Its presence routes
+    // the job through the revision execution/commit path (inlay swap/insert +
+    // reference/lineage CAS) instead of the slot-splice commit.
+    revision?: IllustrationJobRevisionDescriptorV1
+}
+
+// ---------------------------------------------------------------------------
+// Image Revision V1 (contract §4/§6): durable reference/lineage ledger types.
+// ---------------------------------------------------------------------------
+
+export type IllustrationRevisionMode = 'exact-prompt' | 'edited-prompt' | 'retag'
+export type IllustrationRevisionDisposition = 'replace' | 'retain'
+
+// The provider-dispatch/charge state surfaced to the Plugin for cancellation
+// wording (§4.3) and history (§6). 'not-started' = no provider dispatch yet;
+// 'charged' = dispatch happened and a charge is assumed; 'not-charged' = closed
+// out before/without a charge; 'uncertain' = dispatch happened but the charge is
+// unknown (mirrors the ledger 'uncertain' terminal).
+export type IllustrationRevisionChargeCertainty =
+    | 'not-started'
+    | 'charged'
+    | 'not-charged'
+    | 'uncertain'
+
+// Internal lineage-entry mode. Superset of the RPC-visible IllustrationRevisionMode:
+// adds 'genesis' (the original committed asset) and 'restore' (a no-charge re-point).
+export type IllustrationLineageEntryMode =
+    | 'genesis'
+    | 'exact-prompt'
+    | 'edited-prompt'
+    | 'retag'
+    | 'restore'
+
+export type IllustrationRevisionIdentity = {
+    referenceId: string
+    operationVersion: number
+    lineageId: string
+    lineageVersion: number
+    sourceJobId: string
+    currentAssetId: string
+}
+
+// Immutable descriptor attached to a revision child job at admission time.
+export type IllustrationJobRevisionDescriptorV1 = {
+    referenceId: string
+    lineageId: string
+    parentRevisionId: string
+    // The lineage entry id this child will create on commit.
+    revisionId: string
+    mode: IllustrationRevisionMode
+    disposition: IllustrationRevisionDisposition
+    // The reference operationVersion consumed when this child was admitted.
+    admittedOperationVersion: number
+    // Commit-time CAS inputs captured at admission (the "expected" tuple).
+    expectedLineageVersion: number
+    expectedCurrentAssetId: string
+    // Retain fork identities, minted at admission, materialized at commit.
+    forkReferenceId?: string
+    forkLineageId?: string
+    // Prompt hash bound at admission (exact/edited); recomputed for retag at supply.
+    promptHash: string
+}
+
+export type IllustrationLineageRevisionEntryV1 = {
+    revisionId: string
+    parentRevisionId: string | null
+    jobId: string | null
+    assetId: string
+    // Full structured prompt is retained so a no-charge restore can re-point the
+    // reference to any past revision's exact prompt (getImageRevisionTarget).
+    prompt: IllustrationPromptV1
+    promptHash: string
+    mode: IllustrationLineageEntryMode
+    disposition: IllustrationRevisionDisposition | null
+    chargeCertainty: IllustrationRevisionChargeCertainty
+    createdAt: number
+}
+
+export type IllustrationImageReferenceRecordV1 = {
+    schemaVersion: 1
+    referenceId: string
+    operationVersion: number
+    lineageId: string
+    lineageVersion: number
+    sourceJobId: string
+    currentAssetId: string
+    currentRevisionId: string
+    currentPrompt: IllustrationPromptV1
+    currentPromptHash: string
+    settingsFingerprint: string
+    sceneId: string
+    scenePayload: ScenePayloadV1
+    target: IllustrationTargetV1
+    // Retain provenance: present only on forked references.
+    sourceLineageId?: string
+    sourceRevisionId?: string
+    createdAt: number
+    updatedAt: number
+}
+
+export type IllustrationImageLineageRecordV1 = {
+    schemaVersion: 1
+    lineageId: string
+    referenceId: string
+    revisions: IllustrationLineageRevisionEntryV1[]
+    createdAt: number
+    updatedAt: number
+}
+
+// Durable admission receipt keyed by the Plugin's idempotencyKey. A repeated key
+// with the same binding returns the same admitted child/result; a divergent
+// binding is an idempotency_conflict.
+export type IllustrationRevisionIntentReceiptV1 = {
+    schemaVersion: 1
+    idempotencyKey: string
+    referenceId: string
+    kind: 'revision' | 'restore'
+    bindingHash: string
+    admittedOperationVersion: number
+    childJobId?: string
+    restoredIdentity?: IllustrationRevisionIdentity
+    createdAt: number
+}
+
+export type IllustrationRevisionSummaryV1 = {
+    revisionId: string
+    parentRevisionId: string | null
+    jobId: string | null
+    assetId: string
+    promptHash: string
+    mode: IllustrationLineageEntryMode
+    disposition: IllustrationRevisionDisposition | null
+    chargeCertainty: IllustrationRevisionChargeCertainty
+    isCurrent: boolean
+    createdAt: number
+}
+
+export type IllustrationImageReferenceSummaryV1 = {
+    protocolVersion: 1
+    referenceId: string
+    operationVersion: number
+    lineageId: string
+    lineageVersion: number
+    sourceJobId: string
+    currentAssetId: string
+    target: Pick<
+        IllustrationTargetV1,
+        'chaId' | 'conversationId' | 'expectedMessageId' | 'rootTurnId'
+    >
+    createdAt: number
+    updatedAt: number
+}
+
+export type IllustrationRevisionJobProjectionV1 = {
+    referenceId: string
+    lineageId: string
+    revisionId: string
+    parentRevisionId: string
+    mode: IllustrationRevisionMode
+    disposition: IllustrationRevisionDisposition
+    operationVersion: number
+    providerDispatched: boolean
+    chargeCertainty: IllustrationRevisionChargeCertainty
 }
 
 export type StoredPlanManifestV1 = PlanManifestV1 & {
@@ -309,6 +478,8 @@ export type IllustrationJobFullSnapshotV1 = {
     updatedAt: number
     agentAttemptCount: number
     error?: IllustrationRecordErrorV1
+    // Image Revision V1: present only on revision child jobs.
+    revision?: IllustrationRevisionJobProjectionV1
 }
 
 export type IllustrationJobTerminalSummaryV1 = {
