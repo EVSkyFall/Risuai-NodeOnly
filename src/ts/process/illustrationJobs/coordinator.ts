@@ -22,11 +22,14 @@ import {
 } from './errors'
 import {
     claimCoordinator as claimCoordinatorRecord,
+    forceTakeoverCoordinator as forceTakeoverCoordinatorRecord,
     markCoordinatorDraining as markCoordinatorDrainingRecord,
     releaseCoordinator as releaseCoordinatorRecord,
     releaseCoordinatorFinal as releaseCoordinatorFinalRecord,
     type ClaimCoordinatorInput,
+    type ClaimCoordinatorResult,
     type CoordinatorReleaseProof,
+    type ForceTakeoverCoordinatorInput,
     type ReleaseCoordinatorInput,
 } from './coordinatorRecord'
 import { requireIllustrationFeatureEnabled } from './featureFlag'
@@ -75,10 +78,16 @@ export const ILLUSTRATION_PROTOCOL_VERSION = 1
 
 export async function claimCoordinatorLedger(
     input: ClaimCoordinatorInput,
-): Promise<IllustrationCoordinatorSnapshotV1> {
+): Promise<ClaimCoordinatorResult> {
     // Gate 4b injects a host-generated, non-forgeable runtime ID. This ledger
     // layer only stores and binds the verbatim value; it is not an auth boundary.
     return await claimCoordinatorRecord(input)
+}
+
+export async function forceTakeoverCoordinatorLedger(
+    input: ForceTakeoverCoordinatorInput,
+): Promise<IllustrationCoordinatorSnapshotV1> {
+    return await forceTakeoverCoordinatorRecord(input)
 }
 
 export async function releaseCoordinatorLedger(input: ReleaseCoordinatorInput): Promise<void> {

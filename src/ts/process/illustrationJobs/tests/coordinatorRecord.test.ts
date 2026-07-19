@@ -40,6 +40,7 @@ const {
     COORDINATOR_LEASE_DURATION_MS,
     ORPHAN_TAKEOVER_COOLDOWN_MS,
     claimCoordinator,
+    forceTakeoverCoordinator,
     getCoordinatorRecord,
     markCoordinatorDraining,
     releaseCoordinator,
@@ -51,7 +52,13 @@ const {
     resetIllustrationLockManagerAccessorForTests,
     setIllustrationLockManagerAccessorForTests,
 } = lockModule
-const { IllustrationCoordinatorCooldownError, IllustrationCoordinatorDrainingError } = errorModule
+const {
+    IllustrationCoordinatorCooldownError,
+    IllustrationCoordinatorDrainingError,
+    IllustrationLedgerLeaseConflictError,
+    IllustrationLedgerValidationError,
+    IllustrationLedgerVersionConflictError,
+} = errorModule
 
 const BASE_TIME = Date.UTC(2026, 6, 15)
 let lockManager: InMemoryLockManager
@@ -285,5 +292,189 @@ describe('global Agent coordinator record', () => {
             fence: renewed.fence,
         })
         expect(takeover).toMatchObject({ fence: 2, ownedByCaller: true, draining: false })
+    })
+})
+
+describe('Coordinator Recovery Status V2 (§5)', () => {
+    async function claimOwner(leaseId = 'coordinator-a', holderRuntimeId = 'runtime-a') {
+        return await claimCoordinator({ protocolVersion: 1, leaseId, holderRuntimeId })
+    }
+
+    test('waitStatus surfaces a live foreign lease as typed leased data with a finite expiresAt', async () => {
+        const owner = await claimOwner()
+
+        // Default path: a live foreign lease is a non-owner snapshot (unchanged, no state).
+        const legacy = await claimCoordinator({
+            protocolVersion: 1,
+            leaseId: 'coordinator-b',
+            holderRuntimeId: 'runtime-b',
+        })
+        expect(legacy).toMatchObject({ ownedByCaller: false, expiresAt: owner.expiresAt })
+        expect(legacy).not.toHaveProperty('state')
+
+        // Opt-in path: the same standby is typed DATA with the exact live lease expiry.
+        const wait = await claimCoordinator({
+            protocolVersion: 1,
+            leaseId: 'coordinator-b',
+            holderRuntimeId: 'runtime-b',
+            waitStatus: true,
+        })
+        expect(wait).toEqual({
+            protocolVersion: 1,
+            ownedByCaller: false,
+            state: 'leased',
+            expiresAt: owner.expiresAt,
+            retryAt: null,
+            canForceTakeover: false,
+        })
+    })
+
+    test('waitStatus distinguishes a draining live foreign lease', async () => {
+        const owner = await claimOwner()
+        await markCoordinatorDraining({
+            protocolVersion: 1,
+            leaseId: 'coordinator-a',
+            expectedVersion: owner.version,
+            fence: owner.fence,
+        })
+        const drainingOwner = (await getCoordinatorRecord())!
+        const wait = await claimCoordinator({
+            protocolVersion: 1,
+            leaseId: 'coordinator-b',
+            holderRuntimeId: 'runtime-b',
+            waitStatus: true,
+        })
+        expect(wait).toEqual({
+            protocolVersion: 1,
+            ownedByCaller: false,
+            state: 'draining',
+            expiresAt: drainingOwner.expiresAt,
+            retryAt: null,
+            canForceTakeover: false,
+        })
+    })
+
+    test('waitStatus preserves the exact orphan-cooldown retryAt where the default path throws', async () => {
+        const owner = await claimOwner()
+        vi.advanceTimersByTime(COORDINATOR_LEASE_DURATION_MS)
+        const retryAt = owner.expiresAt + ORPHAN_TAKEOVER_COOLDOWN_MS
+
+        // Default path: the retryAt lives only on the private Error and is lost at the RPC.
+        await expect(claimCoordinator({
+            protocolVersion: 1,
+            leaseId: 'coordinator-b',
+            holderRuntimeId: 'runtime-b',
+        })).rejects.toBeInstanceOf(IllustrationCoordinatorCooldownError)
+
+        // Opt-in path: the exact bounded retryAt survives as data.
+        const wait = await claimCoordinator({
+            protocolVersion: 1,
+            leaseId: 'coordinator-b',
+            holderRuntimeId: 'runtime-b',
+            waitStatus: true,
+        })
+        expect(wait).toEqual({
+            protocolVersion: 1,
+            ownedByCaller: false,
+            state: 'orphan-cooldown',
+            expiresAt: null,
+            retryAt,
+            canForceTakeover: true,
+        })
+    })
+
+    test('waitStatus must be a boolean', async () => {
+        await claimOwner()
+        await expect(claimCoordinator({
+            protocolVersion: 1,
+            leaseId: 'coordinator-b',
+            holderRuntimeId: 'runtime-b',
+            waitStatus: 'yes' as unknown as boolean,
+        })).rejects.toBeInstanceOf(IllustrationLedgerValidationError)
+    })
+
+    test('forceTakeoverCoordinator rejects a live owner, an unexpired lease, and stale versions', async () => {
+        const owner = await claimOwner()
+
+        // A live owner is never force-takeover-eligible.
+        await expect(forceTakeoverCoordinator({
+            protocolVersion: 1,
+            leaseId: 'coordinator-b',
+            holderRuntimeId: 'runtime-b',
+            confirmRisk: true,
+            expectedVersion: owner.version,
+        })).rejects.toBeInstanceOf(IllustrationLedgerLeaseConflictError)
+
+        // confirmRisk is mandatory — never automatic.
+        await expect(forceTakeoverCoordinator({
+            protocolVersion: 1,
+            leaseId: 'coordinator-b',
+            holderRuntimeId: 'runtime-b',
+            confirmRisk: false as unknown as true,
+            expectedVersion: owner.version,
+        })).rejects.toBeInstanceOf(IllustrationLedgerValidationError)
+
+        vi.advanceTimersByTime(COORDINATOR_LEASE_DURATION_MS)
+        await expect(forceTakeoverCoordinator({
+            protocolVersion: 1,
+            leaseId: 'coordinator-b',
+            holderRuntimeId: 'runtime-b',
+            confirmRisk: true,
+            expectedVersion: owner.version + 5,
+        })).rejects.toBeInstanceOf(IllustrationLedgerVersionConflictError)
+    })
+
+    test('forceTakeoverCoordinator CAS-takes an expired orphan, bypassing the cooldown', async () => {
+        const owner = await claimOwner()
+        vi.advanceTimersByTime(COORDINATOR_LEASE_DURATION_MS)
+        const now = BASE_TIME + COORDINATOR_LEASE_DURATION_MS
+        const taken = await forceTakeoverCoordinator({
+            protocolVersion: 1,
+            leaseId: 'coordinator-b',
+            holderRuntimeId: 'runtime-b',
+            confirmRisk: true,
+            expectedVersion: owner.version,
+            fence: owner.fence,
+        })
+        expect(taken).toEqual({
+            protocolVersion: 1,
+            version: owner.version + 1,
+            fence: owner.fence + 1,
+            expiresAt: now + COORDINATOR_LEASE_DURATION_MS,
+            ownedByCaller: true,
+            draining: false,
+        })
+        expect(await getCoordinatorRecord()).toMatchObject({
+            leaseId: 'coordinator-b',
+            holderRuntimeId: 'runtime-b',
+            draining: false,
+        })
+    })
+
+    test('concurrent force takeovers of an expired orphan admit exactly one winner', async () => {
+        const owner = await claimOwner()
+        vi.advanceTimersByTime(COORDINATOR_LEASE_DURATION_MS)
+        const attempts = await Promise.allSettled([
+            forceTakeoverCoordinator({
+                protocolVersion: 1,
+                leaseId: 'coordinator-b',
+                holderRuntimeId: 'runtime-b',
+                confirmRisk: true,
+                expectedVersion: owner.version,
+            }),
+            forceTakeoverCoordinator({
+                protocolVersion: 1,
+                leaseId: 'coordinator-c',
+                holderRuntimeId: 'runtime-c',
+                confirmRisk: true,
+                expectedVersion: owner.version,
+            }),
+        ])
+        const fulfilled = attempts.filter((attempt) => attempt.status === 'fulfilled')
+        const rejected = attempts.filter((attempt) => attempt.status === 'rejected')
+        expect(fulfilled).toHaveLength(1)
+        expect(rejected).toHaveLength(1)
+        expect((rejected[0] as PromiseRejectedResult).reason)
+            .toBeInstanceOf(IllustrationLedgerVersionConflictError)
     })
 })

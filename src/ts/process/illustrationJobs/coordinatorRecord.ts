@@ -4,6 +4,7 @@ import {
     IllustrationCoordinatorDrainingError,
     IllustrationCoordinatorExpiredError,
     IllustrationCoordinatorMismatchError,
+    IllustrationLedgerLeaseConflictError,
     IllustrationLedgerValidationError,
     IllustrationLedgerVersionConflictError,
 } from './errors'
@@ -16,6 +17,8 @@ import type {
     IllustrationCoordinatorProof,
     IllustrationCoordinatorRecordV1,
     IllustrationCoordinatorSnapshotV1,
+    IllustrationCoordinatorWaitStateV1,
+    IllustrationCoordinatorWaitV1,
 } from './types'
 
 export const ILLUSTRATION_COORDINATOR_KEY = 'illustration:v1:coordinator'
@@ -27,6 +30,25 @@ export type ClaimCoordinatorInput = {
     leaseId: string
     holderRuntimeId: string
     expectedVersion?: number
+    fence?: number
+    // Coordinator Recovery Status V2 (§5): opt-in. When true, EXPECTED non-owner
+    // standby outcomes (live foreign lease / draining / orphan cooldown) return a
+    // typed IllustrationCoordinatorWaitV1 DATA result instead of throwing. Without
+    // it (default), the claim path is byte-identical to the pre-V2 behavior.
+    waitStatus?: boolean
+}
+
+export type ClaimCoordinatorResult =
+    | IllustrationCoordinatorSnapshotV1
+    | IllustrationCoordinatorWaitV1
+
+export type ForceTakeoverCoordinatorInput = {
+    protocolVersion: 1
+    leaseId: string
+    holderRuntimeId: string
+    // Never automatic (§5): the caller must explicitly accept the recovery risk.
+    confirmRisk: true
+    expectedVersion: number
     fence?: number
 }
 
@@ -89,6 +111,22 @@ function snapshot(
     }
 }
 
+function waitResult(
+    state: IllustrationCoordinatorWaitStateV1,
+    expiresAt: number | null,
+    retryAt: number | null,
+    canForceTakeover: boolean,
+): IllustrationCoordinatorWaitV1 {
+    return {
+        protocolVersion: 1,
+        ownedByCaller: false,
+        state,
+        expiresAt,
+        retryAt,
+        canForceTakeover,
+    }
+}
+
 async function readCoordinatorUnlocked(): Promise<IllustrationCoordinatorRecordV1 | null> {
     return await readPersistentJson<IllustrationCoordinatorRecordV1>(ILLUSTRATION_COORDINATOR_KEY)
 }
@@ -129,13 +167,26 @@ async function markCoordinatorDrainingUnlocked(
     return structuredClone(next)
 }
 
+// Overloads: the default (no opt-in) path only ever resolves an owner snapshot, so
+// callers that never pass waitStatus keep the narrow snapshot type and their existing
+// .version/.fence access. Only the explicit waitStatus path widens to the wait union.
+export async function claimCoordinator(
+    input: ClaimCoordinatorInput & { waitStatus?: false },
+): Promise<IllustrationCoordinatorSnapshotV1>
 export async function claimCoordinator(
     input: ClaimCoordinatorInput,
-): Promise<IllustrationCoordinatorSnapshotV1> {
+): Promise<ClaimCoordinatorResult>
+export async function claimCoordinator(
+    input: ClaimCoordinatorInput,
+): Promise<ClaimCoordinatorResult> {
     return await withIllustrationLedgerLock(async () => {
         assertProtocolVersion(input.protocolVersion)
         assertNonEmptyString(input.leaseId, 'leaseId')
         assertNonEmptyString(input.holderRuntimeId, 'holderRuntimeId')
+        if (input.waitStatus !== undefined && typeof input.waitStatus !== 'boolean') {
+            throw new IllustrationLedgerValidationError('waitStatus must be a boolean')
+        }
+        const waitStatus = input.waitStatus === true
         await requireIllustrationFeatureEnabled()
         const current = await readCoordinatorUnlocked()
         const now = Date.now()
@@ -166,7 +217,19 @@ export async function claimCoordinator(
         const sameOwner = unexpired
             && current.leaseId === input.leaseId
             && current.holderRuntimeId === input.holderRuntimeId
-        if (unexpired && !sameOwner) return snapshot(current, false)
+        if (unexpired && !sameOwner) {
+            // A live foreign lease is never force-takeover-eligible (the lease has
+            // not expired). The host cannot override this to true.
+            if (waitStatus) {
+                return waitResult(
+                    current.draining ? 'draining' : 'leased',
+                    current.expiresAt,
+                    null,
+                    false,
+                )
+            }
+            return snapshot(current, false)
+        }
 
         assertOptionalSnapshot(input, current)
         if (sameOwner) {
@@ -188,9 +251,12 @@ export async function claimCoordinator(
             && current.expiresAt <= now
             && now < current.expiresAt + ORPHAN_TAKEOVER_COOLDOWN_MS
         ) {
-            throw new IllustrationCoordinatorCooldownError(
-                current.expiresAt + ORPHAN_TAKEOVER_COOLDOWN_MS,
-            )
+            const retryAt = current.expiresAt + ORPHAN_TAKEOVER_COOLDOWN_MS
+            // The lease has expired, so it is force-takeover-eligible by expiry. The
+            // host downgrades canForceTakeover to false when the stale holder still
+            // has active LLM calls (a check the record layer cannot see).
+            if (waitStatus) return waitResult('orphan-cooldown', null, retryAt, true)
+            throw new IllustrationCoordinatorCooldownError(retryAt)
         }
 
         const takenOver: IllustrationCoordinatorRecordV1 = {
@@ -201,6 +267,65 @@ export async function claimCoordinator(
             expiresAt: now + COORDINATOR_LEASE_DURATION_MS,
             // A successful fresh claim is the explicit boundary that clears an
             // expired predecessor's durable draining state.
+            draining: false,
+            updatedAt: now,
+        }
+        await writePersistentJson(ILLUSTRATION_COORDINATOR_KEY, takenOver)
+        return snapshot(takenOver, true)
+    })
+}
+
+// Coordinator Recovery Status V2 (§5): the CAS half of an operator-confirmed force
+// takeover. Permitted ONLY when the existing lease is actually expired (now >=
+// expiresAt). The "zero active host LLM for the stale holder" precondition lives at
+// the host registry layer and is checked BEFORE this record CAS runs; a live owner
+// is rejected here as a lease_conflict. Never automatic — confirmRisk must be true.
+export async function forceTakeoverCoordinator(
+    input: ForceTakeoverCoordinatorInput,
+): Promise<IllustrationCoordinatorSnapshotV1> {
+    return await withIllustrationLedgerLock(async () => {
+        assertProtocolVersion(input.protocolVersion)
+        assertNonEmptyString(input.leaseId, 'leaseId')
+        assertNonEmptyString(input.holderRuntimeId, 'holderRuntimeId')
+        if (input.confirmRisk !== true) {
+            throw new IllustrationLedgerValidationError('forceTakeoverAfterExpiry requires confirmRisk: true')
+        }
+        assertNonNegativeInteger(input.expectedVersion, 'expectedVersion')
+        if (input.fence !== undefined) assertNonNegativeInteger(input.fence, 'fence')
+        await requireIllustrationFeatureEnabled()
+        const current = await readCoordinatorUnlocked()
+        const now = Date.now()
+
+        if (!current || current.leaseId === null) {
+            // Nothing stale to force. A vacant coordinator is served by the normal
+            // claim path, so reject rather than mint a fresh lease from here.
+            throw new IllustrationLedgerLeaseConflictError(
+                'Illustration coordinator has no lease to force takeover',
+            )
+        }
+        if (current.version !== input.expectedVersion) {
+            throw new IllustrationLedgerVersionConflictError(input.expectedVersion, current.version)
+        }
+        if (input.fence !== undefined && input.fence !== current.fence) {
+            throw new IllustrationCoordinatorMismatchError(
+                'Illustration coordinator fence does not match the latest snapshot',
+            )
+        }
+        if (current.expiresAt > now) {
+            // A live owner is never force-takeover-eligible.
+            throw new IllustrationLedgerLeaseConflictError(
+                'Illustration coordinator lease has not expired',
+            )
+        }
+
+        const takenOver: IllustrationCoordinatorRecordV1 = {
+            version: current.version + 1,
+            fence: current.fence + 1,
+            leaseId: input.leaseId,
+            holderRuntimeId: input.holderRuntimeId,
+            expiresAt: now + COORDINATOR_LEASE_DURATION_MS,
+            // A successful takeover starts a fresh non-draining ownership epoch,
+            // clearing any durable draining marker from the stale predecessor.
             draining: false,
             updatedAt: now,
         }

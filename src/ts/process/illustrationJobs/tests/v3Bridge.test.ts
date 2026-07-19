@@ -73,14 +73,46 @@ function makeHarness(runtimeId = 'host-runtime') {
     let uuidSequence = 0
     const wakeListeners = new Set<IllustrationWakeHintListener>()
     const provider = vi.fn(async (_options: unknown, _signal: AbortSignal): Promise<unknown> => ({ ok: true }))
+    const ORPHAN_COOLDOWN_MS = 300_000
     const claimCoordinator = vi.fn(async (input: {
         protocolVersion: 1
         leaseId: string
         holderRuntimeId: string
         expectedVersion?: number
         fence?: number
+        waitStatus?: boolean
     }) => {
         const previous = state.coordinator
+        // Coordinator Recovery Status V2: mirror the record layer's expected-standby
+        // outcomes as typed DATA when the opt-in waitStatus flag is set.
+        if (input.waitStatus === true && previous && previous.leaseId !== null) {
+            const foreignLive = previous.expiresAt > state.now
+                && (previous.leaseId !== input.leaseId
+                    || previous.holderRuntimeId !== input.holderRuntimeId)
+            if (foreignLive) {
+                return {
+                    protocolVersion: 1 as const,
+                    ownedByCaller: false as const,
+                    state: previous.draining ? ('draining' as const) : ('leased' as const),
+                    expiresAt: previous.expiresAt,
+                    retryAt: null,
+                    canForceTakeover: false,
+                }
+            }
+            if (
+                previous.expiresAt <= state.now
+                && state.now < previous.expiresAt + ORPHAN_COOLDOWN_MS
+            ) {
+                return {
+                    protocolVersion: 1 as const,
+                    ownedByCaller: false as const,
+                    state: 'orphan-cooldown' as const,
+                    expiresAt: null,
+                    retryAt: previous.expiresAt + ORPHAN_COOLDOWN_MS,
+                    canForceTakeover: true,
+                }
+            }
+        }
         state.coordinator = {
             version: (state.coordinator?.version ?? 0) + 1,
             fence: previous?.leaseId === null
@@ -92,6 +124,38 @@ function makeHarness(runtimeId = 'host-runtime') {
             draining: false,
         }
         if (state.disableFeatureAfterClaim) state.featureEnabled = false
+        return {
+            protocolVersion: 1 as const,
+            version: state.coordinator.version,
+            fence: state.coordinator.fence,
+            expiresAt: state.coordinator.expiresAt,
+            ownedByCaller: true,
+            draining: false,
+        }
+    })
+    const forceTakeoverCoordinator = vi.fn(async (input: {
+        protocolVersion: 1
+        leaseId: string
+        holderRuntimeId: string
+        confirmRisk: true
+        expectedVersion: number
+        fence?: number
+    }) => {
+        const previous = state.coordinator
+        if (!previous || previous.leaseId === null) throw coded('lease_conflict')
+        if (previous.version !== input.expectedVersion) throw coded('version_conflict')
+        if (input.fence !== undefined && input.fence !== previous.fence) {
+            throw coded('coordinator_mismatch')
+        }
+        if (previous.expiresAt > state.now) throw coded('lease_conflict')
+        state.coordinator = {
+            version: previous.version + 1,
+            fence: previous.fence + 1,
+            leaseId: input.leaseId,
+            holderRuntimeId: input.holderRuntimeId,
+            expiresAt: state.now + 60_000,
+            draining: false,
+        }
         return {
             protocolVersion: 1 as const,
             version: state.coordinator.version,
@@ -209,6 +273,7 @@ function makeHarness(runtimeId = 'host-runtime') {
             }
         }),
         claimCoordinator,
+        forceTakeoverCoordinator,
         releaseCoordinator,
         markCoordinatorDraining,
         releaseCoordinatorFinal,
@@ -302,6 +367,7 @@ function makeHarness(runtimeId = 'host-runtime') {
         bridge,
         provider,
         claimCoordinator,
+        forceTakeoverCoordinator,
         releaseCoordinator,
         markCoordinatorDraining,
         releaseCoordinatorFinal,
@@ -478,6 +544,7 @@ describe('private V3 API shape and hygiene', () => {
             '_ijClaimTurn',
             '_ijCreateImageRevision',
             '_ijEnqueueRevisionImage',
+            '_ijForceTakeoverAfterExpiry',
             '_ijGetCapabilities',
             '_ijGetCapturePolicy',
             '_ijGetImageRevisionTarget',
@@ -520,6 +587,7 @@ describe('private V3 API shape and hygiene', () => {
             imagePromptMeasurement: 'core-provider-model-exact',
             supportsNaiV4CharacterCaptions: true,
             capturePolicyContractVersion: 1,
+            coordinatorWaitContractVersion: 1,
             imageRevisionContractVersion: 1,
             illustrationStructuredOutputContractVersion: 1,
             illustrationSingleGeneration: true,
@@ -646,6 +714,198 @@ describe('private V3 API shape and hygiene', () => {
         }) as any
         expect(supplied).not.toHaveProperty('leaseId')
         expect(supplied.lease.ownedByCaller).toBe(true)
+    })
+})
+
+describe('Coordinator Recovery Status V2 RPC surface (§5)', () => {
+    test('a default claim forwards no waitStatus and never yields standby data', async () => {
+        const harness = makeHarness()
+        const result = await harness.bridge.rootMethods._ijClaimCoordinator({
+            protocolVersion: 1,
+            leaseId: 'my-lease',
+        })
+        // Byte-identical legacy call: the injected runtime, and exactly no waitStatus key.
+        expect(harness.claimCoordinator).toHaveBeenCalledWith({
+            protocolVersion: 1,
+            leaseId: 'my-lease',
+            holderRuntimeId: harness.runtimeId,
+        })
+        expect(result).not.toHaveProperty('state')
+        expect(result).toMatchObject({ ownedByCaller: true })
+    })
+
+    test('waitStatus is forwarded and a live foreign lease returns typed leased data', async () => {
+        const harness = makeHarness()
+        harness.state.coordinator = {
+            ...harness.state.coordinator!,
+            holderRuntimeId: 'other-runtime',
+            leaseId: 'other-lease',
+        }
+        const wait = await harness.bridge.rootMethods._ijClaimCoordinator({
+            protocolVersion: 1,
+            leaseId: 'my-lease',
+            waitStatus: true,
+        })
+        expect(harness.claimCoordinator).toHaveBeenCalledWith({
+            protocolVersion: 1,
+            leaseId: 'my-lease',
+            holderRuntimeId: harness.runtimeId,
+            waitStatus: true,
+        })
+        expect(wait).toEqual({
+            protocolVersion: 1,
+            ownedByCaller: false,
+            state: 'leased',
+            expiresAt: 61_000,
+            retryAt: null,
+            canForceTakeover: false,
+        })
+    })
+
+    test('a draining foreign lease throws on the default path but returns typed data on opt-in', async () => {
+        const harness = makeHarness()
+        // Legacy: a draining non-owner snapshot still throws coordinator_draining.
+        harness.claimCoordinator.mockImplementationOnce(async () => ({
+            protocolVersion: 1 as const,
+            version: 9,
+            fence: 7,
+            expiresAt: 61_000,
+            ownedByCaller: false,
+            draining: true,
+        }))
+        await expect(harness.bridge.rootMethods._ijClaimCoordinator({
+            protocolVersion: 1,
+            leaseId: 'mine',
+        })).rejects.toThrow('[IJ:coordinator_draining]')
+
+        harness.state.coordinator = {
+            ...harness.state.coordinator!,
+            holderRuntimeId: 'other-runtime',
+            leaseId: 'other-lease',
+            draining: true,
+        }
+        const wait = await harness.bridge.rootMethods._ijClaimCoordinator({
+            protocolVersion: 1,
+            leaseId: 'mine',
+            waitStatus: true,
+        })
+        expect(wait).toMatchObject({
+            ownedByCaller: false,
+            state: 'draining',
+            expiresAt: 61_000,
+            retryAt: null,
+            canForceTakeover: false,
+        })
+    })
+
+    test('an expired orphan reports canForceTakeover true only with zero active host LLM', async () => {
+        // Zero active LLM: force takeover is offered.
+        const idle = makeHarness()
+        idle.state.now = idle.state.coordinator!.expiresAt + 1
+        const offered = await idle.bridge.rootMethods._ijClaimCoordinator({
+            protocolVersion: 1,
+            leaseId: 'reclaim',
+            waitStatus: true,
+        })
+        expect(offered).toEqual({
+            protocolVersion: 1,
+            ownedByCaller: false,
+            state: 'orphan-cooldown',
+            expiresAt: null,
+            retryAt: 61_000 + 300_000,
+            canForceTakeover: true,
+        })
+
+        // Active LLM for the stale holder: the host downgrades canForceTakeover to false.
+        const busy = makeHarness()
+        const pending = deferred<unknown>()
+        busy.provider.mockImplementationOnce(async () => await pending.promise)
+        const running = busy.bridge.runLLMModel({ mode: 'model', messages: [] })
+        await flushMicrotasks()
+        expect(busy.registry.getActiveCount(busy.runtimeId, 7)).toBe(1)
+        busy.state.now = busy.state.coordinator!.expiresAt + 1
+        const downgraded = await busy.bridge.rootMethods._ijClaimCoordinator({
+            protocolVersion: 1,
+            leaseId: 'reclaim',
+            waitStatus: true,
+        })
+        expect(downgraded).toMatchObject({ state: 'orphan-cooldown', canForceTakeover: false })
+        pending.resolve({ ok: true })
+        await running.catch(() => undefined)
+    })
+
+    test('forceTakeoverAfterExpiry rejects a live owner before any record CAS', async () => {
+        const harness = makeHarness()
+        await expect(harness.bridge.rootMethods._ijForceTakeoverAfterExpiry({
+            protocolVersion: 1,
+            leaseId: 'reclaim',
+            confirmRisk: true,
+            expectedVersion: harness.state.coordinator!.version,
+        })).rejects.toThrow('[IJ:lease_conflict]')
+        expect(harness.forceTakeoverCoordinator).not.toHaveBeenCalled()
+    })
+
+    test('forceTakeoverAfterExpiry rejects an expired holder with active host LLM calls', async () => {
+        const harness = makeHarness()
+        const pending = deferred<unknown>()
+        harness.provider.mockImplementationOnce(async () => await pending.promise)
+        const running = harness.bridge.runLLMModel({ mode: 'model', messages: [] })
+        await flushMicrotasks()
+        expect(harness.registry.getActiveCount(harness.runtimeId, 7)).toBe(1)
+        harness.state.now = harness.state.coordinator!.expiresAt + 1
+        await expect(harness.bridge.rootMethods._ijForceTakeoverAfterExpiry({
+            protocolVersion: 1,
+            leaseId: 'reclaim',
+            confirmRisk: true,
+            expectedVersion: harness.state.coordinator!.version,
+        })).rejects.toThrow('[IJ:lease_conflict]')
+        expect(harness.forceTakeoverCoordinator).not.toHaveBeenCalled()
+        pending.resolve({ ok: true })
+        await running.catch(() => undefined)
+    })
+
+    test('forceTakeoverAfterExpiry recovers an expired orphan with zero active host LLM', async () => {
+        const harness = makeHarness()
+        harness.state.now = harness.state.coordinator!.expiresAt + 1
+        const version = harness.state.coordinator!.version
+        const taken = await harness.bridge.rootMethods._ijForceTakeoverAfterExpiry({
+            protocolVersion: 1,
+            leaseId: 'reclaim',
+            confirmRisk: true,
+            expectedVersion: version,
+            runtimeId: 'forged-runtime',
+            holderRuntimeId: 'forged-runtime',
+        })
+        expect(taken).toMatchObject({ ownedByCaller: true })
+        // The host injects its own immutable runtime identity, ignoring caller-supplied ids.
+        expect(harness.forceTakeoverCoordinator).toHaveBeenCalledWith(expect.objectContaining({
+            protocolVersion: 1,
+            leaseId: 'reclaim',
+            holderRuntimeId: harness.runtimeId,
+            confirmRisk: true,
+            expectedVersion: version,
+        }))
+    })
+
+    test('forceTakeoverAfterExpiry requires explicit confirmRisk and a valid CAS shape', async () => {
+        const harness = makeHarness()
+        await expect(harness.bridge.rootMethods._ijForceTakeoverAfterExpiry({
+            protocolVersion: 1,
+            leaseId: 'reclaim',
+            expectedVersion: 1,
+        })).rejects.toThrow('[IJ:validation]')
+        await expect(harness.bridge.rootMethods._ijForceTakeoverAfterExpiry({
+            protocolVersion: 1,
+            leaseId: 'reclaim',
+            confirmRisk: false,
+            expectedVersion: 1,
+        })).rejects.toThrow('[IJ:validation]')
+        await expect(harness.bridge.rootMethods._ijForceTakeoverAfterExpiry({
+            protocolVersion: 1,
+            leaseId: 'reclaim',
+            confirmRisk: true,
+        })).rejects.toThrow('[IJ:validation]')
+        expect(harness.forceTakeoverCoordinator).not.toHaveBeenCalled()
     })
 })
 

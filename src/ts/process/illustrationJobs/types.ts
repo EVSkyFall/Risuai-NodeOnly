@@ -435,6 +435,24 @@ export type IllustrationCoordinatorSnapshotV1 = {
     draining: boolean
 }
 
+// Coordinator Recovery Status V2 (§5): an EXPECTED non-owner standby outcome
+// carried as transport-safe DATA instead of a thrown coded error. Only surfaces
+// on the opt-in claimCoordinator waitStatus path; the default claim path keeps
+// throwing so byte-identical legacy behavior is preserved.
+export type IllustrationCoordinatorWaitStateV1 = 'leased' | 'draining' | 'orphan-cooldown'
+
+export type IllustrationCoordinatorWaitV1 = {
+    protocolVersion: 1
+    ownedByCaller: false
+    state: IllustrationCoordinatorWaitStateV1
+    // Live foreign/draining lease -> exact expiresAt; orphan cooldown -> null (no
+    // live lease to count down from).
+    expiresAt: number | null
+    // Orphan cooldown -> exact bounded retryAt; otherwise null.
+    retryAt: number | null
+    canForceTakeover: boolean
+}
+
 export type IllustrationLeaseViewV1 = {
     expiresAt: number
     fence: number

@@ -261,6 +261,23 @@ type CoordinatorSnapshot = {
     draining?: boolean
 }
 
+// Coordinator Recovery Status V2 (§5): the typed non-owner standby DATA result the
+// opt-in claimCoordinator waitStatus path returns instead of throwing.
+type CoordinatorWait = {
+    protocolVersion: 1
+    ownedByCaller: false
+    state: 'leased' | 'draining' | 'orphan-cooldown'
+    expiresAt: number | null
+    retryAt: number | null
+    canForceTakeover: boolean
+}
+
+type CoordinatorClaimResult = CoordinatorSnapshot | CoordinatorWait
+
+function isCoordinatorWait(value: CoordinatorClaimResult): value is CoordinatorWait {
+    return value.ownedByCaller === false && 'state' in value
+}
+
 type CoordinatorProof = {
     protocolVersion: 1
     leaseId: string
@@ -283,6 +300,15 @@ export type IllustrationV3BridgeDependencies = {
         leaseId: string
         holderRuntimeId: string
         expectedVersion?: number
+        fence?: number
+        waitStatus?: boolean
+    }): Promise<CoordinatorClaimResult>
+    forceTakeoverCoordinator(input: {
+        protocolVersion: 1
+        leaseId: string
+        holderRuntimeId: string
+        confirmRisk: true
+        expectedVersion: number
         fence?: number
     }): Promise<CoordinatorSnapshot>
     releaseCoordinator(input: CoordinatorProof & { drain: boolean }): Promise<void>
@@ -569,7 +595,7 @@ export class IllustrationV3HostLlmRegistry {
     async claimCoordinator(
         runtimeId: string,
         input: Record<string, unknown>,
-    ): Promise<CoordinatorSnapshot> {
+    ): Promise<CoordinatorClaimResult> {
         return await this.exclusive(async () => {
             if (!(await this.deps.isFeatureEnabled())) throw codedError('feature_disabled')
             const claimed = await this.deps.claimCoordinator({
@@ -580,6 +606,7 @@ export class IllustrationV3HostLlmRegistry {
                     expectedVersion: input.expectedVersion as number,
                 }),
                 ...(input.fence === undefined ? {} : { fence: input.fence as number }),
+                ...(input.waitStatus === undefined ? {} : { waitStatus: input.waitStatus as boolean }),
             })
             if (!(await this.deps.isFeatureEnabled())) {
                 const draining = await this.markLatestRuntimeDrainingLocked(runtimeId)
@@ -587,8 +614,53 @@ export class IllustrationV3HostLlmRegistry {
                 await this.releaseIfLocalDrainedLocked(draining)
                 throw codedError('feature_disabled')
             }
+            // Coordinator Recovery Status V2 (§5): a typed non-owner standby result is
+            // returned as DATA. The record layer already ruled the lease force-takeover-
+            // eligible by expiry for orphan-cooldown; downgrade canForceTakeover to false
+            // when the stale holder still has active host LLM calls.
+            if (isCoordinatorWait(claimed)) {
+                if (claimed.state === 'orphan-cooldown' && claimed.canForceTakeover) {
+                    const record = await this.deps.getCoordinatorRecord()
+                    const activeCount = record && record.holderRuntimeId !== null
+                        ? this.getActiveCount(record.holderRuntimeId, record.fence)
+                        : 0
+                    if (activeCount > 0) return { ...claimed, canForceTakeover: false }
+                }
+                return claimed
+            }
             if (claimed.draining) throw codedError('coordinator_draining')
             return claimed
+        })
+    }
+
+    // Coordinator Recovery Status V2 (§5): operator-confirmed force takeover of an
+    // EXPIRED orphan lease. Two host-side preconditions gate the record CAS: the
+    // existing lease must be expired, and the stale holder must have ZERO active host
+    // LLM calls. A live owner or an active-LLM stale holder rejects as lease_conflict
+    // — no new error codes, never automatic.
+    async forceTakeoverAfterExpiry(
+        runtimeId: string,
+        input: Record<string, unknown>,
+    ): Promise<CoordinatorSnapshot> {
+        return await this.exclusive(async () => {
+            if (!(await this.deps.isFeatureEnabled())) throw codedError('feature_disabled')
+            if (input.confirmRisk !== true) throw codedError('validation')
+            const current = await this.deps.getCoordinatorRecord()
+            if (!current || current.leaseId === null || current.holderRuntimeId === null) {
+                throw codedError('lease_conflict')
+            }
+            if (current.expiresAt > this.deps.now()) throw codedError('lease_conflict')
+            if (this.getActiveCount(current.holderRuntimeId, current.fence) > 0) {
+                throw codedError('lease_conflict')
+            }
+            return await this.deps.forceTakeoverCoordinator({
+                protocolVersion: input.protocolVersion as 1,
+                leaseId: input.leaseId as string,
+                holderRuntimeId: runtimeId,
+                confirmRisk: true,
+                expectedVersion: input.expectedVersion as number,
+                ...(input.fence === undefined ? {} : { fence: input.fence as number }),
+            })
         })
     }
 
@@ -778,6 +850,7 @@ export const ILLUSTRATION_JOBS_ALIAS = Object.freeze({
     purgeAutomaticBacklog: '_ijPurgeAutomaticBacklog',
     setFeatureEnabled: '_ijSetFeatureEnabled',
     claimCoordinator: '_ijClaimCoordinator',
+    forceTakeoverAfterExpiry: '_ijForceTakeoverAfterExpiry',
     releaseCoordinator: '_ijReleaseCoordinator',
     listPendingTurns: '_ijListPendingTurns',
     claimTurn: '_ijClaimTurn',
@@ -885,6 +958,11 @@ export function createAuthorizedIllustrationV3Bridge(input: {
                 // Capture Policy V1: durable manual/automatic capture mode, manual
                 // per-response capture, and the pending-only backlog controls. Additive.
                 capturePolicyContractVersion: 1,
+                // Coordinator Recovery Status V2 (§5): opt-in claimCoordinator waitStatus
+                // returns typed non-owner standby data (leased/draining/orphan-cooldown
+                // with expiresAt/retryAt/canForceTakeover), and forceTakeoverAfterExpiry
+                // recovers an expired orphan with zero active LLM. Additive.
+                coordinatorWaitContractVersion: 1,
                 // Image Revision V1: reference/lineage ledger, exact/edited/retag
                 // revision children, replace/retain dispositions, no-charge restore,
                 // and bounded revision/reference projections. Additive.
@@ -953,7 +1031,31 @@ export function createAuthorizedIllustrationV3Bridge(input: {
             ensureLive()
             const request = sanitizedInput(value)
             assertProtocol(request)
+            // Coordinator Recovery Status V2 (§5): additive, validated boolean.
+            if (request.waitStatus !== undefined && typeof request.waitStatus !== 'boolean') {
+                throw codedError('validation')
+            }
             return await hostRegistry.claimCoordinator(auth.runtimeId, request)
+        }),
+        _ijForceTakeoverAfterExpiry: async (value) => await invokeRpc(async () => {
+            ensureLive()
+            const request = sanitizedInput(value)
+            assertProtocol(request)
+            // Never automatic (§5): the caller must explicitly accept the recovery risk.
+            if (request.confirmRisk !== true) throw codedError('validation')
+            if (typeof request.leaseId !== 'string' || request.leaseId.length === 0) {
+                throw codedError('validation')
+            }
+            if (!Number.isSafeInteger(request.expectedVersion) || (request.expectedVersion as number) < 0) {
+                throw codedError('validation')
+            }
+            if (
+                request.fence !== undefined
+                && (!Number.isSafeInteger(request.fence) || (request.fence as number) < 0)
+            ) {
+                throw codedError('validation')
+            }
+            return await hostRegistry.forceTakeoverAfterExpiry(auth.runtimeId, request)
         }),
         _ijReleaseCoordinator: async (value) => await invokeRpc(async () => {
             ensureLive()
