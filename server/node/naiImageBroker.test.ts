@@ -776,7 +776,10 @@ describe('server-authoritative NAI image broker', { timeout: 30_000 }, () => {
         const cases = [
             proxyRequest(context, `${upstream.origin}/ai/generate-image`, { requestClass: 'urgent' }),
             proxyRequest(context, `${upstream.origin}/ai/generate-image`, { requestClass: 'interactive' }),
-            proxyRequest(context, 'https://example.com/not-an-image-endpoint', { requestClass: 'interactive' }),
+            // Marked requests no longer validate the target PATH (NAI-compatible
+            // custom endpoints serve the API on arbitrary paths), but embedded
+            // credentials still reject.
+            proxyRequest(context, 'https://user:secret@image.novelai.net/ai/generate-image', { requestClass: 'interactive' }),
             proxyRequest(context, officialTarget, { requestClass: 'interactive', method: 'GET' }),
             proxyRequest(context, officialTarget, { requestClass: 'interactive', contentType: 'text/plain' }),
             proxyRequest(context, officialTarget, { requestClass: 'interactive', body: { action: 'generate' } }),
@@ -791,5 +794,27 @@ describe('server-authoritative NAI image broker', { timeout: 30_000 }, () => {
         expect(responses.every((response) => response.status === 400)).toBe(true)
         expect(responses.every((response) => response.headers.get('risu-image-result') === 'validation-reject')).toBe(true)
         expect(upstreamCalls).toBe(0)
+    })
+
+    it('accepts a marked NAI-compatible custom endpoint path through the broker', async () => {
+        const upstreamPaths: string[] = []
+        const upstream = await startUpstream((req, res) => {
+            upstreamPaths.push(req.url ?? '')
+            res.writeHead(200, { 'content-type': 'image/png' })
+            res.end(Buffer.from('image'))
+        })
+        const context = await boot()
+
+        // Marked requests declare NAI-image intent explicitly, so the target path
+        // is no longer validated — NAI-compatible custom endpoints serve the
+        // generate API on arbitrary paths.
+        const response = await proxyRequest(context, `${upstream.origin}/nai-compatible/custom-generate`, {
+            id: 'custom-path',
+            requestClass: 'interactive',
+        })
+        await response.arrayBuffer()
+        expect(response.status).toBe(200)
+        expect(response.headers.get('risu-image-result')).toBe('provider-response')
+        expect(upstreamPaths).toEqual(['/nai-compatible/custom-generate'])
     })
 })

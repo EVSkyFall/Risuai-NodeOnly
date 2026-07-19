@@ -3192,10 +3192,18 @@ function classifyNaiImageRequest(req, urlParam) {
         if (requestClass !== 'interactive' && requestClass !== 'background') {
             return { error: 'Invalid NAI image request class' };
         }
-        const validTarget = pathMatches
-            && !target.username
+        // A marked request is an explicit client declaration that this is an NAI
+        // image call, so the target path is NOT validated here: NAI-compatible
+        // custom endpoints legitimately serve the generate API on arbitrary paths
+        // (2026-07-19 user decision). Transport safety checks remain: https only
+        // (loopback http allowed in the test-target mode) and no embedded
+        // credentials.
+        const markedInsecureTestTarget = allowInsecureNaiTestTarget()
+            && target.protocol === 'http:'
+            && isLoopbackHostname(hostname);
+        const validTarget = !target.username
             && !target.password
-            && (target.protocol === 'https:' || insecureTestTarget);
+            && (target.protocol === 'https:' || markedInsecureTestTarget);
         if (!validTarget) return { error: 'Invalid NAI image target' };
         return { target, requestClass };
     }
