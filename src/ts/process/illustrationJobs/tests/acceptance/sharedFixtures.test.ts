@@ -109,12 +109,12 @@ describe('Gate 4d shared Core fixtures', () => {
     // removed 0.1.3, the discarded pre-contract 0.2.0 snapshot, the two discarded
     // 0.2.1 interim drafts, and the removed 0.2.0/0.2.1/0.2.2/0.2.3/0.2.4 releases —
     // never authorizes.
-    test('pins the 0.2.6 sticky-incident/JSON-envelope rotation window and rejects every superseded digest', async () => {
+    test('pins the 0.2.6 terminal-close UX hotfix rotation window and rejects every superseded digest', async () => {
         expect(PINNED_ILLUSTRATION_PLUGIN_DIGESTS).toEqual([
             PRODUCTION_PLUGIN.scriptSha256,
             PRODUCTION_PLUGIN.scriptSha256Next,
         ])
-        expect(REJECTED_PLUGIN_SHA256S).toHaveLength(11)
+        expect(REJECTED_PLUGIN_SHA256S).toHaveLength(12)
         expect(new Set(REJECTED_PLUGIN_SHA256S).size).toBe(REJECTED_PLUGIN_SHA256S.length)
 
         const authorize = (digest: string) => evaluateIllustrationV3Authorization({

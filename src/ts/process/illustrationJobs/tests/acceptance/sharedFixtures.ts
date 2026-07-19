@@ -15,13 +15,11 @@ export const PRODUCTION_SLOT_TOKEN_RE = /^[0-9a-f]{32}$/
 
 export const PRODUCTION_PLUGIN = Object.freeze({
     name: 'lb_xnai_agent',
-    // 0.2.5 JSON/poll stability release bundle (259,169 bytes) — kept as the rollback
-    // window.
-    scriptSha256: '31e284ab4d55a65c9043ece4de59ff0f9489b2b683d4c528a99510d75e5b0ed7',
-    // 0.2.6 sticky-incident/JSON-envelope release bundle (268,747 bytes) — digest
-    // independently recomputed from the root and dist bundles on 2026-07-19 during
-    // the repin request.
-    scriptSha256Next: '86eaa7e163e87d2f6c5547d510e419ffa7acaf632bd29e678400748e3f0c8438',
+    // Previous release — kept as the rollback window.
+    scriptSha256: '86eaa7e163e87d2f6c5547d510e419ffa7acaf632bd29e678400748e3f0c8438',
+    // 0.2.6 terminal-close UX hotfix release bundle (269,816 bytes) — digest independently
+    // recomputed from the root and dist bundles on 2026-07-19 by scripts/rotate-illustration-pin.mjs.
+    scriptSha256Next: '3249d4ef850d765369e55dd014cee0a10426a64150688ba1ffead8904bbbdaae',
 })
 
 // Digests that must NEVER authorize: releases removed from the rotation window,
@@ -55,6 +53,9 @@ export const REJECTED_PLUGIN_SHA256S = Object.freeze([
     // 0.2.4 validation/submission stability release (251,906 bytes), removed from the
     // window in the 0.2.6 sticky-incident/JSON-envelope rotation.
     '97b5f09b6512317a172937fabdb8765c5d07d1087bf1deb7a6ba5ca1dce7742b',
+    // Displaced from the rotation window by the 0.2.6 terminal-close UX hotfix rotation (2026-07-19,
+    // scripts/rotate-illustration-pin.mjs).
+    '31e284ab4d55a65c9043ece4de59ff0f9489b2b683d4c528a99510d75e5b0ed7',
 ])
 
 export type JobStateAcceptanceClassification = Readonly<{
