@@ -16,7 +16,10 @@ import {
     IllustrationLedgerVersionConflictError,
     IllustrationPromptContextRebindError,
 } from './errors'
-import type { IllustrationPromptContextV2 } from './promptContextV2'
+import type {
+    IllustrationPromptContextV2,
+    IllustrationTransportConfigV1,
+} from './promptContextV2'
 import { validateCoordinatorProofUnlocked } from './coordinatorRecord'
 import {
     isLegacyIllustrationStoredPrompt,
@@ -57,6 +60,11 @@ export const ILLUSTRATION_MANIFEST_PREFIX = 'illustration:v1:manifest:'
 export const ILLUSTRATION_JOB_PREFIX = 'illustration:v1:job:'
 export const ILLUSTRATION_TURN_JOBS_PREFIX = 'illustration:v1:turnjobs:'
 export const ILLUSTRATION_WORKER_EPOCH_KEY = 'illustration:v1:workerEpoch'
+// Prompt Target V2 (request §D1/§D5): the user's explicit transport election, set
+// by the Plugin via a validated RPC. Core never guesses a non-native transport —
+// this durable record is the only source. It stores NO credentials/URLs (those are
+// referenced from the db by name at resolve time).
+export const ILLUSTRATION_TRANSPORT_CONFIG_KEY = 'illustration:v1:transportConfig'
 // Durable pending-turn index: the set of non-terminal turn IDs. `listPendingTurns`
 // reads this and bulk-reads only those records, so the pending-listing cost stays
 // proportional to in-flight turns instead of O(total accumulated turn history).
@@ -115,6 +123,15 @@ export type PrepareTurnPromptContextInput = {
     turnId: string
     expectedVersion: number
     promptContext: IllustrationPromptContextV2
+}
+
+// Durable persistence wrapper for the transport election (adds a monotonic version
+// + updatedAt around IllustrationTransportConfigV1's payload).
+type IllustrationTransportConfigRecordV1 = {
+    schemaVersion: 1
+    election: IllustrationTransportConfigV1['election']
+    version: number
+    updatedAt: number
 }
 
 export type CreateManifestPreparedInput = {
@@ -1945,6 +1962,43 @@ export class IllustrationJobStore {
                 await writePersistentJson(illustrationTurnKey(input.id), next)
             }
             return cloneJson(next)
+        })
+    }
+
+    // Prompt Target V2: read the durable transport election RAW (no interpretation).
+    // Absent/legacy => an empty election. Re-validation lives in the coordinator layer
+    // so the store keeps a type-only dependency on the (measurement-importing)
+    // promptContextV2 module and never drags that chain into store-only test harnesses.
+    // Readable without any lease so a reloading Plugin/executor can resolve the target
+    // before opening a scheduler.
+    async getTransportConfig(): Promise<IllustrationTransportConfigV1> {
+        const record = await readPersistentJson<IllustrationTransportConfigRecordV1>(
+            ILLUSTRATION_TRANSPORT_CONFIG_KEY,
+        )
+        return { schemaVersion: 1, election: record?.election ?? null }
+    }
+
+    // Overwrite the durable transport election under the ledger lock. The config is
+    // strictly validated by the caller (coordinator.setTransportConfig via
+    // parseTransportConfig); this only persists it with a monotonic version. There is
+    // no per-turn binding here — the durable PromptContext snapshot
+    // (prepareTurnPromptContext) is what freezes a turn's target.
+    async setTransportConfig(
+        config: IllustrationTransportConfigV1,
+    ): Promise<IllustrationTransportConfigV1> {
+        return await withIllustrationLedgerLock(async () => {
+            const current = await readPersistentJson<IllustrationTransportConfigRecordV1>(
+                ILLUSTRATION_TRANSPORT_CONFIG_KEY,
+            )
+            const next: IllustrationTransportConfigRecordV1 = {
+                schemaVersion: 1,
+                election: config.election,
+                version: (current?.version ?? 0) + 1,
+                updatedAt: Date.now(),
+            }
+            assertJsonSerializable(next, 'transport config record')
+            await writePersistentJson(ILLUSTRATION_TRANSPORT_CONFIG_KEY, next)
+            return { schemaVersion: 1, election: config.election }
         })
     }
 

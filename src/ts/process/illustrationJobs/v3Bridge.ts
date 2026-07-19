@@ -355,6 +355,10 @@ export type IllustrationV3BridgeDependencies = {
     // Prompt Target V2 (Slice D). Optional so existing dependency literals keep
     // type-checking; when absent the RPC surfaces 'unavailable'.
     preparePromptContext?(input: Record<string, unknown>): Promise<unknown>
+    // Prompt Target V2 (Slice E): the durable transport election surface. Optional
+    // for the same reason; absent => 'unavailable'.
+    setTransportConfig?(input: unknown): Promise<unknown>
+    getTransportConfig?(): Promise<unknown>
     measureImagePrompt(input: MeasureImagePromptInputV1): Promise<IllustrationImagePromptMeasurementV1>
     cancelJob(input: { jobId: string; expectedVersion: number }): Promise<BridgeRecord>
     cancelTurn(input: { turnId: string; expectedVersion: number }): Promise<unknown>
@@ -877,6 +881,8 @@ export const ILLUSTRATION_JOBS_ALIAS = Object.freeze({
     submitPlan: '_ijSubmitPlan',
     supplyPrompt: '_ijSupplyPrompt',
     preparePromptContext: '_ijPreparePromptContext',
+    setTransportConfig: '_ijSetTransportConfig',
+    getTransportConfig: '_ijGetTransportConfig',
     measureImagePrompt: '_ijMeasureImagePrompt',
     listJobs: '_ijListJobs',
     cancel: '_ijCancel',
@@ -981,7 +987,21 @@ export function createAuthorizedIllustrationV3Bridge(input: {
                 // novelai-native transport resolves so far (others report
                 // prompt_target_unavailable until Slice E).
                 promptTargetContractVersion: ILLUSTRATION_V3_CONTRACT_IMPLEMENTATION.promptTargetV2 ? 2 : 0,
+                // Transports that auto-resolve from the current provider without an
+                // explicit election (unchanged — additive fields carry Slice E).
                 promptTargetResolvableTransports: ['novelai-native'],
+                // Slice E: every transport adapter Core can serialize/dispatch. The
+                // non-native three resolve only via an explicit setTransportConfig
+                // election on a compatible provider; this list is purely additive.
+                promptTransportsAvailable: [
+                    'novelai-native',
+                    'nai-compatible-flat',
+                    'webui-flat',
+                    'comfyui-flat',
+                ],
+                // Durable transport-election RPC surface (setTransportConfig /
+                // getTransportConfig). Additive.
+                transportConfigContractVersion: 1,
                 // Capture Policy V1: durable manual/automatic capture mode, manual
                 // per-response capture, and the pending-only backlog controls. Additive.
                 capturePolicyContractVersion: 1,
@@ -1154,6 +1174,28 @@ export function createAuthorizedIllustrationV3Bridge(input: {
                 {},
                 async () => await prepare(request),
             )
+        }),
+        _ijSetTransportConfig: async (value) => await invokeRpc(async () => {
+            ensureLive()
+            const request = sanitizedInput(value)
+            if (request.protocolVersion !== 2) throw codedError('validation')
+            const setConfig = deps.setTransportConfig
+            if (!setConfig) throw codedError('unavailable')
+            // A durable global mutation — require coordinator ownership like every
+            // other durable write.
+            return await hostRegistry.runOwned(
+                auth.runtimeId,
+                {},
+                async () => await setConfig(request.transportConfig),
+            )
+        }),
+        _ijGetTransportConfig: async () => await invokeRpc(async () => {
+            ensureLive()
+            const getConfig = deps.getTransportConfig
+            if (!getConfig) throw codedError('unavailable')
+            // Read-only durable setting, readable without ownership so a reloading
+            // Plugin/executor can resolve its target before opening a scheduler.
+            return await getConfig()
         }),
         _ijListJobs: async (value) => await invokeRpc(async () => {
             ensureLive()

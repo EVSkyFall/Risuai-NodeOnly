@@ -47,10 +47,12 @@ import {
     measureAndEnforceImagePromptForDispatch,
 } from './imagePromptMeasurement'
 import {
+    parseTransportConfig,
     resolvePromptTargetV2,
     validateOpaquePromptRef,
     validateTagProfileRef,
     type IllustrationPromptContextV2,
+    type IllustrationTransportConfigV1,
 } from './promptContextV2'
 import { withIllustrationOperationLock } from './operationLock'
 import { computeNaiSettingsFingerprint } from './settingsFingerprint'
@@ -1151,9 +1153,12 @@ export async function preparePromptContext(
     )
     const assetCatalogDigest = validateOpaquePromptRef(input.assetCatalogDigest, 'assetCatalogDigest')
 
-    // Snapshot the current provider target. resolvePromptTargetV2 raises a typed
-    // prompt_target_unavailable failure for the not-yet-implemented transports.
-    const target = await resolvePromptTargetV2(getDatabase())
+    // Snapshot the current provider target. The durable transport election (set by
+    // the Plugin via setTransportConfig) is authoritative for the non-native
+    // transports; without one, only novelai-native auto-resolves. A typed
+    // prompt_target_unavailable failure fails closed before any durable write.
+    const transportConfig = await readStoredTransportConfig()
+    const target = await resolvePromptTargetV2(getDatabase(), transportConfig)
 
     const promptContext: IllustrationPromptContextV2 = {
         target,
@@ -1167,6 +1172,33 @@ export async function preparePromptContext(
         promptContext,
     })
     return projectTurnSnapshot(record)
+}
+
+// Read + re-validate the durable transport election. A corrupt/hand-edited record
+// fails closed to an empty election (only novelai-native auto-resolves) rather than
+// resolving a malformed target. Validation lives here (not in the store) so the store
+// keeps a type-only dependency on promptContextV2's measurement-importing chain.
+async function readStoredTransportConfig(): Promise<IllustrationTransportConfigV1> {
+    const raw = await illustrationJobStore.getTransportConfig()
+    try {
+        return parseTransportConfig(raw)
+    } catch {
+        return { schemaVersion: 1, election: null }
+    }
+}
+
+// Prompt Target V2 (request §D1/§D5): the Plugin's explicit transport election.
+// Core strictly validates the shape (bounded strings, valid modes, explicit
+// measurement opt-ins) but never interprets it against a URL/provider — resolution
+// cross-checks provider compatibility later. This is a durable global setting; it
+// does not bind any in-flight turn (prepared turns keep their captured snapshot).
+export async function setTransportConfig(input: unknown): Promise<IllustrationTransportConfigV1> {
+    const config = parseTransportConfig(input)
+    return await illustrationJobStore.setTransportConfig(config)
+}
+
+export async function getTransportConfig(): Promise<IllustrationTransportConfigV1> {
+    return await readStoredTransportConfig()
 }
 
 type SupplyPromptLedgerBaseInput = IllustrationHolderWrite & IllustrationCoordinatorProof & {

@@ -173,7 +173,10 @@ function intendedTransportForProvider(provider: string): IllustrationPromptTrans
     }
 }
 
-export type PromptTargetDatabase = Pick<Database, 'sdProvider' | 'NAIImgUrl' | 'NAIImgModel'>
+export type PromptTargetDatabase = Pick<
+    Database,
+    'sdProvider' | 'NAIImgUrl' | 'NAIImgModel' | 'webUiUrl' | 'comfyUiUrl' | 'comfyConfig'
+>
 
 // The canonical execution descriptor that the target fingerprint hashes. It
 // intentionally carries `endpoint` (a dispatch identity) even though the public
@@ -281,12 +284,574 @@ function novelAiNativeModelIsMeasurable(db: PromptTargetDatabase): boolean {
     return isNaiV4ImageModel(db.NAIImgModel ?? DEFAULT_NAI_MODEL)
 }
 
-// Resolve the durable target for the CURRENTLY configured provider. Slice D only
-// resolves 'novelai' + a V4 model -> novelai-native; every other provider yields a
-// typed preparation failure (request §4/§7: the other transports arrive in Slice E).
+// ---------------------------------------------------------------------------
+// Explicit transport election (request §2/§7.2-7.4). The non-native transports
+// are NEVER inferred from provider/URL shape — the Plugin sets a durable election
+// via a validated RPC and Core resolves ONLY what the election names, cross-checked
+// against the current provider protocol. Endpoints and credentials are read from
+// the existing db fields BY NAME (never copied into the election), so the election
+// stores no secrets (request §D5 / gap §4).
+// ---------------------------------------------------------------------------
+
+export const TRANSPORT_CONFIG_CONTRACT_VERSION = 1 as const
+export const TRANSPORT_ONLY_MEASUREMENT_REVISION = 'transport-only/1'
+export const UNMEASURED_MEASUREMENT_REVISION = 'unmeasured/1'
+export const PROVIDER_REPORTED_MEASUREMENT_REVISION = 'provider-reported/1'
+export const WEBUI_FLAT_QUEUE_POLICY_REVISION = 'webui-flat-queue/1'
+export const COMFYUI_FLAT_QUEUE_POLICY_REVISION = 'comfyui-flat-queue/1'
+export const NAI_COMPATIBLE_FLAT_QUEUE_POLICY_REVISION = 'nai-compatible-flat-queue/1'
+export const MAX_TRANSPORT_SUBJECT_SLOTS = 32
+export const MAX_TRANSPORT_CONCURRENCY = 32
+
+// The user's explicit measurement election. transport_only / unmeasured carry the
+// REQUIRED explicit opt-in literal so the eligibility is snapshotted into the target
+// fingerprint and there is never an automatic opt-in (request §6).
+export type IllustrationTransportMeasurementElection =
+    | {
+        mode: 'transport_only'
+        unit: IllustrationPromptTransportLimitUnit
+        positive: number | null
+        negative: number | null
+        combined: number | null
+        allowTransportOnly: true
+    }
+    | { mode: 'provider_reported' }
+    | { mode: 'unmeasured'; allowUnmeasured: true }
+
+export type IllustrationNaiCompatibleFlatElection = {
+    transportId: 'nai-compatible-flat'
+    layout: 'flat' | 'pipe-slots'
+    // Present iff layout === 'pipe-slots'.
+    pipe?: {
+        revision: string
+        maxSubjects: number
+        negative: 'base-only' | 'base-then-subjects'
+    }
+    measurement: IllustrationTransportMeasurementElection
+    maxConcurrency: number
+    priorityPolicy: 'interactive-first' | 'fifo'
+}
+
+export type IllustrationWebuiFlatElection = {
+    transportId: 'webui-flat'
+    binding:
+        | { mode: 'request-pinned'; checkpoint: string }
+        | { mode: 'probe-and-revalidate'; checkpointFingerprint: string }
+    measurement: IllustrationTransportMeasurementElection
+    maxConcurrency: number
+    priorityPolicy: 'interactive-first' | 'fifo'
+}
+
+export type IllustrationComfyuiFlatElection = {
+    transportId: 'comfyui-flat'
+    workflowFingerprint: string
+    positiveNode: { nodeId: string; inputName: string }
+    negativeNode: { nodeId: string; inputName: string }
+    modelBindingRevision: string
+    measurement: IllustrationTransportMeasurementElection
+    maxConcurrency: number
+    priorityPolicy: 'interactive-first' | 'fifo'
+}
+
+export type IllustrationTransportElection =
+    | IllustrationNaiCompatibleFlatElection
+    | IllustrationWebuiFlatElection
+    | IllustrationComfyuiFlatElection
+
+export type IllustrationTransportConfigV1 = {
+    schemaVersion: 1
+    election: IllustrationTransportElection | null
+}
+
+export const EMPTY_TRANSPORT_CONFIG: IllustrationTransportConfigV1 = Object.freeze({
+    schemaVersion: 1,
+    election: null,
+})
+
+function invalidTransportConfig(message: string): never {
+    throw new IllustrationLedgerValidationError(`transportConfig ${message}`)
+}
+
+function boundedRef(value: unknown, label: string): string {
+    if (typeof value !== 'string' || value.length === 0) {
+        invalidTransportConfig(`${label} must be a non-empty string`)
+    }
+    if ((value as string).length > MAX_ILLUSTRATION_OPAQUE_REF_LENGTH) {
+        invalidTransportConfig(`${label} must be at most ${MAX_ILLUSTRATION_OPAQUE_REF_LENGTH} code units`)
+    }
+    return value as string
+}
+
+function boundedCount(value: unknown, label: string, max: number): number {
+    if (!Number.isSafeInteger(value) || (value as number) < 0 || (value as number) > max) {
+        invalidTransportConfig(`${label} must be an integer in [0, ${max}]`)
+    }
+    return value as number
+}
+
+function optionalLimit(value: unknown, label: string): number | null {
+    if (value === null) return null
+    if (!Number.isSafeInteger(value) || (value as number) < 0) {
+        invalidTransportConfig(`${label} must be null or a non-negative integer`)
+    }
+    return value as number
+}
+
+function parseMeasurementElection(value: unknown): IllustrationTransportMeasurementElection {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        invalidTransportConfig('measurement must be an object')
+    }
+    const input = value as Record<string, unknown>
+    if (input.mode === 'transport_only') {
+        if (
+            input.unit !== 'utf8_byte'
+            && input.unit !== 'utf16_code_unit'
+            && input.unit !== 'unicode_scalar_value'
+        ) {
+            invalidTransportConfig('measurement.unit must be a documented transport unit')
+        }
+        // The explicit opt-in must be literally present (request §6: no auto opt-in).
+        if (input.allowTransportOnly !== true) {
+            invalidTransportConfig('transport_only measurement requires allowTransportOnly:true')
+        }
+        return {
+            mode: 'transport_only',
+            unit: input.unit,
+            positive: optionalLimit(input.positive, 'measurement.positive'),
+            negative: optionalLimit(input.negative, 'measurement.negative'),
+            combined: optionalLimit(input.combined, 'measurement.combined'),
+            allowTransportOnly: true,
+        }
+    }
+    if (input.mode === 'provider_reported') {
+        return { mode: 'provider_reported' }
+    }
+    if (input.mode === 'unmeasured') {
+        if (input.allowUnmeasured !== true) {
+            invalidTransportConfig('unmeasured measurement requires allowUnmeasured:true')
+        }
+        return { mode: 'unmeasured', allowUnmeasured: true }
+    }
+    invalidTransportConfig('measurement.mode is not a non-native transport mode')
+}
+
+function parsePriorityPolicy(value: unknown): 'interactive-first' | 'fifo' {
+    if (value !== 'interactive-first' && value !== 'fifo') {
+        invalidTransportConfig('priorityPolicy must be "interactive-first" or "fifo"')
+    }
+    return value
+}
+
+function parseTransportElection(value: unknown): IllustrationTransportElection {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        invalidTransportConfig('election must be an object')
+    }
+    const input = value as Record<string, unknown>
+    const measurement = parseMeasurementElection(input.measurement)
+    const maxConcurrency = boundedCount(input.maxConcurrency, 'maxConcurrency', MAX_TRANSPORT_CONCURRENCY)
+    if (maxConcurrency < 1) invalidTransportConfig('maxConcurrency must be at least 1')
+    const priorityPolicy = parsePriorityPolicy(input.priorityPolicy)
+
+    if (input.transportId === 'nai-compatible-flat') {
+        if (input.layout !== 'flat' && input.layout !== 'pipe-slots') {
+            invalidTransportConfig('nai-compatible-flat layout must be "flat" or "pipe-slots"')
+        }
+        let pipe: IllustrationNaiCompatibleFlatElection['pipe']
+        if (input.layout === 'pipe-slots') {
+            const raw = input.pipe
+            if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+                invalidTransportConfig('pipe-slots layout requires a pipe descriptor')
+            }
+            const pipeInput = raw as Record<string, unknown>
+            if (pipeInput.negative !== 'base-only' && pipeInput.negative !== 'base-then-subjects') {
+                invalidTransportConfig('pipe.negative must be "base-only" or "base-then-subjects"')
+            }
+            pipe = {
+                revision: boundedRef(pipeInput.revision, 'pipe.revision'),
+                maxSubjects: boundedCount(pipeInput.maxSubjects, 'pipe.maxSubjects', MAX_TRANSPORT_SUBJECT_SLOTS),
+                negative: pipeInput.negative,
+            }
+        } else if (input.pipe !== undefined) {
+            invalidTransportConfig('flat layout must not carry a pipe descriptor')
+        }
+        return { transportId: 'nai-compatible-flat', layout: input.layout, pipe, measurement, maxConcurrency, priorityPolicy }
+    }
+
+    if (input.transportId === 'webui-flat') {
+        const binding = input.binding
+        if (!binding || typeof binding !== 'object' || Array.isArray(binding)) {
+            invalidTransportConfig('webui-flat requires a binding')
+        }
+        const bindingInput = binding as Record<string, unknown>
+        if (bindingInput.mode === 'request-pinned') {
+            return {
+                transportId: 'webui-flat',
+                binding: { mode: 'request-pinned', checkpoint: boundedRef(bindingInput.checkpoint, 'binding.checkpoint') },
+                measurement,
+                maxConcurrency,
+                priorityPolicy,
+            }
+        }
+        if (bindingInput.mode === 'probe-and-revalidate') {
+            return {
+                transportId: 'webui-flat',
+                binding: {
+                    mode: 'probe-and-revalidate',
+                    checkpointFingerprint: boundedRef(bindingInput.checkpointFingerprint, 'binding.checkpointFingerprint'),
+                },
+                measurement,
+                maxConcurrency,
+                priorityPolicy,
+            }
+        }
+        // A plain user label is NOT a checkpoint proof (request §7.3): neither
+        // binding mode is provable -> the election itself is invalid.
+        invalidTransportConfig('webui-flat binding.mode must be "request-pinned" or "probe-and-revalidate"')
+    }
+
+    if (input.transportId === 'comfyui-flat') {
+        const parseNode = (raw: unknown, label: string) => {
+            if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+                invalidTransportConfig(`${label} must be an object`)
+            }
+            const node = raw as Record<string, unknown>
+            return {
+                nodeId: boundedRef(node.nodeId, `${label}.nodeId`),
+                inputName: boundedRef(node.inputName, `${label}.inputName`),
+            }
+        }
+        return {
+            transportId: 'comfyui-flat',
+            workflowFingerprint: boundedRef(input.workflowFingerprint, 'workflowFingerprint'),
+            positiveNode: parseNode(input.positiveNode, 'positiveNode'),
+            negativeNode: parseNode(input.negativeNode, 'negativeNode'),
+            modelBindingRevision: boundedRef(input.modelBindingRevision, 'modelBindingRevision'),
+            measurement,
+            maxConcurrency,
+            priorityPolicy,
+        }
+    }
+
+    invalidTransportConfig('election.transportId is not a supported non-native transport')
+}
+
+export function parseTransportConfig(value: unknown): IllustrationTransportConfigV1 {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        invalidTransportConfig('must be an object')
+    }
+    const input = value as Record<string, unknown>
+    if (input.schemaVersion !== TRANSPORT_CONFIG_CONTRACT_VERSION) {
+        invalidTransportConfig('schemaVersion must be 1')
+    }
+    if (input.election === null || input.election === undefined) {
+        return { schemaVersion: 1, election: null }
+    }
+    return { schemaVersion: 1, election: parseTransportElection(input.election) }
+}
+
+// A non-native transport election, when present, is authoritative. It never
+// silently infers a transport from the provider; instead it validates that the
+// current provider protocol is COMPATIBLE with the elected NAI-shaped/webui/comfy
+// transport (request §2). An incompatible provider fails closed.
+function requireCompatibleProvider(
+    transportId: IllustrationPromptTransportId,
+    provider: string,
+): void {
+    const compatible =
+        (transportId === 'nai-compatible-flat' && provider === 'novelai')
+        || (transportId === 'webui-flat' && provider === 'webui')
+        || (transportId === 'comfyui-flat' && (provider === 'comfy' || provider === 'comfyui'))
+    if (!compatible) {
+        throw new IllustrationPromptTargetUnavailableError(
+            transportId,
+            `the elected transport is not compatible with the current provider "${provider.length > 0 ? provider : 'unset'}"`,
+        )
+    }
+}
+
+function requireEndpoint(
+    raw: unknown,
+    transportId: IllustrationPromptTransportId,
+    requireHttps: boolean,
+): string {
+    if (typeof raw !== 'string' || raw.length === 0) {
+        throw new IllustrationPromptTargetUnavailableError(transportId, 'no endpoint URL is configured')
+    }
+    let url: URL
+    try {
+        url = new URL(raw)
+    } catch {
+        throw new IllustrationPromptTargetUnavailableError(transportId, 'the configured endpoint is not a valid URL')
+    }
+    if (requireHttps ? url.protocol !== 'https:' : url.protocol !== 'http:' && url.protocol !== 'https:') {
+        throw new IllustrationPromptTargetUnavailableError(
+            transportId,
+            requireHttps ? 'the endpoint must be an https URL' : 'the endpoint must be an http(s) URL',
+        )
+    }
+    return raw
+}
+
+function measurementDescriptorFromElection(
+    election: IllustrationTransportMeasurementElection,
+): IllustrationPromptMeasurementDescriptor {
+    switch (election.mode) {
+        case 'transport_only':
+            return {
+                mode: 'transport_only',
+                revision: TRANSPORT_ONLY_MEASUREMENT_REVISION,
+                tokenizerId: null,
+                documentedTransportLimit: {
+                    unit: election.unit,
+                    positive: election.positive,
+                    negative: election.negative,
+                    combined: election.combined,
+                },
+                dispatchPolicy: 'allow-transport-only',
+            }
+        case 'provider_reported':
+            return {
+                mode: 'provider_reported',
+                revision: PROVIDER_REPORTED_MEASUREMENT_REVISION,
+                tokenizerId: null,
+                documentedTransportLimit: null,
+                dispatchPolicy: 'allow-provider-authoritative',
+            }
+        case 'unmeasured':
+            return {
+                mode: 'unmeasured',
+                revision: UNMEASURED_MEASUREMENT_REVISION,
+                tokenizerId: null,
+                documentedTransportLimit: null,
+                dispatchPolicy: 'allow-unmeasured',
+            }
+    }
+}
+
+function electionAllowFlags(
+    election: IllustrationTransportMeasurementElection,
+): { allowTransportOnly: boolean; allowUnmeasured: boolean } {
+    return {
+        allowTransportOnly: election.mode === 'transport_only',
+        allowUnmeasured: election.mode === 'unmeasured',
+    }
+}
+
+// Distinct concurrency keys never serialize against each other (request §8); the
+// key is stable per transport+endpoint so two targets on the same backend share a
+// queue while different backends run in parallel. It participates in the target
+// fingerprint (endpoint identity), but the mutable maxConcurrency/priorityPolicy
+// do not (request §4/§20).
+function transportConcurrencyKey(
+    transportId: IllustrationPromptTransportId,
+    endpoint: string,
+): string {
+    return `${transportId}:${endpoint}`
+}
+
+async function finalizeTarget(
+    descriptor: PromptTargetExecutionDescriptor,
+    queue: { policyRevision: string; maxConcurrency: number; priorityPolicy: 'interactive-first' | 'fifo' },
+): Promise<IllustrationPromptTargetV2> {
+    const targetFingerprint = await computeTargetFingerprint(descriptor)
+    return {
+        schemaVersion: 2,
+        targetFingerprint,
+        providerId: descriptor.providerId,
+        transportId: descriptor.transportId,
+        modelId: descriptor.modelId,
+        checkpointFingerprint: descriptor.checkpointFingerprint,
+        workflowFingerprint: descriptor.workflowFingerprint,
+        bindingRevision: descriptor.bindingRevision,
+        bindingMode: descriptor.bindingMode,
+        acceptedLayouts: [...descriptor.acceptedLayouts],
+        negativeChannel: descriptor.negativeChannel,
+        textPreservation: descriptor.textPreservation,
+        subjectSlots: {
+            ...descriptor.subjectSlots,
+            pipeSerialization: descriptor.subjectSlots.pipeSerialization
+                ? { ...descriptor.subjectSlots.pipeSerialization }
+                : null,
+        },
+        measurement: {
+            ...descriptor.measurement,
+            documentedTransportLimit: descriptor.measurement.documentedTransportLimit
+                ? { ...descriptor.measurement.documentedTransportLimit }
+                : null,
+        },
+        queue: {
+            concurrencyKey: descriptor.concurrencyKey,
+            policyRevision: queue.policyRevision,
+            maxConcurrency: queue.maxConcurrency,
+            priorityPolicy: queue.priorityPolicy,
+        },
+    }
+}
+
+export async function resolveNaiCompatibleFlatTarget(
+    db: PromptTargetDatabase,
+    election: IllustrationNaiCompatibleFlatElection,
+): Promise<IllustrationPromptTargetV2> {
+    const endpoint = requireEndpoint(db.NAIImgUrl ?? DEFAULT_NAI_ENDPOINT, 'nai-compatible-flat', true)
+    const pipeSerialization: IllustrationPromptPipeSerialization | null =
+        election.layout === 'pipe-slots' && election.pipe
+            ? {
+                revision: election.pipe.revision,
+                separator: ' | ',
+                positive: 'base-then-subjects',
+                negative: election.pipe.negative,
+                rejectLiteralSeparator: true,
+            }
+            : null
+    const subjectSlots: IllustrationPromptSubjectSlots =
+        election.layout === 'pipe-slots' && election.pipe
+            ? {
+                maxSubjects: election.pipe.maxSubjects,
+                positive: 'exact-scene-subjects',
+                negative: election.pipe.negative === 'base-then-subjects' ? 'match-positive' : 'empty',
+                allowEmptyPositive: false,
+                allowEmptyNegative: true,
+                pipeSerialization,
+            }
+            : {
+                maxSubjects: 0,
+                positive: 'empty',
+                negative: 'empty',
+                allowEmptyPositive: false,
+                allowEmptyNegative: true,
+                pipeSerialization: null,
+            }
+    const flags = electionAllowFlags(election.measurement)
+    const descriptor: PromptTargetExecutionDescriptor = {
+        schemaVersion: 2,
+        providerId: 'novelai',
+        transportId: 'nai-compatible-flat',
+        endpoint,
+        modelId: db.NAIImgModel ?? DEFAULT_NAI_MODEL,
+        checkpointFingerprint: null,
+        workflowFingerprint: null,
+        bindingMode: 'opaque-remote',
+        bindingRevision: null,
+        acceptedLayouts: [election.layout],
+        negativeChannel: 'separate',
+        textPreservation: 'exact',
+        subjectSlots,
+        measurement: measurementDescriptorFromElection(election.measurement),
+        allowTransportOnly: flags.allowTransportOnly,
+        allowUnmeasured: flags.allowUnmeasured,
+        concurrencyKey: transportConcurrencyKey('nai-compatible-flat', endpoint),
+    }
+    return await finalizeTarget(descriptor, {
+        policyRevision: NAI_COMPATIBLE_FLAT_QUEUE_POLICY_REVISION,
+        maxConcurrency: election.maxConcurrency,
+        priorityPolicy: election.priorityPolicy,
+    })
+}
+
+const FLAT_SUBJECT_SLOTS: IllustrationPromptSubjectSlots = Object.freeze({
+    maxSubjects: 0,
+    positive: 'empty',
+    negative: 'empty',
+    allowEmptyPositive: false,
+    allowEmptyNegative: true,
+    pipeSerialization: null,
+})
+
+export async function resolveWebuiFlatTarget(
+    db: PromptTargetDatabase,
+    election: IllustrationWebuiFlatElection,
+): Promise<IllustrationPromptTargetV2> {
+    const endpoint = requireEndpoint(db.webUiUrl, 'webui-flat', false)
+    const checkpointFingerprint =
+        election.binding.mode === 'request-pinned'
+            ? await sha256Hex(`webui-request-pinned:${election.binding.checkpoint}`)
+            : election.binding.checkpointFingerprint
+    const flags = electionAllowFlags(election.measurement)
+    const descriptor: PromptTargetExecutionDescriptor = {
+        schemaVersion: 2,
+        providerId: 'webui',
+        transportId: 'webui-flat',
+        endpoint,
+        modelId: null,
+        checkpointFingerprint,
+        workflowFingerprint: null,
+        bindingMode: election.binding.mode,
+        bindingRevision: null,
+        acceptedLayouts: ['flat'],
+        negativeChannel: 'separate',
+        textPreservation: 'exact',
+        subjectSlots: { ...FLAT_SUBJECT_SLOTS },
+        measurement: measurementDescriptorFromElection(election.measurement),
+        allowTransportOnly: flags.allowTransportOnly,
+        allowUnmeasured: flags.allowUnmeasured,
+        concurrencyKey: transportConcurrencyKey('webui-flat', endpoint),
+    }
+    return await finalizeTarget(descriptor, {
+        policyRevision: WEBUI_FLAT_QUEUE_POLICY_REVISION,
+        maxConcurrency: election.maxConcurrency,
+        priorityPolicy: election.priorityPolicy,
+    })
+}
+
+export async function resolveComfyuiFlatTarget(
+    db: PromptTargetDatabase,
+    election: IllustrationComfyuiFlatElection,
+): Promise<IllustrationPromptTargetV2> {
+    const endpoint = requireEndpoint(db.comfyUiUrl, 'comfyui-flat', false)
+    const flags = electionAllowFlags(election.measurement)
+    const descriptor: PromptTargetExecutionDescriptor = {
+        schemaVersion: 2,
+        providerId: db.sdProvider ?? 'comfyui',
+        transportId: 'comfyui-flat',
+        endpoint,
+        modelId: null,
+        checkpointFingerprint: null,
+        workflowFingerprint: election.workflowFingerprint,
+        bindingMode: 'workflow-pinned',
+        bindingRevision: election.modelBindingRevision,
+        acceptedLayouts: ['flat'],
+        negativeChannel: 'separate',
+        textPreservation: 'exact',
+        subjectSlots: { ...FLAT_SUBJECT_SLOTS },
+        measurement: measurementDescriptorFromElection(election.measurement),
+        allowTransportOnly: flags.allowTransportOnly,
+        allowUnmeasured: flags.allowUnmeasured,
+        concurrencyKey: transportConcurrencyKey('comfyui-flat', endpoint),
+    }
+    return await finalizeTarget(descriptor, {
+        policyRevision: COMFYUI_FLAT_QUEUE_POLICY_REVISION,
+        maxConcurrency: election.maxConcurrency,
+        priorityPolicy: election.priorityPolicy,
+    })
+}
+
+async function resolveElectedTarget(
+    db: PromptTargetDatabase,
+    election: IllustrationTransportElection,
+): Promise<IllustrationPromptTargetV2> {
+    const provider = db.sdProvider ?? ''
+    requireCompatibleProvider(election.transportId, provider)
+    switch (election.transportId) {
+        case 'nai-compatible-flat':
+            return await resolveNaiCompatibleFlatTarget(db, election)
+        case 'webui-flat':
+            return await resolveWebuiFlatTarget(db, election)
+        case 'comfyui-flat':
+            return await resolveComfyuiFlatTarget(db, election)
+    }
+}
+
+// Resolve the durable target for the CURRENTLY configured provider. A non-native
+// transport election (when present) is authoritative and never inferred; without
+// an election only 'novelai' + a V4 model resolves (novelai-native). Everything
+// else fails closed with a typed preparation failure (request §2/§4/§7).
 export async function resolvePromptTargetV2(
     db: PromptTargetDatabase,
+    transportConfig: IllustrationTransportConfigV1 | null = null,
 ): Promise<IllustrationPromptTargetV2> {
+    const election = transportConfig?.election ?? null
+    if (election) return await resolveElectedTarget(db, election)
+
     const provider = db.sdProvider ?? ''
     if (provider === 'novelai') {
         // Fail closed BEFORE any durable capture rather than pinning a descriptor
@@ -308,7 +873,7 @@ export async function resolvePromptTargetV2(
     if (intended) {
         throw new IllustrationPromptTargetUnavailableError(
             intended,
-            'this transport adapter is not implemented until Slice E',
+            'this transport requires an explicit Plugin transport election before it can resolve',
         )
     }
     throw new IllustrationPromptTargetUnavailableError(
@@ -352,21 +917,22 @@ export function validateTagProfileRef(value: unknown): IllustrationTagProfileRef
     }
 }
 
-// Re-resolve the target from the CURRENT database and confirm its fingerprint
-// still matches the value captured at prepare time. Used before any provider
-// dispatch so a post-capture endpoint/model change fails closed (request §4/§10-6).
+// Re-resolve the target from the CURRENT database + transport config and confirm
+// its fingerprint still matches the value captured at prepare time. Used before any
+// provider dispatch so a post-capture endpoint/model/checkpoint/workflow change (or
+// a dropped/altered election) fails closed (request §4/§10-6/§10-7). Any resolution
+// failure (unavailable transport, incompatible provider) is a definite mismatch,
+// never a silent pass. Queue tuning alone never changes the fingerprint (§20).
 export async function targetFingerprintMatchesCurrentDb(
     db: PromptTargetDatabase,
     expectedFingerprint: string,
+    transportConfig: IllustrationTransportConfigV1 | null = null,
 ): Promise<boolean> {
-    const provider = db.sdProvider ?? ''
-    // A provider change that no longer resolves any target is, by definition, a
-    // fingerprint mismatch — never a silent pass.
-    if (provider !== 'novelai') return false
-    // A NovelAI model that dropped out of the V4 family no longer resolves a valid
-    // novelai-native target (only V4 honors the pinned T5 model_exact measurement):
-    // a definite mismatch, never a silent pass.
-    if (!novelAiNativeModelIsMeasurable(db)) return false
-    const current = await resolveNovelAiNativeTarget(db)
+    let current: IllustrationPromptTargetV2
+    try {
+        current = await resolvePromptTargetV2(db, transportConfig)
+    } catch {
+        return false
+    }
     return current.targetFingerprint === expectedFingerprint
 }

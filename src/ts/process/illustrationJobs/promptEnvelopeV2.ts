@@ -258,19 +258,92 @@ export function validateEnvelopeAgainstTarget(
     }
 
     if (envelope.layout === 'pipe-slots') {
-        // Repeat the literal-separator conflict check Core owes before serializing.
+        const pipe = slots.pipeSerialization
+        if (!pipe) {
+            // A target that accepts the pipe-slots layout but declares no pipe
+            // serialization contract cannot serialize it — fail closed.
+            throw new IllustrationPromptV2ContractError(
+                'prompt_pipe_serialization_unsupported',
+                `Target transport "${target.transportId}" accepts pipe-slots but declares no pipe serialization contract`,
+            )
+        }
+        // Repeat the literal-separator conflict check Core owes before serializing
+        // (request §5): Plugin rejected it earlier, Core re-validates with position.
         assertNoLiteralSeparatorConflict(
             [envelope.basePositive, ...envelope.subjectPositives],
             'positive',
         )
-        assertNoLiteralSeparatorConflict(
-            [envelope.baseNegative, ...envelope.subjectNegatives],
-            'negative',
-        )
-        // Slice D validates pipe structure but does not serialize it.
-        throw new IllustrationPromptV2ContractError(
-            'prompt_pipe_serialization_unsupported',
-            'pipe-slots serialization is not implemented until Slice E',
-        )
+        if (pipe.negative === 'base-only') {
+            // base-only negative serialization only emits baseNegative. Subject-level
+            // negative CONTENT would be silently dropped, so reject it instead of
+            // dropping (request §4: no silent drop).
+            for (let index = 0; index < envelope.subjectNegatives.length; index += 1) {
+                if (envelope.subjectNegatives[index].length > 0) {
+                    throw new IllustrationPromptV2ContractError(
+                        'prompt_negative_channel_unsupported',
+                        `Target transport "${target.transportId}" serializes a base-only negative; subjectNegatives[${index}] carries content that would be dropped`,
+                    )
+                }
+            }
+            assertNoLiteralSeparatorConflict([envelope.baseNegative], 'negative')
+        } else {
+            assertNoLiteralSeparatorConflict(
+                [envelope.baseNegative, ...envelope.subjectNegatives],
+                'negative',
+            )
+        }
     }
+}
+
+// The exact pipe join contract (request §5): positive is base-then-subjects; the
+// negative follows the target's declared mode. Every part is code-unit exact —
+// we never trim, reorder, or normalize; a literal separator inside any part has
+// already been rejected by validateEnvelopeAgainstTarget/assertNoLiteralSeparatorConflict.
+function joinPipe(parts: readonly string[]): string {
+    return parts.join(PIPE_SEPARATOR)
+}
+
+export type SerializedTransportText = {
+    positive: string
+    negative: string
+}
+
+// Serialize a validated envelope into the exact positive/negative transport text
+// for a flat or pipe-slots target. Call validateEnvelopeAgainstTarget first — this
+// re-runs the literal-separator guard defensively but assumes cardinality/layout
+// were already enforced. native-character-slots has no flat text serialization
+// (its structured captions are transported directly), so it is rejected here.
+export function serializeEnvelopeForTransport(
+    envelope: IllustrationPromptEnvelopeV2,
+    target: IllustrationPromptTargetV2,
+): SerializedTransportText {
+    if (envelope.layout === 'flat') {
+        return { positive: envelope.basePositive, negative: envelope.baseNegative }
+    }
+    if (envelope.layout === 'pipe-slots') {
+        const pipe = target.subjectSlots.pipeSerialization
+        if (!pipe) {
+            throw new IllustrationPromptV2ContractError(
+                'prompt_pipe_serialization_unsupported',
+                `Target transport "${target.transportId}" declares no pipe serialization contract`,
+            )
+        }
+        const positiveParts = [envelope.basePositive, ...envelope.subjectPositives]
+        assertNoLiteralSeparatorConflict(positiveParts, 'positive')
+        const positive = joinPipe(positiveParts)
+        let negative: string
+        if (pipe.negative === 'base-only') {
+            assertNoLiteralSeparatorConflict([envelope.baseNegative], 'negative')
+            negative = envelope.baseNegative
+        } else {
+            const negativeParts = [envelope.baseNegative, ...envelope.subjectNegatives]
+            assertNoLiteralSeparatorConflict(negativeParts, 'negative')
+            negative = joinPipe(negativeParts)
+        }
+        return { positive, negative }
+    }
+    throw new IllustrationPromptV2ContractError(
+        'prompt_layout_unsupported',
+        `The "${envelope.layout}" layout has no flat/pipe text serialization`,
+    )
 }

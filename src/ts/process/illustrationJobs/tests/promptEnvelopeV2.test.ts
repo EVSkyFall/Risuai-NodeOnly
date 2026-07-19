@@ -4,6 +4,7 @@ import {
     computeEnvelopeHash,
     MAX_ILLUSTRATION_ENVELOPE_BYTES,
     parseIllustrationPromptEnvelopeV2,
+    serializeEnvelopeForTransport,
     validateEnvelopeAgainstTarget,
     type IllustrationPromptEnvelopeV2,
 } from '../promptEnvelopeV2'
@@ -169,38 +170,85 @@ describe('envelope-to-target binding (request §5/§8/§10-17)', () => {
             .toThrowError(invalid('prompt_envelope_invalid'))
     })
 
-    test('validates a pipe target structurally but defers its serialization to Slice E', () => {
-        const pipeTarget: IllustrationPromptTargetV2 = {
+    function pipeTargetWith(negative: 'base-only' | 'base-then-subjects'): IllustrationPromptTargetV2 {
+        return {
             ...naiTarget,
             transportId: 'nai-compatible-flat',
             acceptedLayouts: ['pipe-slots'],
             subjectSlots: {
                 ...naiTarget.subjectSlots,
+                maxSubjects: 4,
                 pipeSerialization: {
                     revision: '1',
                     separator: ' | ',
                     positive: 'base-then-subjects',
-                    negative: 'base-only',
+                    negative,
                     rejectLiteralSeparator: true,
                 },
             },
         }
+    }
+
+    test('re-validates a literal pipe conflict at the serializer boundary with position (§5/§9)', () => {
+        const pipeTarget = pipeTargetWith('base-only')
         const conflicting = parseIllustrationPromptEnvelopeV2(flatEnvelope({
             layout: 'pipe-slots',
             basePositive: 'base | extra',
             subjectPositives: ['a'],
-            subjectNegatives: ['na'],
+            subjectNegatives: [''],
         }))
-        expect(() => validateEnvelopeAgainstTarget(conflicting, pipeTarget))
-            .toThrowError(invalid('prompt_pipe_conflict'))
-        const clean = parseIllustrationPromptEnvelopeV2(flatEnvelope({
+        try {
+            validateEnvelopeAgainstTarget(conflicting, pipeTarget)
+            throw new Error('expected a pipe conflict')
+        } catch (error) {
+            expect((error as { code: string }).code).toBe('prompt_pipe_conflict')
+            // Position info is carried: the '|' is at code-unit offset 5 of part[0].
+            expect((error as Error).message).toContain('offset 5')
+        }
+    })
+
+    test('base-only negative rejects subject-level negative content instead of silently dropping it (§4)', () => {
+        const pipeTarget = pipeTargetWith('base-only')
+        const dropping = parseIllustrationPromptEnvelopeV2(flatEnvelope({
             layout: 'pipe-slots',
             basePositive: 'base',
             subjectPositives: ['a'],
             subjectNegatives: ['na'],
         }))
-        expect(() => validateEnvelopeAgainstTarget(clean, pipeTarget))
-            .toThrowError(invalid('prompt_pipe_serialization_unsupported'))
+        expect(() => validateEnvelopeAgainstTarget(dropping, pipeTarget))
+            .toThrowError(invalid('prompt_negative_channel_unsupported'))
+    })
+
+    test('serializes base-then-subjects exactly, code-unit for code-unit (§5/§9)', () => {
+        const pipeTarget = pipeTargetWith('base-then-subjects')
+        const envelope = parseIllustrationPromptEnvelopeV2(flatEnvelope({
+            layout: 'pipe-slots',
+            basePositive: 'base 😀',
+            subjectPositives: ['alice', '𐐷 bob'],
+            baseNegative: 'lowres',
+            subjectNegatives: ['blurry', ''],
+        }))
+        validateEnvelopeAgainstTarget(envelope, pipeTarget)
+        expect(serializeEnvelopeForTransport(envelope, pipeTarget)).toEqual({
+            positive: 'base 😀 | alice | 𐐷 bob',
+            negative: 'lowres | blurry | ',
+        })
+    })
+
+    test('base-only negative serializes just the base negative', () => {
+        const pipeTarget = pipeTargetWith('base-only')
+        const envelope = parseIllustrationPromptEnvelopeV2(flatEnvelope({
+            layout: 'pipe-slots',
+            basePositive: 'base',
+            subjectPositives: ['a', 'b'],
+            baseNegative: 'lowres',
+            subjectNegatives: ['', ''],
+        }))
+        validateEnvelopeAgainstTarget(envelope, pipeTarget)
+        expect(serializeEnvelopeForTransport(envelope, pipeTarget)).toEqual({
+            positive: 'base | a | b',
+            negative: 'lowres',
+        })
     })
 })
 

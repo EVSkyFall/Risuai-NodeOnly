@@ -178,11 +178,14 @@ describe('novelai-native model_exact receipt (request §6)', () => {
         }
     })
 
-    test('non-model_exact measurement modes are not producible this slice', async () => {
+    test('a transport_only mode with no documented limit is rejected as unmeasurable', async () => {
         const db = naiDb()
         const restore = installImagePromptMeasurementTestService(() => db)
         try {
             const base = await resolveNovelAiNativeTarget(db)
+            // A transport_only descriptor MUST carry a documentedTransportLimit; one
+            // synthesized without it (measurement.documentedTransportLimit === null)
+            // cannot honestly measure anything and fails closed.
             const transportOnlyTarget: IllustrationPromptTargetV2 = {
                 ...base,
                 measurement: { ...base.measurement, mode: 'transport_only' },

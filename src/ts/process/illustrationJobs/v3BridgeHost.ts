@@ -8,6 +8,7 @@ import {
     claimJobLedger,
     claimTurnLedger,
     forceTakeoverCoordinatorLedger,
+    getTransportConfig,
     listJobsLedger,
     listPendingTurnsLedger,
     markCoordinatorDrainingLedger,
@@ -19,6 +20,7 @@ import {
     requestCurrentVariant,
     retryAgentFailureLedger,
     retryUncertainLedger,
+    setTransportConfig,
     submitPlanLedger,
     supplyPromptLedger,
 } from './coordinator'
@@ -98,6 +100,8 @@ const bridgeDependencies: IllustrationV3BridgeDependencies = {
     preparePromptContext: async (input) => await preparePromptContext(
         input as Parameters<typeof preparePromptContext>[0],
     ),
+    setTransportConfig: async (input) => await setTransportConfig(input),
+    getTransportConfig: async () => await getTransportConfig(),
     measureImagePrompt: async (input) => await measureImagePrompt(input),
     cancelJob: cancelLedger,
     cancelTurn: cancelTurnLedger,

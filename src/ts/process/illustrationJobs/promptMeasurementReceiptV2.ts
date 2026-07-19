@@ -2,6 +2,7 @@ import { IllustrationPromptV2ContractError } from './errors'
 import { measureImagePrompt } from './imagePromptMeasurement'
 import {
     computeEnvelopeHash,
+    serializeEnvelopeForTransport,
     validateEnvelopeAgainstTarget,
     type IllustrationPromptEnvelopeV2,
 } from './promptEnvelopeV2'
@@ -9,6 +10,7 @@ import type {
     IllustrationPromptDispatchPolicy,
     IllustrationPromptMeasurementMode,
     IllustrationPromptTargetV2,
+    IllustrationPromptTransportLimitUnit,
 } from './promptContextV2'
 import type { IllustrationPromptV1 } from './types'
 
@@ -160,13 +162,33 @@ export async function measurePromptEnvelopeReceiptV2(
     const envelopeHash = await computeEnvelopeHash(input.envelope)
     const { measurement } = input.target
 
-    if (measurement.mode !== 'model_exact') {
-        throw new IllustrationPromptV2ContractError(
-            'prompt_measurement_mode_unsupported',
-            `Slice D can only produce model_exact receipts; target requested "${measurement.mode}"`,
-        )
+    switch (measurement.mode) {
+        case 'model_exact':
+            return await measureModelExactReceipt(input, envelopeHash)
+        case 'transport_only':
+            return measureTransportOnlyReceipt(input, envelopeHash)
+        case 'unmeasured':
+            return buildNonMeasuringReceipt(input, envelopeHash, 'unmeasured', 'unknown')
+        case 'provider_reported':
+            // A side-effect-free measurement cannot obtain a provider's official
+            // per-prompt count (that arrives only after a charged dispatch), so
+            // Slice E ships no live provider_reported producer: modelVerdict stays
+            // 'unknown' and the eligibility table renders it non-dispatchable rather
+            // than faking an authoritative within-limit verdict (request §6 honesty).
+            return buildNonMeasuringReceipt(input, envelopeHash, 'provider_reported', 'unknown')
+        default:
+            throw new IllustrationPromptV2ContractError(
+                'prompt_measurement_mode_unsupported',
+                `Unsupported measurement mode "${measurement.mode as string}"`,
+            )
     }
+}
 
+async function measureModelExactReceipt(
+    input: MeasurePromptEnvelopeReceiptInputV2,
+    envelopeHash: string,
+): Promise<IllustrationPromptMeasurementReceiptV2> {
+    const { measurement } = input.target
     const measured = await measureImagePrompt({
         protocolVersion: 1,
         settingsFingerprint: input.settingsFingerprint,
@@ -210,6 +232,111 @@ export async function measurePromptEnvelopeReceiptV2(
                 verdict: negativeVerdict,
             },
         ],
+        modelVerdict,
+        dispatchEligible: eligibility.dispatchEligible,
+        eligibilityBasis: eligibility.eligibilityBasis,
+    }
+}
+
+// Count code units per the DOCUMENTED transport unit. An astral scalar (e.g. U+10437
+// '𐐷') distinguishes all three: 4 utf8 bytes, 2 utf16 code units, 1 scalar value —
+// so we must never conflate them (request §6/§10-13). The count is over the exact
+// serialized transport text; nothing is trimmed or normalized.
+function countTransportUnit(text: string, unit: IllustrationPromptTransportLimitUnit): number {
+    switch (unit) {
+        case 'utf8_byte':
+            return new TextEncoder().encode(text).byteLength
+        case 'utf16_code_unit':
+            return text.length
+        case 'unicode_scalar_value':
+            return [...text].length
+    }
+}
+
+function transportDimensionVerdict(measured: number, limit: number | null): IllustrationPromptMeasurementVerdict {
+    if (limit === null) return 'unknown'
+    return measured <= limit ? 'within_limit' : 'over_limit'
+}
+
+function measureTransportOnlyReceipt(
+    input: MeasurePromptEnvelopeReceiptInputV2,
+    envelopeHash: string,
+): IllustrationPromptMeasurementReceiptV2 {
+    const { measurement } = input.target
+    const limit = measurement.documentedTransportLimit
+    if (!limit) {
+        throw new IllustrationPromptV2ContractError(
+            'prompt_measurement_mode_unsupported',
+            'transport_only measurement requires a documentedTransportLimit',
+        )
+    }
+    const serialized = serializeEnvelopeForTransport(input.envelope, input.target)
+    const positiveMeasured = countTransportUnit(serialized.positive, limit.unit)
+    const negativeMeasured = countTransportUnit(serialized.negative, limit.unit)
+    // Combined budget is the sum of the independently-transported parts, so a lone
+    // surrogate at a part boundary can never be silently coalesced across parts.
+    const combinedMeasured = positiveMeasured + negativeMeasured
+
+    const positiveVerdict = transportDimensionVerdict(positiveMeasured, limit.positive)
+    const negativeVerdict = transportDimensionVerdict(negativeMeasured, limit.negative)
+    const combinedVerdict = transportDimensionVerdict(combinedMeasured, limit.combined)
+
+    const anyOver = positiveVerdict === 'over_limit'
+        || negativeVerdict === 'over_limit'
+        || combinedVerdict === 'over_limit'
+    const anyKnown = limit.positive !== null || limit.negative !== null || limit.combined !== null
+    const transportVerdict: IllustrationPromptMeasurementVerdict =
+        anyOver ? 'over_limit' : anyKnown ? 'within_limit' : 'unknown'
+
+    const eligibility = computeDispatchEligibility({
+        mode: 'transport_only',
+        // transport_only NEVER sets modelVerdict to within/over (request §6).
+        modelVerdict: 'unknown',
+        transportVerdict,
+        dispatchPolicy: measurement.dispatchPolicy,
+    })
+
+    return {
+        schemaVersion: PROMPT_MEASUREMENT_RECEIPT_SCHEMA_VERSION,
+        targetFingerprint: input.target.targetFingerprint,
+        envelopeHash,
+        measurementMode: 'transport_only',
+        measurementRevision: measurement.revision,
+        dimensions: [
+            { scope: 'positive', unit: limit.unit, measured: positiveMeasured, limit: limit.positive, verdict: positiveVerdict },
+            { scope: 'negative', unit: limit.unit, measured: negativeMeasured, limit: limit.negative, verdict: negativeVerdict },
+            { scope: 'combined', unit: limit.unit, measured: combinedMeasured, limit: limit.combined, verdict: combinedVerdict },
+        ],
+        modelVerdict: 'unknown',
+        dispatchEligible: eligibility.dispatchEligible,
+        eligibilityBasis: eligibility.eligibilityBasis,
+    }
+}
+
+// unmeasured / provider_reported: no enforceable measurement is produced. Dimensions
+// stay empty (nothing was measured) and modelVerdict is 'unknown' — never dressed up
+// as a completed measurement (request §6). Eligibility falls entirely to the target's
+// explicit dispatch policy.
+function buildNonMeasuringReceipt(
+    input: MeasurePromptEnvelopeReceiptInputV2,
+    envelopeHash: string,
+    mode: 'unmeasured' | 'provider_reported',
+    modelVerdict: IllustrationPromptMeasurementVerdict,
+): IllustrationPromptMeasurementReceiptV2 {
+    const { measurement } = input.target
+    const eligibility = computeDispatchEligibility({
+        mode,
+        modelVerdict,
+        transportVerdict: 'unknown',
+        dispatchPolicy: measurement.dispatchPolicy,
+    })
+    return {
+        schemaVersion: PROMPT_MEASUREMENT_RECEIPT_SCHEMA_VERSION,
+        targetFingerprint: input.target.targetFingerprint,
+        envelopeHash,
+        measurementMode: mode,
+        measurementRevision: measurement.revision,
+        dimensions: [],
         modelVerdict,
         dispatchEligible: eligibility.dispatchEligible,
         eligibilityBasis: eligibility.eligibilityBasis,
