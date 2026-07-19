@@ -20,6 +20,7 @@ import {
     IllustrationLedgerCorruptError,
     IllustrationLedgerTerminalCloseError,
     IllustrationLedgerValidationError,
+    IllustrationPromptV2ContractError,
 } from './errors'
 import {
     claimCoordinator as claimCoordinatorRecord,
@@ -51,9 +52,19 @@ import {
     resolvePromptTargetV2,
     validateOpaquePromptRef,
     validateTagProfileRef,
+    verifyWebuiCheckpointBinding,
     type IllustrationPromptContextV2,
     type IllustrationTransportConfigV1,
 } from './promptContextV2'
+import {
+    assertEnvelopeMatchesContext,
+    computeEnvelopeHash,
+    parseIllustrationPromptEnvelopeV2,
+} from './promptEnvelopeV2'
+import {
+    assertReceiptDispatchEligibleForTarget,
+    measurePromptEnvelopeReceiptV2,
+} from './promptMeasurementReceiptV2'
 import { withIllustrationOperationLock } from './operationLock'
 import { computeNaiSettingsFingerprint } from './settingsFingerprint'
 import { computeSourceRevisionHash, hashesMatch, sha256Hex } from './sourceHash'
@@ -1159,6 +1170,11 @@ export async function preparePromptContext(
     // prompt_target_unavailable failure fails closed before any durable write.
     const transportConfig = await readStoredTransportConfig()
     const target = await resolvePromptTargetV2(getDatabase(), transportConfig)
+    // Carried gap 1 (request §7.3): a webui-flat probe-and-revalidate target must
+    // prove its live backend checkpoint identity at CAPTURE, before any durable write.
+    // A probe failure / checkpoint drift is a typed prompt_target_unavailable — a plain
+    // user label is never accepted as proof. No-op for every other binding mode.
+    await verifyWebuiCheckpointBinding(getDatabase().webUiUrl ?? '', target)
 
     const promptContext: IllustrationPromptContextV2 = {
         target,
@@ -1178,7 +1194,7 @@ export async function preparePromptContext(
 // fails closed to an empty election (only novelai-native auto-resolves) rather than
 // resolving a malformed target. Validation lives here (not in the store) so the store
 // keeps a type-only dependency on promptContextV2's measurement-importing chain.
-async function readStoredTransportConfig(): Promise<IllustrationTransportConfigV1> {
+export async function readStoredTransportConfig(): Promise<IllustrationTransportConfigV1> {
     const raw = await illustrationJobStore.getTransportConfig()
     try {
         return parseTransportConfig(raw)
@@ -1361,6 +1377,20 @@ export async function supplyPromptLedger(
     const supplied = supplyPromptValue(input)
     const job = await illustrationJobStore.getJob(input.jobId)
     if (!job) throw new IllustrationLedgerValidationError('Illustration job was not found')
+    // Prompt Target V2 cross-mode guard (request §D1): a turn prepared via
+    // preparePromptContext requires a V2 envelope supply. Reject a legacy V1 supply
+    // with a typed validation-family error rather than silently accepting it (no
+    // silent cross-mode). Inert for legacy/V1 turns (no promptContext) and for the
+    // revision subsystem, so V1 behavior stays byte-identical for V1 turns.
+    if (!job.revision) {
+        const supplyTurn = await illustrationJobStore.getTurn(job.turnId)
+        if (supplyTurn?.promptContext) {
+            throw new IllustrationPromptV2ContractError(
+                'prompt_supply_mode_mismatch',
+                'This turn was prepared for a V2 prompt envelope; use supplyPromptEnvelope instead of supplyPrompt',
+            )
+        }
+    }
     // Image Revision V1: a retag revision child's Tagger supply stops at
     // prompt_ready (never queued). It requires an explicit enqueueRevisionImage
     // image-charge confirmation before the provider runs. Its target is a committed
@@ -1447,6 +1477,131 @@ export async function supplyPromptLedger(
         patch: {
             idempotencyKey: input.idempotencyKey,
             prompt: supplied.prompt,
+        },
+    })
+    signalIllustrationExecutor()
+    emitIllustrationWakeHint('job_changed', queued.turnId, queued.jobId)
+    return queued
+}
+
+// Prompt Target V2 (request §D1/§5/§6): the Plugin's compiled envelope supply for a
+// job on a PREPARED (PromptContext-bound) turn. In one holder-write transaction Core:
+//   1. validates the envelope refs === the turn's captured context refs,
+//   2. produces the side-effect-free measurement receipt (which itself validates the
+//      envelope against the captured target incl. pipe/negative/cardinality rules),
+//   3. requires the receipt to be dispatch-eligible + exactly bound (target
+//      fingerprint + envelope hash + measurement revision/mode),
+//   4. durably stores envelope+receipt on the job and transitions it exactly as V1
+//      supplyPrompt does (awaiting_prompt -> queued; stale/corrupt slot -> settled).
+// A V1-prepared turn (no promptContext) rejects this with a typed cross-mode error, and
+// a V2-prepared turn rejects V1 supplyPrompt — never a silent cross-mode.
+export type SupplyPromptEnvelopeInput = IllustrationHolderWrite & IllustrationCoordinatorProof & {
+    jobId: string
+    idempotencyKey: string
+    envelope: unknown
+}
+
+export async function supplyPromptEnvelope(
+    input: SupplyPromptEnvelopeInput,
+): Promise<IllustrationJobRecordV1> {
+    const envelope = parseIllustrationPromptEnvelopeV2(input.envelope)
+    const job = await illustrationJobStore.getJob(input.jobId)
+    if (!job) throw new IllustrationLedgerValidationError('Illustration job was not found')
+    if (job.revision) {
+        throw new IllustrationPromptV2ContractError(
+            'prompt_supply_mode_mismatch',
+            'Revision jobs use the V1 supply path and cannot accept a V2 prompt envelope',
+        )
+    }
+    const turn = await illustrationJobStore.getTurn(job.turnId)
+    if (!turn?.promptContext) {
+        throw new IllustrationPromptV2ContractError(
+            'prompt_supply_mode_mismatch',
+            'This turn was not prepared for a V2 prompt envelope; call preparePromptContext first',
+        )
+    }
+    const context: IllustrationPromptContextV2 = turn.promptContext
+    // Every job/envelope ref must equal the captured snapshot (request §4).
+    assertEnvelopeMatchesContext(envelope, context)
+    const envelopeHash = await computeEnvelopeHash(envelope)
+
+    // Lost-ACK replay: the job already advanced past awaiting_prompt. Reuse its durable
+    // envelope+receipt as the replay patch so we never re-measure (which could throw on
+    // drifted live settings) — the store's full-patch lost-ACK compare decides identity.
+    if (job.state !== 'awaiting_prompt') {
+        if (!job.promptEnvelope || !job.promptReceipt) {
+            throw new IllustrationPromptV2ContractError(
+                'prompt_supply_mode_mismatch',
+                'This job did not accept a V2 prompt envelope and cannot replay one',
+            )
+        }
+        const replay = await illustrationJobStore.transitionJob({
+            jobId: job.jobId,
+            expectedVersion: input.expectedVersion,
+            to: 'queued',
+            leaseId: input.leaseId,
+            fence: input.fence,
+            coordinatorLeaseId: input.coordinatorLeaseId,
+            coordinatorFence: input.coordinatorFence,
+            patch: {
+                idempotencyKey: input.idempotencyKey,
+                promptEnvelope: job.promptEnvelope,
+                promptReceipt: job.promptReceipt,
+            },
+        })
+        signalIllustrationExecutor()
+        return replay
+    }
+
+    validateHolderWrite(job, input)
+    // Side-effect-free measurement (no image, no charge, no provider queue): this
+    // validates the envelope against the captured target and yields the receipt.
+    const receipt = await measurePromptEnvelopeReceiptV2({
+        protocolVersion: 2,
+        target: context.target,
+        settingsFingerprint: job.settingsFingerprint ?? '',
+        envelope,
+    })
+    // Executor consults dispatchEligible, never modelVerdict — enforce it up-front so an
+    // over-limit / policy-rejected envelope never queues (request §6). The binding guard
+    // rejects any cross-target / cross-envelope reuse (§10-10).
+    assertReceiptDispatchEligibleForTarget(receipt, context.target, envelopeHash)
+
+    const jobContext = await resolveIllustrationJobContext(job)
+    if (jobContext.kind !== 'valid') {
+        const settled = await illustrationJobStore.transitionJob({
+            jobId: job.jobId,
+            expectedVersion: input.expectedVersion,
+            to: jobContext.kind,
+            leaseId: input.leaseId,
+            fence: input.fence,
+            coordinatorLeaseId: input.coordinatorLeaseId,
+            coordinatorFence: input.coordinatorFence,
+            patch: {
+                idempotencyKey: `prompt-envelope-target:${input.idempotencyKey}:${jobContext.kind}`,
+                error: { code: jobContext.reason },
+            },
+        })
+        if (isTerminalJobState(settled.state)) {
+            await illustrationJobStore.finalizeTurnAfterJobs(settled.turnId)
+        }
+        throw new IllustrationLedgerValidationError(
+            `Illustration job is ${jobContext.kind}: ${jobContext.reason}`,
+        )
+    }
+
+    const queued = await illustrationJobStore.transitionJob({
+        jobId: job.jobId,
+        expectedVersion: input.expectedVersion,
+        to: 'queued',
+        leaseId: input.leaseId,
+        fence: input.fence,
+        coordinatorLeaseId: input.coordinatorLeaseId,
+        coordinatorFence: input.coordinatorFence,
+        patch: {
+            idempotencyKey: input.idempotencyKey,
+            promptEnvelope: envelope,
+            promptReceipt: receipt,
         },
     })
     signalIllustrationExecutor()

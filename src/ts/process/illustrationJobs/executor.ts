@@ -5,14 +5,45 @@ import {
     repairInlayAssetRecords,
     writeInlayImage,
 } from '../files/inlays'
-import { generateAIImageTyped } from '../stableDiff'
+import {
+    generateAIImageTyped,
+    type ImageGenerationPriority,
+    type ImageGenerationResult,
+} from '../stableDiff'
 import { patchSlotInVariant } from './anchors'
 import {
     isIllustrationJobLiveContextCurrent,
+    readStoredTransportConfig,
     resolveIllustrationJobContext,
     type IllustrationJobContextResult,
     type IllustrationJobLiveContext,
 } from './coordinator'
+import { illustrationTransportBroker } from './transportBroker'
+import {
+    dispatchComfyuiFlat,
+    dispatchNaiCompatibleFlat,
+    dispatchWebuiFlat,
+    type TransportFetch,
+    type TransportNativeFetch,
+    type WebuiDispatchParams,
+} from './transportDispatch'
+import {
+    computeEnvelopeHash,
+    serializeEnvelopeForTransport,
+    type IllustrationPromptEnvelopeV2,
+} from './promptEnvelopeV2'
+import {
+    assertReceiptDispatchEligibleForTarget,
+    envelopeToPromptV1,
+    type IllustrationPromptMeasurementReceiptV2,
+} from './promptMeasurementReceiptV2'
+import {
+    DEFAULT_NAI_ENDPOINT,
+    resolvePromptTargetV2,
+    verifyWebuiCheckpointBinding,
+    type IllustrationPromptTargetV2,
+    type IllustrationTransportConfigV1,
+} from './promptContextV2'
 import { findSlotNodes } from './controlNodes'
 import {
     IllustrationImagePromptContractError,
@@ -20,6 +51,7 @@ import {
     IllustrationLedgerUnavailableError,
     IllustrationLedgerValidationError,
     IllustrationLedgerVersionConflictError,
+    IllustrationPromptV2ContractError,
 } from './errors'
 import {
     decodeIllustrationStoredPrompt,
@@ -56,6 +88,11 @@ import type {
 
 export const ILLUSTRATION_EXECUTOR_POLL_MS = 5_000
 export const ILLUSTRATION_IMAGE_DECODE_TIMEOUT_MS = 15_000
+// A blocked_config V2 job whose captured target re-verifies via a LIVE backend probe
+// (webui-flat probe-and-revalidate) must not fire that GET on every 5s executor poll.
+// Every other resume path recomputes a purely local fingerprint at zero network cost, so
+// only the live-probe binding needs a slower re-check cadence while blocked.
+export const ILLUSTRATION_BLOCKED_LIVE_PROBE_MIN_INTERVAL_MS = 30_000
 
 export interface IllustrationWorkerLockManager {
     request<T>(
@@ -172,7 +209,14 @@ function currentNaiSettingsSnapshot(): string {
     return serializeCanonicalNaiSettings(canonicalizeNaiSettings(getDatabase()))
 }
 
-type DispatchConfigurationBlockCode = 'settings_fingerprint_mismatch' | 'unsupported_provider'
+type DispatchConfigurationBlockCode =
+    | 'settings_fingerprint_mismatch'
+    | 'unsupported_provider'
+    // Prompt Target V2 (request §D2): the captured target no longer resolves / no
+    // longer matches / failed its live checkpoint probe at dispatch => blocked_config,
+    // provider-call-0. Distinct from the NAI V1 settings-fingerprint drift codes.
+    | 'prompt_target_fingerprint_mismatch'
+    | 'prompt_target_unavailable'
 
 async function resolveDispatchConfigurationBlock(
     job: IllustrationJobRecordV1,
@@ -1441,6 +1485,14 @@ async function swapDisplayedInlayAsset(
 }
 
 async function processQueuedJob(job: IllustrationJobRecordV1, epoch: number): Promise<void> {
+    // Prompt Target V2 (request §D2): a job carrying a durable V2 envelope takes the
+    // provider-neutral V2 dispatch path. This is the ONLY branch added to the V1
+    // executor — everything below is the byte-identical V1 (incl. NAI genesis) path and
+    // a V1 job never reaches the V2 modules (broker/serializer/transport dispatch).
+    if (job.promptEnvelope) {
+        await processQueuedV2Job(job, epoch)
+        return
+    }
     if (!(await isIllustrationFeatureEnabled())) return
     let context = await resolveIllustrationJobContext(job)
     if (context.kind !== 'valid') {
@@ -1749,7 +1801,522 @@ async function processQueuedJob(job: IllustrationJobRecordV1, epoch: number): Pr
     await commitIllustrationAssetReadyJob(job.jobId, epoch)
 }
 
+// ---------------------------------------------------------------------------
+// Prompt Target V2 dispatch (request §D2/§D3/§7/§8).
+//
+// A queued job carrying a durable V2 envelope re-resolves + re-verifies its CAPTURED
+// target against the CURRENT config (fingerprint drift => blocked_config, provider-
+// call-0), live-probes a webui probe-and-revalidate checkpoint, re-binds the receipt
+// (dispatch-ineligible / cross-target reuse => provider-call-0), acquires the provider-
+// wide broker slot for the captured concurrency key (current policy of that key), then
+// serializes + dispatches over the same redacted global-fetch conventions the V1 path
+// uses. novelai-native reuses the byte-identical NAI genesis dispatch (native captions
+// + server-side risu-image-class marking); the three flat transports use the transport
+// dispatch builders. Socket/timeout => uncertain, never auto-duplicated. The generated
+// asset is handed to the same asset-write/commit machinery the V1 path uses (replicated
+// in writeAndCommitV2ProviderImage so the V1 tail stays byte-identical).
+// ---------------------------------------------------------------------------
+
+// Injectable transport I/O so the exact wire body + certainty are unit-testable without
+// a live provider (mirrors the worker-lock-manager accessor pattern).
+export type IllustrationV2TransportFetchers = {
+    // JSON-decoding POST (webui /txt2img, comfy /prompt).
+    fetchImpl: TransportFetch
+    // Raw-bytes POST (nai-compatible ZIP body).
+    rawFetchImpl: TransportFetch
+    // Raw GET (comfy /history + /view).
+    nativeFetchImpl: TransportNativeFetch
+}
+
+let v2TransportFetchersOverride: IllustrationV2TransportFetchers | null = null
+
+export function setIllustrationV2TransportFetchersForTests(
+    fetchers: IllustrationV2TransportFetchers,
+): () => void {
+    const previous = v2TransportFetchersOverride
+    v2TransportFetchersOverride = fetchers
+    return () => {
+        v2TransportFetchersOverride = previous
+    }
+}
+
+export function resetIllustrationV2TransportFetchersForTests(): void {
+    v2TransportFetchersOverride = null
+}
+
+async function getV2TransportFetchers(): Promise<IllustrationV2TransportFetchers> {
+    if (v2TransportFetchersOverride) return v2TransportFetchersOverride
+    // Lazily imported so the executor's static graph is unchanged and the default only
+    // resolves the real global-fetch when a live V2 dispatch actually runs.
+    const { globalFetch, fetchNative } = await import('../../globalApi.svelte')
+    const post = (raw: boolean): TransportFetch => async (url, arg) => {
+        const response = await globalFetch(url, {
+            method: arg.method ?? 'POST',
+            body: arg.body,
+            headers: arg.headers,
+            plainFetchDeforce: arg.plainFetchDeforce,
+            redactRequestLog: arg.redactRequestLog,
+            proxyRequestHeaders: arg.proxyRequestHeaders,
+            abortSignal: arg.abortSignal,
+            rawResponse: raw,
+        })
+        return { ok: response.ok, data: response.data, headers: response.headers ?? {}, status: response.status }
+    }
+    const nativeFetchImpl: TransportNativeFetch = async (url, arg) => await fetchNative(url, {
+        method: arg.method ?? 'GET',
+        headers: arg.headers,
+        body: arg.body as string | Uint8Array | ArrayBuffer | undefined,
+        signal: arg.abortSignal,
+    })
+    return { fetchImpl: post(false), rawFetchImpl: post(true), nativeFetchImpl }
+}
+
+function webuiDispatchParamsFromDb(db: ReturnType<typeof getDatabase>): WebuiDispatchParams {
+    const config = db.sdConfig
+    return {
+        width: config.width,
+        height: config.height,
+        steps: db.sdSteps,
+        cfgScale: db.sdCFG,
+        samplerName: config.sampler_name,
+        enableHr: config.enable_hr,
+        denoisingStrength: config.denoising_strength,
+        hrScale: config.hr_scale,
+        hrUpscaler: config.hr_upscaler,
+    }
+}
+
+// nai-compatible responses are NAI-shaped ZIPs (the same envelope stableDiff unpacks
+// via processZip); dispatchNaiCompatibleFlat re-adds the data-url prefix, so we return
+// just the base64 payload.
+async function extractNaiZipImage(data: unknown): Promise<string | null> {
+    if (!(data instanceof Uint8Array)) return null
+    const { processZip } = await import('../processzip')
+    const dataUrl = await processZip(data)
+    const comma = dataUrl.indexOf(',')
+    return comma >= 0 ? dataUrl.slice(comma + 1) : null
+}
+
+async function dispatchIllustrationEnvelopeV2(
+    target: IllustrationPromptTargetV2,
+    transportConfig: IllustrationTransportConfigV1,
+    envelope: IllustrationPromptEnvelopeV2,
+    dispatchCharacter: character,
+    priorityClass: ImageGenerationPriority,
+): Promise<ImageGenerationResult> {
+    const db = getDatabase()
+    if (target.transportId === 'novelai-native') {
+        // Reuse the byte-identical NAI genesis dispatch (native structured captions +
+        // server-side risu-image-class marking) — never a flat transport builder.
+        const prompt = envelopeToPromptV1(envelope)
+        const attempt = await generateAIImageTyped(
+            prompt.basePositive,
+            dispatchCharacter,
+            prompt.baseNegative,
+            'inlay',
+            priorityClass,
+            { preservePromptText: true, illustrationPrompt: prompt },
+        )
+        return attempt.result
+    }
+
+    // flat / pipe-slots serialize to exact positive/negative transport text.
+    const serialized = serializeEnvelopeForTransport(envelope, target)
+    const fetchers = await getV2TransportFetchers()
+    const election = transportConfig.election
+
+    if (target.transportId === 'webui-flat') {
+        const pinnedCheckpoint = election?.transportId === 'webui-flat' && election.binding.mode === 'request-pinned'
+            ? election.binding.checkpoint
+            : null
+        return await dispatchWebuiFlat({
+            target,
+            endpoint: db.webUiUrl,
+            positive: serialized.positive,
+            negative: serialized.negative,
+            params: webuiDispatchParamsFromDb(db),
+            pinnedCheckpoint,
+            fetchImpl: fetchers.fetchImpl,
+            priorityClass,
+        })
+    }
+
+    if (target.transportId === 'nai-compatible-flat') {
+        return await dispatchNaiCompatibleFlat({
+            target,
+            endpoint: db.NAIImgUrl ?? DEFAULT_NAI_ENDPOINT,
+            positive: serialized.positive,
+            negative: serialized.negative,
+            modelId: db.NAIImgModel ?? null,
+            apiKey: db.NAIApiKey ?? '',
+            fetchImpl: fetchers.rawFetchImpl,
+            priorityClass,
+            extractImage: extractNaiZipImage,
+        })
+    }
+
+    if (target.transportId === 'comfyui-flat') {
+        if (election?.transportId !== 'comfyui-flat') {
+            return { ok: false, certainty: 'definite', reason: 'comfyui-flat dispatch is missing its node-binding election' }
+        }
+        const timeoutSeconds = typeof db.comfyConfig?.timeout === 'number' ? db.comfyConfig.timeout : 60
+        return await dispatchComfyuiFlat({
+            target,
+            endpoint: db.comfyUiUrl,
+            positive: serialized.positive,
+            negative: serialized.negative,
+            workflowJson: db.comfyConfig?.workflow ?? '',
+            positiveNode: election.positiveNode,
+            negativeNode: election.negativeNode,
+            fetchImpl: fetchers.fetchImpl,
+            nativeFetchImpl: fetchers.nativeFetchImpl,
+            timeoutMs: timeoutSeconds * 1000,
+            now: () => Date.now(),
+            sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+        })
+    }
+
+    return { ok: false, certainty: 'definite', reason: `unsupported V2 transport "${target.transportId}"` }
+}
+
+type V2DispatchGate =
+    | { kind: 'ready'; target: IllustrationPromptTargetV2; transportConfig: IllustrationTransportConfigV1 }
+    | { kind: 'drift'; code: DispatchConfigurationBlockCode }
+    | { kind: 'rebind'; error: IllustrationPromptV2ContractError }
+
+// Re-resolve the captured target against the CURRENT db + transport election, verify the
+// fingerprint still matches, live-probe a webui probe-and-revalidate checkpoint, and
+// re-bind the receipt to the current target + envelope. Any drift/probe failure is a
+// definite blocked_config (provider-call-0); a receipt-binding failure is a definite
+// failed (provider-call-0). Queue tuning alone never changes the fingerprint (§20).
+async function evaluateV2DispatchGate(
+    job: IllustrationJobRecordV1,
+    envelope: IllustrationPromptEnvelopeV2,
+    receipt: IllustrationPromptMeasurementReceiptV2,
+): Promise<V2DispatchGate> {
+    const turn = await illustrationJobStore.getTurn(job.turnId)
+    const captured = turn?.promptContext?.target.targetFingerprint
+    if (!captured) return { kind: 'drift', code: 'prompt_target_unavailable' }
+
+    let transportConfig: IllustrationTransportConfigV1
+    let target: IllustrationPromptTargetV2
+    try {
+        transportConfig = await readStoredTransportConfig()
+        target = await resolvePromptTargetV2(getDatabase(), transportConfig)
+    } catch {
+        // The captured transport no longer resolves (endpoint/provider/election gone).
+        return { kind: 'drift', code: 'prompt_target_unavailable' }
+    }
+    if (target.targetFingerprint !== captured) {
+        return { kind: 'drift', code: 'prompt_target_fingerprint_mismatch' }
+    }
+    // Carried gap 1 (request §7.3): live-probe a webui probe-and-revalidate checkpoint at
+    // DISPATCH; probe failure / checkpoint drift => blocked_config, provider-call-0.
+    try {
+        await verifyWebuiCheckpointBinding(getDatabase().webUiUrl ?? '', target)
+    } catch {
+        return { kind: 'drift', code: 'prompt_target_fingerprint_mismatch' }
+    }
+    // Re-bind the receipt to the CURRENT target + this envelope; executor consults
+    // dispatchEligible (request §6/§10-10), never modelVerdict.
+    const envelopeHash = await computeEnvelopeHash(envelope)
+    try {
+        assertReceiptDispatchEligibleForTarget(receipt, target, envelopeHash)
+    } catch (error) {
+        if (error instanceof IllustrationPromptV2ContractError) return { kind: 'rebind', error }
+        throw error
+    }
+    return { kind: 'ready', target, transportConfig }
+}
+
+async function settleV2ReceiptRebindFailure(
+    job: IllustrationJobRecordV1,
+    epoch: number,
+    error: IllustrationPromptV2ContractError,
+    step: string,
+): Promise<void> {
+    const patch: IllustrationJobTransitionPatch = {
+        idempotencyKey: transitionKey(epoch, job, step),
+        workerEpoch: epoch,
+        error: { code: error.code, retryable: false },
+    }
+    if (job.state === 'queued') {
+        await transitionPreDispatchJob(job, 'failed', patch)
+        return
+    }
+    if (job.state !== 'generating') return
+    await transitionExecutorJob({
+        jobId: job.jobId,
+        expectedVersion: job.version,
+        to: 'failed',
+        patch,
+    })
+}
+
+async function processQueuedV2Job(job: IllustrationJobRecordV1, epoch: number): Promise<void> {
+    if (!(await isIllustrationFeatureEnabled())) return
+    const envelope = job.promptEnvelope
+    const receipt = job.promptReceipt
+    // The delegate guard only routes jobs that carry a durable envelope; a receipt is
+    // always written with it. A record missing either is inert here (never dispatched).
+    if (!envelope || !receipt) return
+
+    let context = await resolveIllustrationJobContext(job)
+    if (context.kind !== 'valid') {
+        await settleContextFailure(job, context, epoch)
+        return
+    }
+
+    // Pre-dispatch gate #1 (while queued): re-resolve/fingerprint/probe/rebind.
+    const queuedGate = await evaluateV2DispatchGate(job, envelope, receipt)
+    if (queuedGate.kind === 'drift') {
+        await settleDispatchConfigurationBlock(job, epoch, queuedGate.code, `v2-config-${queuedGate.code}`)
+        return
+    }
+    if (queuedGate.kind === 'rebind') {
+        await settleV2ReceiptRebindFailure(job, epoch, queuedGate.error, 'v2-receipt-rebind')
+        return
+    }
+
+    const attemptId = job.attemptId ?? freshAttemptId()
+    const assetId = await deriveIllustrationAssetId(job.jobId, attemptId)
+    let generating = await transitionPreDispatchJob(job, 'generating', {
+        idempotencyKey: `worker:${epoch}:${job.jobId}:${attemptId}:generating`,
+        workerEpoch: epoch,
+        attemptId,
+        assetId,
+        error: null,
+    })
+    if (!generating) return
+
+    const dispatchRecord = await illustrationJobStore.getJob(job.jobId)
+    if (!dispatchRecord
+        || dispatchRecord.attemptId !== generating.attemptId
+        || dispatchRecord.assetId !== generating.assetId) return
+    if (dispatchRecord.state === 'cancel_requested') {
+        await transitionExecutorJob({
+            jobId: dispatchRecord.jobId,
+            expectedVersion: dispatchRecord.version,
+            to: 'cancelled',
+            patch: {
+                idempotencyKey: transitionKey(epoch, dispatchRecord, 'cancelled-before-dispatch'),
+                workerEpoch: epoch,
+                error: null,
+            },
+        })
+        return
+    }
+    if (dispatchRecord.state !== 'generating') return
+    const dispatchContext = await resolveIllustrationJobContext(dispatchRecord)
+    if (dispatchContext.kind !== 'valid') {
+        if (dispatchContext.kind === 'stale') {
+            await settleContextFailure(dispatchRecord, dispatchContext, epoch)
+        } else {
+            await transitionExecutorJob({
+                jobId: dispatchRecord.jobId,
+                expectedVersion: dispatchRecord.version,
+                to: 'stale',
+                patch: {
+                    idempotencyKey: transitionKey(epoch, dispatchRecord, 'pre-provider-corrupt'),
+                    workerEpoch: epoch,
+                    error: { code: `pre_provider_${dispatchContext.reason}` },
+                },
+            })
+        }
+        return
+    }
+    generating = dispatchRecord
+
+    // Pre-dispatch gate #2 (after entering the provider-intent state): a config change
+    // during the transition still yields provider-call-0.
+    const finalGate = await evaluateV2DispatchGate(generating, envelope, receipt)
+    if (finalGate.kind === 'drift') {
+        await settleDispatchConfigurationBlock(generating, epoch, finalGate.code, `v2-final-${finalGate.code}`)
+        return
+    }
+    if (finalGate.kind === 'rebind') {
+        await settleV2ReceiptRebindFailure(generating, epoch, finalGate.error, 'v2-final-receipt-rebind')
+        return
+    }
+    if (!isIllustrationJobLiveContextCurrent(generating, dispatchContext)) {
+        await transitionExecutorJob({
+            jobId: generating.jobId,
+            expectedVersion: generating.version,
+            to: 'stale',
+            patch: {
+                idempotencyKey: transitionKey(epoch, generating, 'final-context-changed'),
+                workerEpoch: epoch,
+                error: { code: 'pre_provider_context_changed' },
+            },
+        })
+        return
+    }
+
+    // Provider-wide broker slot for the captured concurrency key, applying the CURRENT
+    // policy of that key (request §4/§8). Released as soon as the provider call returns.
+    const release = await illustrationTransportBroker.acquire(
+        finalGate.target.queue.concurrencyKey,
+        {
+            maxConcurrency: finalGate.target.queue.maxConcurrency,
+            priorityPolicy: finalGate.target.queue.priorityPolicy,
+        },
+        'background',
+    )
+    let result: ImageGenerationResult
+    try {
+        result = await dispatchIllustrationEnvelopeV2(
+            finalGate.target,
+            finalGate.transportConfig,
+            envelope,
+            dispatchContext.character,
+            'background',
+        )
+    } finally {
+        release()
+    }
+
+    if (result.ok === false) {
+        // socket/timeout/lost response => uncertain (never auto-duplicated, request §8).
+        await transitionProviderFailure(job.jobId, epoch, result.certainty)
+        return
+    }
+    await writeAndCommitV2ProviderImage(job, generating, result.bytesOrDataUrl, assetId, epoch)
+}
+
+// The provider-neutral asset-write/commit tail, replicated from processQueuedJob so the
+// V1 (NAI genesis) path stays byte-identical. It calls the SAME machinery (write inlay,
+// integrity, CAS transitions, commit) V1 uses — only the image source differs.
+async function writeAndCommitV2ProviderImage(
+    job: IllustrationJobRecordV1,
+    generatingInput: IllustrationJobRecordV1,
+    bytesOrDataUrl: string,
+    assetId: string,
+    epoch: number,
+): Promise<void> {
+    let generating = generatingInput
+    let latest = await illustrationJobStore.getJob(job.jobId)
+    if (!latest || (latest.state !== 'generating' && latest.state !== 'cancel_requested')) return
+    if (latest.state === 'generating') {
+        const returnedContext = await resolveIllustrationJobContext(latest)
+        if (returnedContext.kind !== 'valid') {
+            if (returnedContext.kind === 'stale') {
+                await settleContextFailure(latest, returnedContext, epoch)
+            } else {
+                await transitionExecutorJob({
+                    jobId: latest.jobId,
+                    expectedVersion: latest.version,
+                    to: 'stale',
+                    patch: {
+                        idempotencyKey: transitionKey(epoch, latest, 'post-provider-corrupt'),
+                        workerEpoch: epoch,
+                        error: { code: `post_provider_${returnedContext.reason}` },
+                    },
+                })
+            }
+            return
+        }
+    }
+    for (;;) {
+        if (
+            latest.attemptId !== generating.attemptId
+            || latest.assetId !== generating.assetId
+            || (latest.state !== 'generating' && latest.state !== 'cancel_requested')
+        ) return
+        try {
+            generating = await transitionExecutorJob({
+                jobId: job.jobId,
+                expectedVersion: latest.version,
+                to: 'asset_writing',
+                patch: {
+                    idempotencyKey: transitionKey(epoch, latest, 'asset-writing'),
+                    workerEpoch: epoch,
+                },
+            })
+            break
+        } catch (error) {
+            if (!(error instanceof IllustrationLedgerVersionConflictError)) throw error
+            const winner = await illustrationJobStore.getJob(job.jobId)
+            if (!winner) return
+            latest = winner
+        }
+    }
+
+    try {
+        const image = new Image()
+        image.src = bytesOrDataUrl
+        await writeInlayImage(image, {
+            id: assetId,
+            target: { charId: job.target!.chaId, chatId: job.target!.conversationId },
+            decodeTimeoutMs: ILLUSTRATION_IMAGE_DECODE_TIMEOUT_MS,
+        })
+        const integrity = await inspectInlayAssetIntegrity(assetId)
+        if (integrity.status !== 'complete') throw new Error('asset integrity incomplete')
+    } catch {
+        let latestWriting = await illustrationJobStore.getJob(job.jobId)
+        for (;;) {
+            if (
+                !latestWriting
+                || latestWriting.state !== 'asset_writing'
+                || latestWriting.attemptId !== generating.attemptId
+                || latestWriting.assetId !== generating.assetId
+            ) return
+            try {
+                await transitionExecutorJob({
+                    jobId: job.jobId,
+                    expectedVersion: latestWriting.version,
+                    to: 'uncertain',
+                    patch: {
+                        idempotencyKey: transitionKey(epoch, latestWriting, 'asset-write-uncertain'),
+                        workerEpoch: epoch,
+                        error: { code: 'asset_write_uncertain', certainty: 'uncertain' },
+                    },
+                })
+                return
+            } catch (error) {
+                if (!(error instanceof IllustrationLedgerVersionConflictError)) throw error
+                latestWriting = await illustrationJobStore.getJob(job.jobId)
+            }
+        }
+    }
+
+    let latestWriting = await illustrationJobStore.getJob(job.jobId)
+    let ready: IllustrationJobRecordV1
+    for (;;) {
+        if (
+            !latestWriting
+            || latestWriting.state !== 'asset_writing'
+            || latestWriting.attemptId !== generating.attemptId
+            || latestWriting.assetId !== generating.assetId
+        ) return
+        try {
+            ready = await transitionExecutorJob({
+                jobId: job.jobId,
+                expectedVersion: latestWriting.version,
+                to: 'asset_ready',
+                patch: {
+                    idempotencyKey: transitionKey(epoch, latestWriting, 'asset-ready'),
+                    workerEpoch: epoch,
+                },
+            })
+            break
+        } catch (error) {
+            if (!(error instanceof IllustrationLedgerVersionConflictError)) throw error
+            latestWriting = await illustrationJobStore.getJob(job.jobId)
+        }
+    }
+    ready = (await illustrationJobStore.getJob(job.jobId)) ?? ready
+    if (ready.cancelRequestedAt !== undefined) {
+        await cancelExecutorJob({ jobId: job.jobId, expectedVersion: ready.version })
+        return
+    }
+    await commitIllustrationAssetReadyJob(job.jobId, epoch)
+}
+
 async function resumeBlockedConfig(job: IllustrationJobRecordV1, epoch: number): Promise<boolean> {
+    // Prompt Target V2 (request §D2): a V2 job blocked on target drift re-queues once its
+    // captured target resolves + matches + re-binds again — the symmetric restore of the
+    // same blocked_config drift flow, evaluated against the V2 gate rather than NAI settings.
+    if (job.promptEnvelope) return await resumeV2BlockedConfig(job, epoch)
     const database = getDatabase()
     if (database.sdProvider !== 'novelai') return false
     if ((await computeNaiSettingsFingerprint(database)) !== job.settingsFingerprint) return false
@@ -1764,6 +2331,58 @@ async function resumeBlockedConfig(job: IllustrationJobRecordV1, epoch: number):
         error: null,
     })
     return true
+}
+
+// Per-job earliest wall-clock at which a blocked live-probe re-check may fire again. In
+// memory only: a process restart re-probes once immediately (bounded), which is the
+// correct fail-open. Entries are cleared when the job leaves blocked_config.
+const blockedLiveProbeNextAt = new Map<string, number>()
+
+// Only a webui-flat probe-and-revalidate target re-verifies its blocked_config via a live
+// backend GET (verifyWebuiCheckpointBinding). The captured target carries the same
+// transport/binding the live one must fingerprint-match, so the binding mode is readable
+// from the durable turn snapshot without a network call.
+async function v2BlockedResumeUsesLiveProbe(job: IllustrationJobRecordV1): Promise<boolean> {
+    const turn = await illustrationJobStore.getTurn(job.turnId)
+    const target = turn?.promptContext?.target
+    return target?.transportId === 'webui-flat' && target.bindingMode === 'probe-and-revalidate'
+}
+
+async function resumeV2BlockedConfig(job: IllustrationJobRecordV1, epoch: number): Promise<boolean> {
+    const envelope = job.promptEnvelope
+    const receipt = job.promptReceipt
+    if (!envelope || !receipt) return false
+    // A webui-flat probe-and-revalidate target can only detect checkpoint restoration via a
+    // live backend GET. Firing that on every 5s poll while blocked would hammer a remote /
+    // metered backend uncapped (and stall the single pump for each probe's duration), so
+    // throttle the live re-check to a slower cadence. Every other V2 binding mode resolves
+    // drift locally at zero network cost and keeps the normal poll cadence — parity with the
+    // V1/NAI local-fingerprint resume.
+    if (await v2BlockedResumeUsesLiveProbe(job)) {
+        const now = Date.now()
+        const nextAt = blockedLiveProbeNextAt.get(job.jobId)
+        if (nextAt !== undefined && now < nextAt) return false
+        blockedLiveProbeNextAt.set(job.jobId, now + ILLUSTRATION_BLOCKED_LIVE_PROBE_MIN_INTERVAL_MS)
+    }
+    // Still drifted / probe-failing / re-bind-failing => stay blocked (no state change).
+    const gate = await evaluateV2DispatchGate(job, envelope, receipt)
+    if (gate.kind !== 'ready') return false
+    blockedLiveProbeNextAt.delete(job.jobId)
+    const context = await resolveIllustrationJobContext(job)
+    if (context.kind !== 'valid') {
+        await settleContextFailure(job, context, epoch)
+        return true
+    }
+    await transitionPreDispatchJob(job, 'queued', {
+        idempotencyKey: transitionKey(epoch, job, 'v2-resume-config'),
+        workerEpoch: epoch,
+        error: null,
+    })
+    return true
+}
+
+export function resetIllustrationBlockedProbeBackoffForTests(): void {
+    blockedLiveProbeNextAt.clear()
 }
 
 async function processNextJob(epoch: number): Promise<boolean> {

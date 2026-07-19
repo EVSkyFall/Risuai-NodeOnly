@@ -221,6 +221,10 @@ const transitionPatchKeys = new Set<keyof IllustrationJobTransitionPatch>([
     'workerEpoch',
     'target',
     'prompt',
+    // Prompt Target V2 (request §D1): durable envelope + receipt written with the
+    // awaiting_prompt -> queued transition by supplyPromptEnvelope.
+    'promptEnvelope',
+    'promptReceipt',
     'settingsFingerprint',
     'attemptId',
     'assetId',
@@ -1531,6 +1535,27 @@ export class IllustrationJobStore {
                 assertNonEmptyString(patch.assetId, 'patch.assetId')
                 next.assetId = patch.assetId
             }
+            // Prompt Target V2 (request §D1): the envelope + receipt are already fully
+            // validated by the coordinator (parse, context match, target validation,
+            // receipt binding + dispatch-eligibility) before this transition. The store
+            // only persists them verbatim under a light structural guard — mirroring how
+            // `patch.target` is stored (assertJsonSerializable + cloneJson) without a
+            // deep re-parse, so the store keeps only a TYPE-level dependency on the
+            // (measurement-importing) V2 modules.
+            if (hasOwn(patch, 'promptEnvelope')) {
+                if (!patch.promptEnvelope || (patch.promptEnvelope as { schemaVersion?: unknown }).schemaVersion !== 2) {
+                    throw new IllustrationLedgerValidationError('patch.promptEnvelope must be a schemaVersion 2 envelope')
+                }
+                assertJsonSerializable(patch.promptEnvelope, 'patch.promptEnvelope')
+                next.promptEnvelope = cloneJson(patch.promptEnvelope)
+            }
+            if (hasOwn(patch, 'promptReceipt')) {
+                if (!patch.promptReceipt || (patch.promptReceipt as { schemaVersion?: unknown }).schemaVersion !== 2) {
+                    throw new IllustrationLedgerValidationError('patch.promptReceipt must be a schemaVersion 2 receipt')
+                }
+                assertJsonSerializable(patch.promptReceipt, 'patch.promptReceipt')
+                next.promptReceipt = cloneJson(patch.promptReceipt)
+            }
             if (hasOwn(patch, 'error')) {
                 if (patch.error === null) {
                     delete next.error
@@ -1561,6 +1586,9 @@ export class IllustrationJobStore {
                 current.state === 'awaiting_prompt'
                 && (input.to === 'queued' || input.to === 'prompt_ready')
                 && !next.prompt
+                // Prompt Target V2 (request §D1): a durable envelope is the queuing proof
+                // for a V2 job (which carries no V1 `prompt`).
+                && !next.promptEnvelope
             ) {
                 throw new IllustrationLedgerValidationError('Final prompts must be durable before queuing')
             }

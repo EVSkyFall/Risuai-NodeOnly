@@ -137,7 +137,7 @@ export const NOVELAI_NATIVE_MAX_SUBJECTS = 6
 export const NOVELAI_NATIVE_MEASUREMENT_REVISION = 'novelai-native-t5-spiece-v1/1'
 export const NOVELAI_NATIVE_QUEUE_POLICY_REVISION = 'novelai-native-queue/1'
 export const NOVELAI_NATIVE_CONCURRENCY_KEY = 'novelai'
-const DEFAULT_NAI_ENDPOINT = 'https://image.novelai.net/ai/generate-image'
+export const DEFAULT_NAI_ENDPOINT = 'https://image.novelai.net/ai/generate-image'
 const DEFAULT_NAI_MODEL = 'nai-diffusion-4-5-full'
 
 export const NOVELAI_NATIVE_SUBJECT_SLOTS: IllustrationPromptSubjectSlots = Object.freeze({
@@ -414,12 +414,25 @@ function parseMeasurementElection(value: unknown): IllustrationTransportMeasurem
         if (input.allowTransportOnly !== true) {
             invalidTransportConfig('transport_only measurement requires allowTransportOnly:true')
         }
+        const positive = optionalLimit(input.positive, 'measurement.positive')
+        const negative = optionalLimit(input.negative, 'measurement.negative')
+        const combined = optionalLimit(input.combined, 'measurement.combined')
+        // Request §D4: a transport_only election with EVERY documented limit null
+        // enforces nothing — it would masquerade as a measured election while measuring
+        // nothing. Reject it here; the honest election for a truly limitless endpoint is
+        // an explicit `unmeasured` + allowUnmeasured opt-in, not a null-limit transport_only.
+        if (positive === null && negative === null && combined === null) {
+            invalidTransportConfig(
+                'transport_only measurement requires at least one non-null documented limit; '
+                    + 'use an explicit unmeasured election (allowUnmeasured) for a limitless endpoint',
+            )
+        }
         return {
             mode: 'transport_only',
             unit: input.unit,
-            positive: optionalLimit(input.positive, 'measurement.positive'),
-            negative: optionalLimit(input.negative, 'measurement.negative'),
-            combined: optionalLimit(input.combined, 'measurement.combined'),
+            positive,
+            negative,
+            combined,
             allowTransportOnly: true,
         }
     }
@@ -935,4 +948,97 @@ export async function targetFingerprintMatchesCurrentDb(
         return false
     }
     return current.targetFingerprint === expectedFingerprint
+}
+
+// ---------------------------------------------------------------------------
+// WebUI probe-and-revalidate live checkpoint binding (request §7.3 / carried gap 1).
+//
+// A `webui-flat` target with bindingMode 'probe-and-revalidate' does NOT pin the
+// checkpoint via a request override — it trusts the backend's currently-loaded
+// checkpoint. A plain user label is not proof, so Core LIVE-probes the backend's
+// checkpoint identity BOTH at capture (preparePromptContext) and at dispatch, and
+// fails closed with a typed unavailable if the probe fails or the live identity has
+// drifted from the captured one. The probe is injected (default = a GET against the
+// backend's /sdapi/v1/options, read via a lazily-imported globalFetch so this module
+// keeps a clean static import graph for the pure resolver tests).
+// ---------------------------------------------------------------------------
+
+// Returns the backend's live checkpoint identity string (A1111/Forge report it as
+// `sd_model_checkpoint` on GET /sdapi/v1/options — the same field Core pins through
+// override_settings on the request-pinned path), or null when the probe cannot
+// establish an identity (unreachable backend, non-ok response, missing field).
+export type WebuiCheckpointProbe = (endpoint: string) => Promise<string | null>
+
+// The canonical fingerprint Core derives from a live checkpoint identity. The
+// probe-and-revalidate election's `checkpointFingerprint` is exactly this derivation
+// of the checkpoint the user pinned, so a live probe is provable against it without
+// Core interpreting the raw identity string.
+export async function deriveWebuiCheckpointFingerprint(checkpointIdentity: string): Promise<string> {
+    return sha256Hex(`webui-probe-checkpoint/1:${checkpointIdentity}`)
+}
+
+async function defaultWebuiCheckpointProbe(endpoint: string): Promise<string | null> {
+    try {
+        const optionsUrl = new URL(endpoint)
+        optionsUrl.pathname = '/sdapi/v1/options'
+        const { globalFetch } = await import('../../globalApi.svelte')
+        const response = await globalFetch(optionsUrl.toString(), {
+            method: 'GET',
+            headers: { 'Content-Type': 'application/json' },
+            plainFetchDeforce: true,
+            redactRequestLog: true,
+        })
+        if (!response.ok || !response.data || typeof response.data !== 'object') return null
+        const identity = (response.data as Record<string, unknown>).sd_model_checkpoint
+        return typeof identity === 'string' && identity.length > 0 ? identity : null
+    } catch {
+        return null
+    }
+}
+
+let webuiCheckpointProbe: WebuiCheckpointProbe = defaultWebuiCheckpointProbe
+
+export function setWebuiCheckpointProbeForTests(probe: WebuiCheckpointProbe): () => void {
+    const previous = webuiCheckpointProbe
+    webuiCheckpointProbe = probe
+    return () => {
+        webuiCheckpointProbe = previous
+    }
+}
+
+export function resetWebuiCheckpointProbeForTests(): void {
+    webuiCheckpointProbe = defaultWebuiCheckpointProbe
+}
+
+// Live-verify a resolved target's checkpoint binding. A no-op for every binding mode
+// except webui-flat probe-and-revalidate; for that mode it probes the live backend and
+// throws a typed prompt_target_unavailable when the probe fails or the live checkpoint
+// identity no longer matches the captured fingerprint (checkpoint drift => provider-
+// call-0). `endpoint` is the current db.webUiUrl (the raw URL is intentionally omitted
+// from the public target). Used at BOTH capture and dispatch (request §7.3 / gap 1).
+export async function verifyWebuiCheckpointBinding(
+    endpoint: string,
+    target: IllustrationPromptTargetV2,
+): Promise<void> {
+    if (target.transportId !== 'webui-flat' || target.bindingMode !== 'probe-and-revalidate') return
+    if (target.checkpointFingerprint === null) {
+        throw new IllustrationPromptTargetUnavailableError(
+            'webui-flat',
+            'a probe-and-revalidate target must carry a captured checkpoint fingerprint',
+        )
+    }
+    const identity = await webuiCheckpointProbe(endpoint)
+    if (identity === null) {
+        throw new IllustrationPromptTargetUnavailableError(
+            'webui-flat',
+            'the backend checkpoint identity probe failed; a live checkpoint identity is required for probe-and-revalidate',
+        )
+    }
+    const liveFingerprint = await deriveWebuiCheckpointFingerprint(identity)
+    if (liveFingerprint !== target.checkpointFingerprint) {
+        throw new IllustrationPromptTargetUnavailableError(
+            'webui-flat',
+            'the backend checkpoint drifted from the captured probe-and-revalidate identity',
+        )
+    }
 }

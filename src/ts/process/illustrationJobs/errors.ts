@@ -189,6 +189,10 @@ export type IllustrationPromptV2ContractErrorCode =
     | 'prompt_receipt_binding_mismatch'
     | 'prompt_target_fingerprint_mismatch'
     | 'prompt_dispatch_ineligible'
+    // Cross-mode supply rejection (request §D1): a V2-prepared turn rejects a V1
+    // supplyPrompt and a V1 (unprepared) turn rejects a V2 supplyPromptEnvelope. The
+    // mismatch is a definite validation-family rejection — never a silent cross-mode.
+    | 'prompt_supply_mode_mismatch'
 
 // Envelope validation, measurement-receipt binding, and dispatch-eligibility
 // failures on the V2 surface. All are definite validation-family rejections.

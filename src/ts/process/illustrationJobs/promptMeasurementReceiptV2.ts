@@ -109,7 +109,10 @@ export function computeDispatchEligibility(
     }
 }
 
-function envelopeToPromptV1(envelope: IllustrationPromptEnvelopeV2): IllustrationPromptV1 {
+// Map a flat / native-character-slots envelope to the V1 structured prompt shape the
+// existing NAI T5 measurement + novelai-native dispatch already consume. pipe-slots has
+// no V1 mapping (it is serialized to flat transport text instead) and is rejected.
+export function envelopeToPromptV1(envelope: IllustrationPromptEnvelopeV2): IllustrationPromptV1 {
     if (envelope.layout === 'flat') {
         return {
             schemaVersion: 1,

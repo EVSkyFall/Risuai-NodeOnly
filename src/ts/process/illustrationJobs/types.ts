@@ -1,4 +1,6 @@
 import type { IllustrationPromptContextV2 } from './promptContextV2'
+import type { IllustrationPromptEnvelopeV2 } from './promptEnvelopeV2'
+import type { IllustrationPromptMeasurementReceiptV2 } from './promptMeasurementReceiptV2'
 
 export type ScenePayloadV1 = {
     schemaVersion: number
@@ -212,6 +214,12 @@ export type IllustrationJobRecordV1 = IllustrationLeaseRecordFields & {
     }
     target?: IllustrationTargetV1
     prompt?: IllustrationStoredPromptV1
+    // Prompt Target V2 (request §D1): a V2-supplied job carries the Plugin's compiled
+    // envelope and the side-effect-free measurement receipt instead of a V1 `prompt`.
+    // Both are additive — legacy/V1 records never set them, and a V2 job never sets
+    // `prompt`. Durable so a reload preserves envelope/receipt identity (§10-21).
+    promptEnvelope?: IllustrationPromptEnvelopeV2
+    promptReceipt?: IllustrationPromptMeasurementReceiptV2
     settingsFingerprint?: string
     attemptId?: string
     assetId?: string
@@ -404,6 +412,10 @@ export type IllustrationJobTransitionPatch = {
     workerEpoch?: number
     target?: IllustrationTargetV1
     prompt?: IllustrationStoredPromptV1
+    // Prompt Target V2 (request §D1): durable envelope + receipt written atomically
+    // with the awaiting_prompt -> queued transition by supplyPromptEnvelope.
+    promptEnvelope?: IllustrationPromptEnvelopeV2
+    promptReceipt?: IllustrationPromptMeasurementReceiptV2
     settingsFingerprint?: string
     attemptId?: string
     assetId?: string

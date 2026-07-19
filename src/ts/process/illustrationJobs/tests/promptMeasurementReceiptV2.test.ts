@@ -123,6 +123,13 @@ describe('dispatch eligibility table (request §6/§10-11/§10-12)', () => {
     })
 })
 
+// NOTE: these receipt tests install installImagePromptMeasurementTestService, whose
+// tokenizer is a STUB (encode -> { length: text.length === 0 ? 0 : 1 }). The asserted
+// token dims (measured:1 / measured:513) come from that stub, and limit:512 is the NAI
+// constant — so this block proves receipt/eligibility WIRING and the 512 ceiling, NOT
+// real SentencePiece tokenization. The genuine shipped-t5 spiece.model regression (exact
+// token counts) lives in imagePromptMeasurement.node.test.ts; cite THAT, not this file,
+// as the real-T5 proof.
 describe('novelai-native model_exact receipt (request §6)', () => {
     test('produces an eligible within-limit receipt bound to fingerprint + envelope hash', async () => {
         const db = naiDb()

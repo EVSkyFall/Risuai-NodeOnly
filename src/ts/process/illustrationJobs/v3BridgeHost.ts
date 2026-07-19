@@ -22,6 +22,7 @@ import {
     retryUncertainLedger,
     setTransportConfig,
     submitPlanLedger,
+    supplyPromptEnvelope,
     supplyPromptLedger,
 } from './coordinator'
 import { getCapturePolicy, setCaptureMode } from './capturePolicy'
@@ -96,6 +97,9 @@ const bridgeDependencies: IllustrationV3BridgeDependencies = {
     ),
     supplyPrompt: async (input) => await supplyPromptLedger(
         input as Parameters<typeof supplyPromptLedger>[0],
+    ),
+    supplyPromptEnvelope: async (input) => await supplyPromptEnvelope(
+        input as Parameters<typeof supplyPromptEnvelope>[0],
     ),
     preparePromptContext: async (input) => await preparePromptContext(
         input as Parameters<typeof preparePromptContext>[0],

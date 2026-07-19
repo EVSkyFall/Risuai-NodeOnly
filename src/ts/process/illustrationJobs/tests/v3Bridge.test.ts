@@ -568,6 +568,7 @@ describe('private V3 API shape and hygiene', () => {
             '_ijSubmitPlan',
             '_ijSubscribe',
             '_ijSupplyPrompt',
+            '_ijSupplyPromptEnvelope',
             '_ijUnsubscribe',
         ])
         expect(bridge.aliases).toEqual({ illustrationJobs: ILLUSTRATION_JOBS_ALIAS })

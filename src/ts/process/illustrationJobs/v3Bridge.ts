@@ -352,6 +352,9 @@ export type IllustrationV3BridgeDependencies = {
     claimJob(input: Record<string, unknown>): Promise<unknown>
     submitPlan(input: Record<string, unknown>): Promise<BridgeRecord[]>
     supplyPrompt(input: Record<string, unknown>): Promise<BridgeRecord>
+    // Prompt Target V2 (Slice F): the compiled-envelope supply for a prepared turn.
+    // Optional for the same reason; absent => 'unavailable'.
+    supplyPromptEnvelope?(input: Record<string, unknown>): Promise<BridgeRecord>
     // Prompt Target V2 (Slice D). Optional so existing dependency literals keep
     // type-checking; when absent the RPC surfaces 'unavailable'.
     preparePromptContext?(input: Record<string, unknown>): Promise<unknown>
@@ -880,6 +883,7 @@ export const ILLUSTRATION_JOBS_ALIAS = Object.freeze({
     claimJob: '_ijClaimJob',
     submitPlan: '_ijSubmitPlan',
     supplyPrompt: '_ijSupplyPrompt',
+    supplyPromptEnvelope: '_ijSupplyPromptEnvelope',
     preparePromptContext: '_ijPreparePromptContext',
     setTransportConfig: '_ijSetTransportConfig',
     getTransportConfig: '_ijGetTransportConfig',
@@ -1156,6 +1160,21 @@ export function createAuthorizedIllustrationV3Bridge(input: {
                 auth.runtimeId,
                 {},
                 async () => await deps.supplyPrompt(request),
+            )
+            return deps.projectJobSnapshot(record, request.leaseId as string)
+        }),
+        _ijSupplyPromptEnvelope: async (value) => await invokeRpc(async () => {
+            ensureLive()
+            const request = sanitizedInput(value)
+            // Prompt Target V2 uses protocolVersion 2 for THIS method; the rest of the
+            // bridge stays on protocolVersion 1.
+            if (request.protocolVersion !== 2) throw codedError('validation')
+            const supply = deps.supplyPromptEnvelope
+            if (!supply) throw codedError('unavailable')
+            const record = await hostRegistry.runOwned(
+                auth.runtimeId,
+                {},
+                async () => await supply(request),
             )
             return deps.projectJobSnapshot(record, request.leaseId as string)
         }),
