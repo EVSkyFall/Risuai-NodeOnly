@@ -4,12 +4,10 @@ import {
     ILLUSTRATION_V3_ERROR_MESSAGES,
     ILLUSTRATION_V3_PROTECTED_PLUGIN_NAME,
     IllustrationV3HostLlmRegistry,
-    PINNED_ILLUSTRATION_PLUGIN_DIGESTS,
     createAuthorizedIllustrationV3Bridge,
     createIllustrationV3CapabilityIfAuthorized,
     evaluateIllustrationV3Authorization,
     toIllustrationV3RpcError,
-    validatePinnedIllustrationDigests,
     type IllustrationV3AuthorizationContext,
     type IllustrationV3BridgeDependencies,
 } from '../v3Bridge'
@@ -448,7 +446,7 @@ afterEach(() => {
 })
 
 describe('private V3 authorization', () => {
-    test('requires exact name, V3 version, pinned script digest, and a unique persisted name', async () => {
+    test('requires exact name, V3 version, and a unique persisted name while retaining script digest only for audit', async () => {
         const base = {
             pluginName: ILLUSTRATION_V3_PROTECTED_PLUGIN_NAME,
             pluginScript: 'exact script snapshot',
@@ -457,28 +455,28 @@ describe('private V3 authorization', () => {
             permissionGranted: true,
         }
         const sha = vi.fn(async () => DIGEST_A)
-        await expect(evaluateIllustrationV3Authorization(base, [DIGEST_A], sha)).resolves.toEqual(AUTH)
+        await expect(evaluateIllustrationV3Authorization(base, [], sha)).resolves.toEqual(AUTH)
         await expect(evaluateIllustrationV3Authorization(
             { ...base, pluginName: 'permission-only-plugin' },
-            [DIGEST_A],
+            [],
             sha,
         )).resolves.toBeNull()
         await expect(evaluateIllustrationV3Authorization(
             { ...base, apiVersion: '2.0' },
-            [DIGEST_A],
+            [],
             sha,
         )).resolves.toBeNull()
-        await expect(evaluateIllustrationV3Authorization(base, [DIGEST_B], sha)).resolves.toBeNull()
+        await expect(evaluateIllustrationV3Authorization(base, [DIGEST_B], sha)).resolves.toEqual(AUTH)
         await expect(evaluateIllustrationV3Authorization({
             ...base,
             persistedPluginNames: [
                 ILLUSTRATION_V3_PROTECTED_PLUGIN_NAME,
                 ILLUSTRATION_V3_PROTECTED_PLUGIN_NAME,
             ],
-        }, [DIGEST_A], sha)).resolves.toBeNull()
+        }, [], sha)).resolves.toBeNull()
     })
 
-    test('captures plugin and rotation inputs immutably before async hashing resolves', async () => {
+    test('captures plugin identity inputs immutably before async hashing resolves', async () => {
         const hash = deferred<string>()
         const persistedNames = [ILLUSTRATION_V3_PROTECTED_PLUGIN_NAME]
         const pins = [DIGEST_A]
@@ -504,7 +502,7 @@ describe('private V3 authorization', () => {
         await expect(authorization).resolves.toEqual(AUTH)
     })
 
-    test('supports a two-digest rotation and rejects invalid rotation lists', async () => {
+    test('ignores legacy digest rotation lists and reports the measured script digest', async () => {
         const input = {
             pluginName: ILLUSTRATION_V3_PROTECTED_PLUGIN_NAME,
             pluginScript: 'script',
@@ -516,11 +514,11 @@ describe('private V3 authorization', () => {
             [DIGEST_A, DIGEST_B],
             async () => DIGEST_B,
         )).resolves.toMatchObject({ scriptDigest: DIGEST_B })
-        expect(() => validatePinnedIllustrationDigests([])).toThrow()
-        expect(() => validatePinnedIllustrationDigests([DIGEST_A, DIGEST_B, 'c'.repeat(64)])).toThrow()
-        expect(() => validatePinnedIllustrationDigests([DIGEST_A, DIGEST_A])).toThrow()
-        expect(() => validatePinnedIllustrationDigests(['A'.repeat(64)])).toThrow()
-        expect(Object.isFrozen(PINNED_ILLUSTRATION_PLUGIN_DIGESTS)).toBe(true)
+        await expect(evaluateIllustrationV3Authorization(
+            input,
+            [],
+            async () => DIGEST_A,
+        )).resolves.toMatchObject({ scriptDigest: DIGEST_A })
     })
 
     test('does not construct roots or aliases when authorization is absent', () => {

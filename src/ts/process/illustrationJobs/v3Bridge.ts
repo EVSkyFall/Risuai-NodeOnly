@@ -7,19 +7,10 @@ import type {
 
 export const ILLUSTRATION_V3_PROTECTED_PLUGIN_NAME = 'lb_xnai_agent'
 
-type PinnedDigestRotation = readonly [string] | readonly [string, string]
-
-// Rotation may temporarily contain the old and new production digests, never more than two.
-// [0] = previous release (rollback window), [1] = 0.2.6 terminal-close copy (280,745 bytes;
-// digest independently recomputed from the root and dist bundles on 2026-07-20 by
-// scripts/rotate-illustration-pin.mjs — Clarify corrupt marker/swipe terminal-close recovery copy). Retired releases, the discarded
-// pre-contract 0.2.0 snapshot, and the discarded interim drafts must never re-enter
-// (regressions in tests/acceptance/sharedFixtures.ts). Converge to a single pin once
-// rollout confirms.
-export const PINNED_ILLUSTRATION_PLUGIN_DIGESTS = Object.freeze([
-    'ee55f45bca5cfa63a43739b9bf6c9b3b08bcb8169c49dbfb3c3aa2bed2b53992',
-    '1578cb779e8cbee2f9ecf43fa9dddb3672432918408eb7b8ade7191c0e5e8079',
-] as const satisfies PinnedDigestRotation)
+// Personal deployment mode: script SHA-256 is retained only as an audit identity.
+// Authorization no longer gates on a rotating digest allowlist; access is scoped by
+// the protected plugin name, API version, and persisted-name uniqueness.
+export const PINNED_ILLUSTRATION_PLUGIN_DIGESTS = Object.freeze([] as const)
 
 export type IllustrationV3AuthorizationInput = {
     pluginName: string
@@ -48,19 +39,10 @@ async function sha256HexUtf8(value: string): Promise<string> {
 }
 
 export function validatePinnedIllustrationDigests(
-    digests: readonly string[],
-): asserts digests is PinnedDigestRotation {
-    if (digests.length < 1 || digests.length > 2) {
-        throw new Error('Illustration V3 authorization requires one or two pinned digests')
-    }
-    if (new Set(digests).size !== digests.length) {
-        throw new Error('Illustration V3 authorization digests must be unique')
-    }
-    for (const digest of digests) {
-        if (!/^[0-9a-f]{64}$/.test(digest)) {
-            throw new Error('Illustration V3 authorization digests must be lowercase SHA-256')
-        }
-    }
+    _digests: readonly string[],
+): void {
+    // Deprecated compatibility shim. Digest pinning is intentionally disabled for
+    // this personal deployment; callers may keep passing old rotation arrays.
 }
 
 export async function evaluateIllustrationV3Authorization(
@@ -68,14 +50,13 @@ export async function evaluateIllustrationV3Authorization(
     pinnedDigests: readonly string[],
     sha256Hex: Sha256Hex,
 ): Promise<IllustrationV3AuthorizationContext | null> {
-    const capturedDigests = Object.freeze([...pinnedDigests])
+    void pinnedDigests
     const captured = Object.freeze({
         pluginName: input.pluginName,
         pluginScript: input.pluginScript,
         apiVersion: input.apiVersion,
         persistedPluginNames: Object.freeze([...input.persistedPluginNames]),
     })
-    validatePinnedIllustrationDigests(capturedDigests)
     if (
         captured.pluginName !== ILLUSTRATION_V3_PROTECTED_PLUGIN_NAME
         || captured.apiVersion !== '3.0'
@@ -85,7 +66,6 @@ export async function evaluateIllustrationV3Authorization(
     ) return null
 
     const scriptDigest = await sha256Hex(captured.pluginScript)
-    if (!capturedDigests.includes(scriptDigest)) return null
     return Object.freeze({
         pluginName: ILLUSTRATION_V3_PROTECTED_PLUGIN_NAME,
         scriptDigest,

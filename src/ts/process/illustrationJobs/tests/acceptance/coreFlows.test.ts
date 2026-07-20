@@ -121,7 +121,6 @@ const { illustrationJobStore } = storeModule
 const { finalizeIllustrationRootTurn } = terminalCaptureModule
 const {
     ILLUSTRATION_V3_PROTECTED_PLUGIN_NAME,
-    PINNED_ILLUSTRATION_PLUGIN_DIGESTS,
 } = v3BridgeModule
 const { createAuthorizedIllustrationV3HostBridge } = v3BridgeHostModule
 
@@ -148,7 +147,7 @@ type JobSnapshot = {
 
 const AUTH = Object.freeze({
     pluginName: ILLUSTRATION_V3_PROTECTED_PLUGIN_NAME,
-    scriptDigest: PINNED_ILLUSTRATION_PLUGIN_DIGESTS[0],
+    scriptDigest: 'personal-trusted-plugin-digest',
     apiVersion: '3.0' as const,
 })
 

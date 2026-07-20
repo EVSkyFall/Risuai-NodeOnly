@@ -12,7 +12,6 @@ import {
 } from '../../stateMachine'
 import {
     ILLUSTRATION_V3_PROTECTED_PLUGIN_NAME,
-    PINNED_ILLUSTRATION_PLUGIN_DIGESTS,
     authorizeIllustrationV3Plugin,
     evaluateIllustrationV3Authorization,
 } from '../../v3Bridge'
@@ -87,16 +86,15 @@ describe('Gate 4d shared Core fixtures', () => {
         })
     })
 
-    // §5 shared fixture: the requesting project's current production identity is the Core pin.
-    test('pins the production plugin name and current script digest through authorization', async () => {
+    // §5 shared fixture: personal deployment authorization trusts the protected plugin identity.
+    test('authorizes the production plugin name without digest pinning', async () => {
         expect(PRODUCTION_PLUGIN.name).toBe(ILLUSTRATION_V3_PROTECTED_PLUGIN_NAME)
-        expect(PINNED_ILLUSTRATION_PLUGIN_DIGESTS).toContain(PRODUCTION_PLUGIN.scriptSha256Next)
         await expect(evaluateIllustrationV3Authorization({
             pluginName: PRODUCTION_PLUGIN.name,
             pluginScript: 'captured production script bytes',
             apiVersion: '3.0',
             persistedPluginNames: [PRODUCTION_PLUGIN.name],
-        }, PINNED_ILLUSTRATION_PLUGIN_DIGESTS, async () => PRODUCTION_PLUGIN.scriptSha256Next))
+        }, [], async () => PRODUCTION_PLUGIN.scriptSha256Next))
             .resolves.toEqual({
                 pluginName: PRODUCTION_PLUGIN.name,
                 scriptDigest: PRODUCTION_PLUGIN.scriptSha256Next,
@@ -104,16 +102,8 @@ describe('Gate 4d shared Core fixtures', () => {
             })
     })
 
-    // 0.2.6 prompt-dialect flat profiles repin: the [terminal-close UX 0.2.6,
-    // prompt-dialect 0.2.6] rotation window authorizes both releases while every
-    // rejected digest — retired, unapproved, discarded, removed, or displaced —
-    // never authorizes.
-    test('pins the 0.2.6 terminal-close copy rotation window and rejects every superseded digest', async () => {
-        expect(PINNED_ILLUSTRATION_PLUGIN_DIGESTS).toEqual([
-            PRODUCTION_PLUGIN.scriptSha256,
-            PRODUCTION_PLUGIN.scriptSha256Next,
-        ])
-        expect(REJECTED_PLUGIN_SHA256S).toHaveLength(16)
+    test('keeps historical rejected digests as audit history only', async () => {
+        expect(REJECTED_PLUGIN_SHA256S).toHaveLength(17)
         expect(new Set(REJECTED_PLUGIN_SHA256S).size).toBe(REJECTED_PLUGIN_SHA256S.length)
 
         const authorize = (digest: string) => evaluateIllustrationV3Authorization({
@@ -121,7 +111,7 @@ describe('Gate 4d shared Core fixtures', () => {
             pluginScript: 'captured production script bytes',
             apiVersion: '3.0',
             persistedPluginNames: [PRODUCTION_PLUGIN.name],
-        }, PINNED_ILLUSTRATION_PLUGIN_DIGESTS, async () => digest)
+        }, [], async () => digest)
 
         await expect(authorize(PRODUCTION_PLUGIN.scriptSha256Next)).resolves.toMatchObject({
             scriptDigest: PRODUCTION_PLUGIN.scriptSha256Next,
@@ -131,22 +121,24 @@ describe('Gate 4d shared Core fixtures', () => {
         })
         for (const rejected of REJECTED_PLUGIN_SHA256S) {
             expect(rejected).toMatch(/^[0-9a-f]{64}$/)
-            expect(PINNED_ILLUSTRATION_PLUGIN_DIGESTS).not.toContain(rejected)
-            await expect(authorize(rejected)).resolves.toBeNull()
+            await expect(authorize(rejected)).resolves.toMatchObject({ scriptDigest: rejected })
         }
     })
 
-    // Repin acceptance 6: through the production WebCrypto hash path against the real
-    // pin array, candidates whose bytes differ from a pinned release (including by a
-    // single character) hash to unpinned digests and never authorize.
-    test('rejects byte-different candidates through the real hashing path', async () => {
+    test('authorizes byte-different candidates through the real hashing path for personal trusted plugin mode', async () => {
         const authorize = (script: string) => authorizeIllustrationV3Plugin({
             pluginName: PRODUCTION_PLUGIN.name,
             pluginScript: script,
             apiVersion: '3.0',
             persistedPluginNames: [PRODUCTION_PLUGIN.name],
         })
-        await expect(authorize('not the pinned production bundle')).resolves.toBeNull()
-        await expect(authorize('not the pinned production bundle.')).resolves.toBeNull()
+        await expect(authorize('not the pinned production bundle')).resolves.toMatchObject({
+            pluginName: PRODUCTION_PLUGIN.name,
+            apiVersion: '3.0',
+        })
+        await expect(authorize('not the pinned production bundle.')).resolves.toMatchObject({
+            pluginName: PRODUCTION_PLUGIN.name,
+            apiVersion: '3.0',
+        })
     })
 })

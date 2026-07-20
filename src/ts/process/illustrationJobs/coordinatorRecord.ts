@@ -22,8 +22,8 @@ import type {
 } from './types'
 
 export const ILLUSTRATION_COORDINATOR_KEY = 'illustration:v1:coordinator'
-export const COORDINATOR_LEASE_DURATION_MS = 60_000
-export const ORPHAN_TAKEOVER_COOLDOWN_MS = 300_000
+export const COORDINATOR_LEASE_DURATION_MS = 5_000
+export const ORPHAN_TAKEOVER_COOLDOWN_MS = 5_000
 
 export type ClaimCoordinatorInput = {
     protocolVersion: 1
