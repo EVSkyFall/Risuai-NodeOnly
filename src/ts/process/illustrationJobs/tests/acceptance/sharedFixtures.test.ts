@@ -108,12 +108,12 @@ describe('Gate 4d shared Core fixtures', () => {
     // prompt-dialect 0.2.6] rotation window authorizes both releases while every
     // rejected digest — retired, unapproved, discarded, removed, or displaced —
     // never authorizes.
-    test('pins the 0.2.6 prompt-dialect flat profiles rotation window and rejects every superseded digest', async () => {
+    test('pins the 0.2.6 manual capture UX rotation window and rejects every superseded digest', async () => {
         expect(PINNED_ILLUSTRATION_PLUGIN_DIGESTS).toEqual([
             PRODUCTION_PLUGIN.scriptSha256,
             PRODUCTION_PLUGIN.scriptSha256Next,
         ])
-        expect(REJECTED_PLUGIN_SHA256S).toHaveLength(13)
+        expect(REJECTED_PLUGIN_SHA256S).toHaveLength(14)
         expect(new Set(REJECTED_PLUGIN_SHA256S).size).toBe(REJECTED_PLUGIN_SHA256S.length)
 
         const authorize = (digest: string) => evaluateIllustrationV3Authorization({
