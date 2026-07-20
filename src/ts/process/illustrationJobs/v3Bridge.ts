@@ -10,15 +10,15 @@ export const ILLUSTRATION_V3_PROTECTED_PLUGIN_NAME = 'lb_xnai_agent'
 type PinnedDigestRotation = readonly [string] | readonly [string, string]
 
 // Rotation may temporarily contain the old and new production digests, never more than two.
-// [0] = previous release (rollback window), [1] = 0.2.6 coordinator-safe manual capture (280,296 bytes;
+// [0] = previous release (rollback window), [1] = 0.2.6 terminal-close copy (280,745 bytes;
 // digest independently recomputed from the root and dist bundles on 2026-07-20 by
-// scripts/rotate-illustration-pin.mjs — Manual capture requires owned coordinator before Core request). Retired releases, the discarded
+// scripts/rotate-illustration-pin.mjs — Clarify corrupt marker/swipe terminal-close recovery copy). Retired releases, the discarded
 // pre-contract 0.2.0 snapshot, and the discarded interim drafts must never re-enter
 // (regressions in tests/acceptance/sharedFixtures.ts). Converge to a single pin once
 // rollout confirms.
 export const PINNED_ILLUSTRATION_PLUGIN_DIGESTS = Object.freeze([
-    'fb3902e646bd787c6f35f455a9725f044d89d9d0a0dbcafda21c9d2096c6ec6c',
     'ee55f45bca5cfa63a43739b9bf6c9b3b08bcb8169c49dbfb3c3aa2bed2b53992',
+    '1578cb779e8cbee2f9ecf43fa9dddb3672432918408eb7b8ade7191c0e5e8079',
 ] as const satisfies PinnedDigestRotation)
 
 export type IllustrationV3AuthorizationInput = {
