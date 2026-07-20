@@ -16,10 +16,10 @@ export const PRODUCTION_SLOT_TOKEN_RE = /^[0-9a-f]{32}$/
 export const PRODUCTION_PLUGIN = Object.freeze({
     name: 'lb_xnai_agent',
     // Previous release — kept as the rollback window.
-    scriptSha256: '987586f7297b56f767acee718e7f2f6525d86c677b91d64ab14691f9ebe48ba5',
-    // 0.2.6 manual capture UX release bundle (279,712 bytes) — digest independently
+    scriptSha256: 'fb3902e646bd787c6f35f455a9725f044d89d9d0a0dbcafda21c9d2096c6ec6c',
+    // 0.2.6 coordinator-safe manual capture release bundle (280,296 bytes) — digest independently
     // recomputed from the root and dist bundles on 2026-07-20 by scripts/rotate-illustration-pin.mjs.
-    scriptSha256Next: 'fb3902e646bd787c6f35f455a9725f044d89d9d0a0dbcafda21c9d2096c6ec6c',
+    scriptSha256Next: 'ee55f45bca5cfa63a43739b9bf6c9b3b08bcb8169c49dbfb3c3aa2bed2b53992',
 })
 
 // Digests that must NEVER authorize: releases removed from the rotation window,
@@ -62,6 +62,9 @@ export const REJECTED_PLUGIN_SHA256S = Object.freeze([
     // Displaced from the rotation window by the 0.2.6 manual capture UX rotation (2026-07-20,
     // scripts/rotate-illustration-pin.mjs).
     '3249d4ef850d765369e55dd014cee0a10426a64150688ba1ffead8904bbbdaae',
+    // Displaced from the rotation window by the 0.2.6 coordinator-safe manual capture rotation (2026-07-20,
+    // scripts/rotate-illustration-pin.mjs).
+    '987586f7297b56f767acee718e7f2f6525d86c677b91d64ab14691f9ebe48ba5',
 ])
 
 export type JobStateAcceptanceClassification = Readonly<{
