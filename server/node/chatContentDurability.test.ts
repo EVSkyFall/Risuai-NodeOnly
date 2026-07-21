@@ -196,6 +196,32 @@ describe('strict durable chat-content flush', { timeout: 30_000 }, () => {
         expect(persistedChat.message[0].data).toBe('strict durable value')
     })
 
+    it('rejects stub/metadata-only chat bodies so the fullChatStore is never poisoned', async () => {
+        // 2026-07-21 multi-browser incident: a client that regressed a hydrated
+        // chat to a raw `_stub` entry saved it through this endpoint, replacing
+        // the fullChatStore entry with a message-less object. Every subsequent
+        // database.bin persist then hit the stub-loss guard and aborted (500)
+        // until restart. The boundary must reject non-full chat bodies.
+        const context = await boot()
+
+        const stubBody = { id: 'chat-0-0', name: 'Chat 0', _stub: true } as unknown as ReturnType<typeof makeChat>
+        const stubResponse = await postChat(context, stubBody, { strict: true })
+        expect(stubResponse.status).toBe(400)
+        expect(await stubResponse.json()).toMatchObject({ code: 'CHAT_CONTENT_NOT_FULL' })
+
+        const neitherBody = { id: 'chat-0-0', name: 'Chat 0' } as unknown as ReturnType<typeof makeChat>
+        const neitherResponse = await postChat(context, neitherBody)
+        expect(neitherResponse.status).toBe(400)
+        expect(await neitherResponse.json()).toMatchObject({ code: 'CHAT_CONTENT_NOT_FULL' })
+
+        // The store stayed healthy: a real strict save still lands durably.
+        const healthyResponse = await postChat(context, makeChat('still healthy after rejects'), { strict: true })
+        expect(healthyResponse.status).toBe(200)
+        expect(await healthyResponse.json()).toMatchObject({ success: true, durable: true })
+        const persistedChat = await readPersistedChat(context.server)
+        expect(persistedChat.message[0].data).toBe('still healthy after rejects')
+    })
+
     it('returns a core persist failure for strict mode while legacy mode still returns 200', async () => {
         const context = await boot()
         installFailureTrigger(

@@ -12,7 +12,7 @@ import { hasher } from "./parser/parser.svelte";
 import { characterURLImport, hubURL } from "./characterCards";
 import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from "./storage/defaultPrompts";
 import { decodeRisuSave, encodeRisuSaveLegacy, findDangerousChatOps, RisuSaveEncoder, RisuSavePatcher, type toSaveType } from "./storage/risuSave";
-import { isHydrating, saveChatToServer, ensureChatHydrated, chatToStub, classifyChat } from "./storage/chatStorage";
+import { isHydrating, saveChatToServer, ensureChatHydrated, chatToStub, classifyChat, restoreChatShapeAfterRebase } from "./storage/chatStorage";
 import { AutoStorage } from "./storage/autoStorage";
 import { ConflictError, type PersistWarning } from "./storage/nodeStorage";
 import { supportsPatchSync } from "./platform";
@@ -749,6 +749,14 @@ export async function saveDb() {
                 }
             }
             mergedDb.characters = mergedCharacters
+            // The server decode carries raw `_stub` chats. Boot runs
+            // convertStubsToPlaceholders before the DB ever reaches UI state;
+            // this mid-session merge must restore the same invariant (and graft
+            // locally hydrated chats back) or raw stubs reach live state — Chat
+            // consumers crash on `message.length` and a stub can flow into the
+            // per-chat save path, poisoning the server's fullChatStore
+            // (2026-07-21 multi-browser incident).
+            restoreChatShapeAfterRebase(mergedCharacters, localCharacters)
             const mergedBaseline = safeStructuredClone(mergedDb) as Database
             setDatabase(mergedDb)
 
@@ -785,8 +793,12 @@ export async function saveDb() {
             const chatIndex = char.chats.findIndex(c => c.id === chatId)
             if (chatIndex === -1) continue
             const chat = char.chats[chatIndex]
-            // Skip placeholders — they have no real data to save
-            if (!chat || chat._placeholder) continue
+            // Only a REAL chat may be sent as chat CONTENT: a placeholder has
+            // nothing to save, and a stub/metadata-only object (no message
+            // array) would replace the server's fullChatStore entry, after
+            // which reassembly emits a metadata-only chat and the stub-loss
+            // guard aborts every database.bin persist until restart.
+            if (!chat || chat._placeholder || (chat as any)._stub === true || !Array.isArray(chat.message)) continue
             try {
                 await saveChatToServer(chaId, chatIndex, chatId, chat)
             } catch (e) {

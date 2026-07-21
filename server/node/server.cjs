@@ -5430,13 +5430,20 @@ app.get('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
         const charChats = fullChatStore.get(chaId);
         if (charChats && expectedChatId) {
             const chat = charChats.get(expectedChatId);
-            if (chat) {
+            // Serve only REAL chats. A message-less entry (poisoned store) fed
+            // to the client would hydrate into a crashing/metadata-only chat;
+            // 404 keeps the client on its safe placeholder instead.
+            if (chat && Array.isArray(chat.message)) {
                 if (!restoreColdStorageChat(chat)) {
                     return res.status(500).json({ error: 'Cold storage restore failed' });
                 }
                 const encoded = Buffer.from(encodeRisuSaveLegacy(chat));
                 res.setHeader('Content-Type', 'application/octet-stream');
                 return res.send(encoded);
+            }
+            if (chat) {
+                logger.error(`[ChatContent] refusing to serve message-less chat entry ${chaId}/${expectedChatId} (poisoned store?)`);
+                return res.status(404).json({ error: 'Chat content unavailable (metadata-only entry)' });
             }
         }
 
@@ -5489,6 +5496,18 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
 
             if (!chatData || !expectedChatId) {
                 return res.status(400).json({ error: 'Chat data and x-chat-id required' });
+            }
+
+            // A chat-content body must be a REAL chat. A stub/metadata-only
+            // object (no message array) would replace the fullChatStore entry,
+            // after which reassembleFullDb emits a metadata-only chat and the
+            // stub-loss guard aborts every database.bin persist until restart
+            // (2026-07-21 multi-browser incident). Reject at the boundary.
+            if (chatData._stub === true || !Array.isArray(chatData.message)) {
+                return res.status(400).json({
+                    error: 'Chat content must carry a message array — stub/metadata-only bodies are rejected',
+                    code: 'CHAT_CONTENT_NOT_FULL',
+                });
             }
 
             if (strictFlush && chatData.id !== expectedChatId) {

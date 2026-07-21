@@ -11,7 +11,7 @@ vi.mock('./database.svelte', () => ({
         && !Array.isArray(chat.message),
 }))
 
-const { chatToStub, stubToPlaceholder, convertStubsToPlaceholders, classifyChat } = await import('./chatStorage')
+const { chatToStub, stubToPlaceholder, convertStubsToPlaceholders, classifyChat, restoreChatShapeAfterRebase } = await import('./chatStorage')
 type Chat = any
 type ChatStub = any
 
@@ -213,5 +213,69 @@ describe('hybrid corruption (chat with _stub:true + message)', () => {
         expect('note' in stub).toBe(false)
         // Once stripped, the chat-data guard would see no chat-internal field
         // ops in a baseline-vs-current diff between two of these stubs.
+    })
+})
+
+// 2026-07-21 multi-browser incident: the save loop's rebase merged a raw
+// server decode (chats = `_stub` entries) straight into live UI state without
+// the boot-time convertStubsToPlaceholders pass. Chat consumers crashed on
+// `message.length`, and a raw stub flowed into the per-chat save path,
+// poisoning the server's fullChatStore. restoreChatShapeAfterRebase is the
+// rebase-side invariant restorer + local-hydration graft.
+describe('restoreChatShapeAfterRebase', () => {
+    const rawStub = (id: string): ChatStub => ({ id, name: 'n-' + id, _stub: true })
+    const fullChat = (id: string, text: string): Chat => ({
+        message: [{ role: 'char', data: text }],
+        note: '', name: 'n-' + id, localLore: [], id,
+    })
+
+    test('converts raw server stubs to placeholders (no message-less chat survives)', () => {
+        const merged = [{ chaId: 'A', chats: [rawStub('c1'), rawStub('c2')] }]
+        restoreChatShapeAfterRebase(merged, [])
+        for (const chat of merged[0].chats as any[]) {
+            expect(chat._stub).toBeUndefined()
+            expect(chat._placeholder).toBe(true)
+            expect(Array.isArray(chat.message)).toBe(true)
+        }
+    })
+
+    test('grafts the locally hydrated chat back over its placeholder slot', () => {
+        const hydrated = fullChat('c1', 'hello from the open chat')
+        const merged = [{ chaId: 'A', chats: [rawStub('c1'), rawStub('c2')] }]
+        const local = [{ chaId: 'A', chats: [hydrated] }]
+        restoreChatShapeAfterRebase(merged, local)
+        expect((merged[0].chats[0] as any).message[0].data).toBe('hello from the open chat')
+        expect((merged[0].chats[1] as any)._placeholder).toBe(true)
+    })
+
+    test('never grafts a local stub or placeholder over the slot', () => {
+        const merged = [{ chaId: 'A', chats: [rawStub('c1'), rawStub('c2')] }]
+        const local = [{
+            chaId: 'A',
+            chats: [rawStub('c1'), { ...fullChat('c2', 'x'), message: [], _placeholder: true }],
+        }]
+        restoreChatShapeAfterRebase(merged, local)
+        expect((merged[0].chats[0] as any)._placeholder).toBe(true)
+        expect((merged[0].chats[0] as any)._stub).toBeUndefined()
+        expect((merged[0].chats[1] as any)._placeholder).toBe(true)
+    })
+
+    test('leaves already-correct characters untouched and self-heals hybrids', () => {
+        const untouched = fullChat('c9', 'kept')
+        const merged = [{
+            chaId: 'B',
+            chats: [untouched, { ...fullChat('c8', 'hybrid'), _stub: true }],
+        }]
+        restoreChatShapeAfterRebase(merged, [])
+        expect(merged[0].chats[0]).toBe(untouched)
+        expect((merged[0].chats[1] as any)._stub).toBeUndefined()
+        expect((merged[0].chats[1] as any).message[0].data).toBe('hybrid')
+    })
+
+    test('characters missing locally get placeholders only (no graft, no crash)', () => {
+        const merged = [{ chaId: 'C', chats: [rawStub('c3')] }, { chats: [rawStub('c4')] }]
+        restoreChatShapeAfterRebase(merged as any, [{ chaId: 'Z', chats: [] }])
+        expect((merged[0].chats![0] as any)._placeholder).toBe(true)
+        expect((merged[1].chats![0] as any)._placeholder).toBe(true)
     })
 })

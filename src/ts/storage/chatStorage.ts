@@ -72,6 +72,52 @@ export function convertStubsToPlaceholders(chats: ChatOrStub[]): Chat[] {
     })
 }
 
+/**
+ * Restore the runtime chat-shape invariant on characters merged from a raw
+ * server decode (the save loop's rebase path). Boot applies
+ * convertStubsToPlaceholders exactly once (bootstrap.ts); a mid-session rebase
+ * that skips it injects raw `_stub` entries into live UI state, where every
+ * Chat consumer reads `message.length` and crashes — and a raw stub flowing
+ * back through the per-chat save path poisons the server's fullChatStore with
+ * a message-less entry, after which the stub-loss guard aborts every
+ * database.bin persist until restart (2026-07-21 multi-browser incident).
+ *
+ * EVERY locally hydrated full chat is grafted back over its converted
+ * placeholder slot (matched by chat id) — not just the currently open one —
+ * so this browser's hydrated view survives the rebase intact: the open chat
+ * keeps rendering, and previously opened chats keep the local copy until
+ * they re-hydrate. That deliberately prefers the local copy over a possibly
+ * newer server copy for off-screen chats, matching the documented
+ * no-live-sync / per-chat last-writer-wins model. Mutates mergedCharacters
+ * in place; localCharacters is read-only.
+ */
+export function restoreChatShapeAfterRebase(
+    mergedCharacters: { chaId?: string; chats?: ChatOrStub[] }[],
+    localCharacters: { chaId?: string; chats?: ChatOrStub[] }[],
+): void {
+    const localByChaId = new Map<string, { chaId?: string; chats?: ChatOrStub[] }>()
+    for (const char of localCharacters ?? []) {
+        if (char?.chaId) localByChaId.set(char.chaId, char)
+    }
+    for (const char of mergedCharacters ?? []) {
+        if (!char || !Array.isArray(char.chats)) continue
+        char.chats = convertStubsToPlaceholders(char.chats)
+        const localChar = char.chaId ? localByChaId.get(char.chaId) : undefined
+        if (!localChar || !Array.isArray(localChar.chats)) continue
+        for (let i = 0; i < char.chats.length; i++) {
+            const slot = char.chats[i] as Chat | undefined
+            if (!slot || slot._placeholder !== true || !slot.id) continue
+            const localFull = localChar.chats.find((c) =>
+                c
+                && (c as Chat).id === slot.id
+                && (c as Chat)._placeholder !== true
+                && (c as any)._stub !== true
+                && Array.isArray((c as Chat).message))
+            if (localFull) char.chats[i] = localFull as Chat
+        }
+    }
+}
+
 // Classify a chat slot by shape. Used by the chat-data guard's diagnostic
 // dump to surface hybrid corruption (the `_stub: true` + message pattern that
 // caused widespread chat data loss in v1.4.x).
