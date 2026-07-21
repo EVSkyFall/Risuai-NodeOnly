@@ -774,7 +774,6 @@ export async function saveDb() {
                 localSelectedCharIndex: liveSelectedCharIndex,
             })
             mergedDb.botPresetsId = rebasedSelection.botPresetsId
-            const mergedBaseline = safeStructuredClone(mergedDb) as Database
             setDatabase(mergedDb)
             if (rebasedSelection.selectedCharIndex !== liveSelectedCharIndex) {
                 selectedCharID.set(rebasedSelection.selectedCharIndex)
@@ -786,7 +785,15 @@ export async function saveDb() {
             })
             if (supportsPatchSync) {
                 patcher = new RisuSavePatcher()
-                await patcher.init(mergedBaseline)
+                // The patch baseline must be the SERVER's decoded content, not
+                // the merged DB: the merge carries local changes the server has
+                // not seen, so a merged baseline guarantees the next patch's
+                // expectedHash mismatches and every cross-browser conflict
+                // escalates to a full-DB write (the 2026-07-21 two-browser
+                // "[Patch] Hash mismatch" ping-pong storm). Against latestDb the
+                // retry diffs exactly the local tracked changes against what the
+                // server actually holds and converges as a small patch.
+                await patcher.init(latestDb)
             }
         }
         requeueTrackedChanges(toSave)

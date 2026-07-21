@@ -3,6 +3,7 @@ import {
     decodeStorageKeyComponent,
     listPersistentKeys,
     makeEncodedStorageKey,
+    readManyPersistentJson,
     readPersistentJson,
     removePersistentKey,
     writePersistentJson,
@@ -23,13 +24,17 @@ export class PluginCustomKvStorage {
     async init(legacyData?: Record<string, any>): Promise<void> {
         const serverKeys = await listPersistentKeys(CUSTOM_PREFIX)
 
-        for (const fullKey of serverKeys) {
-            const encoded = fullKey.slice(CUSTOM_PREFIX.length, -'.json'.length)
+        // One bulk round trip instead of N sequential /api/read calls — with
+        // many plugin keys (chat-scoped stores accumulate one per chat) the
+        // sequential form made boot storage init take N×RTT, so plugins came
+        // up seconds before their data on remote servers.
+        const values = await readManyPersistentJson<any>(serverKeys)
+        for (let i = 0; i < serverKeys.length; i++) {
+            const value = values[i]
+            if (value === null) continue
+            const encoded = serverKeys[i].slice(CUSTOM_PREFIX.length, -'.json'.length)
             const rawKey = decodeStorageKeyComponent(encoded)
-            const value = await readPersistentJson<any>(fullKey)
-            if (value !== null) {
-                this.cache.set(rawKey, value)
-            }
+            this.cache.set(rawKey, value)
         }
 
         if (legacyData && typeof legacyData === 'object') {
