@@ -2449,7 +2449,9 @@ export function saveCurrentPreset(){
     }
     const savedPreset:botPreset =  {
         id: pres[db.botPresetsId]?.id || uuidv4(),
-        name: pres[db.botPresetsId].name,
+        // Out-of-bounds is a supported state below (the slot gets pushed as a
+        // new preset) — the name read must not be the one thing that crashes.
+        name: pres[db.botPresetsId]?.name ?? 'New Preset',
         apiType: db.apiType,
         openAIKey: db.openAIKey,
         localNetworkMode: db.localNetworkMode,

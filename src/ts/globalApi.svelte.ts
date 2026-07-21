@@ -13,6 +13,7 @@ import { characterURLImport, hubURL } from "./characterCards";
 import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from "./storage/defaultPrompts";
 import { decodeRisuSave, encodeRisuSaveLegacy, findDangerousChatOps, RisuSaveEncoder, RisuSavePatcher, type toSaveType } from "./storage/risuSave";
 import { isHydrating, saveChatToServer, ensureChatHydrated, chatToStub, classifyChat, restoreChatShapeAfterRebase } from "./storage/chatStorage";
+import { reanchorRebasedSelection } from "./storage/rebaseSelection";
 import { AutoStorage } from "./storage/autoStorage";
 import { ConflictError, type PersistWarning } from "./storage/nodeStorage";
 import { supportsPatchSync } from "./platform";
@@ -757,8 +758,27 @@ export async function saveDb() {
             // per-chat save path, poisoning the server's fullChatStore
             // (2026-07-21 multi-browser incident).
             restoreChatShapeAfterRebase(mergedCharacters, localCharacters)
+            // Index-based selections must be re-derived by identity: the merge
+            // keeps LOCAL root scalars (botPresetsId) while adopting the SERVER
+            // botPresets/characters arrays, so a surviving raw index can point
+            // at the wrong element or out of bounds (saveCurrentPreset crashed
+            // on `botPresets[botPresetsId].name`, 2026-07-21 incident #2).
+            let liveSelectedCharIndex = -1
+            try { selectedCharID.subscribe(v => { liveSelectedCharIndex = v })() } catch {}
+            const rebasedSelection = reanchorRebasedSelection({
+                mergedBotPresets: mergedDb.botPresets,
+                localBotPresets: localDb.botPresets,
+                localBotPresetsId: localDb.botPresetsId,
+                mergedCharacters,
+                localCharacters,
+                localSelectedCharIndex: liveSelectedCharIndex,
+            })
+            mergedDb.botPresetsId = rebasedSelection.botPresetsId
             const mergedBaseline = safeStructuredClone(mergedDb) as Database
             setDatabase(mergedDb)
+            if (rebasedSelection.selectedCharIndex !== liveSelectedCharIndex) {
+                selectedCharID.set(rebasedSelection.selectedCharIndex)
+            }
 
             encoder = new RisuSaveEncoder()
             await encoder.init(getDatabase(), {
