@@ -1,5 +1,5 @@
 import { changeFullscreen, checkNullish, sleep } from "./util"
-import { v4 as uuidv4, v4 } from 'uuid';
+import { v4 as uuidv4 } from 'uuid';
 import { tick } from "svelte";
 import { get } from "svelte/store";
 import streamSaver from 'streamsaver';
@@ -7,7 +7,7 @@ import { setDatabase, type Database, defaultSdDataFunc, getDatabase, appVer, nod
 import { checkRisuUpdate } from "./update";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, DBState, LoadingStatusState, selIdState, ReloadGUIPointer, bodyIntercepterStore, loadingOverlayStore, chatDeselected } from "./stores.svelte";
 import { loadPlugins } from "./plugins/plugins.svelte";
-import { alertConfirm, alertError, alertMd, alertNormalWait, alertSelect, alertTOS, waitAlert, notifySuccess, notifyError } from "./alert";
+import { alertConfirm, alertError, alertMd, alertSelect, alertTOS, waitAlert, notifySuccess, notifyError } from "./alert";
 import { hasher } from "./parser/parser.svelte";
 import { characterURLImport, hubURL } from "./characterCards";
 import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from "./storage/defaultPrompts";
@@ -392,8 +392,6 @@ export function setPatchSyncBaseline(data: Database | null) {
 
 export async function saveDb() {
     let changed = false
-    let gotChannel = false
-    const sessionID = v4()
     let saveInFlight: Promise<void> | null = null
     const knownChatIdsByCharacter = new Map<string, Set<string>>(
         (getDatabase()?.characters ?? [])
@@ -403,33 +401,13 @@ export async function saveDb() {
                 new Set((character.chats ?? []).map(chat => chat?.id).filter(Boolean)),
             ])
     )
-    let channel: BroadcastChannel
-    if (window.BroadcastChannel) {
-        channel = new BroadcastChannel('risu-db')
-    }
-    if (channel) {
-        channel.onmessage = (ev) => {
-            if (ev.data === sessionID) {
-                return
-            }
-            if (!gotChannel) {
-                gotChannel = true
-                alertNormalWait(language.activeTabChange).then(() => {
-                    location.reload()
-                })
-            }
-        }
-    }
-    // Cross-device single-writer lock: mirrors BroadcastChannel behavior
-    // across devices via server-side session check (423 → deactivate)
-    window.addEventListener('risu-session-deactivated', () => {
-        if (!gotChannel) {
-            gotChannel = true
-            alertNormalWait(language.activeTabChange).then(() => {
-                location.reload()
-            })
-        }
-    })
+    // Concurrent tabs/browsers are allowed to save independently. Convergence
+    // relies on the server-side guards alone: per-chat saves are isolated,
+    // database.bin patches carry expectedHash, and a stale full write trips the
+    // ETag ConflictError -> rebase -> retry path. A proactive peer-save rebase
+    // was tried and removed: deferring the write on a peer signal livelocks two
+    // continuously-saving tabs (each defers for the other, neither ever writes),
+    // while the conflict machinery always has a per-round winner.
 
     const changeTracker: toSaveType = {
         character: [],
@@ -519,9 +497,7 @@ export async function saveDb() {
                 saveTimeout = null;
             }
             changed = true;
-            void triggerSave({
-                skipBroadcast: true,
-            })
+            void triggerSave()
             void flushServerDbKeepalive()
             void pluginCustomKv.flushImmediate()
         }
@@ -793,18 +769,8 @@ export async function saveDb() {
         toSave: toSaveType,
         options?: {
             forceFullWrite?: boolean
-            skipBroadcast?: boolean
         }
     ): Promise<'saved' | 'retry' | 'noop'> {
-        if (gotChannel) {
-            // Data is saved in another tab.
-            await sleep(1000)
-            return 'noop'
-        }
-        if (channel && !options?.skipBroadcast) {
-            channel.postMessage(sessionID)
-        }
-
         const db = getDatabase()
         if (!db.characters) {
             await sleep(1000)
@@ -1061,7 +1027,6 @@ export async function saveDb() {
 
     async function triggerSave(options?: {
         forceFullWrite?: boolean
-        skipBroadcast?: boolean
     }) {
         if (saveInFlight) {
             return saveInFlight

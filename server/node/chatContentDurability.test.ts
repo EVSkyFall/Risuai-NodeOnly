@@ -41,7 +41,10 @@ afterEach(async () => {
     await Promise.all(servers.splice(0).map(cleanupServer))
 })
 
-async function boot(extraEnv: Record<string, string> = {}): Promise<TestContext> {
+async function boot(
+    extraEnv: Record<string, string> = {},
+    seedOpts: Parameters<typeof createSeedBackup>[0] = {},
+): Promise<TestContext> {
     const server = await spawnServer({
         env: {
             POCKETRISU_CHUNK_THRESHOLD: '9999999999',
@@ -52,7 +55,7 @@ async function boot(extraEnv: Record<string, string> = {}): Promise<TestContext>
     })
     servers.push(server)
     const client = await createClient(server.port, server.password)
-    const imported = await client.importBackup(createSeedBackup())
+    const imported = await client.importBackup(createSeedBackup(seedOpts))
     expect(imported.ok).toBe(true)
 
     const sessionId = 'gate1-active-session'
@@ -92,15 +95,17 @@ function makeCombinedChat(legacyText: string, strictText: string) {
 async function postChat(
     context: TestContext,
     chat: ReturnType<typeof makeChat>,
-    options: { strict?: boolean; sessionId?: string; chatId?: string } = {},
+    options: { strict?: boolean; sessionId?: string; chatId?: string; charId?: string; chatIndex?: number } = {},
 ) {
+    const charId = options.charId ?? 'test-char-0'
+    const chatIndex = options.chatIndex ?? 0
     const headers: Record<string, string> = {
         'content-type': 'application/octet-stream',
         'x-chat-id': options.chatId ?? 'chat-0-0',
         'x-session-id': options.sessionId ?? context.sessionId,
     }
     if (options.strict) headers['x-strict-flush'] = '1'
-    return context.client.fetch('/api/chat-content/test-char-0/0', {
+    return context.client.fetch(`/api/chat-content/${charId}/${chatIndex}`, {
         method: 'POST',
         headers,
         body: new Uint8Array(encodeRisuSaveLegacy(chat)),
@@ -111,7 +116,7 @@ function databasePath(server: ServerHandle) {
     return path.join(server.cwd, 'save', 'risuai.db')
 }
 
-async function readPersistedChat(server: ServerHandle) {
+async function readPersistedChat(server: ServerHandle, chaId = 'test-char-0') {
     const db = new Database(databasePath(server), { readonly: true })
     let raw: Buffer
     try {
@@ -124,7 +129,7 @@ async function readPersistedChat(server: ServerHandle) {
         db.close()
     }
     const persisted = await decodeRisuSave(raw)
-    return persisted.characters.find((character: any) => character.chaId === 'test-char-0').chats[0]
+    return persisted.characters.find((character: any) => character.chaId === chaId).chats[0]
 }
 
 function installFailureTrigger(server: ServerHandle, name: string, keyPredicate: string, message: string) {
@@ -292,16 +297,71 @@ describe('strict durable chat-content flush', { timeout: 30_000 }, () => {
         expect(persistedChat.message[0].data).toBe('core write survives backup failure')
     })
 
-    it('rejects a deactivated writer session on the strict path', async () => {
+    it('accepts a write from a non-active session after a newer session registers', async () => {
         const context = await boot()
-        const response = await postChat(context, makeChat('wrong writer'), {
+
+        // A second browser/tab registers a newer session. Under the old
+        // single-writer lock this deactivated the first session (423 on its
+        // next write). With the lock removed, the original session must keep
+        // writing and its content must persist durably.
+        const newerSession = await context.client.fetch('/api/session', {
+            method: 'POST',
+            headers: { 'x-session-id': 'gate1-newer-session' },
+        })
+        expect(newerSession.status).toBe(200)
+
+        const response = await postChat(context, makeChat('older writer still allowed'), {
             strict: true,
-            sessionId: 'gate1-deactivated-session',
+            sessionId: context.sessionId,
         })
 
-        expect(response.status).toBe(423)
-        expect(await response.json()).toMatchObject({ error: 'Session deactivated' })
+        expect(response.status).toBe(200)
+        expect(await response.json()).toMatchObject({ success: true, durable: true })
+
+        const persistedChat = await readPersistedChat(context.server)
+        expect(persistedChat.message[0].data).toBe('older writer still allowed')
     })
+
+    it('persists interleaved writes from two distinct sessions to different chats', async () => {
+        const context = await boot({}, { characterCount: 2 })
+
+        // Two browsers each register their own session id.
+        for (const id of ['gate1-session-a', 'gate1-session-b']) {
+            const reg = await context.client.fetch('/api/session', {
+                method: 'POST',
+                headers: { 'x-session-id': id },
+            })
+            expect(reg.status).toBe(200)
+        }
+
+        // Concurrent strict writes to different chats. Under the old lock, at
+        // most one session id matched the active writer, so the other got 423.
+        // Now both must succeed durably; the server serializes them.
+        const [respA, respB] = await Promise.all([
+            postChat(context, makeChat('from session A', 'chat-0-0'), {
+                strict: true,
+                sessionId: 'gate1-session-a',
+                charId: 'test-char-0',
+                chatIndex: 0,
+                chatId: 'chat-0-0',
+            }),
+            postChat(context, makeChat('from session B', 'chat-1-0'), {
+                strict: true,
+                sessionId: 'gate1-session-b',
+                charId: 'test-char-1',
+                chatIndex: 0,
+                chatId: 'chat-1-0',
+            }),
+        ])
+
+        expect(respA.status).toBe(200)
+        expect(respB.status).toBe(200)
+        expect(await respA.json()).toMatchObject({ success: true, durable: true })
+        expect(await respB.json()).toMatchObject({ success: true, durable: true })
+
+        expect((await readPersistedChat(context.server, 'test-char-0')).message[0].data).toBe('from session A')
+        expect((await readPersistedChat(context.server, 'test-char-1')).message[0].data).toBe('from session B')
+    }, 30_000)
 
     it('rejects a strict request whose Chat.id differs from x-chat-id', async () => {
         const context = await boot()
