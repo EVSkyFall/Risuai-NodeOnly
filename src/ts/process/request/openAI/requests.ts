@@ -602,7 +602,19 @@ export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<req
         }
     }
 
-    if(db.openAIFlex && arg.modelInfo.provider === LLMProvider.OpenAI){
+    // Flex is an official-OpenAI-only service tier. Gate on the ACTUAL resolved
+    // destination (same single-source-of-truth helper as the role predicate and
+    // the send site), not the provider enum: enum-OpenAI also covers
+    // OpenAI-compatible endpoints (Copilot, gateways) that reject the parameter
+    // with 400 "service_tier is not supported" — which silently killed plugin
+    // sub-model calls while db.openAIFlex was on (2026-07-22 incident).
+    if(db.openAIFlex && arg.modelInfo.provider === LLMProvider.OpenAI && isOfficialOpenAIEndpoint(resolveOpenAIRequestUrl({
+        aiModel,
+        customURL: arg.customURL,
+        endpoint: arg.modelInfo?.endpoint,
+        nanogptUseSubscriptionEndpoint: db.nanogptUseSubscriptionEndpoint,
+        autofillRequestUrl: db.autofillRequestUrl,
+    }).url)){
         body.service_tier = "flex"
     }
 

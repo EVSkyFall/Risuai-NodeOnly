@@ -622,7 +622,33 @@ export async function requestGoogleCloudVertex(arg:RequestDataArgumentExtended):
         }
     }
 
-    return requestGoogle(url, body, headers, arg)
+    // Vertex rejects Flex for models outside its supported set with a 400
+    // ("Flex API is not supported for model: ..."), which silently killed every
+    // sub-model call routed through Vertex while db.googleFlex was on
+    // (2026-07-22 incident: plugin pipelines died on their analysis calls).
+    // The rejection happens before any generation — an unbilled retry without
+    // Flex (and with the region recomputed, since Flex forced 'global') keeps
+    // the flag usable on supported models without bricking the rest.
+    const firstResult = await requestGoogle(url, body, headers, arg)
+    if(
+        isVertexFlexRequest
+        && firstResult.type === 'fail'
+        && typeof firstResult.result === 'string'
+        && firstResult.result.includes('Flex API is not supported')
+    ){
+        console.warn(`[google] Vertex Flex unsupported for ${arg.modelInfo.internalID} — retrying once without Flex`)
+        delete headers['X-Vertex-AI-LLM-Shared-Request-Type']
+        if(body.service_tier === 'flex'){
+            delete body.service_tier
+        }
+        const retryEndpoint = arg.useStreaming ? 'streamGenerateContent?alt=sse' : 'generateContent'
+        const retryRegion = isVertexGlobalOnlyModel(arg.modelInfo.internalID) ? 'global' : REGION
+        const retryUrl = retryRegion === 'global' ?
+            `https://aiplatform.googleapis.com/v1/projects/${PROJECT_ID}/locations/${retryRegion}/publishers/google/models/${arg.modelInfo.internalID}:${retryEndpoint}` :
+            `https://${retryRegion}-aiplatform.googleapis.com/v1/projects/${PROJECT_ID}/locations/${retryRegion}/publishers/google/models/${arg.modelInfo.internalID}:${retryEndpoint}`
+        return requestGoogle(retryUrl, body, headers, arg)
+    }
+    return firstResult
 }
 
 async function requestGoogle(url:string, body:any, headers:{[key:string]:string}, arg:RequestDataArgumentExtended):Promise<requestDataResponse> {
