@@ -439,11 +439,34 @@ export async function loadPlugins() {
 
 
     const enabledPlugins = safeStructuredClone(db.plugins).filter((p: RisuPlugin) => p.enabled)
-    const pluginV2 = enabledPlugins.filter((a: RisuPlugin) => a.version === 2 || a.version === '2.1')
-    const pluginV3 = enabledPlugins.filter((a: RisuPlugin) => a.version === '3.0')
+    const v2PluginList = enabledPlugins.filter((a: RisuPlugin) => a.version === 2 || a.version === '2.1')
+    const v3PluginList = enabledPlugins.filter((a: RisuPlugin) => a.version === '3.0')
 
-    await loadV2Plugin(pluginV2)
-    await loadV3Plugins(pluginV3)
+    await loadV2Plugin(v2PluginList)
+    await loadV3Plugins(v3PluginList)
+
+    // Post-load health lines: whether the send pipeline actually has hooks is
+    // invisible until a request runs, so surface the registration counts
+    // (2026-07-22 report: preprocessing silently absent from sends). Plugin
+    // scripts are async IIFEs that may register AFTER load returns, so log
+    // once immediately and once after a settle window — the settled line is
+    // the meaningful one.
+    const hookCounts = () =>
+        `replacerBefore=${pluginV2.replacerbeforeRequest.size}`
+        + ` replacerAfter=${pluginV2.replacerafterRequest.size}`
+        + ` editProcess=${pluginV2.editprocess.size}`
+        + ` editInput=${pluginV2.editinput.size}`
+        + ` editOutput=${pluginV2.editoutput.size}`
+        + ` editDisplay=${pluginV2.editdisplay.size}`
+        + ` providers=${pluginV2.providers.size}`
+    console.log(
+        `[Plugins] loaded — v2/2.1: [${v2PluginList.map((p: RisuPlugin) => p.name).join(', ')}]`
+        + ` v3: [${v3PluginList.map((p: RisuPlugin) => p.name).join(', ')}]`
+        + ` | hooks now: ${hookCounts()}`,
+    )
+    setTimeout(() => {
+        console.log(`[Plugins] hooks after settle: ${hookCounts()}`)
+    }, 3000)
 }
 
 export type PluginV2ProviderArgument = {

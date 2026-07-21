@@ -28,14 +28,37 @@ export class PluginCustomKvStorage {
         // many plugin keys (chat-scoped stores accumulate one per chat) the
         // sequential form made boot storage init take N×RTT, so plugins came
         // up seconds before their data on remote servers.
-        const values = await readManyPersistentJson<any>(serverKeys)
+        //
+        // Failure isolation: the bulk reader is fail-closed (it throws on any
+        // correlation anomaly or corrupt value), but ONE bad key must not cost
+        // every plugin its entire storage — fall back to per-key reads with
+        // per-key isolation, and surface what was skipped instead of dying.
+        let values: (any | null)[]
+        try {
+            values = await readManyPersistentJson<any>(serverKeys)
+        } catch (bulkError) {
+            console.warn('[PluginCustomKvStorage] bulk init read failed; falling back to per-key reads:', bulkError)
+            values = await Promise.all(serverKeys.map(async (fullKey) => {
+                try {
+                    return await readPersistentJson<any>(fullKey)
+                } catch (keyError) {
+                    console.warn(`[PluginCustomKvStorage] skipping unreadable key ${fullKey}:`, keyError)
+                    return null
+                }
+            }))
+        }
+        let skipped = 0
         for (let i = 0; i < serverKeys.length; i++) {
             const value = values[i]
-            if (value === null) continue
+            if (value === null) {
+                skipped++
+                continue
+            }
             const encoded = serverKeys[i].slice(CUSTOM_PREFIX.length, -'.json'.length)
             const rawKey = decodeStorageKeyComponent(encoded)
             this.cache.set(rawKey, value)
         }
+        console.log(`[PluginCustomKvStorage] init: ${this.cache.size} keys loaded (${skipped} empty/skipped of ${serverKeys.length})`)
 
         if (legacyData && typeof legacyData === 'object') {
             const legacyKeys = Object.keys(legacyData)

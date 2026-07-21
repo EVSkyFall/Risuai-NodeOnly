@@ -110,11 +110,22 @@ export async function loadData() {
                 }
             }
             LoadingStatusState.text = "Loading Plugins..."
+            // KV-init failure must NOT take loadPlugins down with it: a plugin
+            // with empty storage still registers its hooks, while a skipped
+            // loadPlugins silently removes every replacer/edit hook from the
+            // send pipeline (2026-07-22 report: preprocessing plugins never ran,
+            // LLM requests went out raw, zero console evidence).
             try {
                 await initPluginKvStorage(getDatabase().pluginCustomStorage)
                 getDatabase().pluginCustomStorage = {}
+            } catch (error) {
+                console.error('[bootstrap] plugin KV storage init failed (plugins will start with cold storage):', error)
+            }
+            try {
                 await loadPlugins()
-            } catch (error) { }
+            } catch (error) {
+                console.error('[bootstrap] loadPlugins failed:', error)
+            }
             try {
                 //@ts-expect-error navigator.standalone is iOS Safari non-standard property, not in Navigator interface
                 const isInStandaloneMode = (window.matchMedia('(display-mode: standalone)').matches) || (window.navigator.standalone) || document.referrer.includes('android-app://');
