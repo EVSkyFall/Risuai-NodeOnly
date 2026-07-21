@@ -188,6 +188,10 @@ export async function requestChatData(arg:requestDataArgument, model:ModelModeEx
                 }
             }
     
+            // warn-level per-request health line (production drops console.log):
+            // pins whether the send pipeline actually has hooks at call time —
+            // registrations can exist at boot yet be empty here (2026-07-22).
+            console.warn(`[plugin] beforeRequest replacers at call time: ${pluginV2.replacerbeforeRequest.size}${arg.replayExact ? ' (replayExact: skipped)' : ''}`)
             if(!arg.replayExact && pluginV2.replacerbeforeRequest.size > 0){
                 for(const replacer of pluginV2.replacerbeforeRequest){
                     try {

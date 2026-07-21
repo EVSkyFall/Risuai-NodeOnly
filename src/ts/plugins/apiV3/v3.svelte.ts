@@ -899,9 +899,14 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
             //permission check for replacer
             const conf = await getPluginPermission(plugin.name, 'replacer', 'periodically');
             if(!conf){
+                // warn-level (survives the production console.log drop): a
+                // refused registration silently removes the plugin from the
+                // send pipeline — make it visible (2026-07-22 incident).
+                console.warn(`[Plugins] ${plugin.name}: addRisuReplacer('${name}') refused by permission`)
                 return;
             }
             oldApis.addRisuReplacer(name, func as any);
+            console.warn(`[Plugins] ${plugin.name}: addRisuReplacer('${name}') registered`)
         },
         removeRisuReplacer: oldApis.removeRisuReplacer,
         setDatabaseLite: oldApis.setDatabaseLite,

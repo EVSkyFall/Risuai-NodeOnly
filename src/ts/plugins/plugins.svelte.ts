@@ -459,13 +459,16 @@ export async function loadPlugins() {
         + ` editOutput=${pluginV2.editoutput.size}`
         + ` editDisplay=${pluginV2.editdisplay.size}`
         + ` providers=${pluginV2.providers.size}`
-    console.log(
+    // console.warn, not console.log: the production build drops console.log
+    // (2026-07-22 finding — log-level telemetry never reaches a deployed
+    // browser), and these lines exist precisely to diagnose deployed sessions.
+    console.warn(
         `[Plugins] loaded — v2/2.1: [${v2PluginList.map((p: RisuPlugin) => p.name).join(', ')}]`
         + ` v3: [${v3PluginList.map((p: RisuPlugin) => p.name).join(', ')}]`
         + ` | hooks now: ${hookCounts()}`,
     )
     setTimeout(() => {
-        console.log(`[Plugins] hooks after settle: ${hookCounts()}`)
+        console.warn(`[Plugins] hooks after settle: ${hookCounts()}`)
     }, 3000)
 }
 
@@ -819,6 +822,9 @@ export const getV2PluginAPIs = () => {
 export async function loadV2Plugin(plugins: RisuPlugin[]) {
 
     if (pluginV2.loaded) {
+        // warn-level: a mid-session reload clears every hook registry — if hooks
+        // vanish between boot and a request, this line is the tell.
+        console.warn('[Plugins] reloading — clearing all v2 hook registries')
         for (const unload of pluginV2.unload) {
             await unload()
         }
