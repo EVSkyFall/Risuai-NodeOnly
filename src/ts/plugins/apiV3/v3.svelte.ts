@@ -713,13 +713,20 @@ const isPermissionResolved = async (
 const getPluginPermission = async (pluginName: string, permissionDesc: PluginPermissionDesc, reconfirm: boolean|'periodically' = false) => {
     await ensurePluginPermissionStateLoaded()
 
-    // Recomputed (not captured) so a periodic reconfirm reflects the latest
-    // lastGrantTime: when several identical requests queue together, an earlier
-    // one may refresh it, making the reconfirm no longer due for the rest.
+    // Personal-fork posture (same reasoning as the d6ca55eb plugin-auth
+    // decision: home-IP-only deployment, plugins are already fully trusted):
+    // a permission the user granted once stays granted — the upstream 3-day
+    // periodic reconfirm is removed. The expiry synchronized permission
+    // dialogs with boot (plugins register replacers at startup), where the
+    // single-slot global alertStore can eat or mis-answer the prompt; a lost
+    // prompt wedges the permission dialog chain forever, so every gated host
+    // call silently hangs and the plugin's whole send pipeline goes dark
+    // (2026-07-22 Omninode incident). A deny stays deliberately non-sticky
+    // for these: the next call re-asks instead of permanently disabling the
+    // plugin.
     const computeRequiresReconfirm = () => {
         if(reconfirm === 'periodically'){
-            const lastGrantTime = permissionCache.get(permissionKeyOf(pluginName, permissionDesc) + '_lastGrantTime') as number | undefined;
-            return !lastGrantTime || Date.now() - lastGrantTime > 3 * 24 * 60 * 60 * 1000; //3 days
+            return !permissionGivenPlugins.has(permissionKeyOf(pluginName, permissionDesc));
         }
         return reconfirm === true;
     }
