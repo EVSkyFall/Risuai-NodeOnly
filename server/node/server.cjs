@@ -25,7 +25,9 @@ const getVips = () => {
 }
 const { kvGet, kvSet, kvDel, kvList,
         kvDelPrefix, kvListWithSizes, kvSize, kvGetUpdatedAt, kvCopyValue, clearEntities, checkpointWal,
-        gcChunks, reclaimableChunkBytes, isDbBlobChunked, snapshotFootprint, db: sqliteDb } = require('./db.cjs');
+        gcChunks, reclaimableChunkBytes, isDbBlobChunked, snapshotFootprint, illustrationAtomic,
+        db: sqliteDb } = require('./db.cjs');
+const { MUTATING_OPS: ILLUSTRATION_ATOMIC_MUTATING_OPS } = require('./illustrationAtomicStore.cjs');
 const { preparePluginStorageImport, writePluginStorageRescue } = require('./pluginStorageSafety.cjs');
 const {
     addLogBatch, queryLogs, clearLogs, countLogs,
@@ -4495,6 +4497,46 @@ app.post('/api/write', async (req, res, next) => {
             });
         });
     } catch (error) {
+        next(error);
+    }
+});
+
+// ─── Illustration atomic storage (Gate 1a) ───────────────────────────────────
+// Server-authoritative per-key CAS + guarded mutation + durable operation
+// receipts for the cross-context illustration subsystem. The store module
+// (illustrationAtomicStore.cjs) owns the tables and the transactional logic; this
+// endpoint owns only transport: auth, queue routing, and typed-error mapping.
+// Because the server is a single Node process with one better-sqlite3 writer, the
+// store's synchronous db.transaction is a true global linearization point — this
+// capability is advertised only for this single-process topology.
+function sendIllustrationAtomicError(res, error) {
+    if (error && error.isIllustrationAtomicError) {
+        res.status(error.httpStatus).json({ error: error.message, code: error.code, ...(error.extra || {}) });
+        return true;
+    }
+    return false;
+}
+
+app.post('/api/illustration/atomic', async (req, res, next) => {
+    if (!await checkAuth(req, res)) {
+        return;
+    }
+    const body = req.body;
+    const op = body && typeof body === 'object' ? body.op : undefined;
+    try {
+        if (ILLUSTRATION_ATOMIC_MUTATING_OPS.has(op)) {
+            // cas/remove mutate; read/bulkRead may lazily import a legacy value.
+            // Serialize against every other storage write on the shared queue so a
+            // debounced database.bin persist cannot interleave with the operation.
+            await queueStorageOperation(async () => {
+                res.json(illustrationAtomic.execute(body));
+            });
+        } else {
+            // list / receipt are pure reads over the atomic table only.
+            res.json(illustrationAtomic.execute(body));
+        }
+    } catch (error) {
+        if (sendIllustrationAtomicError(res, error)) return;
         next(error);
     }
 });

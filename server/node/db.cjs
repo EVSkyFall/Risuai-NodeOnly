@@ -4,6 +4,7 @@ const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
 const { createChunkStore } = require('./chunkStore.cjs');
+const { createIllustrationAtomicStore } = require('./illustrationAtomicStore.cjs');
 
 const saveDir = path.join(process.cwd(), 'save');
 if (!fs.existsSync(saveDir)) {
@@ -98,6 +99,14 @@ const chunkThreshold = process.env.POCKETRISU_CHUNK_THRESHOLD
 const chunkStore = createChunkStore(db, { threshold: chunkThreshold });
 
 migrateFromSaveDir();
+
+// ─── Illustration atomic storage (Gate 1a) ────────────────────────────────────
+// Server-authoritative per-key CAS + guarded mutation + durable operation
+// receipts for the cross-context illustration subsystem. Owns its own tables
+// (illustration_atomic / illustration_receipts / illustration_counters), bound
+// to this shared db instance — same wiring pattern as chunkStore. The kv table
+// (created above) must already exist because lazy legacy migration reads from it.
+const illustrationAtomic = createIllustrationAtomicStore(db);
 
 // ─── KV operations ────────────────────────────────────────────────────────────
 // kv reads/writes for the DB blob route through chunkStore (get/put/size/copy);
@@ -215,4 +224,6 @@ module.exports = {
     reclaimableChunkBytes,
     isDbBlobChunked,
     snapshotFootprint,
+    // Illustration atomic storage (Gate 1a)
+    illustrationAtomic,
 };
