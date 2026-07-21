@@ -25,7 +25,8 @@ import {
     isLegacyIllustrationStoredPrompt,
     parseIllustrationPromptV1,
 } from './imagePrompt'
-import { withIllustrationLedgerLock } from './locks'
+import { withIllustrationLedgerLockDomain } from './locks'
+import type { IllustrationLockManagerAccessor } from './locks'
 import {
     assertTransition,
     isPrunableJobState,
@@ -784,7 +785,32 @@ function makeOpaqueId(prefix: string): string {
     throw new IllustrationLedgerValidationError('Secure random identifiers are unavailable')
 }
 
+export interface IllustrationJobStoreOptions {
+    // Gate 0 multi-context seam: route this instance's ledger lock through a
+    // caller-supplied lock domain instead of the module-global accessor, so two
+    // store instances can model two independent browsers over one shared server
+    // store. Undefined (the production default, used by the module singleton
+    // below) resolves to the global accessor — byte-identical to the pre-seam
+    // behavior, including fail-closed when no lock manager is available.
+    ledgerLockAccessor?: IllustrationLockManagerAccessor
+}
+
 export class IllustrationJobStore {
+    private readonly ledgerLockAccessor?: IllustrationLockManagerAccessor
+
+    constructor(options: IllustrationJobStoreOptions = {}) {
+        this.ledgerLockAccessor = options.ledgerLockAccessor
+    }
+
+    // Every read-then-write method routes through here. The default instance passes
+    // no accessor, so this is exactly withIllustrationLedgerLock (the module global);
+    // an injected instance uses its own domain. The pendingTurnMirror below is
+    // per-instance, so two injected instances get isolated mirrors as well as
+    // isolated lock domains — the two-browser shape.
+    private async withLedgerLock<T>(callback: () => T | Promise<T>): Promise<T> {
+        return await withIllustrationLedgerLockDomain(this.ledgerLockAccessor, callback)
+    }
+
     private async readTurnUnlocked(turnId: string): Promise<IllustrationTurnRecordV1 | null> {
         return await readPersistentJson<IllustrationTurnRecordV1>(illustrationTurnKey(turnId))
     }
@@ -986,7 +1012,7 @@ export class IllustrationJobStore {
     }
 
     async createTurn(input: CreateTurnInput): Promise<IllustrationTurnRecordV1> {
-        return await withIllustrationLedgerLock(async () => {
+        return await this.withLedgerLock(async () => {
             assertNonEmptyString(input.turnId, 'turnId')
             assertNonEmptyString(input.idempotencyKey, 'idempotencyKey')
             const workerEpoch = input.workerEpoch ?? 0
@@ -1031,7 +1057,7 @@ export class IllustrationJobStore {
     }
 
     async getTurn(turnId: string): Promise<IllustrationTurnRecordV1 | null> {
-        return await withIllustrationLedgerLock(async () => {
+        return await this.withLedgerLock(async () => {
             assertNonEmptyString(turnId, 'turnId')
             const record = await this.readTurnUnlocked(turnId)
             return record ? cloneJson(record) : null
@@ -1039,7 +1065,7 @@ export class IllustrationJobStore {
     }
 
     async listTurns(): Promise<IllustrationTurnRecordV1[]> {
-        return await withIllustrationLedgerLock(async () => {
+        return await this.withLedgerLock(async () => {
             const keys = await listPersistentKeys(ILLUSTRATION_TURN_PREFIX)
             const records = await Promise.all(
                 keys.map((key) => readPersistentJson<IllustrationTurnRecordV1>(key)),
@@ -1052,7 +1078,7 @@ export class IllustrationJobStore {
     }
 
     async updateTurn(input: UpdateTurnInput): Promise<IllustrationTurnRecordV1> {
-        return await withIllustrationLedgerLock(async () => {
+        return await this.withLedgerLock(async () => {
             const current = await this.requireTurnUnlocked(input.turnId)
             assertVersion(input.expectedVersion, current.version)
             const draft = cloneJson(current)
@@ -1145,7 +1171,7 @@ export class IllustrationJobStore {
     // split the turn across modes. Revision children ride the V1 supply path on their
     // own committed target and never gate a turn's genesis mode.
     async turnHasNonRevisionPromptSupply(turnId: string): Promise<boolean> {
-        return await withIllustrationLedgerLock(async () => {
+        return await this.withLedgerLock(async () => {
             assertNonEmptyString(turnId, 'turnId')
             const jobs = await this.listTurnJobRecordsUnlocked(turnId)
             return jobs.some((job) =>
@@ -1156,7 +1182,7 @@ export class IllustrationJobStore {
     async createManifestPrepared(
         input: CreateManifestPreparedInput,
     ): Promise<StoredPlanManifestV1> {
-        return await withIllustrationLedgerLock(async () => {
+        return await this.withLedgerLock(async () => {
             assertNonEmptyString(input.idempotencyKey, 'idempotencyKey')
             assertNonEmptyString(input.manifest.turnId, 'manifest.turnId')
             assertJsonSerializable(input.manifest, 'plan manifest')
@@ -1249,7 +1275,7 @@ export class IllustrationJobStore {
     }
 
     async getManifest(turnId: string): Promise<StoredPlanManifestV1 | null> {
-        return await withIllustrationLedgerLock(async () => {
+        return await this.withLedgerLock(async () => {
             assertNonEmptyString(turnId, 'turnId')
             const manifest = await this.readManifestUnlocked(turnId)
             return manifest ? cloneJson(manifest) : null
@@ -1257,7 +1283,7 @@ export class IllustrationJobStore {
     }
 
     async advanceManifestPhase(input: AdvanceManifestPhaseInput): Promise<StoredPlanManifestV1> {
-        return await withIllustrationLedgerLock(async () => {
+        return await this.withLedgerLock(async () => {
             const current = await this.requireManifestUnlocked(input.turnId)
             if (current.phase === input.to) {
                 if (
@@ -1294,7 +1320,7 @@ export class IllustrationJobStore {
     async createJobsFromManifest(
         input: CreateJobsFromManifestInput,
     ): Promise<IllustrationJobRecordV1[]> {
-        return await withIllustrationLedgerLock(async () => {
+        return await this.withLedgerLock(async () => {
             const manifest = await this.requireManifestUnlocked(input.turnId)
             validateManifest(manifest)
             const workerEpoch = input.workerEpoch ?? 0
@@ -1373,7 +1399,7 @@ export class IllustrationJobStore {
     }
 
     async getJob(jobId: string): Promise<IllustrationJobRecordV1 | null> {
-        return await withIllustrationLedgerLock(async () => {
+        return await this.withLedgerLock(async () => {
             assertNonEmptyString(jobId, 'jobId')
             const record = await this.readJobUnlocked(jobId)
             return record ? cloneJson(record) : null
@@ -1381,7 +1407,7 @@ export class IllustrationJobStore {
     }
 
     async listJobRecords(input: { turnId?: string } = {}): Promise<IllustrationJobRecordV1[]> {
-        return await withIllustrationLedgerLock(async () => {
+        return await this.withLedgerLock(async () => {
             if (input.turnId !== undefined) {
                 assertNonEmptyString(input.turnId, 'turnId')
                 return (await this.listTurnJobRecordsUnlocked(input.turnId)).map(cloneJson)
@@ -1398,14 +1424,14 @@ export class IllustrationJobStore {
     }
 
     async finalizeTurnAfterJobs(turnId: string): Promise<IllustrationTurnRecordV1 | null> {
-        return await withIllustrationLedgerLock(async () => {
+        return await this.withLedgerLock(async () => {
             assertNonEmptyString(turnId, 'turnId')
             return await this.finalizeTurnAfterJobsUnlocked(turnId)
         })
     }
 
     async listJobs(input: { turnId?: string } = {}): Promise<IllustrationJobSnapshotV1[]> {
-        return await withIllustrationLedgerLock(async () => {
+        return await this.withLedgerLock(async () => {
             let records: IllustrationJobRecordV1[]
             if (input.turnId !== undefined) {
                 assertNonEmptyString(input.turnId, 'turnId')
@@ -1431,7 +1457,7 @@ export class IllustrationJobStore {
     }
 
     async listPendingTurns(): Promise<IllustrationTurnSnapshotV1[]> {
-        return await withIllustrationLedgerLock(async () => {
+        return await this.withLedgerLock(async () => {
             // Read the durable pending index (rebuilding once from a full scan if it
             // is missing or corrupt) and bulk-read exactly those records, so the cost
             // stays proportional to in-flight turns, not O(total turn history).
@@ -1469,7 +1495,7 @@ export class IllustrationJobStore {
     // to reach and cancel their queued (paid) jobs. Absent/non-awaiting_prompt
     // indexed IDs are skipped (never fabricated); the pending index is not mutated.
     async listAwaitingPromptTurns(): Promise<IllustrationTurnSnapshotV1[]> {
-        return await withIllustrationLedgerLock(async () => {
+        return await this.withLedgerLock(async () => {
             const ids = await this.ensurePendingIndexUnlocked()
             const records = await readManyPersistentJson<IllustrationTurnRecordV1>(
                 ids.map((turnId) => illustrationTurnKey(turnId)),
@@ -1484,7 +1510,7 @@ export class IllustrationJobStore {
     }
 
     async transitionJob(input: TransitionJobInput): Promise<IllustrationJobRecordV1> {
-        return await withIllustrationLedgerLock(async () => {
+        return await this.withLedgerLock(async () => {
             const current = await this.requireJobUnlocked(input.jobId)
             const patch = input.patch ?? {}
             for (const key of Object.keys(patch)) {
@@ -1693,7 +1719,7 @@ export class IllustrationJobStore {
         jobId: string
         expectedVersion: number
     }): Promise<IllustrationJobRecordV1> {
-        return await withIllustrationLedgerLock(async () => {
+        return await this.withLedgerLock(async () => {
             const current = await this.requireJobUnlocked(input.jobId)
             if (current.version !== input.expectedVersion) {
                 if (
@@ -1757,7 +1783,7 @@ export class IllustrationJobStore {
     }
 
     async closeTurnFromPlan(input: CloseTurnFromPlanInput): Promise<IllustrationTurnRecordV1> {
-        return await withIllustrationLedgerLock(async () => {
+        return await this.withLedgerLock(async () => {
             assertNonEmptyString(input.code, 'code')
             assertNonEmptyString(input.idempotencyKey, 'idempotencyKey')
             const now = Date.now()
@@ -1815,7 +1841,7 @@ export class IllustrationJobStore {
         turnId: string
         expectedVersion: number
     }): Promise<IllustrationTurnRecordV1> {
-        return await withIllustrationLedgerLock(async () => {
+        return await this.withLedgerLock(async () => {
             const current = await this.requireTurnUnlocked(input.turnId)
             if (current.version !== input.expectedVersion) {
                 if (
@@ -1875,7 +1901,7 @@ export class IllustrationJobStore {
     }
 
     async claimTurn(input: ClaimLeaseInput & { turnId: string }): Promise<IllustrationTurnRecordV1> {
-        return await withIllustrationLedgerLock(async () => {
+        return await this.withLedgerLock(async () => {
             const current = await this.requireTurnUnlocked(input.turnId)
             const now = Date.now()
             await validateCoordinatorProofUnlocked(input, { now })
@@ -1889,7 +1915,7 @@ export class IllustrationJobStore {
     }
 
     async claimJob(input: ClaimLeaseInput & { jobId: string }): Promise<IllustrationJobRecordV1> {
-        return await withIllustrationLedgerLock(async () => {
+        return await this.withLedgerLock(async () => {
             const current = await this.requireJobUnlocked(input.jobId)
             const now = Date.now()
             await validateCoordinatorProofUnlocked(input, { now })
@@ -1917,7 +1943,7 @@ export class IllustrationJobStore {
     async reportAgentFailure(
         input: ReportAgentFailureInput,
     ): Promise<IllustrationTurnRecordV1 | IllustrationJobRecordV1> {
-        return await withIllustrationLedgerLock(async () => {
+        return await this.withLedgerLock(async () => {
             if (input.protocolVersion !== 1) {
                 throw new IllustrationLedgerValidationError('protocolVersion must be 1')
             }
@@ -2007,7 +2033,7 @@ export class IllustrationJobStore {
     async retryAgentFailure(
         input: RetryAgentFailureInput,
     ): Promise<IllustrationTurnRecordV1 | IllustrationJobRecordV1> {
-        return await withIllustrationLedgerLock(async () => {
+        return await this.withLedgerLock(async () => {
             if (input.protocolVersion !== 1) {
                 throw new IllustrationLedgerValidationError('protocolVersion must be 1')
             }
@@ -2083,7 +2109,7 @@ export class IllustrationJobStore {
     async setTransportConfig(
         config: IllustrationTransportConfigV1,
     ): Promise<IllustrationTransportConfigV1> {
-        return await withIllustrationLedgerLock(async () => {
+        return await this.withLedgerLock(async () => {
             const current = await readPersistentJson<IllustrationTransportConfigRecordV1>(
                 ILLUSTRATION_TRANSPORT_CONFIG_KEY,
             )
@@ -2100,7 +2126,7 @@ export class IllustrationJobStore {
     }
 
     async acquireWorkerEpoch(): Promise<number> {
-        return await withIllustrationLedgerLock(async () => {
+        return await this.withLedgerLock(async () => {
             const current = await readPersistentJson<IllustrationWorkerEpochRecordV1>(
                 ILLUSTRATION_WORKER_EPOCH_KEY,
             )
@@ -2119,7 +2145,7 @@ export class IllustrationJobStore {
     }
 
     async retryUncertainJob(input: RetryUncertainJobInput): Promise<IllustrationJobRecordV1> {
-        return await withIllustrationLedgerLock(async () => {
+        return await this.withLedgerLock(async () => {
             if (input.confirmNewCharge !== true) {
                 throw new IllustrationLedgerConfirmationRequiredError()
             }
@@ -2180,7 +2206,7 @@ export class IllustrationJobStore {
     async enqueueRevisionImageJob(
         input: EnqueueRevisionImageInput,
     ): Promise<IllustrationJobRecordV1> {
-        return await withIllustrationLedgerLock(async () => {
+        return await this.withLedgerLock(async () => {
             if (input.confirmNewImageCharge !== true) {
                 throw new IllustrationLedgerConfirmationRequiredError(
                     'Enqueuing a retag revision image requires confirmNewImageCharge: true',
@@ -2230,7 +2256,7 @@ export class IllustrationJobStore {
     async pruneTerminalRecords(
         input: PruneTerminalRecordsInput = {},
     ): Promise<PruneTerminalRecordsResult> {
-        return await withIllustrationLedgerLock(async () => {
+        return await this.withLedgerLock(async () => {
             const olderThanMs = input.olderThanMs ?? TERMINAL_RECORD_TTL_MS
             const maxDeletes = input.maxDeletes ?? DEFAULT_PRUNE_MAX_DELETES
             assertNonNegativeInteger(olderThanMs, 'olderThanMs')

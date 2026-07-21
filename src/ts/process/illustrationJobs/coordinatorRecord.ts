@@ -12,7 +12,8 @@ import {
     requireIllustrationFeatureEnabled,
     setIllustrationFeatureEnabled,
 } from './featureFlag'
-import { withIllustrationLedgerLock } from './locks'
+import { withIllustrationLedgerLock, withIllustrationLedgerLockDomain } from './locks'
+import type { IllustrationLockManagerAccessor } from './locks'
 import type {
     IllustrationCoordinatorProof,
     IllustrationCoordinatorRecordV1,
@@ -172,14 +173,22 @@ async function markCoordinatorDrainingUnlocked(
 // .version/.fence access. Only the explicit waitStatus path widens to the wait union.
 export async function claimCoordinator(
     input: ClaimCoordinatorInput & { waitStatus?: false },
+    lockDomain?: IllustrationLockManagerAccessor,
 ): Promise<IllustrationCoordinatorSnapshotV1>
 export async function claimCoordinator(
     input: ClaimCoordinatorInput,
+    lockDomain?: IllustrationLockManagerAccessor,
 ): Promise<ClaimCoordinatorResult>
 export async function claimCoordinator(
     input: ClaimCoordinatorInput,
+    // Gate 0 multi-context seam: an explicit lock domain lets a test run two
+    // concurrent claims under two independent lock domains over one shared store.
+    // Undefined (production default) delegates to the module-global ledger lock —
+    // byte-identical to the pre-seam behavior. The same one-argument helper extends
+    // to the other coordinatorRecord verbs when a later slice needs them.
+    lockDomain?: IllustrationLockManagerAccessor,
 ): Promise<ClaimCoordinatorResult> {
-    return await withIllustrationLedgerLock(async () => {
+    return await withIllustrationLedgerLockDomain(lockDomain, async () => {
         assertProtocolVersion(input.protocolVersion)
         assertNonEmptyString(input.leaseId, 'leaseId')
         assertNonEmptyString(input.holderRuntimeId, 'holderRuntimeId')
