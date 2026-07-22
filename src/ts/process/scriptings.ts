@@ -42,8 +42,22 @@ interface BasicScriptingEngineState {
     char?: character|simpleCharacterArgument;
 }
 
+type LuaHandlerName = 'onInput' | 'onOutput' | 'onStart' | 'onButtonClick' | 'callListenMain';
+type StandardLuaHandlerName = Exclude<LuaHandlerName, 'callListenMain'>;
+
+interface LuaHandlers {
+    onInput?: Function;
+    onOutput?: Function;
+    onStart?: Function;
+    onButtonClick?: Function;
+    callListenMain?: Function;
+}
+
 interface LuaScriptingEngineState extends BasicScriptingEngineState {
     engine?: LuaEngine;
+    luaHandlers?: LuaHandlers;
+    luaHandlerSnapshotMatches?: (name: LuaHandlerName) => boolean;
+    warnedLuaHandlerOverrides?: Set<StandardLuaHandlerName>;
     type: 'lua';
 }
 
@@ -79,6 +93,22 @@ let engineUseCounter = 0
 const EDIT_ENGINE_MODES = new Set(['editRequest', 'editDisplay', 'editInput', 'editOutput'])
 function engineBucket(type: 'lua'|'py', mode: string){
     return type + ':' + (EDIT_ENGINE_MODES.has(mode) ? 'edit' : 'main')
+}
+
+function warnIfLuaHandlerOverwritten(state: LuaScriptingEngineState, name: StandardLuaHandlerName) {
+    const warnedHandlers = state.warnedLuaHandlerOverrides
+    if (!warnedHandlers || warnedHandlers.has(name)) {
+        return
+    }
+
+    try {
+        if (state.luaHandlerSnapshotMatches?.(name) === false) {
+            warnedHandlers.add(name)
+            console.warn(`[ScriptGuard] global ${name} was overwritten after bundle init — dispatching the init snapshot (module chunk leaked a global?)`)
+        }
+    } catch {
+        // Telemetry must never block dispatch of the init snapshot.
+    }
 }
 
 function evictUnusedScriptEngines() {
@@ -1114,7 +1144,31 @@ export async function runScripted(code:string, arg:{
 
             console.log('Running Lua code:', code)
             if(ScriptingEngineState.type === 'lua'){
-                await ScriptingEngineState.engine?.doString(luaCodeWrapper(code))
+                const luaEngine = ScriptingEngineState.engine
+                await luaEngine?.doString(luaCodeWrapper(code))
+                const luaHandlers: LuaHandlers = {
+                    onInput: luaEngine?.global.get('onInput'),
+                    onOutput: luaEngine?.global.get('onOutput'),
+                    onStart: luaEngine?.global.get('onStart'),
+                    onButtonClick: luaEngine?.global.get('onButtonClick'),
+                    callListenMain: luaEngine?.global.get('callListenMain'),
+                }
+                const luaHandlerSnapshotMatches = await luaEngine?.doString(`
+local globals = _G
+local snapshot = {
+    onInput = onInput,
+    onOutput = onOutput,
+    onStart = onStart,
+    onButtonClick = onButtonClick,
+    callListenMain = callListenMain,
+}
+return function(name)
+    return globals[name] == snapshot[name]
+end
+`)
+                ScriptingEngineState.luaHandlers = luaHandlers
+                ScriptingEngineState.luaHandlerSnapshotMatches = luaHandlerSnapshotMatches
+                ScriptingEngineState.warnedLuaHandlerOverrides = new Set()
             }
             if(ScriptingEngineState.type === 'py'){
                 await ScriptingEngineState.pyodide?.init(code)
@@ -1141,28 +1195,32 @@ export async function runScripted(code:string, arg:{
             try {
                 switch(mode){
                     case 'input':{
-                        const func = luaEngine.global.get('onInput')
+                        const func = ScriptingEngineState.luaHandlers?.onInput
+                        warnIfLuaHandlerOverwritten(ScriptingEngineState, 'onInput')
                         if(func){
                             res = await func(accessKey)
                         }
                         break
                     }
                     case 'output':{
-                        const func = luaEngine.global.get('onOutput')
+                        const func = ScriptingEngineState.luaHandlers?.onOutput
+                        warnIfLuaHandlerOverwritten(ScriptingEngineState, 'onOutput')
                         if(func){
                             res = await func(accessKey)
                         }
                         break
                     }
                     case 'start':{
-                        const func = luaEngine.global.get('onStart')
+                        const func = ScriptingEngineState.luaHandlers?.onStart
+                        warnIfLuaHandlerOverwritten(ScriptingEngineState, 'onStart')
                         if(func){
                             res = await func(accessKey)
                         }
                         break
                     }
                     case 'onButtonClick':{
-                        const func = luaEngine.global.get('onButtonClick')
+                        const func = ScriptingEngineState.luaHandlers?.onButtonClick
+                        warnIfLuaHandlerOverwritten(ScriptingEngineState, 'onButtonClick')
                         if(func){
                             res = await func(accessKey, data)
                         }
@@ -1172,7 +1230,7 @@ export async function runScripted(code:string, arg:{
                     case 'editDisplay':
                     case 'editInput':
                     case 'editOutput':{
-                        const func = luaEngine.global.get('callListenMain')
+                        const func = ScriptingEngineState.luaHandlers?.callListenMain
                         if(func){
                             res = await func(mode, accessKey, JSON.stringify(data), JSON.stringify(meta))
                             res = JSON.parse(res)
