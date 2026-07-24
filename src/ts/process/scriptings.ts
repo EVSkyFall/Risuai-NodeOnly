@@ -43,7 +43,6 @@ interface BasicScriptingEngineState {
 }
 
 type LuaHandlerName = 'onInput' | 'onOutput' | 'onStart' | 'onButtonClick' | 'callListenMain';
-type StandardLuaHandlerName = Exclude<LuaHandlerName, 'callListenMain'>;
 
 interface LuaHandlers {
     onInput?: Function;
@@ -57,7 +56,7 @@ interface LuaScriptingEngineState extends BasicScriptingEngineState {
     engine?: LuaEngine;
     luaHandlers?: LuaHandlers;
     luaHandlerSnapshotMatches?: (name: LuaHandlerName) => boolean;
-    warnedLuaHandlerOverrides?: Set<StandardLuaHandlerName>;
+    warnedLuaHandlerOverrides?: Set<LuaHandlerName>;
     type: 'lua';
 }
 
@@ -95,7 +94,7 @@ function engineBucket(type: 'lua'|'py', mode: string){
     return type + ':' + (EDIT_ENGINE_MODES.has(mode) ? 'edit' : 'main')
 }
 
-function warnIfLuaHandlerOverwritten(state: LuaScriptingEngineState, name: StandardLuaHandlerName) {
+function warnIfLuaHandlerOverwritten(state: LuaScriptingEngineState, name: LuaHandlerName) {
     const warnedHandlers = state.warnedLuaHandlerOverrides
     if (!warnedHandlers || warnedHandlers.has(name)) {
         return
@@ -1153,7 +1152,14 @@ export async function runScripted(code:string, arg:{
                     onButtonClick: luaEngine?.global.get('onButtonClick'),
                     callListenMain: luaEngine?.global.get('callListenMain'),
                 }
-                const luaHandlerSnapshotMatches = await luaEngine?.doString(`
+                // Detector only — it exists to WARN that a later chunk replaced a
+                // global. It must never decide whether init succeeded: a throw here
+                // would skip the `code` stamp below, so every later call would
+                // re-init the engine (the MB-scale doString storm cf66d09c removed).
+                // Failing it closed costs telemetry; failing it open costs nothing.
+                let luaHandlerSnapshotMatches: ((name: string) => boolean) | undefined
+                try {
+                    luaHandlerSnapshotMatches = await luaEngine?.doString(`
 local globals = _G
 local snapshot = {
     onInput = onInput,
@@ -1166,6 +1172,9 @@ return function(name)
     return globals[name] == snapshot[name]
 end
 `)
+                } catch (snapshotProbeError) {
+                    console.warn('[ScriptGuard] handler-override detector unavailable (dispatch still uses the init snapshot):', snapshotProbeError)
+                }
                 ScriptingEngineState.luaHandlers = luaHandlers
                 ScriptingEngineState.luaHandlerSnapshotMatches = luaHandlerSnapshotMatches
                 ScriptingEngineState.warnedLuaHandlerOverrides = new Set()
@@ -1231,6 +1240,10 @@ end
                     case 'editInput':
                     case 'editOutput':{
                         const func = ScriptingEngineState.luaHandlers?.callListenMain
+                        // Same override telemetry as the four standard handlers: this
+                        // dispatches EVERY edit mode, so a clobber here silently kills
+                        // every listenEdit registration at once.
+                        warnIfLuaHandlerOverwritten(ScriptingEngineState, 'callListenMain')
                         if(func){
                             res = await func(mode, accessKey, JSON.stringify(data), JSON.stringify(meta))
                             res = JSON.parse(res)
