@@ -23,6 +23,7 @@ import type { ModelModeExtended } from "src/ts/process/request/shared";
 import { requestChatDataMain } from "src/ts/process/request/request";
 import type { OpenAIChat } from "src/ts/process/index.svelte";
 import { authorizeIllustrationV3Plugin, createIllustrationV3CapabilityIfAuthorized, type AuthorizedIllustrationV3Bridge } from "src/ts/process/illustrationJobs/v3Bridge";
+import { createPluginAtomicSandboxApi } from "src/ts/process/pluginPrimitives/pluginAtomic";
 import { createAuthorizedIllustrationV3HostBridge } from "src/ts/process/illustrationJobs/v3BridgeHost";
 import { tokenize as tokenizerTokenize, tokenizeAccurate as tokenizerTokenizeAccurate, encodeWithTokenizer, tokenizerList } from "src/ts/tokenizer";
 import { getModuleLorebooks } from "src/ts/process/modules";
@@ -802,6 +803,19 @@ const authorizationHeaders = [
 const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustrationBridge?:AuthorizedIllustrationV3Bridge) => {
 
     const oldApis = getV2PluginAPIs();
+
+    // Server-authoritative atomic storage, scoped to THIS plugin installation.
+    // Built once per plugin instance, so each plugin gets its own transport and
+    // its own revision cache. The installId is read from the host's persisted
+    // plugin record and is never accepted from the caller — see
+    // pluginPrimitives/pluginAtomic.ts for why that makes the namespace
+    // structurally inescapable.
+    //
+    // No permission prompt gates this API: it is the plugin's own private
+    // namespace, and the pre-existing `pluginStorage` surface — which is a
+    // SHARED global namespace, i.e. strictly more exposed — is likewise ungated.
+    const pluginAtomicApi = createPluginAtomicSandboxApi({ installId: plugin.installId });
+
     return {
 
         //Old APIs from v2.1
@@ -1414,6 +1428,25 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
         },
         _keySafeLocalStorage: oldApis.safeLocalStorage.key,
         _keysSafeLocalStorage: oldApis.safeLocalStorage.keys,
+        // pluginAtomic.* — every method takes a plugin-RELATIVE key; the host
+        // prepends `p:<installId>:`. There is deliberately no parameter through
+        // which a namespace could be supplied.
+        _readPluginAtomic: (key: string) => pluginAtomicApi.read(key),
+        _readManyPluginAtomic: (keys: string[]) => pluginAtomicApi.readMany(keys),
+        _listPluginAtomic: (input: any) => pluginAtomicApi.list(input),
+        _casPluginAtomic: (input: any) => pluginAtomicApi.cas(input),
+        _removePluginAtomic: (input: any) => pluginAtomicApi.remove(input),
+        _receiptPluginAtomic: (operationKey: string) => pluginAtomicApi.getReceipt(operationKey),
+        _changesPluginAtomic: (input: any) => pluginAtomicApi.changes(input),
+        getCapabilities: async () => {
+            // Generic, illustration-agnostic capability handshake (request §3).
+            // Additive only — the illustration bridge keeps its own separate
+            // `_ijGetCapabilities` contract, which is pinned by a test and must
+            // not gain fields here.
+            return {
+                pluginAtomicV1: 1,
+            }
+        },
         searchTranslationCache: async (partialKey: string) => {
             return searchLLMCache(partialKey)
         },
@@ -1444,6 +1477,15 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
                     'clear': '_clearSafeLocalStorage',
                     'key': '_keySafeLocalStorage',
                     'keys': '_keysSafeLocalStorage',
+                },
+                'pluginAtomic':{
+                    'read': '_readPluginAtomic',
+                    'readMany': '_readManyPluginAtomic',
+                    'list': '_listPluginAtomic',
+                    'cas': '_casPluginAtomic',
+                    'remove': '_removePluginAtomic',
+                    'getReceipt': '_receiptPluginAtomic',
+                    'changes': '_changesPluginAtomic',
                 },
                 ...(illustrationBridge?.aliases ?? {})
             }

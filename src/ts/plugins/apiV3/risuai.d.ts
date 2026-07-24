@@ -1020,6 +1020,179 @@ interface PluginStorage {
 }
 
 /**
+ * A single record in plugin atomic storage.
+ *
+ * `key` is always plugin-RELATIVE — the installation namespace is added and
+ * stripped by the host and is never visible to, or expressible by, the plugin.
+ * An absent key reads back as `revision: 0, value: null, deleted: false`.
+ */
+interface PluginAtomicRecord<T = any> {
+    key: string;
+    /** Monotonic per-key counter. Never resets, not even across delete+recreate. */
+    revision: number;
+    value: T | null;
+    /** True for a tombstone: the record was removed but its revision lives on. */
+    deleted: boolean;
+}
+
+/** Bounded key-ordered projection. Carries no values. */
+interface PluginAtomicListPage {
+    items: Array<{ key: string; revision: number; deleted: boolean }>;
+    /** Pass back as `cursor` for the next page; null when the page is the last. */
+    nextCursor: string | null;
+}
+
+/** Result of a successful `cas`/`remove`. */
+interface PluginAtomicMutation {
+    applied: boolean;
+    revision: number;
+}
+
+/** Durable proof of an `operationKey`'s outcome. */
+interface PluginAtomicReceipt {
+    applied: boolean;
+    key: string;
+    resultingRevision: number;
+}
+
+/** Bounded change feed — the cheap wake that replaces steady-state polling. */
+interface PluginAtomicChangesPage {
+    /** Opaque. Store it and pass it back as `afterCursor`. */
+    cursor: string;
+    /** Keys touched since the cursor, oldest change first. Bounded by `limit`. */
+    changedKeys: string[];
+    /**
+     * Storage generation. Bumped whenever the save is replaced under live
+     * storage (backup import, save-folder import, snapshot restore). A cursor
+     * from an older epoch is rejected with `PLUGIN_ATOMIC_CURSOR_EXPIRED`
+     * rather than silently skipping the changes it missed.
+     */
+    epoch: number;
+}
+
+/**
+ * Failure envelope. Plugin atomic methods never reject with a typed error —
+ * the sandbox bridge can only carry an error's message, which would strip the
+ * code and its detail fields — so failures resolve as this object instead.
+ * Check `ok` before using a result.
+ */
+interface PluginAtomicFailure {
+    ok: false;
+    /**
+     * One of:
+     * - `PLUGIN_ATOMIC_CONFLICT` — expectedRevision lost the race; retry from
+     *   `currentRevision`
+     * - `PLUGIN_ATOMIC_RECEIPT_MISMATCH` — this `operationKey` was already used
+     *   with a different payload; nothing was written
+     * - `PLUGIN_ATOMIC_CURSOR_EXPIRED` — cursor predates `epoch`; re-enumerate
+     *   with `list()`
+     * - `PLUGIN_ATOMIC_VALUE_TOO_LARGE` — value exceeds the 16 MiB cap
+     * - `PLUGIN_ATOMIC_BAD_KEY` / `PLUGIN_ATOMIC_BAD_REQUEST` — malformed input
+     * - `PLUGIN_ATOMIC_NO_INSTALL_ID` — this installation has no persisted
+     *   identity, so no namespace can be resolved; every call fails closed
+     */
+    code: string;
+    message: string;
+    /** `PLUGIN_ATOMIC_CONFLICT` only. */
+    currentRevision?: number;
+    /** `PLUGIN_ATOMIC_CONFLICT` only. */
+    currentDeleted?: boolean;
+    /** `PLUGIN_ATOMIC_RECEIPT_MISMATCH` only. */
+    operationKey?: string;
+    /** `PLUGIN_ATOMIC_CURSOR_EXPIRED` only. */
+    epoch?: number;
+}
+
+type PluginAtomicResult<T> = ({ ok: true } & T) | PluginAtomicFailure;
+
+/**
+ * Server-authoritative atomic storage, private to this plugin installation.
+ *
+ * Unlike `pluginStorage` (a single global namespace shared by every plugin,
+ * last-write-wins), this is namespaced per installation and every mutation is a
+ * compare-and-swap committed in one SQLite transaction together with its
+ * operation receipt. That makes it safe when several browser tabs run the same
+ * plugin at once: exactly one CAS wins, the losers get a typed conflict, and a
+ * lost response can be resolved after the fact through `getReceipt`.
+ *
+ * Keys are plugin-relative. The namespace is applied by the host from a
+ * persisted installation id, so a plugin cannot address another plugin's data
+ * — a key like `p:<other-install>:secret` simply resolves inside your own
+ * namespace.
+ *
+ * **All methods return Promises** due to iframe message passing, and resolve to
+ * either a success object (with `ok: true`) or a {@link PluginAtomicFailure}.
+ *
+ * @example
+ * ```typescript
+ * // Read → modify → CAS. A losing tab is told exactly where to resume.
+ * const current = await risuai.pluginAtomic.read('jobs/42');
+ * if (!current.ok) throw new Error(current.code);
+ *
+ * const written = await risuai.pluginAtomic.cas({
+ *     key: 'jobs/42',
+ *     expectedRevision: current.revision,
+ *     value: { state: 'claimed' },
+ *     operationKey: crypto.randomUUID(),
+ * });
+ * if (!written.ok && written.code === 'PLUGIN_ATOMIC_CONFLICT') {
+ *     // another tab got there first — reread from written.currentRevision
+ * }
+ *
+ * // Cheap wake instead of polling everything.
+ * let cursor: string | undefined;
+ * const changed = await risuai.pluginAtomic.changes({ prefix: 'jobs/', limit: 50, afterCursor: cursor });
+ * if (changed.ok) cursor = changed.cursor;
+ * ```
+ */
+interface PluginAtomicStorage {
+    /** Reads one record. Absent keys resolve with `revision: 0`. */
+    read<T = any>(key: string): Promise<PluginAtomicResult<PluginAtomicRecord<T>>>;
+
+    /** Reads up to 256 records in one round trip, one result per input key. */
+    readMany<T = any>(keys: string[]): Promise<PluginAtomicResult<{ items: PluginAtomicRecord<T>[] }>>;
+
+    /**
+     * Bounded, cursor-paged, key-ordered projection. Tombstones are included so
+     * a deletion is observable. `limit` is capped at 200.
+     */
+    list(input: { prefix?: string; cursor?: string | null; limit?: number }): Promise<PluginAtomicResult<PluginAtomicListPage>>;
+
+    /**
+     * Compare-and-swap. Writes only if the stored revision equals
+     * `expectedRevision` (use 0 to create a key that was never touched — note
+     * that a recreated key continues its old revision, so 0 will not match it).
+     *
+     * `operationKey` makes the write idempotent: replaying the same key with
+     * the same payload returns the original outcome without writing again,
+     * while reusing it with a different payload is a typed mismatch.
+     *
+     * Omit `expectedRevision` to reuse the revision cached by the last read of
+     * this key on this instance.
+     */
+    cas<T = any>(input: { key: string; value: T; operationKey: string; expectedRevision?: number }): Promise<PluginAtomicResult<PluginAtomicMutation>>;
+
+    /**
+     * Writes a revisioned tombstone. The row is never physically dropped, so a
+     * stale writer holding an old revision can never resurrect the record.
+     */
+    remove(input: { key: string; operationKey: string; expectedRevision?: number }): Promise<PluginAtomicResult<PluginAtomicMutation>>;
+
+    /**
+     * Resolves what an `operationKey` did, even long after later revisions have
+     * landed. This is how a mutation whose response was lost is recovered.
+     */
+    getReceipt(operationKey: string): Promise<PluginAtomicResult<{ receipt: PluginAtomicReceipt | null }>>;
+
+    /**
+     * Bounded feed of keys changed since `afterCursor`. A key written several
+     * times appears once, at its latest position: the feed is a hint, and the
+     * record snapshot is the truth. `limit` is capped at 200.
+     */
+    changes(input: { prefix?: string; afterCursor?: string | null; limit?: number }): Promise<PluginAtomicResult<PluginAtomicChangesPage>>;
+}
+
+/**
  * Device-local storage that persists outside of save files.
  * Uses generic types for flexible value storage.
  * Storage is shared between all plugins under a common prefix.
@@ -1334,8 +1507,24 @@ interface RisuaiPluginAPI {
     /** Plugin-specific storage (syncs with save files) */
     pluginStorage: PluginStorage;
 
+    /**
+     * Server-authoritative CAS storage private to this plugin installation.
+     * Use this instead of `pluginStorage` for anything several tabs may write
+     * concurrently, or anything that must survive a lost response.
+     */
+    pluginAtomic: PluginAtomicStorage;
+
     /** Device-specific storage (shared between plugins) */
     safeLocalStorage: SafeLocalStorage;
+
+    /**
+     * Reports which generic Core primitives this host build provides, so a
+     * plugin can fail closed on an older Core instead of half-working.
+     *
+     * @returns A map of capability name to contract version, e.g.
+     *          `{ pluginAtomicV1: 1 }`
+     */
+    getCapabilities(): Promise<Record<string, number>>;
 
     /**
      * Gets a device-local storage instance shared between plugins

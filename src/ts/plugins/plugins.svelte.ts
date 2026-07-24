@@ -12,11 +12,20 @@ import { SafeDocument, SafeIdbFactory, SafeLocalStorage } from "./pluginSafeClas
 import { pluginCustomKv, pluginBlobKv } from "./pluginKvStorage";
 import { loadV3Plugins } from "./apiV3/v3.svelte";
 import { pluginCodeTranspiler } from "./apiV3/transpiler";
+import { backfillInstallIds, commitImportedPlugin, newInstallId } from "./pluginInstallId";
 
 export const customProviderStore = writable([] as string[])
 
 interface ProviderPlugin {
     name: string
+    /**
+     * Host-minted, persisted installation identity (see pluginInstallId.ts).
+     * `name` comes from the user-editable //@name header, so it cannot safely
+     * namespace durable storage; this can. Assigned on install, backfilled at
+     * load time for older installations, and PRESERVED across OTA updates —
+     * losing it would orphan everything the plugin has stored.
+     */
+    installId?: string
     displayName?: string
     script: string
     arguments: { [key: string]: 'int' | 'string' | string[] }
@@ -408,12 +417,13 @@ export async function importPlugin(code:string|null = null, argu:{
             }
         }
 
-        if(oldPluginIndex !== -1){
-            db.plugins[oldPluginIndex] = pluginData;
-        }
-        else if(!isUpdate || argu.isHotReload){
-            db.plugins.push(pluginData)
-        }
+        // Placement is unchanged; commitImportedPlugin only adds the installId
+        // rule on top of it — most importantly, an update inherits the id of the
+        // record it replaces instead of minting a fresh namespace.
+        commitImportedPlugin(db.plugins, pluginData, oldPluginIndex, {
+            isUpdate,
+            isHotReload: !!argu.isHotReload,
+        })
 
         if(argu.isHotReload && !hotReloading.includes(pluginData.name)){
             hotReloading.push(pluginData.name)
@@ -437,6 +447,14 @@ export async function loadPlugins() {
     console.log('Loading plugins...')
     let db = getDatabase()
 
+    // One-time backfill for installations that predate installId. Idempotent
+    // (a second pass assigns nothing) and order-preserving, so it is safe on
+    // the hot path — loadPlugins runs on every enable/disable toggle. Must land
+    // BEFORE the snapshot below, or the running plugin would see no identity.
+    if(backfillInstallIds(db.plugins) > 0){
+        setDatabaseLite(db)
+        void requestImmediateSave()
+    }
 
     const enabledPlugins = safeStructuredClone(db.plugins).filter((p: RisuPlugin) => p.enabled)
     const v2PluginList = enabledPlugins.filter((a: RisuPlugin) => a.version === 2 || a.version === '2.1')
@@ -965,7 +983,11 @@ export async function handlePluginInstallViaPlugin(plugins: RisuPlugin[]){
             }
             const confirmation = await alertConfirm(language.confirmInstallPluginViaPlugin.replace('{plugin}', plugin.name))
             if(confirmation){
-                trimmedPlugins.push(plugin)
+                // The plugin object comes from ANOTHER plugin's sandbox, so any
+                // installId on it is caller-supplied and must never be honoured
+                // — it could name an existing installation's namespace. Mint a
+                // fresh one unconditionally.
+                trimmedPlugins.push({ ...plugin, installId: newInstallId() })
             }
         }
         else{

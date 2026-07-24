@@ -26,8 +26,13 @@ const getVips = () => {
 const { kvGet, kvSet, kvDel, kvList,
         kvDelPrefix, kvListWithSizes, kvSize, kvGetUpdatedAt, kvCopyValue, clearEntities, checkpointWal,
         gcChunks, reclaimableChunkBytes, isDbBlobChunked, snapshotFootprint, illustrationAtomic,
+        pluginAtomic,
         db: sqliteDb } = require('./db.cjs');
 const { MUTATING_OPS: ILLUSTRATION_ATOMIC_MUTATING_OPS } = require('./illustrationAtomicStore.cjs');
+const {
+    MUTATING_OPS: PLUGIN_ATOMIC_MUTATING_OPS,
+    BACKUP_ENTRY_NAME: PLUGIN_ATOMIC_BACKUP_ENTRY_NAME,
+} = require('./pluginAtomicStore.cjs');
 const { preparePluginStorageImport, writePluginStorageRescue } = require('./pluginStorageSafety.cjs');
 const {
     addLogBatch, queryLogs, clearLogs, countLogs,
@@ -2615,6 +2620,15 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
     // format only — but a fresh import is a clear "data changed" signal.)
     kvDel(REMOTE_MIGRATION_MARKER_KEY);
     kvDel(REMOTE_CHAT_RECOVERY_MARKER);
+    // plugin_atomic is not in kv, so no kvDelPrefix above reaches it. Wipe it
+    // unconditionally (not only when the archive carries an entry): an import
+    // replaces the whole world, and leaving forward-moving CAS revisions paired
+    // with a rewound chat blob is exactly the failure this closes. The epoch
+    // bump inside purgeForRestore invalidates every outstanding change cursor,
+    // so a plugin gets a typed cursor_expired instead of silently resuming.
+    // Runs inside the explicit BEGIN above — better-sqlite3 turns the store's
+    // nested db.transaction into a SAVEPOINT, so it rolls back with the import.
+    pluginAtomic.purgeForRestore();
     clearEntities();
 
     try {
@@ -2701,6 +2715,14 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
                     }
                 } else if (name.startsWith('inlay_thumb/')) {
                     // Skip deprecated thumbnail entries from legacy backups
+                } else if (name === PLUGIN_ATOMIC_BACKUP_ENTRY_NAME) {
+                    // Restores the rows the export carried, with revisions and
+                    // tombstones intact, on top of the wipe performed above.
+                    // Receipts are deliberately NOT carried: after a restore the
+                    // record revisions are authoritative, so a replayed
+                    // operationKey resolves to a CAS conflict rather than a
+                    // double apply.
+                    pluginAtomic.importRows(JSON.parse(data.toString('utf-8')));
                 } else {
                     const storageKey = resolveBackupStorageKey(name);
                     pluginWipeDone = await preparePluginStorageImport({
@@ -4541,6 +4563,52 @@ app.post('/api/illustration/atomic', async (req, res, next) => {
     }
 });
 
+// ─── Generic plugin atomic storage (Pure Plugin Primitives V1 §4) ─────────────
+// The illustration-agnostic successor to the block above. The store module
+// (pluginAtomicStore.cjs) owns the tables and the transactional logic; this
+// endpoint owns only transport: auth, queue routing, and typed-error mapping.
+// Keys are namespaced per plugin INSTALLATION; the server validates key SHAPE
+// only. Namespace enforcement is host-side (src/ts/process/pluginPrimitives/
+// pluginAtomic.ts prepends `p:<installId>:` to a plugin-relative key), because
+// the server has no notion of which plugin a request came from.
+function sendPluginAtomicError(res, error) {
+    if (error && error.isPluginAtomicError) {
+        res.status(error.httpStatus).json({ error: error.message, code: error.code, ...(error.extra || {}) });
+        return true;
+    }
+    return false;
+}
+
+app.post('/api/plugin/atomic', async (req, res, next) => {
+    if (!await checkAuth(req, res)) {
+        return;
+    }
+    const body = req.body;
+    const op = body && typeof body === 'object' ? body.op : undefined;
+    try {
+        if (PLUGIN_ATOMIC_MUTATING_OPS.has(op)) {
+            // cas/remove mutate. Serialize against every other storage write on
+            // the shared queue so a debounced database.bin persist cannot
+            // interleave with the operation. The store's own synchronous
+            // db.transaction supplies atomicity (record + receipt + change_seq
+            // commit together); it contains no await, as better-sqlite3
+            // requires.
+            await queueStorageOperation(async () => {
+                res.json(pluginAtomic.execute(body));
+            });
+        } else {
+            // read/bulkRead/list/receipt/changes are PURE reads over the atomic
+            // tables. Unlike the illustration store — whose read path needed the
+            // queue only because of its lazy legacy-kv import, which this store
+            // deliberately drops — they take no queue slot at all.
+            res.json(pluginAtomic.execute(body));
+        }
+    } catch (error) {
+        if (sendPluginAtomicError(res, error)) return;
+        next(error);
+    }
+});
+
 app.post('/api/db/flush', sessionAuthMiddleware, async (req, res, next) => {    try {
         await queueStorageOperation(async () => {
             await flushPendingDb();
@@ -4863,6 +4931,25 @@ app.get('/api/backup/export', async (req, res, next) => {
                 kind: 'kv', key: entry.key, backupName: entry.key, sortKey: entry.key, size: entry.size,
             })),
         ];
+        // plugin_atomic lives in its own SQLite tables, not in kv, so the kv
+        // prefix enumeration above cannot see it. Without this the export would
+        // carry a chat blob while leaving the plugin's CAS revisions behind, and
+        // a restore would silently pair rewound chats with forward-moving
+        // storage. Excluded for target=upstream: the entry name contains a
+        // slash, which upstream's import treats as a path under assets/.
+        const pluginAtomicEntries = (() => {
+            if (target === 'upstream') return [];
+            const rows = pluginAtomic.exportRows();
+            if (rows.length === 0) return [];
+            const buffer = Buffer.from(JSON.stringify({ version: 1, rows }), 'utf-8');
+            return [{
+                kind: 'buffer',
+                buffer,
+                backupName: PLUGIN_ATOMIC_BACKUP_ENTRY_NAME,
+                sortKey: PLUGIN_ATOMIC_BACKUP_ENTRY_NAME,
+                size: buffer.length,
+            }];
+        })();
         const namespacedEntries = [
             ...kvListWithSizes('assets/').map((entry) => ({
                 kind: 'kv',
@@ -4873,6 +4960,7 @@ app.get('/api/backup/export', async (req, res, next) => {
             })),
             ...listColdStorageBackupEntries(),
             ...pluginStorageEntries,
+            ...pluginAtomicEntries,
             ...inlayMetaEntries,
             ...inlayEntries,
             ...sidecarEntries.filter(Boolean),
@@ -5652,6 +5740,10 @@ function clearExistingData() {
     // to re-evaluate against the new contents on the next ensureChatStore.
     kvDel(REMOTE_MIGRATION_MARKER_KEY);
     kvDel(REMOTE_CHAT_RECOVERY_MARKER);
+    // Same reasoning as the .bin import path: a save-folder import replaces the
+    // whole database blob, so plugin_atomic must not survive it forward-moving.
+    // (Save folders carry no plugin_atomic entry, so this is purge-only.)
+    pluginAtomic.purgeForRestore();
     clearEntities();
 }
 
@@ -6425,6 +6517,12 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
             await flushPendingDb();
             kvCopyValue(key, DB_BLOB_KEY);
             invalidateDbCache();
+            // A snapshot rewinds the chat blob but plugin_atomic keeps moving
+            // forward, so its CAS revisions would end up describing chats that
+            // no longer exist. Purge it and bump the storage epoch, which turns
+            // every outstanding change cursor into a typed cursor_expired.
+            // Snapshots carry no plugin_atomic payload, so this is purge-only.
+            pluginAtomic.purgeForRestore();
             // Snapshot may pre-date the remote-block migration. Clear the marker
             // so migrateRemoteBlocksIfNeeded re-evaluates against the restored
             // bytes instead of skipping based on the prior post-migration state.

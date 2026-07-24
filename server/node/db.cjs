@@ -5,6 +5,7 @@ const path = require('path');
 const fs = require('fs');
 const { createChunkStore } = require('./chunkStore.cjs');
 const { createIllustrationAtomicStore } = require('./illustrationAtomicStore.cjs');
+const { createPluginAtomicStore } = require('./pluginAtomicStore.cjs');
 
 const saveDir = path.join(process.cwd(), 'save');
 if (!fs.existsSync(saveDir)) {
@@ -107,6 +108,15 @@ migrateFromSaveDir();
 // to this shared db instance — same wiring pattern as chunkStore. The kv table
 // (created above) must already exist because lazy legacy migration reads from it.
 const illustrationAtomic = createIllustrationAtomicStore(db);
+
+// ─── Generic plugin atomic storage (Pure Plugin Primitives V1 §4) ─────────────
+// The illustration-agnostic successor: per-key CAS + revisioned tombstones +
+// durable operation receipts + a bounded change cursor, namespaced per plugin
+// INSTALLATION (`p:<installId>:`). Owns its own tables (plugin_atomic /
+// plugin_atomic_receipts / plugin_atomic_counters) on this shared db instance —
+// same wiring pattern as chunkStore. It has no kv dependency: unlike the
+// illustration store it performs no lazy legacy import.
+const pluginAtomic = createPluginAtomicStore(db);
 
 // ─── KV operations ────────────────────────────────────────────────────────────
 // kv reads/writes for the DB blob route through chunkStore (get/put/size/copy);
@@ -226,4 +236,6 @@ module.exports = {
     snapshotFootprint,
     // Illustration atomic storage (Gate 1a)
     illustrationAtomic,
+    // Generic plugin atomic storage (Pure Plugin Primitives V1)
+    pluginAtomic,
 };
