@@ -24,6 +24,7 @@ import { requestChatDataMain } from "src/ts/process/request/request";
 import type { OpenAIChat } from "src/ts/process/index.svelte";
 import { authorizeIllustrationV3Plugin, createIllustrationV3CapabilityIfAuthorized, type AuthorizedIllustrationV3Bridge } from "src/ts/process/illustrationJobs/v3Bridge";
 import { createPluginAtomicSandboxApi } from "src/ts/process/pluginPrimitives/pluginAtomic";
+import { createDefaultPluginImagesApi } from "src/ts/process/pluginPrimitives/pluginImages";
 import { createAuthorizedIllustrationV3HostBridge } from "src/ts/process/illustrationJobs/v3BridgeHost";
 import { tokenize as tokenizerTokenize, tokenizeAccurate as tokenizerTokenizeAccurate, encodeWithTokenizer, tokenizerList } from "src/ts/tokenizer";
 import { getModuleLorebooks } from "src/ts/process/modules";
@@ -816,6 +817,12 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
     // SHARED global namespace, i.e. strictly more exposed — is likewise ungated.
     const pluginAtomicApi = createPluginAtomicSandboxApi({ installId: plugin.installId });
 
+    // Runs the user's configured image provider and lands the result as a
+    // native inlay. Illustration-agnostic: it owns no jobs, coordinator, or
+    // scheduling, and both halves already exist in the core — this is the one
+    // capability a plugin has no other way to reach.
+    const pluginImagesApi = createDefaultPluginImagesApi();
+
     return {
 
         //Old APIs from v2.1
@@ -1438,6 +1445,14 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
         _removePluginAtomic: (input: any) => pluginAtomicApi.remove(input),
         _receiptPluginAtomic: (operationKey: string) => pluginAtomicApi.getReceipt(operationKey),
         _changesPluginAtomic: (input: any) => pluginAtomicApi.changes(input),
+        // pluginImages/pluginInlays.* — paid work answers with a status
+        // envelope instead of throwing. The sandbox boundary carries only
+        // `err.message`, and a caller must be able to distinguish "definitely
+        // did not run" from "cannot tell" without parsing prose, because the
+        // second must never be auto-retried.
+        _measurePluginImagePrompt: (input: any) => pluginImagesApi.measurePrompt(input),
+        _generatePluginImageToInlay: (input: any) => pluginImagesApi.generateToInlay(input),
+        _removePluginInlay: (input: any) => pluginImagesApi.remove(input),
         getCapabilities: async () => {
             // Generic, illustration-agnostic capability handshake (request §3).
             // Additive only — the illustration bridge keeps its own separate
@@ -1445,6 +1460,11 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
             // not gain fields here.
             return {
                 pluginAtomicV1: 1,
+                pluginImagesV1: 1,
+                pluginInlaysV1: 1,
+                // Aggregate readiness marker: every primitive advertised in
+                // this handshake is wired and usable.
+                pluginPrimitiveSuiteV1: { epoch: 1, ready: true },
             }
         },
         searchTranslationCache: async (partialKey: string) => {
@@ -1486,6 +1506,13 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
                     'remove': '_removePluginAtomic',
                     'getReceipt': '_receiptPluginAtomic',
                     'changes': '_changesPluginAtomic',
+                },
+                'pluginImages':{
+                    'measurePrompt': '_measurePluginImagePrompt',
+                    'generateToInlay': '_generatePluginImageToInlay',
+                },
+                'pluginInlays':{
+                    'remove': '_removePluginInlay',
                 },
                 ...(illustrationBridge?.aliases ?? {})
             }
