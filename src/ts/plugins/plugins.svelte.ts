@@ -791,7 +791,15 @@ export const getV2PluginAPIs = () => {
             for (const key of Object.keys(newDb)) {
                 if (key === 'plugins') {
                     console.warn('[WARN] Plugin attempted to access plugin directly. this would be blocked in future versions. Instead, use the provided APIs to manage plugins. Attempting to handle plugin installation via plugin for new plugins in the provided database object.')
-                    newDb[key] = await handlePluginInstallViaPlugin(newDb.plugins)
+                    // handlePluginInstallViaPlugin returns ONLY the newly
+                    // confirmed installs, so assigning it wholesale DELETED
+                    // every already-installed plugin. A plugin doing the
+                    // natural read-modify-write (hand back the db it just read)
+                    // confirms nothing new, so the list was replaced by an
+                    // empty array. Keep what is installed, append what the user
+                    // approved.
+                    const confirmedInstalls = await handlePluginInstallViaPlugin(newDb.plugins)
+                    newDb[key] = [...db.plugins, ...confirmedInstalls]
                 }
 
                 if (allowedDbKeys.includes(key)) {
