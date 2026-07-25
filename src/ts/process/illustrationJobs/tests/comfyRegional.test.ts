@@ -139,34 +139,72 @@ describe('comfy per-subject placeholders', () => {
         // down and right by half a column.
         const graph = await dispatch(twoSubjects([{ x: 0.25, y: 0.72 }, { x: 0.75, y: 0.5 }]))
 
-        // Full-height columns. Measured against a real generation: banding the
-        // vertical axis too confined two standing figures to the bottom third,
-        // making them small rather than near — the opposite of what foreground
-        // means. The vertical coordinate is depth, not height on screen.
+        // Full-height columns, sized by how many subjects are placed. Both
+        // halves of that were measured against real generations:
+        //
+        // Banding the vertical axis as well confined two standing figures to
+        // the bottom third and made them small rather than near — the opposite
+        // of what foreground means. The vertical coordinate is depth, not
+        // height on screen.
+        //
+        // Quantizing the horizontal axis to fixed thirds left the middle third
+        // owned by nobody, and the base conditioning filled that gap with extra
+        // people. Sizing by subject count closes it.
         expect(graph['1'].inputs.x).toBeCloseTo(0)
-        expect(graph['1'].inputs.width).toBeCloseTo(1 / 3)
+        expect(graph['1'].inputs.width).toBeCloseTo(0.5)
         expect(graph['1'].inputs.y).toBe(0)
         expect(graph['1'].inputs.height).toBe(1)
 
-        expect(graph['2'].inputs.x).toBeCloseTo(2 / 3)
-        expect(graph['2'].inputs.width).toBeCloseTo(1 / 3)
+        expect(graph['2'].inputs.x).toBeCloseTo(0.5)
+        expect(graph['2'].inputs.width).toBeCloseTo(0.5)
         expect(graph['2'].inputs.y).toBe(0)
         expect(graph['2'].inputs.height).toBe(1)
+
+        // No gap and no overlap: the two columns tile the canvas exactly.
+        expect(graph['1'].inputs.x + graph['1'].inputs.width).toBeCloseTo(graph['2'].inputs.x)
+        expect(graph['2'].inputs.x + graph['2'].inputs.width).toBeCloseTo(1)
 
         for (const value of Object.values(graph['1'].inputs)) expect(typeof value).toBe('number')
     })
 
-    test('a centre column resolves to the middle third', async () => {
+    test('two subjects sharing a position share a column instead of being pushed apart', async () => {
         harness.db.comfyConfig.workflow = JSON.stringify({
-            '1': {
-                inputs: { x: '{{risu_subject_1_left}}', width: '{{risu_subject_1_width}}', text: '{{risu_subject_2}}' },
-                class_type: 'ConditioningSetAreaPercentage',
-            },
+            '1': { inputs: { x: '{{risu_subject_1_left}}', width: '{{risu_subject_1_width}}' }, class_type: 'ConditioningSetAreaPercentage' },
+            '2': { inputs: { x: '{{risu_subject_2_left}}', width: '{{risu_subject_2_width}}' }, class_type: 'ConditioningSetAreaPercentage' },
         })
-        const graph = await dispatch(twoSubjects([{ x: 0.5, y: 0.5 }, { x: 0.75, y: 0.5 }]))
+        // A clinch: the Planner put both in the same place, and the region
+        // sizing must not invent a separation it never asked for.
+        const graph = await dispatch(twoSubjects([{ x: 0.25, y: 0.5 }, { x: 0.25, y: 0.5 }]))
 
-        expect(graph['1'].inputs.x).toBeCloseTo(1 / 3)
-        expect(graph['1'].inputs.width).toBeCloseTo(1 / 3)
+        expect(graph['1'].inputs.x).toBeCloseTo(graph['2'].inputs.x)
+        expect(graph['1'].inputs.width).toBeCloseTo(graph['2'].inputs.width)
+    })
+
+    test('a lone placed subject owns the whole width', async () => {
+        harness.db.comfyConfig.workflow = JSON.stringify({
+            '1': { inputs: { x: '{{risu_subject_1_left}}', width: '{{risu_subject_1_width}}', text: '{{risu_subject_2}}' }, class_type: 'ConditioningSetAreaPercentage' },
+        })
+        const graph = await dispatch(twoSubjects([{ x: 0.25, y: 0.5 }, null]))
+
+        expect(graph['1'].inputs.x).toBe(0)
+        expect(graph['1'].inputs.width).toBe(1)
+    })
+
+    test('a region for a subject the scene does not have contributes nothing', async () => {
+        harness.db.comfyConfig.workflow = JSON.stringify({
+            '1': { inputs: { text: '{{risu_subject_1}}', strength: '{{risu_subject_1_strength}}' }, class_type: 'ConditioningSetAreaPercentage' },
+            '2': { inputs: { text: '{{risu_subject_2}}', strength: '{{risu_subject_2_strength}}' }, class_type: 'ConditioningSetAreaPercentage' },
+            '3': { inputs: { text: '{{risu_subject_3}}', strength: '{{risu_subject_3_strength}}' }, class_type: 'ConditioningSetAreaPercentage' },
+        })
+        const graph = await dispatch(twoSubjects([{ x: 0.25, y: 0.5 }, { x: 0.75, y: 0.5 }]))
+
+        // This is what lets one workflow with a fixed number of regions serve
+        // scenes with fewer subjects: the spare regions would otherwise apply
+        // an empty caption over the whole canvas at full weight.
+        expect(graph['1'].inputs.strength).toBe(1)
+        expect(graph['2'].inputs.strength).toBe(1)
+        expect(graph['3'].inputs.strength).toBe(0)
+        expect(graph['3'].inputs.text).toBe('')
     })
 
     test('an unplaced subject gets the whole canvas, not a corner', async () => {

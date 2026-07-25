@@ -649,7 +649,13 @@ async function generateAIImageInternal(
                 //   {{risu_subject_N_top}}
                 //   {{risu_subject_N_width}}
                 //   {{risu_subject_N_height}}
+                //   {{risu_subject_N_strength}} 1 if subject N exists, else 0
                 //   {{risu_subject_count}}   how many subjects this scene has
+                //
+                // `_strength` is what lets one workflow with a fixed number of
+                // regions serve scenes with fewer subjects. Without it the
+                // spare regions would each apply an empty caption over the
+                // whole canvas at full weight and wash the composition out.
                 //
                 // Both forms exist because the area nodes want a rectangle
                 // whose x/y is its TOP-LEFT corner, not a centre — feeding a
@@ -683,20 +689,23 @@ async function generateAIImageInternal(
                 // An unplaced subject gets the whole canvas, so a region node
                 // degrades to "no restriction" rather than pinning it somewhere
                 // nobody asked for.
-                const GRID = [0, 1 / 3, 2 / 3, 1]
-                const columnFor = (value: number) => {
-                    for (let band = 0; band < 3; band += 1) {
-                        if (value < GRID[band + 1] || band === 2) {
-                            return { start: GRID[band], size: GRID[band + 1] - GRID[band] }
-                        }
-                    }
-                    return { start: 0, size: 1 }
-                }
+                // Each placed subject owns a column of width 1/N centred on its
+                // own coordinate, where N is how many subjects are placed.
+                //
+                // Quantizing to fixed thirds instead was measured and it left a
+                // gap: two subjects at left and right owned the outer thirds
+                // and nobody owned the middle, so the base conditioning filled
+                // it — with more people. Sizing by subject count closes that,
+                // and it still respects the stated position, so two subjects
+                // pressed together legitimately end up sharing a column rather
+                // than being pushed apart.
+                const placedCount = subjectCenters.filter((centre) => centre).length || 1
+                const columnWidth = 1 / placedCount
                 const regionFor = (index: number) => {
                     const centre = subjectCenters[index]
                     if (!centre) return { left: 0, top: 0, width: 1, height: 1 }
-                    const horizontal = columnFor(centre.x)
-                    return { left: horizontal.start, width: horizontal.size, top: 0, height: 1 }
+                    const left = Math.min(Math.max(centre.x - columnWidth / 2, 0), 1 - columnWidth)
+                    return { left, width: columnWidth, top: 0, height: 1 }
                 }
 
                 const subjectValue = (index: number, suffix: string | undefined): string | number => {
@@ -709,11 +718,12 @@ async function generateAIImageInternal(
                         case '_top': return regionFor(index).top
                         case '_width': return regionFor(index).width
                         case '_height': return regionFor(index).height
+                        case '_strength': return subjectPositives[index] ? 1 : 0
                         default: return subjectPositives[index] ?? ''
                     }
                 }
 
-                const SUBJECT_PLACEHOLDER = /\{\{risu_subject_(\d+)(_neg|_x|_y|_left|_top|_width|_height)?\}\}/g
+                const SUBJECT_PLACEHOLDER = /\{\{risu_subject_(\d+)(_neg|_x|_y|_left|_top|_width|_height|_strength)?\}\}/g
 
                 const substituteText = (value: string) => value
                     .replaceAll('{{risu_prompt}}', genPrompt)
@@ -726,7 +736,7 @@ async function generateAIImageInternal(
                 // Comfy area nodes take numbers, not strings. An input whose
                 // ENTIRE value is a geometry placeholder becomes a number; one
                 // embedded in a larger string stays text.
-                const NUMERIC_PLACEHOLDER = /^\{\{risu_subject_(\d+)(_x|_y|_left|_top|_width|_height)\}\}$/
+                const NUMERIC_PLACEHOLDER = /^\{\{risu_subject_(\d+)(_x|_y|_left|_top|_width|_height|_strength)\}\}$/
                 const NUMERIC_COUNT_PLACEHOLDER = '{{risu_subject_count}}'
 
                 // A workflow with fewer regions than the scene has subjects
