@@ -681,6 +681,18 @@ async function generateAIImageInternal(
                 const NUMERIC_PLACEHOLDER = /^\{\{risu_subject_(\d+)(_x|_y)\}\}$/
                 const NUMERIC_COUNT_PLACEHOLDER = '{{risu_subject_count}}'
 
+                // A workflow with fewer regions than the scene has subjects
+                // would otherwise drop the later ones with no error and no
+                // trace. Silently losing a subject is precisely the failure
+                // regional placement exists to prevent, so track which
+                // captions were actually consumed and refuse before posting.
+                const consumed = new Set<number>()
+                const noteConsumed = (value: string) => {
+                    for (const found of value.matchAll(/\{\{risu_subject_(\d+)(?:_neg|_x|_y)?\}\}/g)) {
+                        consumed.add(Number(found[1]))
+                    }
+                }
+
                 //search all nodes for the prompt and negative prompt
                 const keys = Object.keys(prompt)
                 for(let i = 0; i < keys.length; i++){
@@ -689,6 +701,7 @@ async function generateAIImageInternal(
                     for(let j = 0; j < inputKeys.length; j++){
                         let input = node.inputs[inputKeys[j]]
                         if(typeof input === 'string'){
+                            noteConsumed(input)
                             const trimmed = input.trim()
                             const numeric = NUMERIC_PLACEHOLDER.exec(trimmed)
                             if(numeric){
@@ -709,6 +722,25 @@ async function generateAIImageInternal(
                         }
 
                         node.inputs[inputKeys[j]] = input
+                    }
+                }
+
+                const unconsumed = subjectPositives
+                    .map((_caption, index) => index + 1)
+                    .filter((ordinal) => !consumed.has(ordinal))
+                if (subjectPositives.length > 0 && unconsumed.length > 0) {
+                    // Nothing has been posted yet, so this costs nothing.
+                    return {
+                        result: {
+                            ok: false,
+                            certainty: 'definite',
+                            reason: `The Comfy workflow has no placeholder for subject ${unconsumed.join(', ')}. `
+                                + `Add {{risu_subject_${unconsumed[0]}}} (and its region) to the workflow, `
+                                + 'or turn regional placement off.',
+                        },
+                        compatibilityValue: returnSdData === 'inlay' ? '' : false,
+                        shouldNotify: true,
+                        notifyErrorValue: `Comfy workflow is missing a region for subject ${unconsumed.join(', ')}.`,
                     }
                 }
             }

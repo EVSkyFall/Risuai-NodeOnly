@@ -58,6 +58,12 @@ export interface PluginImageMeasurement {
     configRevision: string
     provider: string
     model: string
+    /**
+     * Whether the configured provider's dispatch actually consumes per-character
+     * captions. Everything else silently drops them, which would send a picture
+     * with no subjects in it, so callers must ask before choosing that shape.
+     */
+    supportsRegional: boolean
     tokenizer: string | null
     detail: {
         positiveTokens: number | null
@@ -147,6 +153,10 @@ async function sha256Hex(text: string): Promise<string> {
     const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
     return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('')
 }
+
+// Only these dispatch branches read illustrationPrompt.characterPositives.
+// Legacy 'comfy' writes into a single configured node and never sees them.
+const REGIONAL_PROVIDERS = Object.freeze(new Set(['novelai', 'comfyui']))
 
 /** Which model string identifies the configured provider's model, if any. */
 function configuredModel(db: Record<string, any>): string {
@@ -253,6 +263,7 @@ export function createPluginImagesApi(deps: PluginImagesDependencies): PluginIma
                     accepted: withinLimits,
                     configRevision,
                     provider,
+                    supportsRegional: REGIONAL_PROVIDERS.has(provider),
                     model: measured.model || model,
                     tokenizer: measured.tokenizer,
                     detail: {
@@ -274,6 +285,7 @@ export function createPluginImagesApi(deps: PluginImagesDependencies): PluginIma
                     accepted: true,
                     configRevision,
                     provider,
+                    supportsRegional: REGIONAL_PROVIDERS.has(provider),
                     model,
                     tokenizer: null,
                     detail: {

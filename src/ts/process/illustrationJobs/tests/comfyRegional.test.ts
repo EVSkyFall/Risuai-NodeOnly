@@ -125,11 +125,12 @@ describe('comfy per-subject placeholders', () => {
         expect(typeof graph['7'].inputs.note).toBe('string')
     })
 
-    test('a subject the scene does not have resolves to empty, not to a leftover placeholder', async () => {
+    test('a region the scene has no subject for resolves to empty, not to a leftover placeholder', async () => {
         harness.db.comfyConfig.workflow = JSON.stringify({
             '1': { inputs: { text: '{{risu_subject_1}}' }, class_type: 'CLIPTextEncode' },
-            '2': { inputs: { text: '{{risu_subject_3}}' }, class_type: 'CLIPTextEncode' },
-            '3': { inputs: { x: '{{risu_subject_3_x}}' }, class_type: 'ConditioningSetAreaPercentage' },
+            '2': { inputs: { text: '{{risu_subject_2}}' }, class_type: 'CLIPTextEncode' },
+            '3': { inputs: { text: '{{risu_subject_3}}' }, class_type: 'CLIPTextEncode' },
+            '4': { inputs: { x: '{{risu_subject_3_x}}' }, class_type: 'ConditioningSetAreaPercentage' },
         })
         const graph = await dispatch(twoSubjects([{ x: 0.25, y: 0.5 }, { x: 0.75, y: 0.5 }]))
 
@@ -137,8 +138,28 @@ describe('comfy per-subject placeholders', () => {
         // regions; an unresolved placeholder reaching the provider would be
         // sent as literal text.
         expect(graph['1'].inputs.text).toBe('1girl, silver hair')
-        expect(graph['2'].inputs.text).toBe('')
-        expect(graph['3'].inputs.x).toBe(0)
+        expect(graph['2'].inputs.text).toBe('1boy, dark hair')
+        expect(graph['3'].inputs.text).toBe('')
+        expect(graph['4'].inputs.x).toBe(0)
+    })
+
+    test('a subject with no region anywhere in the workflow refuses before anything is posted', async () => {
+        harness.db.comfyConfig.workflow = JSON.stringify({
+            '1': { inputs: { text: '{{risu_subject_1}}' }, class_type: 'CLIPTextEncode' },
+        })
+        const attempt = await generateAIImageTyped(
+            'base positive', CHARACTER, 'base negative', 'inlay', 'background',
+            { preservePromptText: true, illustrationPrompt: twoSubjects() as any },
+        )
+
+        // The reverse direction is the dangerous one: a caption nothing asked
+        // for is a subject dropped from the picture with no trace.
+        expect(attempt.result.ok).toBe(false)
+        if (attempt.result.ok) throw new Error('unreachable')
+        expect(attempt.result.certainty).toBe('definite')
+        expect(attempt.result.reason).toMatch(/subject 2/)
+        // Nothing was posted, so nothing was paid.
+        expect(harness.globalFetch).not.toHaveBeenCalled()
     })
 
     test('per-subject negatives are addressable too', async () => {
@@ -160,16 +181,23 @@ describe('comfy per-subject placeholders', () => {
         expect(graph['6'].inputs.y).toBe(0)
     })
 
-    test('a workflow with no per-subject placeholders is untouched by the extension', async () => {
+    test('a workflow written before regional placement keeps working on a flat prompt', async () => {
         harness.db.comfyConfig.workflow = JSON.stringify({
             '1': { inputs: { text: '{{risu_prompt}}' }, class_type: 'CLIPTextEncode' },
             '2': { inputs: { text: '{{risu_neg}}' }, class_type: 'CLIPTextEncode' },
             '3': { inputs: { seed: 7 }, class_type: 'KSampler' },
         })
-        const graph = await dispatch(twoSubjects([{ x: 0.25, y: 0.5 }, { x: 0.75, y: 0.5 }]))
+        // Flat is what such a workflow is sent, and it carries no captions to
+        // lose — so the whole extension is invisible to it.
+        const graph = await dispatch({
+            schemaVersion: 1,
+            layout: 'flat',
+            basePositive: 'base positive',
+            characterPositives: [],
+            baseNegative: 'base negative',
+            characterNegatives: [],
+        })
 
-        // Every workflow written before regional placement existed keeps
-        // behaving exactly as it did.
         expect(graph['1'].inputs.text).toBe('base positive')
         expect(graph['2'].inputs.text).toBe('base negative')
         // Seed randomization is pre-existing behaviour and must survive.
