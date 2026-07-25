@@ -652,10 +652,13 @@ async function generateAIImageInternal(
                 //   {{risu_subject_N_strength}} 1 if subject N exists, else 0
                 //   {{risu_subject_count}}   how many subjects this scene has
                 //
-                // `_strength` is what lets one workflow with a fixed number of
-                // regions serve scenes with fewer subjects. Without it the
-                // spare regions would each apply an empty caption over the
-                // whole canvas at full weight and wash the composition out.
+                // `_strength` zeroes a spare region's contribution, but Comfy
+                // still evaluates its conditioning. An unused slot is therefore
+                // kept degenerate so that wasted pass stays cheap. A workflow
+                // can remove that cost by putting ConditioningSetTimestepRange
+                // between the area node and combine, with `end` bound to the
+                // same {{risu_subject_N_strength}}: 1 keeps it fully active,
+                // while 0 excludes it from every step.
                 //
                 // Both forms exist because the area nodes want a rectangle
                 // whose x/y is its TOP-LEFT corner, not a centre — feeding a
@@ -699,9 +702,18 @@ async function generateAIImageInternal(
                 // and it still respects the stated position, so two subjects
                 // pressed together legitimately end up sharing a column rather
                 // than being pushed apart.
+                const UNUSED_SUBJECT_REGION_SIZE = 0.08
                 const placedCount = subjectCenters.filter((centre) => centre).length || 1
                 const columnWidth = 1 / placedCount
                 const regionFor = (index: number) => {
+                    if (!subjectPositives[index]) {
+                        return {
+                            left: 0,
+                            top: 0,
+                            width: UNUSED_SUBJECT_REGION_SIZE,
+                            height: UNUSED_SUBJECT_REGION_SIZE,
+                        }
+                    }
                     const centre = subjectCenters[index]
                     if (!centre) return { left: 0, top: 0, width: 1, height: 1 }
                     const left = Math.min(Math.max(centre.x - columnWidth / 2, 0), 1 - columnWidth)

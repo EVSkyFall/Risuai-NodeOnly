@@ -198,13 +198,40 @@ describe('comfy per-subject placeholders', () => {
         })
         const graph = await dispatch(twoSubjects([{ x: 0.25, y: 0.5 }, { x: 0.75, y: 0.5 }]))
 
-        // This is what lets one workflow with a fixed number of regions serve
-        // scenes with fewer subjects: the spare regions would otherwise apply
-        // an empty caption over the whole canvas at full weight.
+        // Strength zero prevents a spare region from contributing to the
+        // image. Its degenerate geometry separately keeps the conditioning
+        // pass that Comfy still evaluates cheap.
         expect(graph['1'].inputs.strength).toBe(1)
         expect(graph['2'].inputs.strength).toBe(1)
         expect(graph['3'].inputs.strength).toBe(0)
         expect(graph['3'].inputs.text).toBe('')
+    })
+
+    test('a region for a subject the scene does not have stays degenerate', async () => {
+        harness.db.comfyConfig.workflow = JSON.stringify({
+            '1': {
+                inputs: {
+                    text: '{{risu_subject_1}}{{risu_subject_2}}{{risu_subject_3}}',
+                    x: '{{risu_subject_3_left}}', y: '{{risu_subject_3_top}}',
+                    width: '{{risu_subject_3_width}}', height: '{{risu_subject_3_height}}',
+                    strength: '{{risu_subject_3_strength}}',
+                },
+                class_type: 'ConditioningSetAreaPercentage',
+            },
+        })
+        const graph = await dispatch(twoSubjects([{ x: 0.25, y: 0.5 }, { x: 0.75, y: 0.5 }]))
+        const inputs = graph['1'].inputs
+
+        expect(inputs.x).toBe(0)
+        expect(inputs.y).toBe(0)
+        expect(inputs.width).toBeGreaterThan(0)
+        expect(inputs.width).toBeLessThan(1)
+        expect(inputs.height).toBeGreaterThan(0)
+        expect(inputs.height).toBeLessThan(1)
+        expect(inputs.strength).toBe(0)
+        for (const value of [inputs.x, inputs.y, inputs.width, inputs.height, inputs.strength]) {
+            expect(typeof value).toBe('number')
+        }
     })
 
     test('an unplaced subject gets the whole canvas, not a corner', async () => {
@@ -213,6 +240,7 @@ describe('comfy per-subject placeholders', () => {
                 inputs: {
                     x: '{{risu_subject_2_left}}', y: '{{risu_subject_2_top}}',
                     width: '{{risu_subject_2_width}}', height: '{{risu_subject_2_height}}',
+                    strength: '{{risu_subject_2_strength}}',
                     text: '{{risu_subject_1}}{{risu_subject_2}}',
                 },
                 class_type: 'ConditioningSetAreaPercentage',
@@ -226,6 +254,7 @@ describe('comfy per-subject placeholders', () => {
         expect(graph['1'].inputs.y).toBe(0)
         expect(graph['1'].inputs.width).toBe(1)
         expect(graph['1'].inputs.height).toBe(1)
+        expect(graph['1'].inputs.strength).toBe(1)
     })
 
     test('a placeholder embedded in a larger string stays text', async () => {
@@ -330,5 +359,40 @@ describe('comfy per-subject placeholders', () => {
         expect(graph['3'].inputs.text).toBe('')
         expect(graph['5'].inputs.x).toBe(0)
         expect(graph['7'].inputs.note).toBe('subjects: 0')
+    })
+
+    test('a scene with no subjects still substitutes complete region geometry', async () => {
+        harness.db.comfyConfig.workflow = JSON.stringify({
+            '1': {
+                inputs: {
+                    text: '{{risu_subject_1}}',
+                    x: '{{risu_subject_1_left}}', y: '{{risu_subject_1_top}}',
+                    width: '{{risu_subject_1_width}}', height: '{{risu_subject_1_height}}',
+                    strength: '{{risu_subject_1_strength}}',
+                },
+                class_type: 'ConditioningSetAreaPercentage',
+            },
+        })
+        const graph = await dispatch({
+            schemaVersion: 1,
+            layout: 'flat',
+            basePositive: 'base positive',
+            characterPositives: [],
+            baseNegative: 'base negative',
+            characterNegatives: [],
+        })
+        const inputs = graph['1'].inputs
+
+        expect(inputs.text).toBe('')
+        expect(inputs.x).toBe(0)
+        expect(inputs.y).toBe(0)
+        expect(inputs.width).toBeGreaterThan(0)
+        expect(inputs.width).toBeLessThan(1)
+        expect(inputs.height).toBeGreaterThan(0)
+        expect(inputs.height).toBeLessThan(1)
+        expect(inputs.strength).toBe(0)
+        for (const value of [inputs.x, inputs.y, inputs.width, inputs.height, inputs.strength]) {
+            expect(typeof value).toBe('number')
+        }
     })
 })
