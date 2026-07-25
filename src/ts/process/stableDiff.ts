@@ -208,20 +208,26 @@ async function generateAIImageInternal(
 
         let reqlist:any = {}
 
-        // Illustration character captions are text-only. With coordinate
-        // placement disabled, the existing NAI schema represents that as an
-        // empty centers array and preserves the plugin's subject order.
+        // Character captions can be placed regionally. Placement is opt-in and
+        // driven entirely by the caller: `use_coords` turns on only when the
+        // prompt actually carries a center, so every caller that does not ask
+        // for placement keeps producing the exact request it produced before.
+        //
+        // A caption with no center of its own gets an empty centers array,
+        // which is what the schema already used for "unplaced".
+        const naiCenters = options.illustrationPrompt?.layout === 'nai-v4-characters'
+            ? (options.illustrationPrompt.characterCenters ?? [])
+            : []
+        const useCoords = naiCenters.some((center) => center !== null && center !== undefined)
+        const toCaption = (char_caption: string, index: number) => ({
+            char_caption,
+            centers: naiCenters[index] ? [naiCenters[index]] : ([] as Array<{ x: number, y: number }>),
+        })
         const characterPositives = options.illustrationPrompt?.layout === 'nai-v4-characters'
-            ? options.illustrationPrompt.characterPositives.map((char_caption) => ({
-                char_caption,
-                centers: [] as Array<{ x: number, y: number }>,
-            }))
+            ? options.illustrationPrompt.characterPositives.map(toCaption)
             : []
         const characterNegatives = options.illustrationPrompt?.layout === 'nai-v4-characters'
-            ? options.illustrationPrompt.characterNegatives.map((char_caption) => ({
-                char_caption,
-                centers: [] as Array<{ x: number, y: number }>,
-            }))
+            ? options.illustrationPrompt.characterNegatives.map(toCaption)
             : []
 
         const commonReq = {
@@ -254,14 +260,16 @@ async function generateAIImageInternal(
                     "legacy": false,
                     //add v4
                     "autoSmea": false,
-                    "use_coords": false,
+                    "use_coords": useCoords,
                     "legacy_uc": db.NAIImgConfig.legacy_uc,
                     "v4_prompt":{
                         caption:{
                             base_caption:genPrompt,
                             char_captions: characterPositives
                         },
-                        use_coords: false,
+                        use_coords: useCoords,
+                        // Order still identifies which caption is which subject
+                        // even when coordinates place them, so it stays on.
                         use_order: true,
                     },
                     "v4_negative_prompt":{
@@ -619,6 +627,60 @@ async function generateAIImageInternal(
                 prompt[negNodeID].inputs[negInputName] = neg
             }
             else{
+                // Regional prompting lives in the user's own workflow: Comfy
+                // expresses regions with several CLIPTextEncode nodes wired
+                // into conditioning-area/combine nodes, and only the workflow
+                // author knows which arrangement they want. So this does not
+                // build or patch a graph — it extends the documented
+                // {{risu_prompt}} placeholder contract with per-subject values
+                // the workflow can pull into whichever node it likes.
+                //
+                //   {{risu_subject_N}}      caption for subject N (1-based)
+                //   {{risu_subject_N_neg}}  its negative caption
+                //   {{risu_subject_N_x}}    normalized centre, 0..1
+                //   {{risu_subject_N_y}}
+                //   {{risu_subject_count}}  how many subjects this scene has
+                //
+                // A placeholder for a subject the scene does not have resolves
+                // to empty (or 0), so one workflow can serve scenes with fewer
+                // subjects than it has regions.
+                const subjectPositives = options.illustrationPrompt?.layout === 'nai-v4-characters'
+                    ? options.illustrationPrompt.characterPositives
+                    : []
+                const subjectNegatives = options.illustrationPrompt?.layout === 'nai-v4-characters'
+                    ? options.illustrationPrompt.characterNegatives
+                    : []
+                const subjectCenters = options.illustrationPrompt?.layout === 'nai-v4-characters'
+                    ? (options.illustrationPrompt.characterCenters ?? [])
+                    : []
+
+                const substituteText = (value: string) => {
+                    let next = value
+                        .replaceAll('{{risu_prompt}}', genPrompt)
+                        .replaceAll('{{risu_neg}}', neg)
+                        .replaceAll('{{risu_subject_count}}', String(subjectPositives.length))
+                    next = next.replace(
+                        /\{\{risu_subject_(\d+)(_neg|_x|_y)?\}\}/g,
+                        (_match, ordinal: string, suffix: string | undefined) => {
+                            const index = Number(ordinal) - 1
+                            if (!Number.isInteger(index) || index < 0) return ''
+                            switch (suffix) {
+                                case '_neg': return subjectNegatives[index] ?? ''
+                                case '_x': return String(subjectCenters[index]?.x ?? 0)
+                                case '_y': return String(subjectCenters[index]?.y ?? 0)
+                                default: return subjectPositives[index] ?? ''
+                            }
+                        },
+                    )
+                    return next
+                }
+
+                // Comfy area nodes take numbers, not strings. An input whose
+                // ENTIRE value is a coordinate placeholder becomes a number;
+                // one embedded in a larger string stays text.
+                const NUMERIC_PLACEHOLDER = /^\{\{risu_subject_(\d+)(_x|_y)\}\}$/
+                const NUMERIC_COUNT_PLACEHOLDER = '{{risu_subject_count}}'
+
                 //search all nodes for the prompt and negative prompt
                 const keys = Object.keys(prompt)
                 for(let i = 0; i < keys.length; i++){
@@ -627,8 +689,19 @@ async function generateAIImageInternal(
                     for(let j = 0; j < inputKeys.length; j++){
                         let input = node.inputs[inputKeys[j]]
                         if(typeof input === 'string'){
-                            input = input.replaceAll('{{risu_prompt}}', genPrompt) 
-                            input = input.replaceAll('{{risu_neg}}', neg)
+                            const trimmed = input.trim()
+                            const numeric = NUMERIC_PLACEHOLDER.exec(trimmed)
+                            if(numeric){
+                                const index = Number(numeric[1]) - 1
+                                const center = subjectCenters[index]
+                                input = (numeric[2] === '_x' ? center?.x : center?.y) ?? 0
+                            }
+                            else if(trimmed === NUMERIC_COUNT_PLACEHOLDER){
+                                input = subjectPositives.length
+                            }
+                            else{
+                                input = substituteText(input)
+                            }
                         }
 
                         if(inputKeys[j] === 'seed' && typeof input === 'number'){

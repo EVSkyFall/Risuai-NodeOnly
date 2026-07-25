@@ -46,6 +46,9 @@ export type IllustrationTargetV1 = {
     sourceRevisionHash: string
 }
 
+/** Normalized [0,1] placement for one character caption. */
+export type IllustrationPromptCenterV1 = { x: number; y: number }
+
 export type IllustrationPromptV1 = {
     schemaVersion: 1
     layout: 'flat' | 'nai-v4-characters'
@@ -53,6 +56,16 @@ export type IllustrationPromptV1 = {
     characterPositives: string[]
     baseNegative: string
     characterNegatives: string[]
+    /**
+     * Optional per-character placement, parallel to `characterPositives`.
+     * `null` for a character the caller does not want to place.
+     *
+     * Absent means "no placement requested", which is the pre-existing
+     * behaviour: captions are ordered but not positioned. It is optional
+     * rather than required so that every caller written before regional
+     * placement existed keeps producing byte-identical requests.
+     */
+    characterCenters?: Array<IllustrationPromptCenterV1 | null>
 }
 
 export type LegacyIllustrationJobPromptV1 = {

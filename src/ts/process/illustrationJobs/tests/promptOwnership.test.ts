@@ -186,3 +186,82 @@ describe('illustration prompt ownership', () => {
         expect(harness.globalFetch.mock.calls[0][1].body).toEqual(legacyRequest)
     })
 })
+
+// Regional placement is opt-in and driven entirely by the prompt: `use_coords`
+// is a property of the scene being drawn, not a global setting, because a
+// one-subject scene has nothing to place.
+describe('regional character placement', () => {
+    const character = { chaId: 'character-1', image: '', newGenData: {} } as any
+
+    const dispatch = async (characterCenters?: Array<{ x: number, y: number } | null>) => {
+        await generateAIImageTyped(
+            'base positive',
+            character,
+            'base negative',
+            'inlay',
+            'background',
+            {
+                preservePromptText: true,
+                illustrationPrompt: {
+                    schemaVersion: 1,
+                    layout: 'nai-v4-characters',
+                    basePositive: 'base positive',
+                    characterPositives: ['left subject', 'right subject'],
+                    baseNegative: 'base negative',
+                    characterNegatives: ['', ''],
+                    ...(characterCenters ? { characterCenters } : {}),
+                },
+            },
+        )
+        return harness.globalFetch.mock.calls[0][1].body.parameters
+    }
+
+    test('a prompt with no placement produces the request it always produced', async () => {
+        const parameters = await dispatch()
+
+        expect(parameters.use_coords).toBe(false)
+        expect(parameters.v4_prompt.use_coords).toBe(false)
+        expect(parameters.v4_prompt.caption.char_captions).toEqual([
+            { char_caption: 'left subject', centers: [] },
+            { char_caption: 'right subject', centers: [] },
+        ])
+    })
+
+    test('supplied centres turn coordinate placement on and travel with their caption', async () => {
+        const parameters = await dispatch([{ x: 0.25, y: 0.5 }, { x: 0.75, y: 0.5 }])
+
+        expect(parameters.use_coords).toBe(true)
+        expect(parameters.v4_prompt.use_coords).toBe(true)
+        // Order still identifies which caption belongs to which subject.
+        expect(parameters.v4_prompt.use_order).toBe(true)
+        expect(parameters.v4_prompt.caption.char_captions).toEqual([
+            { char_caption: 'left subject', centers: [{ x: 0.25, y: 0.5 }] },
+            { char_caption: 'right subject', centers: [{ x: 0.75, y: 0.5 }] },
+        ])
+    })
+
+    test('an unplaced subject in a placed scene keeps its caption and stays unplaced', async () => {
+        const parameters = await dispatch([{ x: 0.25, y: 0.5 }, null])
+
+        expect(parameters.use_coords).toBe(true)
+        expect(parameters.v4_prompt.caption.char_captions).toEqual([
+            { char_caption: 'left subject', centers: [{ x: 0.25, y: 0.5 }] },
+            { char_caption: 'right subject', centers: [] },
+        ])
+    })
+
+    test('an all-null placement array is treated as no placement at all', async () => {
+        const parameters = await dispatch([null, null])
+
+        expect(parameters.use_coords).toBe(false)
+    })
+
+    test('negative captions are placed alongside their positive counterpart', async () => {
+        const parameters = await dispatch([{ x: 0.25, y: 0.5 }, { x: 0.75, y: 0.5 }])
+
+        expect(parameters.v4_negative_prompt.caption.char_captions).toEqual([
+            { char_caption: '', centers: [{ x: 0.25, y: 0.5 }] },
+            { char_caption: '', centers: [{ x: 0.75, y: 0.5 }] },
+        ])
+    })
+})

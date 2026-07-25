@@ -216,7 +216,7 @@ describe('generateToInlay', () => {
         expect(response.status).toBe('succeeded')
     })
 
-    it('refuses per-character placement rather than dropping it silently', async () => {
+    it('forwards per-character placement instead of dropping it', async () => {
         const deps = makeDeps()
         const api = createPluginImagesApi(deps)
         const response = await api.generateToInlay(generateInput({
@@ -226,14 +226,92 @@ describe('generateToInlay', () => {
                 negative: '',
                 characters: [
                     { positive: '1girl, silver hair', negative: '', center: { x: 0.25, y: 0.5 } },
-                    { positive: '1girl, dark hair', negative: '' },
+                    { positive: '1girl, dark hair', negative: '', center: { x: 0.75, y: 0.5 } },
                 ],
             },
         }))
 
+        expect(response.status).toBe('succeeded')
+        expect(deps.generated[0].prompt.characterCenters).toEqual([
+            { x: 0.25, y: 0.5 },
+            { x: 0.75, y: 0.5 },
+        ])
+    })
+
+    it('keeps an unplaced character as an explicit null rather than shifting the others', async () => {
+        const deps = makeDeps()
+        const api = createPluginImagesApi(deps)
+        await api.generateToInlay(generateInput({
+            prompt: {
+                layout: 'nai-v4-characters',
+                positive: 'three figures',
+                negative: '',
+                characters: [
+                    { positive: 'a', negative: '', center: { x: 0.2, y: 0.5 } },
+                    { positive: 'b', negative: '' },
+                    { positive: 'c', negative: '', center: { x: 0.8, y: 0.5 } },
+                ],
+            },
+        }))
+
+        // Centres are matched to captions by index, so a dropped entry would
+        // place the wrong subject.
+        expect(deps.generated[0].prompt.characterCenters).toEqual([
+            { x: 0.2, y: 0.5 },
+            null,
+            { x: 0.8, y: 0.5 },
+        ])
+    })
+
+    it('omits the placement field entirely when nobody is placed', async () => {
+        const deps = makeDeps()
+        const api = createPluginImagesApi(deps)
+        await api.generateToInlay(generateInput({
+            prompt: {
+                layout: 'nai-v4-characters',
+                positive: 'two figures',
+                negative: '',
+                characters: [{ positive: 'a', negative: '' }, { positive: 'b', negative: '' }],
+            },
+        }))
+
+        // An unplaced request has to stay byte-identical to what it was before
+        // regional placement existed.
+        expect(Object.hasOwn(deps.generated[0].prompt, 'characterCenters')).toBe(false)
+    })
+
+    it('rejects a placement that is out of range or malformed', async () => {
+        const deps = makeDeps()
+        const api = createPluginImagesApi(deps)
+        const cases = [
+            { x: 1.5, y: 0.5 },
+            { x: -0.1, y: 0.5 },
+            { x: 0.5, y: Number.NaN },
+            { x: 0.5 },
+            { x: 0.5, y: 0.5, z: 0.5 },
+        ]
+        for (const center of cases) {
+            const response = await api.generateToInlay(generateInput({
+                prompt: {
+                    layout: 'nai-v4-characters',
+                    positive: 'two figures',
+                    negative: '',
+                    characters: [{ positive: 'a', negative: '', center }, { positive: 'b', negative: '' }],
+                },
+            }))
+            expect(response.status).toBe('definite_failure')
+        }
+        expect(deps.generated).toHaveLength(0)
+    })
+
+    it('rejects placement on a flat prompt, where it would do nothing', async () => {
+        const deps = makeDeps()
+        const api = createPluginImagesApi(deps)
+        const response = await api.generateToInlay(generateInput({
+            prompt: { ...FLAT_PROMPT, characters: [{ positive: 'a', center: { x: 0.5, y: 0.5 } }] },
+        }))
+
         expect(response.status).toBe('definite_failure')
-        if (response.status === 'succeeded') throw new Error('unreachable')
-        expect(response.code).toBe('image_prompt_unsupported_field')
         expect(deps.generated).toHaveLength(0)
     })
 

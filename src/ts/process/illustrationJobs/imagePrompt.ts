@@ -1,5 +1,6 @@
 import { IllustrationImagePromptContractError } from './errors'
 import type {
+    IllustrationPromptCenterV1,
     IllustrationPromptV1,
     IllustrationStoredPromptV1,
     LegacyIllustrationJobPromptV1,
@@ -19,6 +20,12 @@ const promptKeys = new Set([
     'characterPositives',
     'baseNegative',
     'characterNegatives',
+])
+
+// Additive, and optional on purpose: a caller written before regional
+// placement existed must keep producing a byte-identical request.
+const optionalPromptKeys = new Set([
+    'characterCenters',
 ])
 
 function invalidPrompt(message: string): never {
@@ -48,6 +55,52 @@ function assertStringArray(value: unknown, label: string): asserts value is stri
     }
 }
 
+function parseCharacterCenters(
+    value: unknown,
+    prompt: IllustrationPromptV1,
+): Array<IllustrationPromptCenterV1 | null> {
+    if (!Array.isArray(value)) {
+        invalidPrompt('prompt.characterCenters must be an array')
+    }
+    // Placement only means anything where there are character captions to
+    // place. Accepting it on a flat prompt would silently do nothing.
+    if (prompt.layout !== 'nai-v4-characters') {
+        invalidPrompt('prompt.characterCenters requires the nai-v4-characters layout')
+    }
+    // Parallel to the captions by index, so a length mismatch would place the
+    // wrong subject rather than fail.
+    if (value.length !== prompt.characterPositives.length) {
+        invalidPrompt('prompt.characterCenters must have one entry per character caption')
+    }
+    return value.map((entry, index) => {
+        const descriptor = Object.getOwnPropertyDescriptor(value, index)
+        if (!descriptor || !Object.hasOwn(descriptor, 'value')) {
+            invalidPrompt('prompt.characterCenters must be a dense array')
+        }
+        if (entry === null) return null
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+            invalidPrompt('prompt.characterCenters entries must be null or {x, y}')
+        }
+        const center = entry as Record<string, unknown>
+        const keys = Object.keys(center)
+        if (keys.length !== 2 || !keys.includes('x') || !keys.includes('y')) {
+            invalidPrompt('prompt.characterCenters entries must contain exactly x and y')
+        }
+        for (const axis of ['x', 'y'] as const) {
+            const coordinate = center[axis]
+            if (typeof coordinate !== 'number' || !Number.isFinite(coordinate)) {
+                invalidPrompt(`prompt.characterCenters ${axis} must be a finite number`)
+            }
+            // Normalized coordinates. Clamping a stray value would place a
+            // subject somewhere the caller never asked for, so reject instead.
+            if (coordinate < 0 || coordinate > 1) {
+                invalidPrompt(`prompt.characterCenters ${axis} must be within 0 and 1`)
+            }
+        }
+        return { x: center.x as number, y: center.y as number }
+    })
+}
+
 export function parseIllustrationPromptV1(value: unknown): IllustrationPromptV1 {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
         invalidPrompt('prompt must be an object')
@@ -55,13 +108,12 @@ export function parseIllustrationPromptV1(value: unknown): IllustrationPromptV1 
     const input = value as Record<string, unknown>
     const inputKeys = Object.keys(input)
     if (
-        inputKeys.length !== promptKeys.size
-        || inputKeys.some((key) => !promptKeys.has(key))
+        inputKeys.some((key) => !promptKeys.has(key) && !optionalPromptKeys.has(key))
         || [...promptKeys].some((key) => !Object.hasOwn(input, key))
     ) {
         invalidPrompt('prompt must contain exactly the IllustrationPromptV1 fields')
     }
-    for (const key of promptKeys) {
+    for (const key of [...promptKeys, ...inputKeys.filter((key) => optionalPromptKeys.has(key))]) {
         const descriptor = Object.getOwnPropertyDescriptor(input, key)
         if (!descriptor || !Object.hasOwn(descriptor, 'value')) {
             invalidPrompt('prompt fields must be plain data properties')
@@ -94,6 +146,9 @@ export function parseIllustrationPromptV1(value: unknown): IllustrationPromptV1 
         characterPositives: [...input.characterPositives],
         baseNegative: input.baseNegative,
         characterNegatives: [...input.characterNegatives],
+    }
+    if (Object.hasOwn(input, 'characterCenters')) {
+        prompt.characterCenters = parseCharacterCenters(input.characterCenters, prompt)
     }
     if (utf8PartBytes([prompt.basePositive, ...prompt.characterPositives])
         > MAX_ILLUSTRATION_PROMPT_BYTES) {

@@ -168,17 +168,13 @@ function toIllustrationPrompt(input: PluginImagePromptInput): IllustrationPrompt
         throw new PluginImageError('image_prompt_invalid', 'prompt must be an object')
     }
     const characters = Array.isArray(input.characters) ? input.characters : []
-    // A per-character center is a placement signal. The transport this maps
-    // onto carries text captions only, so dropping it would silently change
-    // the picture that was asked for — refuse instead.
-    for (const character of characters) {
-        if (character && typeof character === 'object' && character.center !== undefined) {
-            throw new PluginImageError(
-                'image_prompt_unsupported_field',
-                'per-character center placement is not supported by the configured transport',
-            )
-        }
-    }
+    // Per-character placement is regional prompting. It is forwarded, never
+    // dropped: silently discarding a placement would change the picture that
+    // was asked for. When no character carries one the field is omitted
+    // entirely, so an unplaced request stays byte-identical to before.
+    const placed = characters.some((character) => (
+        character && typeof character === 'object' && character.center !== undefined && character.center !== null
+    ))
     return parseIllustrationPromptV1({
         schemaVersion: 1,
         layout: input.layout,
@@ -186,6 +182,9 @@ function toIllustrationPrompt(input: PluginImagePromptInput): IllustrationPrompt
         baseNegative: String(input.negative ?? ''),
         characterPositives: characters.map((character) => String(character?.positive ?? '')),
         characterNegatives: characters.map((character) => String(character?.negative ?? '')),
+        ...(placed
+            ? { characterCenters: characters.map((character) => character?.center ?? null) }
+            : {}),
     })
 }
 
