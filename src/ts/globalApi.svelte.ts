@@ -26,6 +26,7 @@ import { deepTouch } from "./gui/deepTouch.svelte";
 import { updateLorebooks } from "./characters";
 import { initMobileGesture } from "./hotkey";
 import { moduleUpdate } from "./process/modules";
+import { recordDirectFetchFailure, recordDirectFetchSuccess, shouldSkipDirectFetch } from "./network/directFetchPolicy";
 import { isLocalNetworkUrl } from "./network/localNetwork";
 import { decodeProxyJobWsChunk, formatProxyStreamErrorMessage, parseProxyJobWsEvent } from "./network/proxyJobWs";
 import { pluginCustomKv } from "./plugins/pluginKvStorage";
@@ -2140,15 +2141,24 @@ export async function fetchNative(url: string, arg: {
         }
 
         // Try direct fetch first (upstream behavior), fall back to proxy on CORS/network error
+        if (shouldSkipDirectFetch(url, Date.now())) {
+            return await fetchViaProxy2(url, headers, realBody, {
+                ...arg,
+                signal: requestSignal
+            })
+        }
         try {
-            return await fetch(url, {
+            const response = await fetch(url, {
                 body: realBody as any,
                 headers: headers,
                 method: arg.method,
                 signal: requestSignal,
             })
+            recordDirectFetchSuccess(url)
+            return response
         } catch (e) {
             if (requestSignal?.aborted) throw e
+            recordDirectFetchFailure(url, Date.now())
             return await fetchViaProxy2(url, headers, realBody, {
                 ...arg,
                 signal: requestSignal
