@@ -118,6 +118,78 @@ describe('comfy per-subject placeholders', () => {
         }
     })
 
+    test('region geometry is a rectangle, because area nodes take a top-left corner and a size', async () => {
+        harness.db.comfyConfig.workflow = JSON.stringify({
+            '1': {
+                inputs: {
+                    x: '{{risu_subject_1_left}}', y: '{{risu_subject_1_top}}',
+                    width: '{{risu_subject_1_width}}', height: '{{risu_subject_1_height}}',
+                },
+                class_type: 'ConditioningSetAreaPercentage',
+            },
+            '2': {
+                inputs: {
+                    x: '{{risu_subject_2_left}}', y: '{{risu_subject_2_top}}',
+                    width: '{{risu_subject_2_width}}', height: '{{risu_subject_2_height}}',
+                },
+                class_type: 'ConditioningSetAreaPercentage',
+            },
+        })
+        // Feeding the CENTRE straight into these nodes would shift every region
+        // down and right by half a column.
+        const graph = await dispatch(twoSubjects([{ x: 0.25, y: 0.72 }, { x: 0.75, y: 0.5 }]))
+
+        // Full-height columns. Measured against a real generation: banding the
+        // vertical axis too confined two standing figures to the bottom third,
+        // making them small rather than near — the opposite of what foreground
+        // means. The vertical coordinate is depth, not height on screen.
+        expect(graph['1'].inputs.x).toBeCloseTo(0)
+        expect(graph['1'].inputs.width).toBeCloseTo(1 / 3)
+        expect(graph['1'].inputs.y).toBe(0)
+        expect(graph['1'].inputs.height).toBe(1)
+
+        expect(graph['2'].inputs.x).toBeCloseTo(2 / 3)
+        expect(graph['2'].inputs.width).toBeCloseTo(1 / 3)
+        expect(graph['2'].inputs.y).toBe(0)
+        expect(graph['2'].inputs.height).toBe(1)
+
+        for (const value of Object.values(graph['1'].inputs)) expect(typeof value).toBe('number')
+    })
+
+    test('a centre column resolves to the middle third', async () => {
+        harness.db.comfyConfig.workflow = JSON.stringify({
+            '1': {
+                inputs: { x: '{{risu_subject_1_left}}', width: '{{risu_subject_1_width}}', text: '{{risu_subject_2}}' },
+                class_type: 'ConditioningSetAreaPercentage',
+            },
+        })
+        const graph = await dispatch(twoSubjects([{ x: 0.5, y: 0.5 }, { x: 0.75, y: 0.5 }]))
+
+        expect(graph['1'].inputs.x).toBeCloseTo(1 / 3)
+        expect(graph['1'].inputs.width).toBeCloseTo(1 / 3)
+    })
+
+    test('an unplaced subject gets the whole canvas, not a corner', async () => {
+        harness.db.comfyConfig.workflow = JSON.stringify({
+            '1': {
+                inputs: {
+                    x: '{{risu_subject_2_left}}', y: '{{risu_subject_2_top}}',
+                    width: '{{risu_subject_2_width}}', height: '{{risu_subject_2_height}}',
+                    text: '{{risu_subject_1}}{{risu_subject_2}}',
+                },
+                class_type: 'ConditioningSetAreaPercentage',
+            },
+        })
+        const graph = await dispatch(twoSubjects([{ x: 0.25, y: 0.72 }, null]))
+
+        // A region node then degrades to "no restriction" rather than pinning
+        // the subject somewhere nobody asked for.
+        expect(graph['1'].inputs.x).toBe(0)
+        expect(graph['1'].inputs.y).toBe(0)
+        expect(graph['1'].inputs.width).toBe(1)
+        expect(graph['1'].inputs.height).toBe(1)
+    })
+
     test('a placeholder embedded in a larger string stays text', async () => {
         const graph = await dispatch(twoSubjects())
 
@@ -155,9 +227,11 @@ describe('comfy per-subject placeholders', () => {
         // The reverse direction is the dangerous one: a caption nothing asked
         // for is a subject dropped from the picture with no trace.
         expect(attempt.result.ok).toBe(false)
-        if (attempt.result.ok) throw new Error('unreachable')
-        expect(attempt.result.certainty).toBe('definite')
-        expect(attempt.result.reason).toMatch(/subject 2/)
+        // `strict` is off in this project, which weakens discriminated union
+        // narrowing; name the failure member explicitly.
+        const failure = attempt.result as Extract<typeof attempt.result, { ok: false }>
+        expect(failure.certainty).toBe('definite')
+        expect(failure.reason).toMatch(/subject 2/)
         // Nothing was posted, so nothing was paid.
         expect(harness.globalFetch).not.toHaveBeenCalled()
     })

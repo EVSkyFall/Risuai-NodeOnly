@@ -635,11 +635,21 @@ async function generateAIImageInternal(
                 // {{risu_prompt}} placeholder contract with per-subject values
                 // the workflow can pull into whichever node it likes.
                 //
-                //   {{risu_subject_N}}      caption for subject N (1-based)
-                //   {{risu_subject_N_neg}}  its negative caption
-                //   {{risu_subject_N_x}}    normalized centre, 0..1
+                //   {{risu_subject_N}}       caption for subject N (1-based)
+                //   {{risu_subject_N_neg}}   its negative caption
+                //   {{risu_subject_N_x}}     normalized CENTRE, 0..1
                 //   {{risu_subject_N_y}}
-                //   {{risu_subject_count}}  how many subjects this scene has
+                //   {{risu_subject_N_left}}  the region RECTANGLE, 0..1
+                //   {{risu_subject_N_top}}
+                //   {{risu_subject_N_width}}
+                //   {{risu_subject_N_height}}
+                //   {{risu_subject_count}}   how many subjects this scene has
+                //
+                // Both forms exist because the area nodes want a rectangle
+                // whose x/y is its TOP-LEFT corner, not a centre — feeding a
+                // centre straight into them shifts every region down and right.
+                // The rectangle is the grid cell the caller's own centre falls
+                // in, so it asserts nothing the caller did not already say.
                 //
                 // A placeholder for a subject the scene does not have resolves
                 // to empty (or 0), so one workflow can serve scenes with fewer
@@ -654,31 +664,63 @@ async function generateAIImageInternal(
                     ? (options.illustrationPrompt.characterCenters ?? [])
                     : []
 
-                const substituteText = (value: string) => {
-                    let next = value
-                        .replaceAll('{{risu_prompt}}', genPrompt)
-                        .replaceAll('{{risu_neg}}', neg)
-                        .replaceAll('{{risu_subject_count}}', String(subjectPositives.length))
-                    next = next.replace(
-                        /\{\{risu_subject_(\d+)(_neg|_x|_y)?\}\}/g,
-                        (_match, ordinal: string, suffix: string | undefined) => {
-                            const index = Number(ordinal) - 1
-                            if (!Number.isInteger(index) || index < 0) return ''
-                            switch (suffix) {
-                                case '_neg': return subjectNegatives[index] ?? ''
-                                case '_x': return String(subjectCenters[index]?.x ?? 0)
-                                case '_y': return String(subjectCenters[index]?.y ?? 0)
-                                default: return subjectPositives[index] ?? ''
-                            }
-                        },
-                    )
-                    return next
+                // The region is a full-height column, banded horizontally only.
+                //
+                // The vertical coordinate carries DEPTH, not height on screen:
+                // a foreground subject is nearer the camera, not lower in the
+                // frame. Banding vertically as well was measured against a real
+                // generation and it confined two standing figures to the bottom
+                // third — which made them small instead of near, the opposite of
+                // what foreground means. Horizontal placement measured correct
+                // in the same run, so only that becomes a boundary.
+                //
+                // An unplaced subject gets the whole canvas, so a region node
+                // degrades to "no restriction" rather than pinning it somewhere
+                // nobody asked for.
+                const GRID = [0, 1 / 3, 2 / 3, 1]
+                const columnFor = (value: number) => {
+                    for (let band = 0; band < 3; band += 1) {
+                        if (value < GRID[band + 1] || band === 2) {
+                            return { start: GRID[band], size: GRID[band + 1] - GRID[band] }
+                        }
+                    }
+                    return { start: 0, size: 1 }
+                }
+                const regionFor = (index: number) => {
+                    const centre = subjectCenters[index]
+                    if (!centre) return { left: 0, top: 0, width: 1, height: 1 }
+                    const horizontal = columnFor(centre.x)
+                    return { left: horizontal.start, width: horizontal.size, top: 0, height: 1 }
                 }
 
+                const subjectValue = (index: number, suffix: string | undefined): string | number => {
+                    if (!Number.isInteger(index) || index < 0) return ''
+                    switch (suffix) {
+                        case '_neg': return subjectNegatives[index] ?? ''
+                        case '_x': return subjectCenters[index]?.x ?? 0
+                        case '_y': return subjectCenters[index]?.y ?? 0
+                        case '_left': return regionFor(index).left
+                        case '_top': return regionFor(index).top
+                        case '_width': return regionFor(index).width
+                        case '_height': return regionFor(index).height
+                        default: return subjectPositives[index] ?? ''
+                    }
+                }
+
+                const SUBJECT_PLACEHOLDER = /\{\{risu_subject_(\d+)(_neg|_x|_y|_left|_top|_width|_height)?\}\}/g
+
+                const substituteText = (value: string) => value
+                    .replaceAll('{{risu_prompt}}', genPrompt)
+                    .replaceAll('{{risu_neg}}', neg)
+                    .replaceAll('{{risu_subject_count}}', String(subjectPositives.length))
+                    .replace(SUBJECT_PLACEHOLDER, (_match, ordinal: string, suffix: string | undefined) => (
+                        String(subjectValue(Number(ordinal) - 1, suffix))
+                    ))
+
                 // Comfy area nodes take numbers, not strings. An input whose
-                // ENTIRE value is a coordinate placeholder becomes a number;
-                // one embedded in a larger string stays text.
-                const NUMERIC_PLACEHOLDER = /^\{\{risu_subject_(\d+)(_x|_y)\}\}$/
+                // ENTIRE value is a geometry placeholder becomes a number; one
+                // embedded in a larger string stays text.
+                const NUMERIC_PLACEHOLDER = /^\{\{risu_subject_(\d+)(_x|_y|_left|_top|_width|_height)\}\}$/
                 const NUMERIC_COUNT_PLACEHOLDER = '{{risu_subject_count}}'
 
                 // A workflow with fewer regions than the scene has subjects
@@ -688,7 +730,7 @@ async function generateAIImageInternal(
                 // captions were actually consumed and refuse before posting.
                 const consumed = new Set<number>()
                 const noteConsumed = (value: string) => {
-                    for (const found of value.matchAll(/\{\{risu_subject_(\d+)(?:_neg|_x|_y)?\}\}/g)) {
+                    for (const found of value.matchAll(SUBJECT_PLACEHOLDER)) {
                         consumed.add(Number(found[1]))
                     }
                 }
@@ -705,9 +747,7 @@ async function generateAIImageInternal(
                             const trimmed = input.trim()
                             const numeric = NUMERIC_PLACEHOLDER.exec(trimmed)
                             if(numeric){
-                                const index = Number(numeric[1]) - 1
-                                const center = subjectCenters[index]
-                                input = (numeric[2] === '_x' ? center?.x : center?.y) ?? 0
+                                input = Number(subjectValue(Number(numeric[1]) - 1, numeric[2]))
                             }
                             else if(trimmed === NUMERIC_COUNT_PLACEHOLDER){
                                 input = subjectPositives.length
