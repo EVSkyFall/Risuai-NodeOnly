@@ -213,15 +213,21 @@ async function generateAIImageInternal(
         // prompt actually carries a center, so every caller that does not ask
         // for placement keeps producing the exact request it produced before.
         //
-        // A caption with no center of its own gets an empty centers array,
-        // which is what the schema already used for "unplaced".
+        // Every caption must carry a non-empty `centers`, on BOTH sides.
+        // Measured against the live API: an empty array is rejected with HTTP
+        // 500, so is omitting the key, and so is supplying centres on the
+        // positive captions but not the negative ones. Only "one centre per
+        // caption everywhere" is accepted. An unplaced caption therefore gets
+        // the middle of the canvas, which `use_coords: false` tells the
+        // provider to ignore in favour of caption order.
+        const NEUTRAL_CENTER = { x: 0.5, y: 0.5 }
         const naiCenters = options.illustrationPrompt?.layout === 'nai-v4-characters'
             ? (options.illustrationPrompt.characterCenters ?? [])
             : []
         const useCoords = naiCenters.some((center) => center !== null && center !== undefined)
         const toCaption = (char_caption: string, index: number) => ({
             char_caption,
-            centers: naiCenters[index] ? [naiCenters[index]] : ([] as Array<{ x: number, y: number }>),
+            centers: [naiCenters[index] ?? NEUTRAL_CENTER],
         })
         const characterPositives = options.illustrationPrompt?.layout === 'nai-v4-characters'
             ? options.illustrationPrompt.characterPositives.map(toCaption)

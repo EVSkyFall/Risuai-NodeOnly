@@ -43,6 +43,12 @@ vi.mock('lodash/random', () => ({
 
 const { generateAIImageTyped } = await import('../../stableDiff')
 
+// Measured against the live provider: a caption with an empty or absent
+// `centers` is rejected with HTTP 500, on both the positive and the negative
+// side. An unplaced caption therefore carries the middle of the canvas, which
+// `use_coords: false` tells the provider to ignore in favour of order.
+const NEUTRAL = { x: 0.5, y: 0.5 }
+
 beforeEach(() => {
     harness.db = {
         sdProvider: 'novelai',
@@ -136,10 +142,10 @@ describe('illustration prompt ownership', () => {
             const body = harness.globalFetch.mock.calls[0][1].body
             const parameters = body.parameters
             expect(parameters.v4_prompt.caption.char_captions).toEqual(
-                characterPositives.map((char_caption) => ({ char_caption, centers: [] })),
+                characterPositives.map((char_caption) => ({ char_caption, centers: [NEUTRAL] })),
             )
             expect(parameters.v4_negative_prompt.caption.char_captions).toEqual(
-                characterNegatives.map((char_caption) => ({ char_caption, centers: [] })),
+                characterNegatives.map((char_caption) => ({ char_caption, centers: [NEUTRAL] })),
             )
             expect(parameters.v4_prompt.caption.char_captions).toHaveLength(count)
             expect(parameters.v4_negative_prompt.caption.char_captions).toHaveLength(count)
@@ -222,8 +228,8 @@ describe('regional character placement', () => {
         expect(parameters.use_coords).toBe(false)
         expect(parameters.v4_prompt.use_coords).toBe(false)
         expect(parameters.v4_prompt.caption.char_captions).toEqual([
-            { char_caption: 'left subject', centers: [] },
-            { char_caption: 'right subject', centers: [] },
+            { char_caption: 'left subject', centers: [NEUTRAL] },
+            { char_caption: 'right subject', centers: [NEUTRAL] },
         ])
     })
 
@@ -246,7 +252,7 @@ describe('regional character placement', () => {
         expect(parameters.use_coords).toBe(true)
         expect(parameters.v4_prompt.caption.char_captions).toEqual([
             { char_caption: 'left subject', centers: [{ x: 0.25, y: 0.5 }] },
-            { char_caption: 'right subject', centers: [] },
+            { char_caption: 'right subject', centers: [NEUTRAL] },
         ])
     })
 
@@ -254,6 +260,32 @@ describe('regional character placement', () => {
         const parameters = await dispatch([null, null])
 
         expect(parameters.use_coords).toBe(false)
+    })
+
+    // Measured against the live provider, not inferred. Every one of these
+    // shapes was sent for real: an empty `centers`, an absent `centers`, and
+    // centres on the positive captions but not the negative ones each came
+    // back HTTP 500. Only one centre per caption on BOTH sides was accepted.
+    // The core used to send an empty array unconditionally, which means
+    // multi-character generation could not have worked at all.
+    test('every caption carries exactly one centre, on both sides, always', async () => {
+        for (const placement of [undefined, [null, null], [{ x: 0.25, y: 0.72 }, null]] as const) {
+            const parameters = await dispatch(placement as any)
+            const sides = [
+                parameters.v4_prompt.caption.char_captions,
+                parameters.v4_negative_prompt.caption.char_captions,
+            ]
+            for (const captions of sides) {
+                expect(captions).toHaveLength(2)
+                for (const caption of captions) {
+                    expect(Array.isArray(caption.centers)).toBe(true)
+                    expect(caption.centers).toHaveLength(1)
+                    expect(typeof caption.centers[0].x).toBe('number')
+                    expect(typeof caption.centers[0].y).toBe('number')
+                }
+            }
+            harness.globalFetch.mockClear()
+        }
     })
 
     test('negative captions are placed alongside their positive counterpart', async () => {
