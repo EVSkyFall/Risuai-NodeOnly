@@ -1,5 +1,5 @@
 import { toGetter } from "../globalApi.svelte";
-import { clearPersistentPrefix, decodeStorageKeyComponent, listPersistentKeys, makeEncodedStorageKey, readPersistentJson, removePersistentKey, writePersistentJson } from "../storage/persistentKv";
+import { clearPersistentPrefix, decodeStorageKeyComponent, listPersistentKeys, makeEncodedStorageKey, readManyPersistentJson, readPersistentJson, removePersistentKey, writePersistentJson } from "../storage/persistentKv";
 import { recordOwner, removeOwner, clearOwners } from "./pluginStorageMeta";
 
 const pluginStorage = new Map<string, unknown>();
@@ -67,6 +67,57 @@ export class SafeLocalPluginStorage {
             pluginStorage.set(cacheKey, payload);
         }
         return payload;
+    }
+    async getMany<T>(keys: string[]): Promise<(T | null)[]> {
+        if (keys.length === 0) {
+            return [];
+        }
+
+        const result = new Array<T | null>(keys.length);
+        const missingKeys: string[] = [];
+        const missingSet = new Set<string>();
+
+        for (let i = 0; i < keys.length; i++) {
+            const key = keys[i];
+            const cacheKey = `safe_plugin_${key}`;
+            if (pluginStorage.has(cacheKey)) {
+                result[i] = (pluginStorage.get(cacheKey) as T) ?? null;
+            } else if (!missingSet.has(key)) {
+                missingSet.add(key);
+                missingKeys.push(key);
+            }
+        }
+
+        if (missingKeys.length === 0) {
+            return result;
+        }
+
+        const payloads = await readManyPersistentJson<T>(
+            missingKeys.map((key) => makeEncodedStorageKey(pluginStoragePrefix, key)),
+        );
+        if (!Array.isArray(payloads) || payloads.length !== missingKeys.length) {
+            throw new Error('SafeLocalPluginStorage.getMany returned a malformed result');
+        }
+
+        const payloadByKey = new Map<string, T | null>();
+        for (let i = 0; i < missingKeys.length; i++) {
+            payloadByKey.set(missingKeys[i], payloads[i] ?? null);
+        }
+
+        // Commit only after the complete bulk response has decoded and passed
+        // correlation checks. One corrupt row must not leave a partial cache.
+        for (const [key, payload] of payloadByKey) {
+            if (payload !== null) {
+                pluginStorage.set(`safe_plugin_${key}`, payload);
+            }
+        }
+
+        for (let i = 0; i < keys.length; i++) {
+            if (result[i] === undefined) {
+                result[i] = payloadByKey.get(keys[i]) ?? null;
+            }
+        }
+        return result;
     }
     async setItem<T>(key: string, value: T): Promise<void> {
         const cacheKey = `safe_plugin_${key}`;

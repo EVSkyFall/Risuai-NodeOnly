@@ -29,6 +29,7 @@ export interface alertData{
     stackTrace?: string;
     defaultValue?: string
     actions?: AlertAction[]
+    abovePlugin?: boolean
 }
 
 export interface NotifyOptions {
@@ -277,11 +278,12 @@ export async function alertSelectChar(){
     return get(alertStoreImported).msg
 }
 
-export async function alertConfirm(msg:string){
+export async function alertConfirm(msg:string, options?: { abovePlugin?: boolean }){
 
     alertStoreImported.set({
         'type': 'ask',
-        'msg': msg
+        'msg': msg,
+        'abovePlugin': options?.abovePlugin === true,
     })
 
     await waitAlert()

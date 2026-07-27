@@ -19,6 +19,7 @@
         closeOnEscape?: boolean;
         closeOnOutsideClick?: boolean;
         contentClass?: string;
+        overlayClass?: string;
         title?: Snippet;
         description?: Snippet;
         footer?: Snippet;
@@ -38,6 +39,7 @@
         closeOnEscape = false,
         closeOnOutsideClick = false,
         contentClass = '',
+        overlayClass = '',
         title,
         description,
         footer,
@@ -71,7 +73,7 @@
 <AlertDialog.Root bind:open {onOpenChange}>
     <AlertDialog.Portal>
         <AlertDialog.Overlay
-            class={cn('fixed inset-0 bg-black/50 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0', tierClasses[tier])}
+            class={cn('fixed inset-0 bg-black/50 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0', tierClasses[tier], overlayClass)}
         />
         <AlertDialog.Content
             class={cn(contentBase, tierClasses[tier], sizeClasses[size], contentClass)}

@@ -979,6 +979,13 @@ interface PluginStorage {
     getItem(key: string): Promise<any | null>;
 
     /**
+     * Gets multiple items in input order, preserving duplicates and nulls.
+     * @param keys - Storage keys
+     * @returns Promise resolving to one value per input key
+     */
+    getMany(keys: string[]): Promise<(any | null)[]>;
+
+    /**
      * Sets an item in storage
      * @param key - Storage key
      * @param value - Value to store (any JSON-serializable value)
@@ -1223,6 +1230,13 @@ interface SafeLocalPluginStorage {
      * @returns Promise resolving to stored value or null
      */
     getItem<T>(key: string): Promise<T | null>;
+
+    /**
+     * Gets multiple items in input order, preserving duplicates and nulls.
+     * @param keys - Storage keys
+     * @returns Promise resolving to one value per input key
+     */
+    getMany<T>(keys: string[]): Promise<(T | null)[]>;
 
     /**
      * Sets an item in storage

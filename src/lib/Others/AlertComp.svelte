@@ -878,6 +878,8 @@
 <ShAlertDialog
     open={$alertStore.type === 'ask'}
     closeOnOutsideClick={true}
+    overlayClass={$alertStore.abovePlugin ? 'z-[1100]' : ''}
+    contentClass={$alertStore.abovePlugin ? 'z-[1100]' : ''}
     onOpenChange={(v) => {
         if (!v && $alertStore.type === 'ask') {
             alertStore.set({ type: 'none', msg: 'no' })

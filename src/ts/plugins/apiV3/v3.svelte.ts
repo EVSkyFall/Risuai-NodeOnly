@@ -763,7 +763,7 @@ const getPluginPermission = async (pluginName: string, permissionDesc: PluginPer
             return false;
         }
         const permissionKey = permissionKeyOf(pluginName, permissionDesc);
-        const conf = await alertConfirm(alertTitle)
+        const conf = await alertConfirm(alertTitle, { abovePlugin: true })
         if(conf && pluginHash){
             permissionGivenPlugins.add(permissionKey);
             permissionDeniedPlugins.delete(permissionKey);
@@ -1399,6 +1399,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
             return v;
         },
         _getPluginStorage: oldApis.pluginStorage.getItem,
+        _getManyPluginStorage: (keys: string[]) => keys.map((key) => oldApis.pluginStorage.getItem(key)),
         // Wrapped (not aliased) so we can record the originating plugin into the
         // sidecar meta map. The value write is unchanged; reads stay aliased.
         _setPluginStorage: (key: string, value: any) => {
@@ -1478,6 +1479,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
             return {
                 'pluginStorage':{
                     'getItem': '_getPluginStorage',
+                    'getMany': '_getManyPluginStorage',
                     'setItem': '_setPluginStorage',
                     'removeItem': '_removePluginStorage',
                     'clear': '_clearPluginStorage',
