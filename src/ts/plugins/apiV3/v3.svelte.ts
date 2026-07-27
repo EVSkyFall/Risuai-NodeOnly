@@ -1453,6 +1453,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
         _measurePluginImagePrompt: (input: any) => pluginImagesApi.measurePrompt(input),
         _generatePluginImageToInlay: (input: any) => pluginImagesApi.generateToInlay(input),
         _removePluginInlay: (input: any) => pluginImagesApi.remove(input),
+        _readPluginInlay: (input: any) => pluginImagesApi.read(input),
         getCapabilities: async () => {
             // Generic, illustration-agnostic capability handshake (request §3).
             // Additive only — the illustration bridge keeps its own separate
@@ -1513,6 +1514,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
                 },
                 'pluginInlays':{
                     'remove': '_removePluginInlay',
+                    'read': '_readPluginInlay',
                 },
                 ...(illustrationBridge?.aliases ?? {})
             }

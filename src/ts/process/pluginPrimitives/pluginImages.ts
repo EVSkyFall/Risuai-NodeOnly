@@ -20,7 +20,7 @@ import { getDatabase } from 'src/ts/storage/database.svelte'
 import type { character } from 'src/ts/storage/database.svelte'
 import { getCurrentCharacter } from 'src/ts/storage/database.svelte'
 import { generateAIImageTyped, type ImageGenerationAttempt, type ImageGenerationResult } from '../stableDiff'
-import { removeInlayAsset, writeInlayImage } from '../files/inlays'
+import { getInlayAsset, removeInlayAsset, writeInlayImage } from '../files/inlays'
 import { parseIllustrationPromptV1 } from '../illustrationJobs/imagePrompt'
 import { measureImagePrompt } from '../illustrationJobs/imagePromptMeasurement'
 import {
@@ -108,6 +108,27 @@ export interface PluginInlayRemoveInput {
 
 export type PluginInlayRemoveResult =
     | { status: 'succeeded' }
+    | { status: 'definite_failure'; error: string; code: string }
+
+export interface PluginInlayReadInput {
+    assetId: string
+}
+
+// Reading is free and local, but it answers with the same envelope family as
+// the rest of this surface so a sandbox caller handles one shape, not two.
+export type PluginInlayReadResult =
+    | {
+        status: 'succeeded'
+        result: {
+            assetId: string
+            /** Always a browser-ready data: URL, whatever shape storage held. */
+            dataUrl: string
+            ext: string
+            name: string
+            width?: number
+            height?: number
+        }
+    }
     | { status: 'definite_failure'; error: string; code: string }
 
 export class PluginImageError extends Error {
@@ -224,6 +245,14 @@ export interface PluginImagesDependencies {
     }>
     writeInlay(dataUrl: string, assetId: string): Promise<string>
     removeInlay(assetId: string): Promise<void>
+    readInlay(assetId: string): Promise<{
+        data: string
+        ext: string
+        name: string
+        type: string
+        width?: number
+        height?: number
+    } | null>
 }
 
 export interface PluginImagesApi {
@@ -233,6 +262,7 @@ export interface PluginImagesApi {
 
 export interface PluginInlaysApi {
     remove(input: PluginInlayRemoveInput): Promise<PluginInlayRemoveResult>
+    read(input: PluginInlayReadInput): Promise<PluginInlayReadResult>
 }
 
 export function createPluginImagesApi(deps: PluginImagesDependencies): PluginImagesApi & PluginInlaysApi {
@@ -420,6 +450,50 @@ export function createPluginImagesApi(deps: PluginImagesDependencies): PluginIma
                 }
             }
         },
+
+        async read(input) {
+            const assetId = String(input?.assetId ?? '')
+            if (!assetId) {
+                return { status: 'definite_failure', error: 'assetId must be a non-empty string', code: 'inlay_asset_id_invalid' }
+            }
+            let asset: Awaited<ReturnType<PluginImagesDependencies['readInlay']>>
+            try {
+                asset = await deps.readInlay(assetId)
+            } catch (error) {
+                return {
+                    status: 'definite_failure',
+                    error: error instanceof Error ? error.message : String(error),
+                    code: 'inlay_read_failed',
+                }
+            }
+            if (!asset) {
+                return { status: 'definite_failure', error: 'no inlay asset exists with this id', code: 'inlay_not_found' }
+            }
+            if (asset.type !== 'image') {
+                return { status: 'definite_failure', error: `the inlay is ${asset.type}, not an image`, code: 'inlay_not_image' }
+            }
+            const data = String(asset.data ?? '')
+            if (!data) {
+                return { status: 'definite_failure', error: 'the inlay asset holds no data', code: 'inlay_data_empty' }
+            }
+            // Storage hands back either a full data: URL (assets that lived as
+            // Blobs) or a bare base64 string (assets that lived as strings).
+            // The caller gets one shape regardless.
+            const dataUrl = data.startsWith('data:')
+                ? data
+                : `data:image/${asset.ext || 'png'};base64,${data}`
+            return {
+                status: 'succeeded',
+                result: {
+                    assetId,
+                    dataUrl,
+                    ext: asset.ext || '',
+                    name: asset.name || '',
+                    ...(Number.isFinite(asset.width) ? { width: Number(asset.width) } : {}),
+                    ...(Number.isFinite(asset.height) ? { height: Number(asset.height) } : {}),
+                },
+            }
+        },
     }
 }
 
@@ -457,6 +531,7 @@ export const defaultPluginImagesDependencies: PluginImagesDependencies = {
         return await writeInlayImage(image, { id: assetId, name: assetId })
     },
     removeInlay: async (assetId) => { await removeInlayAsset(assetId) },
+    readInlay: async (assetId) => await getInlayAsset(assetId),
 }
 
 export function createDefaultPluginImagesApi(): PluginImagesApi & PluginInlaysApi {

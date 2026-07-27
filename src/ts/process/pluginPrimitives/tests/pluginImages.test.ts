@@ -19,6 +19,9 @@ vi.mock('../../files/inlays', () => ({
     removeInlayAsset: async () => {
         throw new Error('the default inlay path must never run in tests')
     },
+    getInlayAsset: async () => {
+        throw new Error('the default inlay path must never run in tests')
+    },
 }))
 vi.mock('../../illustrationJobs/imagePromptMeasurement', () => ({
     measureImagePrompt: async () => {
@@ -83,6 +86,9 @@ function makeDeps(overrides: Partial<PluginImagesDependencies> = {}): PluginImag
         },
         async removeInlay(assetId: string) {
             removed.push(assetId)
+        },
+        async readInlay(_assetId: string) {
+            return { data: 'QUFBQQ==', ext: 'png', name: 'ri-asset-1', type: 'image', width: 1216, height: 832 }
         },
         ...overrides,
     }
@@ -446,5 +452,89 @@ describe('inlay removal', () => {
         expect(response.status).toBe('definite_failure')
         if (response.status === 'succeeded') throw new Error('unreachable')
         expect(response.code).toBe('inlay_remove_failed')
+    })
+})
+
+describe('inlay read', () => {
+    it('wraps a bare base64 payload into a browser-ready data URL', async () => {
+        const api = createPluginImagesApi(makeDeps())
+        const response = await api.read({ assetId: 'ri-asset-1' })
+
+        expect(response.status).toBe('succeeded')
+        if (response.status !== 'succeeded') throw new Error('unreachable')
+        expect(response.result).toEqual({
+            assetId: 'ri-asset-1',
+            dataUrl: 'data:image/png;base64,QUFBQQ==',
+            ext: 'png',
+            name: 'ri-asset-1',
+            width: 1216,
+            height: 832,
+        })
+    })
+
+    it('passes a stored data: URL through untouched', async () => {
+        const api = createPluginImagesApi(makeDeps({
+            readInlay: async () => ({
+                data: 'data:image/webp;base64,QkJCQg==', ext: 'webp', name: 'n', type: 'image',
+            }),
+        }))
+        const response = await api.read({ assetId: 'ri-asset-1' })
+
+        expect(response.status).toBe('succeeded')
+        if (response.status !== 'succeeded') throw new Error('unreachable')
+        expect(response.result.dataUrl).toBe('data:image/webp;base64,QkJCQg==')
+    })
+
+    it('reports a missing asset as terminal, never as an empty image', async () => {
+        const api = createPluginImagesApi(makeDeps({ readInlay: async () => null }))
+        const response = await api.read({ assetId: 'gone' })
+
+        expect(response.status).toBe('definite_failure')
+        if (response.status === 'succeeded') throw new Error('unreachable')
+        expect(response.code).toBe('inlay_not_found')
+    })
+
+    it('refuses a non-image inlay instead of handing back unrenderable bytes', async () => {
+        const api = createPluginImagesApi(makeDeps({
+            readInlay: async () => ({ data: 'QUFBQQ==', ext: 'mp3', name: 'n', type: 'audio' }),
+        }))
+        const response = await api.read({ assetId: 'ri-asset-1' })
+
+        expect(response.status).toBe('definite_failure')
+        if (response.status === 'succeeded') throw new Error('unreachable')
+        expect(response.code).toBe('inlay_not_image')
+    })
+
+    it('rejects an empty asset id without touching storage', async () => {
+        const readInlay = vi.fn()
+        const api = createPluginImagesApi(makeDeps({ readInlay }))
+        const response = await api.read({ assetId: '' })
+
+        expect(response.status).toBe('definite_failure')
+        if (response.status === 'succeeded') throw new Error('unreachable')
+        expect(response.code).toBe('inlay_asset_id_invalid')
+        expect(readInlay).not.toHaveBeenCalled()
+    })
+
+    it('reports a storage throw as a read failure', async () => {
+        const api = createPluginImagesApi(makeDeps({
+            readInlay: async () => { throw new Error('storage offline') },
+        }))
+        const response = await api.read({ assetId: 'ri-asset-1' })
+
+        expect(response.status).toBe('definite_failure')
+        if (response.status === 'succeeded') throw new Error('unreachable')
+        expect(response.code).toBe('inlay_read_failed')
+    })
+
+    it('reports an asset with no data as terminal', async () => {
+        const api = createPluginImagesApi(makeDeps({
+            readInlay: async () => ({ data: '', ext: 'png', name: 'n', type: 'image' }),
+        }))
+        const response = await api.read({ assetId: 'ri-asset-1' })
+
+        expect(response.status).toBe('definite_failure')
+        if (response.status === 'succeeded') throw new Error('unreachable')
+        expect(response.code).toBe('inlay_data_empty')
     })
 })
