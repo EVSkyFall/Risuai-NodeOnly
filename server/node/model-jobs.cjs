@@ -183,6 +183,20 @@ function createModelJobs(opts = {}) {
         db.exec(`ALTER TABLE model_jobs ADD COLUMN kind TEXT NOT NULL DEFAULT 'main'`);
     } catch { /* column already present */ }
 
+    // Resumable sends: one tombstone per chat marking "a send was started here
+    // and has not concluded". Holds NO pipeline state — the send's durable
+    // ingredients live elsewhere (user message in chat data, hypa partials in
+    // hypaV3Data, the main response in the job journal). A returning client
+    // lists these, applies its idempotency checks, and re-runs the send when
+    // the response truly never made it. See the design note §C.
+    db.exec(`
+        CREATE TABLE IF NOT EXISTS pending_sends (
+            chat_id TEXT PRIMARY KEY,
+            generation_id TEXT,
+            created_at INTEGER NOT NULL
+        );
+    `);
+
     const stmtInsert = db.prepare(`
         INSERT INTO model_jobs (id, chat_id, generation_id, adapter_kind, kind, streaming, status, created_at)
         VALUES (?, ?, ?, ?, ?, ?, 'running', ?)
@@ -219,6 +233,16 @@ function createModelJobs(opts = {}) {
     const stmtTerminalExpired = db.prepare(`
         SELECT id FROM model_jobs WHERE status IN ('done', 'failed', 'aborted') AND (claimed = 1 OR kind = 'aux') AND ended_at < ?
     `);
+    const stmtPendingUpsert = db.prepare(`
+        INSERT INTO pending_sends (chat_id, generation_id, created_at) VALUES (?, ?, ?)
+        ON CONFLICT(chat_id) DO UPDATE SET generation_id = excluded.generation_id, created_at = excluded.created_at
+    `);
+    const stmtPendingDelete = db.prepare(`DELETE FROM pending_sends WHERE chat_id = ?`);
+    const stmtPendingList = db.prepare(`SELECT * FROM pending_sends ORDER BY created_at ASC`);
+    // A pending send this old is noise (the one-shot resume window has long
+    // passed); swept by the same out-of-band cleanup timer as terminal jobs.
+    const stmtPendingExpired = db.prepare(`DELETE FROM pending_sends WHERE created_at < ?`);
+    const PENDING_SEND_MAX_AGE_MS = 48 * 60 * 60 * 1000;
 
     // In-memory state for running jobs: abort controller + live byte counter
     // (the DB `bytes` column is only finalized at job end) + a notify list of
@@ -306,6 +330,41 @@ function createModelJobs(opts = {}) {
             stmtDelete.run(id);
             deleteJobFiles(id);
         }
+        stmtPendingExpired.run(Date.now() - PENDING_SEND_MAX_AGE_MS);
+    }
+
+    // --- pending sends ------------------------------------------------------
+
+    function registerPendingSend(arg) {
+        const chatId = typeof arg?.chatId === 'string' ? arg.chatId : '';
+        if (!chatId) return { error: 'chatId is required', httpStatus: 400 };
+        stmtPendingUpsert.run(
+            chatId,
+            typeof arg.generationId === 'string' ? arg.generationId : null,
+            Date.now()
+        );
+        return { success: true };
+    }
+
+    function clearPendingSend(chatId) {
+        stmtPendingDelete.run(chatId);
+        return { success: true };
+    }
+
+    // Atomic take: delete-and-report in one statement, so among concurrent
+    // claimers exactly one sees claimed=true — the cross-device at-most-once
+    // guarantee for resuming an interrupted send.
+    function claimPendingSend(chatId) {
+        const info = stmtPendingDelete.run(chatId);
+        return { claimed: info.changes > 0 };
+    }
+
+    function listPendingSends() {
+        return stmtPendingList.all().map((row) => ({
+            chatId: row.chat_id,
+            generationId: row.generation_id,
+            createdAt: row.created_at,
+        }));
     }
 
     // Server restart: upstream connections cannot be resumed, so any job that
@@ -621,6 +680,34 @@ function createModelJobs(opts = {}) {
             }
             res.send(result);
         });
+
+        app.post('/api/pending-sends', async (req, res) => {
+            if (!await auth(req, res)) return;
+            const result = registerPendingSend({
+                chatId: req.body?.chatId,
+                generationId: req.body?.generationId,
+            });
+            if (result.error) {
+                res.status(result.httpStatus).send({ error: result.error });
+                return;
+            }
+            res.send(result);
+        });
+
+        app.get('/api/pending-sends', async (req, res) => {
+            if (!await auth(req, res)) return;
+            res.send({ pendingSends: listPendingSends() });
+        });
+
+        app.delete('/api/pending-sends/:chatId', async (req, res) => {
+            if (!await auth(req, res)) return;
+            res.send(clearPendingSend(req.params.chatId));
+        });
+
+        app.post('/api/pending-sends/:chatId/claim', async (req, res) => {
+            if (!await auth(req, res)) return;
+            res.send(claimPendingSend(req.params.chatId));
+        });
     }
 
     // Boot: fail any jobs left 'running' by a previous process.
@@ -640,6 +727,10 @@ function createModelJobs(opts = {}) {
         claimJob,
         deleteJob,
         streamJob,
+        registerPendingSend,
+        clearPendingSend,
+        claimPendingSend,
+        listPendingSends,
         markRunningJobsFailed,
         cleanupTerminalJobs,
         journalPath,

@@ -465,6 +465,76 @@ describe('model-jobs', () => {
         upstream.hang = false
     })
 
+    it('pending sends register (upsert per chat), list, and clear over HTTP', async () => {
+        const reg = await fetch(`${base}/api/pending-sends`, {
+            method: 'POST',
+            headers: { 'risu-auth': AUTH_TOKEN, 'content-type': 'application/json' },
+            body: JSON.stringify({ chatId: 'chat-ps-1', generationId: 'gen-a' }),
+        })
+        expect(reg.status).toBe(200)
+        // Same chat again → upsert replaces, not duplicates.
+        await fetch(`${base}/api/pending-sends`, {
+            method: 'POST',
+            headers: { 'risu-auth': AUTH_TOKEN, 'content-type': 'application/json' },
+            body: JSON.stringify({ chatId: 'chat-ps-1', generationId: 'gen-b' }),
+        })
+        const listRes = await fetch(`${base}/api/pending-sends`, { headers: { 'risu-auth': AUTH_TOKEN } })
+        const listed = (await listRes.json()).pendingSends as { chatId: string, generationId: string }[]
+        const mine = listed.filter((p) => p.chatId === 'chat-ps-1')
+        expect(mine).toHaveLength(1)
+        expect(mine[0].generationId).toBe('gen-b')
+
+        const del = await fetch(`${base}/api/pending-sends/chat-ps-1`, {
+            method: 'DELETE', headers: { 'risu-auth': AUTH_TOKEN },
+        })
+        expect(del.status).toBe(200)
+        const after = await fetch(`${base}/api/pending-sends`, { headers: { 'risu-auth': AUTH_TOKEN } })
+        expect(((await after.json()).pendingSends as { chatId: string }[])
+            .some((p) => p.chatId === 'chat-ps-1')).toBe(false)
+        // Missing chatId rejected; unauthenticated rejected.
+        const bad = await fetch(`${base}/api/pending-sends`, {
+            method: 'POST',
+            headers: { 'risu-auth': AUTH_TOKEN, 'content-type': 'application/json' },
+            body: JSON.stringify({}),
+        })
+        expect(bad.status).toBe(400)
+        const noAuth = await fetch(`${base}/api/pending-sends`)
+        expect(noAuth.status).toBe(400)
+    })
+
+    it('claim is atomic: exactly one claimer wins', async () => {
+        await fetch(`${base}/api/pending-sends`, {
+            method: 'POST',
+            headers: { 'risu-auth': AUTH_TOKEN, 'content-type': 'application/json' },
+            body: JSON.stringify({ chatId: 'chat-claim-1', generationId: 'g' }),
+        })
+        const first = await fetch(`${base}/api/pending-sends/chat-claim-1/claim`, {
+            method: 'POST', headers: { 'risu-auth': AUTH_TOKEN },
+        })
+        const second = await fetch(`${base}/api/pending-sends/chat-claim-1/claim`, {
+            method: 'POST', headers: { 'risu-auth': AUTH_TOKEN },
+        })
+        expect((await first.json()).claimed).toBe(true)
+        expect((await second.json()).claimed).toBe(false)
+    })
+
+    it('expired pending sends are swept by the cleanup pass', () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'model-jobs-ps-'))
+        const localStore = createModelJobs({ saveDir: dir })
+        localStore.registerPendingSend({ chatId: 'old-chat', generationId: 'g' })
+        // Backdate past the 48h window.
+        const raw = require('better-sqlite3')
+        const db = new raw(path.join(dir, 'model-jobs.db'))
+        db.prepare(`UPDATE pending_sends SET created_at = ?`).run(Date.now() - 3 * 24 * 60 * 60 * 1000)
+        db.close()
+        localStore.registerPendingSend({ chatId: 'fresh-chat', generationId: 'g' })
+        localStore.cleanupTerminalJobs()
+        const left = localStore.listPendingSends().map((p: { chatId: string }) => p.chatId)
+        expect(left).toEqual(['fresh-chat'])
+        localStore.close()
+        fs.rmSync(dir, { recursive: true, force: true })
+    })
+
     it('a completed aux job stays streamable but is excluded from the unclaimed list', async () => {
         upstream.chunks = ['data: aux-result\n\n']
         upstream.delayMs = 5
