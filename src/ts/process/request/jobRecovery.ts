@@ -250,9 +250,31 @@ async function readJobResult(job: ModelJobRecord): Promise<{ ok: true, text: str
     }
 }
 
+// A message carrying the job's generationId already exists, so the slot-in
+// becomes a FILL rather than an insert. The live streaming path pushes its
+// message before the first byte arrives (index.svelte.ts) — a client that died
+// mid-stream therefore leaves a message holding only the bytes that made it to
+// the browser, while the journal holds the whole response. That is exactly the
+// case this feature exists for, so a plain "message exists → skip" would drop
+// the recovered text on the floor.
+//
+// Shorter-or-equal recovered text means the live path had already finished and
+// saved the message (only its claim was lost) — possibly after editoutput
+// scripts / removeIncompleteResponse trimmed it — so it is left untouched.
+// Length is the discriminator because per-chunk post-processing makes a prefix
+// test unreliable; the residual trade-off is that a completed message whose
+// claim was lost AND which post-processing shortened could be restored to raw
+// text. That window is far smaller than the partial-response loss it prevents.
+function fillPartialMessage(loc: LocatedChat, index: number, text: string): void {
+    const message = loc.chat.message[index]
+    if (!message || (message.data?.length ?? 0) >= text.length) return
+    message.data = text
+    bumpReload(loc)
+}
+
 // Slot one terminal job into its chat. Idempotent (design §4 safety rule 2):
-// if the chat already holds a message with this generationId — the live path
-// saved it but its claim never landed — only the claim is (re)posted.
+// an existing message with this generationId is never duplicated — it is either
+// left alone or filled in from the journal (see fillPartialMessage).
 export async function recoverTerminalJob(job: ModelJobRecord): Promise<void> {
     const loc = await locateChat(job.chatId)
     if (!loc) {
@@ -261,20 +283,22 @@ export async function recoverTerminalJob(job: ModelJobRecord): Promise<void> {
         await claimJob(job.id)
         return
     }
-    if (job.generationId && loc.chat.message.some((m) => m?.generationInfo?.generationId === job.generationId)) {
-        await claimJob(job.id)
-        return
-    }
+    const existingIdx = job.generationId
+        ? loc.chat.message.findIndex((m) => m?.generationInfo?.generationId === job.generationId)
+        : -1
     if (job.status === 'failed') {
-        insertJobError(loc, job, job.error ?? 'Model request failed')
+        // With the live message already in the chat the user saw this failure as
+        // it happened; an error block on top would only duplicate it.
+        if (existingIdx === -1) insertJobError(loc, job, job.error ?? 'Model request failed')
         await claimJob(job.id)
         return
     }
     if (job.status !== 'done') return
     const result = await readJobResult(job)
     if (result.ok === true) {
-        insertRecoveredMessage(loc, job, result.text)
-    } else {
+        if (existingIdx === -1) insertRecoveredMessage(loc, job, result.text)
+        else fillPartialMessage(loc, existingIdx, result.text)
+    } else if (existingIdx === -1) {
         insertJobError(loc, job, result.error)
     }
     await claimJob(job.id)
@@ -282,12 +306,24 @@ export async function recoverTerminalJob(job: ModelJobRecord): Promise<void> {
 
 // --- running jobs -----------------------------------------------------------
 
+// Jobs with a poll loop already attached in this session. Discovery re-runs on
+// every return (see initModelJobRecovery), so without this a job would collect
+// one poll loop per trigger — each racing to end the same guard.
+const attachedJobs = new Set<string>()
+
 // Reattach a job that is still running server-side: hold the per-chat send
 // guard (client-side complement to the server's 409), publish a 'background'
 // status entry, and poll until terminal → same slot-in as discovery.
 export function attachRunningJob(job: ModelJobRecord): void {
     const genKey = chatGenKey(job.chatId)
     const registeredGenId = job.generationId ?? uuidv4()
+    if (attachedJobs.has(job.id)) return
+    // A LIVE send still owns this chat — the job is this tab's own in-flight
+    // request (a mid-generation return to the tab), not an orphan. Taking it
+    // over would end the live generation's guard out from under it when the
+    // poll finishes. The live path claims the job itself on completion.
+    if (get(generationStates).get(genKey)?.kind === 'live') return
+    attachedJobs.add(job.id)
     // 'background' kind: holds the per-chat send guard without flipping the
     // global doingChat (which would lock every send UI for up to the poll
     // deadline). Survives endAllGenerations cleanup writes for the same reason.
@@ -310,6 +346,7 @@ export function attachRunningJob(job: ModelJobRecord): void {
         }))
     }
     void pollRunningJob(job, genKey, registeredGenId, statusId, controller?.signal)
+        .finally(() => attachedJobs.delete(job.id))
 }
 
 async function pollRunningJob(
@@ -395,15 +432,22 @@ async function listJobs(filter: 'unclaimed' | 'active'): Promise<ModelJobRecord[
     return Array.isArray(parsed?.jobs) ? parsed.jobs : []
 }
 
-let recoveryStarted = false
+let recoveryInFlight: Promise<void> | null = null
 
-// Bootstrap hook (called fire-and-forget from bootstrap.ts loadData). Runs
-// once, never throws, and is a no-op when the job API is unreachable or
-// returns nothing. NOT gated on the nodeOnlyServerSideRequests toggle: jobs
+// Discovery pass. Never throws, and is a no-op when the job API is unreachable
+// or returns nothing. NOT gated on the nodeOnlyServerSideRequests toggle: jobs
 // created before the toggle was switched off must still be recovered.
+//
+// Re-runnable, and collapses concurrent callers onto one in-flight pass. Both
+// halves are idempotent: recoverTerminalJob fills rather than duplicates
+// (matching on generationId), and attachRunningJob is guarded per job id.
 export async function recoverModelJobs(): Promise<void> {
-    if (recoveryStarted) return
-    recoveryStarted = true
+    if (recoveryInFlight) return recoveryInFlight
+    recoveryInFlight = runDiscovery().finally(() => { recoveryInFlight = null })
+    return recoveryInFlight
+}
+
+async function runDiscovery(): Promise<void> {
     try {
         const [unclaimedJobs, activeJobs] = await Promise.all([listJobs('unclaimed'), listJobs('active')])
         // Sequential on purpose: slot-ins mutate the DB and a failure on one
@@ -425,4 +469,25 @@ export async function recoverModelJobs(): Promise<void> {
     } catch (err) {
         console.warn('[ModelJobRecovery] discovery failed', err)
     }
+}
+
+let triggersInstalled = false
+
+// Bootstrap hook (called from bootstrap.ts loadData). Runs discovery now and on
+// every RETURN afterwards, not just at page load.
+//
+// Why the extra triggers: a page load is not the only way a client comes back.
+// A tab that stays alive while the network drops (screen lock, wifi↔cellular —
+// the dominant remote-mobile pattern) loses the journal tail while the job keeps
+// running server-side. With boot-only discovery that response would sit
+// unclaimed until the user manually reloaded the app; the transport already
+// supports reattaching (§1 ③ replay + live tail), only the trigger was missing.
+export function initModelJobRecovery(): void {
+    if (triggersInstalled) return
+    triggersInstalled = true
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') void recoverModelJobs()
+    })
+    window.addEventListener('online', () => { void recoverModelJobs() })
+    void recoverModelJobs()
 }

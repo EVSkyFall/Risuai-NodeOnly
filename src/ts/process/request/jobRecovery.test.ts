@@ -212,18 +212,45 @@ describe('recoverTerminalJob', () => {
         expect(claims()).toEqual(['/api/model-jobs/job-1/claim'])
     })
 
-    test('idempotent: existing generationId means claim only, no duplicate message', async () => {
+    test('idempotent: a complete message with this generationId is left untouched, claim only', async () => {
         const { recovery } = await loadModules()
-        const chat = makeChat({ message: [{ role: 'char', data: 'already saved', generationInfo: { generationId: 'gen-1' } }] })
+        const chat = makeChat({ message: [{ role: 'char', data: 'Hello, and then some more', generationInfo: { generationId: 'gen-1' } }] })
         mocks.db.characters = [makeChar(chat)]
-        const { claims, calls } = setupServer({})
+        const { claims } = setupServer({ journals: { 'job-1': OPENAI_SSE } })
 
         await recovery.recoverTerminalJob(makeJob() as any)
 
         expect(chat.message).toHaveLength(1)
+        expect(chat.message[0].data).toBe('Hello, and then some more') // recovered 'Hello' is shorter
         expect(claims()).toEqual(['/api/model-jobs/job-1/claim'])
-        // journal never read
-        expect(calls.some((c) => c.url.endsWith('/stream'))).toBe(false)
+    })
+
+    test('fills a partial message left by a client that died mid-stream', async () => {
+        const { recovery } = await loadModules()
+        const chat = makeChat({ message: [{ role: 'char', data: 'Hel', generationInfo: { generationId: 'gen-1' } }] })
+        const char = makeChar(chat)
+        mocks.db.characters = [char]
+        const { claims } = setupServer({ journals: { 'job-1': OPENAI_SSE } })
+
+        await recovery.recoverTerminalJob(makeJob() as any)
+
+        expect(chat.message).toHaveLength(1) // filled, not duplicated
+        expect(chat.message[0].data).toBe('Hello')
+        expect(char.reloadKeys).toBe(1)
+        expect(claims()).toEqual(['/api/model-jobs/job-1/claim'])
+    })
+
+    test('failed job with the live message already present adds no error block', async () => {
+        const { recovery } = await loadModules()
+        const chat = makeChat({ message: [{ role: 'char', data: 'partial', generationInfo: { generationId: 'gen-1' } }] })
+        mocks.db.characters = [makeChar(chat)]
+        const { claims } = setupServer({})
+
+        await recovery.recoverTerminalJob(makeJob({ status: 'failed', error: 'upstream timeout' }) as any)
+
+        expect(chat.message).toHaveLength(1)
+        expect(chat.message[0].data).toBe('partial')
+        expect(claims()).toEqual(['/api/model-jobs/job-1/claim'])
     })
 
     test('failed job writes the risuerror block into the originating chat', async () => {
@@ -299,13 +326,13 @@ describe('recoverTerminalJob', () => {
 // --- discovery --------------------------------------------------------------
 
 describe('recoverModelJobs', () => {
-    test('one failing job does not stop the rest; second call is a no-op', async () => {
+    test('one failing job does not stop the rest', async () => {
         const { recovery } = await loadModules()
         const chat = makeChat()
         mocks.db.characters = [makeChar(chat)]
         const jobBroken = makeJob({ id: 'job-broken' })
         const jobOk = makeJob({ id: 'job-ok', generationId: 'gen-ok' })
-        const { calls } = setupServer({
+        setupServer({
             unclaimed: [jobBroken, jobOk],
             journals: { 'job-ok': OPENAI_SSE },
             streamStatus: { 'job-broken': 500 }, // journal unreachable → job left unclaimed
@@ -315,10 +342,33 @@ describe('recoverModelJobs', () => {
 
         expect(chat.message).toHaveLength(1)
         expect(chat.message[0].generationInfo.generationId).toBe('gen-ok')
+    })
 
+    test('re-runs on a later trigger without duplicating the recovered message', async () => {
+        const { recovery } = await loadModules()
+        const chat = makeChat()
+        mocks.db.characters = [makeChar(chat)]
+        // The server still lists it as unclaimed (e.g. the claim never landed),
+        // so the second pass sees the same job again.
+        const { calls } = setupServer({ unclaimed: [makeJob()], journals: { 'job-1': OPENAI_SSE } })
+
+        await recovery.recoverModelJobs()
         const callCount = calls.length
         await recovery.recoverModelJobs()
-        expect(calls.length).toBe(callCount) // once-guarded
+
+        expect(calls.length).toBeGreaterThan(callCount) // ran again, not once-guarded
+        expect(chat.message).toHaveLength(1)            // filled, never duplicated
+        expect(chat.message[0].data).toBe('Hello')
+    })
+
+    test('concurrent callers collapse onto one in-flight pass', async () => {
+        const { recovery } = await loadModules()
+        mocks.db.characters = [makeChar(makeChat())]
+        const { calls } = setupServer({ unclaimed: [], active: [] })
+
+        await Promise.all([recovery.recoverModelJobs(), recovery.recoverModelJobs()])
+
+        expect(calls.filter((c) => c.url === '/api/model-jobs?unclaimed=1')).toHaveLength(1)
     })
 
     test('unreachable job API is a silent no-op', async () => {
@@ -358,6 +408,43 @@ describe('attachRunningJob', () => {
         expect(genState.isChatGenerating('chat-1')).toBe(false)
         expect(get(status.requestStatuses).get('gen-1')?.phase).toBe('done')
         status.stopStatusTimer()
+    })
+
+    test('a second attach of the same job does not start a second poll loop', async () => {
+        vi.useFakeTimers()
+        const { recovery, genState } = await loadModules()
+        const chat = makeChat()
+        mocks.db.characters = [makeChar(chat)]
+        setupServer({
+            journals: { 'job-1': OPENAI_SSE },
+            jobStates: { 'job-1': [makeJob({ status: 'done' })] },
+        })
+
+        // Two returns to the tab in a row → discovery runs twice on one job.
+        recovery.attachRunningJob(makeJob({ status: 'running' }) as any)
+        recovery.attachRunningJob(makeJob({ status: 'running' }) as any)
+
+        await vi.advanceTimersByTimeAsync(recovery.JOB_POLL_INITIAL_MS + 50)
+        expect(chat.message).toHaveLength(1) // one poll loop → one slot-in
+        expect(genState.isChatGenerating('chat-1')).toBe(false)
+    })
+
+    test('skips a chat whose LIVE send still owns the generation', async () => {
+        vi.useFakeTimers()
+        const { recovery, genState } = await loadModules()
+        const chat = makeChat()
+        mocks.db.characters = [makeChar(chat)]
+        setupServer({ jobStates: { 'job-1': [makeJob({ status: 'done' })] } })
+
+        // Returning to the tab mid-generation: the live send is still streaming.
+        genState.startGeneration('chat-1', 'gen-1', 'live')
+        recovery.attachRunningJob(makeJob({ status: 'running' }) as any)
+
+        await vi.advanceTimersByTimeAsync(recovery.JOB_POLL_INITIAL_MS + 50)
+        // The live generation keeps its guard; no background takeover, no slot-in.
+        expect(genState.isChatGenerating('chat-1')).toBe(true)
+        expect(get(genState.generationStates).get('chat-1')?.kind).toBe('live')
+        expect(chat.message).toHaveLength(0)
     })
 
     test('a 404 during polling (job aborted elsewhere) releases the guard as aborted', async () => {
