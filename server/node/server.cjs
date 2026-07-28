@@ -1443,15 +1443,24 @@ async function checkDiskSpace(requiredBytes) {
 
 // ── Active writer session (single-writer lock) ────────────────────────────────
 // Mirrors the BroadcastChannel-based tab lock on the server side so that the
-// same protection extends across devices. The last client to call /api/session
-// becomes the active writer; older sessions receive 423 on write attempts.
-let activeSessionId = null // string | null
+// same protection extends across devices. Lock rules live in session-lock.cjs:
+// page loads REGISTER but never steal the lock (an OS-restored phone tab must
+// not kick a PC mid-session); ownership moves on the first WRITE from a
+// freshly-booted session, and only stale sessions get 423.
+const { createSessionLock } = require('./session-lock.cjs');
+const sessionLock = createSessionLock();
 
 function checkActiveSession(req, res) {
     const clientSessionId = req.headers['x-session-id']
-    if (!clientSessionId) return true  // client without session support
-    if (!activeSessionId) return true  // no session registered yet
-    if (clientSessionId === activeSessionId) return true
+    // The client attaches x-user-active only when a real user gesture happened
+    // recently — automatic writes (boot housekeeping, flush-on-hide) carry no
+    // gesture and must never move the lock (session-lock.cjs rules).
+    const userActive = req.headers['x-user-active'] === '1'
+    const result = sessionLock.checkWrite(typeof clientSessionId === 'string' ? clientSessionId : '', userActive)
+    if (result.tookOver) {
+        console.log('[Session] Write lock taken over by a freshly-booted session')
+    }
+    if (result.ok) return true
     res.status(423).json({ error: 'Session deactivated' })
     return false
 }
@@ -2997,15 +3006,25 @@ app.post('/api/token/refresh', async (req, res) => {
     res.json({ token: createServerJwt() })
 })
 
+// Reload-on-return check: side-effect-free writer-lock state for this session.
+// The client calls it when the tab regains visibility/focus and reloads ONLY
+// on 'stale' — before the user has done anything, so nothing is lost.
+app.get('/api/session/lock-status', async (req, res) => {
+    if (!await checkAuth(req, res)) return
+    const id = req.headers['x-session-id']
+    res.json({ state: sessionLock.peek(typeof id === 'string' ? id : '') })
+})
+
 // ── Session cookie issuance (F-0) ──────────────────────────────────────────
 // Called once after JWT auth succeeds. Issues a long-lived cookie so that
 // <img src="/api/asset/..."> requests can be authenticated without JS.
 app.post('/api/session', async (req, res) => {
     if (!await checkAuth(req, res)) return
     const clientSessionId = req.headers['x-session-id']
-    if (clientSessionId) {
-        activeSessionId = clientSessionId
-        console.log('[Session] Active writer session updated')
+    if (typeof clientSessionId === 'string') {
+        // Registers the boot; takes the lock only if nobody holds it.
+        sessionLock.register(clientSessionId)
+        console.log('[Session] Session boot registered')
     }
     const token = nodeCrypto.randomBytes(32).toString('hex')
     const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000
@@ -3565,8 +3584,11 @@ app.post('/api/write', async (req, res, next) => {
     }
 });
 
+// NOT session-locked: flush carries no data — it only asks the server to
+// fsync what it already has. It fires automatically on tab-hide from EVERY
+// device, so gating it on the write lock made a phone going to background
+// steal (or trip over) the lock without any user action.
 app.post('/api/db/flush', sessionAuthMiddleware, async (req, res, next) => {
-    if (!checkActiveSession(req, res)) return;
     try {
         await queueStorageOperation(async () => {
             await flushPendingDb();

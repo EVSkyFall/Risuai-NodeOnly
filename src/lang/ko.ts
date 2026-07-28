@@ -1093,6 +1093,8 @@ export const languageKorean = {
   antiClaudeOverload: "Claude 오버로드 방지",
   activeTabChange:
     "현재 탭이 비활성화되었습니다. OK를 누르면 탭이 다시 활성화됩니다.",
+  sessionHandoffReload:
+    "다른 기기에서 사용되어 최신 상태로 새로고침했어요.",
   addCharacter: "캐릭터 추가",
   importFromRealm: "RisuRealm에서 고르기",
   importFromRealmDesc:

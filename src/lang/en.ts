@@ -1002,6 +1002,7 @@ export const languageEnglish = {
     noWaitForTranslate: "No Wait for Translate",
     antiClaudeOverload: "Anti-Claude Overload",
     activeTabChange: "Current tab is inactivated since other tab is active. to activate this tab, click OK",
+    sessionHandoffReload: "Refreshed to the latest state because another device was in use.",
     addCharacter: "Add Character",
     importFromRealm: "Choose from RisuRealm",
     importFromRealmDesc: "Choose over 1000 characters in RisuRealm",

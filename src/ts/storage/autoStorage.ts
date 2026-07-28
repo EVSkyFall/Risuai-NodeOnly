@@ -52,6 +52,12 @@ export class AutoStorage{
         return await this.realStorage.patchItem(key, patchData)
     }
 
+    /** Writer-lock state for the reload-on-return check (see NodeStorage). */
+    async getWriterLockState() {
+        await this.Init()
+        return this.realStorage.getWriterLockState()
+    }
+
     /** Get the last known ETag for database.bin */
     getDbEtag(): string | null {
         return this.realStorage._lastDbEtag
