@@ -62,7 +62,10 @@ function beginCacheTurn(
         modelId: prepared.modelId,
         credentialKey: credential?.apiKey,
         boundaryIndex: prepared.cacheBoundary,
-        fetchImpl: options.fetchImpl,
+        // Cache lifecycle calls use their own fetch when the caller supplies one
+        // (see AdapterCacheContext.fetchImpl) — the chat fetchImpl may be a
+        // server-side job fetch, which must carry the main request only.
+        fetchImpl: options.cache.fetchImpl ?? options.fetchImpl,
     })
 }
 

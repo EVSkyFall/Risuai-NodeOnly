@@ -708,20 +708,30 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
         : undefined
 
     // Server-side job routing (Stage 3, model-preset-server-side-requests.md):
-    // toggle ON + main chat request (realChatId present; aux requests carry
-    // none — design §4 rule 4) + no tools (the tool loop stays browser-bound)
-    // + not a preview. makeJobFetch itself falls back to the proxied path when
-    // job creation fails for infra reasons (network/404/5xx — e.g. older
-    // server); a 409 (chat already generating) surfaces as an error instead,
-    // since falling back would double-generate. All defaults off → proxiedFetch
-    // → byte-identical to the previous behavior.
+    // toggle ON + no tools (the tool loop stays browser-bound) + not a preview.
+    // The whole send pipeline rides jobs — a send is a sequential chain of
+    // aux/main requests (input translate → memory summarization → main →
+    // translate/emotion), and any link dying kills the send, so all links get
+    // the reconnectable job transport:
+    //   - main (realChatId present): keyed by chat.id, per-chat guard,
+    //     journal recovered at boot as a chat message.
+    //   - aux (no realChatId — design §4 rule 4): relay-only 'aux' job keyed
+    //     by its unique genId (guard is a no-op); NEVER recovered — its
+    //     journal is not a chat message. It rides only for the in-flight
+    //     stream reattach, so a network blip mid-pipeline resumes in place.
+    // makeJobFetch itself falls back to the proxied path when job creation
+    // fails for infra reasons (network/404/5xx — e.g. older server); a 409
+    // (chat already generating) surfaces as an error instead, since falling
+    // back would double-generate. All defaults off → proxiedFetch →
+    // byte-identical to the previous behavior.
     const useServerJob = getDatabase().nodeOnlyServerSideRequests === true
-        && !!arg.realChatId && !tools && !arg.previewBody
+        && !tools && !arg.previewBody
     const fetchImpl = useServerJob
         ? makeJobFetch({
-            realChatId: arg.realChatId,
+            realChatId: arg.realChatId ?? genId,
             generationId: genId,
             adapterKind: kind,
+            jobKind: arg.realChatId ? 'main' : 'aux',
             streaming: resolvePresetStreaming(preset, arg),
             timeoutMs: (getDatabase().localNetworkTimeoutSec ?? 600) * 1000,
             fallbackFetch: proxiedFetch,
@@ -766,6 +776,11 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
                 task: mode,
                 presetId: preset.id,
                 generationId: genId,
+                // Always the direct proxied fetch, never the server-side job
+                // fetch: a job is keyed to the chat (one at a time) and its
+                // journal is replayed as a CHAT response at boot, so cache
+                // housekeeping calls must not become jobs.
+                fetchImpl: proxiedFetch,
             }
         }
     }
