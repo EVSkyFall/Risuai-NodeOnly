@@ -28,6 +28,7 @@ import { hypaMemoryV3 } from "./memory/hypav3";
 import { getModuleAssets, getModuleToggles } from "./modules";
 import { readImage } from "../globalApi.svelte";
 import { chatGenKey, chatProcessStage, endGeneration, isChatGenerating, setGenerationStage, startGeneration } from "./generationState";
+import { clearPendingSend, registerPendingSend } from "./request/pendingSends";
 
 export interface OpenAIChat{
     role: 'system'|'user'|'assistant'|'function'
@@ -185,6 +186,14 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     }
     const generationId = v4()
     startGeneration(genKey, generationId)
+    // Resumable-send tombstone (pendingSends.ts): registered BEFORE the
+    // pipeline so a tab death anywhere in it (translate → memory → request)
+    // leaves the marker; cleared on every conclude path. Previews never
+    // register (they end without a message, which would read as resumable).
+    // No-op unless the server-side requests toggle is on.
+    if (realChatId && !arg.preview && !arg.previewPrompt) {
+        registerPendingSend(realChatId, generationId)
+    }
 
     if(chatProcessIndex === -1 && DBState.db.presetChain){
         const names = DBState.db.presetChain.split(',').map((v) => v.trim())
@@ -212,6 +221,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     if (nowChatroom.chats[nowChatroom.chatPage]?._placeholder) {
         alertError('Chat is still loading. Please wait a moment.')
         endGeneration(genKey)
+        if (realChatId) clearPendingSend(realChatId)
         return false
     }
     nowChatroom.chats[nowChatroom.chatPage].message = nowChatroom.chats[nowChatroom.chatPage].message.map((v) => {
@@ -797,6 +807,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         currentTokens += triggerResult.tokens
         if(triggerResult.stopSending){
             endGeneration(genKey)
+            if (realChatId) clearPendingSend(realChatId)
             return false
         }
     }
@@ -969,6 +980,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             }
             console.log(sp)
             throwError(sp.error)
+            if (realChatId) clearPendingSend(realChatId)
             return false
         }
         chats = sp.chats
@@ -987,6 +999,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             if(chats.length <= 1){
                 throwError(language.errors.toomuchtoken + "\n\nRequired Tokens: " + currentTokens)
 
+                if (realChatId) clearPendingSend(realChatId)
                 return false
             }
 
@@ -1354,6 +1367,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         while(inputTokens > maxContextTokens){
             if(pointer >= formated.length){
                 throwError(language.errors.toomuchtoken + "\n\nAt token rechecking. Required Tokens: " + inputTokens)
+                if (realChatId) clearPendingSend(realChatId)
                 return false
             }
             if(formated[pointer].removable){
@@ -1387,6 +1401,16 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             stage2: stageTimings.stage2Duration,
             stage3: 0,
             stage4: 0
+        }
+    }
+
+    // Continue writes into the previous reply: stamp it with THIS
+    // generation's id up front so recovery attributes a mid-continue death to
+    // the continued message (fill/skip) instead of inserting a duplicate.
+    if(arg.continue && !arg.preview && !arg.previewPrompt){
+        const contMsgs = DBState.db.characters[selectedChar].chats[selectedChat].message
+        if(contMsgs.length > 0){
+            contMsgs[contMsgs.length - 1].generationInfo = generationInfo
         }
     }
 
@@ -1429,10 +1453,12 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     let resendChat = false
     
     if(abortSignal.aborted === true){
+        if (realChatId) clearPendingSend(realChatId)
         return false
     }
     if(req.type === 'fail'){
         throwError(req.result)
+        if (realChatId) clearPendingSend(realChatId)
         return false
     }
     else if(req.type === 'streaming'){
@@ -1504,6 +1530,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
 
         if(streamAborted || abortSignal.aborted){
+            if (realChatId) clearPendingSend(realChatId)
             return false
         }
 
@@ -1558,7 +1585,9 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     time: Date.now(),
                     generationInfo,
                     promptInfo,
-                    chatId: generationId,
+                    // Keep the original message identity: older jobs match on it
+                    // (jobRecovery secondary match) — see the continue restamp note.
+                    chatId: DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex]?.chatId ?? generationId,
                 }       
                 if(inlayResult.promise){
                     const p = await inlayResult.promise
@@ -1766,6 +1795,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
 
                 
 
+                if (realChatId) clearPendingSend(realChatId)
                 return true
             }
 
@@ -1827,6 +1857,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             }, 'emotion', abortSignal)
 
             if(rq.type === 'fail'){
+                if (realChatId) clearPendingSend(realChatId)
                 if(abortSignal.aborted){
                     return true
                 }
@@ -1834,6 +1865,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 return true
             }
             if(rq.type === 'streaming' || rq.type === 'multiline'){
+                if (realChatId) clearPendingSend(realChatId)
                 if(abortSignal.aborted){
                     return true
                 }
@@ -1879,10 +1911,12 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     }
                 } catch (error) {
                     throwError(language.errors.httpError + `${error}`)
+                    if (realChatId) clearPendingSend(realChatId)
                     return true
                 }
             }
             
+            if (realChatId) clearPendingSend(realChatId)
             return true
 
 
@@ -1919,6 +1953,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         DBState.db.characters[selectedChar].chats[selectedChat].message[lastMessageIndex].generationInfo = generationInfo
     }
 
+    if (realChatId) clearPendingSend(realChatId)
     return true
 }
 
