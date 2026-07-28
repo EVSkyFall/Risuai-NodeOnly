@@ -3,6 +3,7 @@ import { v4 as uuidv4 } from 'uuid'
 import { getDatabase, type Chat, type Database, type Message } from 'src/ts/storage/database.svelte'
 import { ensureChatHydrated } from 'src/ts/storage/chatStorage'
 import { notifyError, notifyInfo } from 'src/ts/alert'
+import { addLog } from 'src/ts/log'
 import { language } from 'src/lang'
 import { chatGenKey, endGeneration, generationStates, registerAbort, startGeneration } from 'src/ts/process/generationState'
 import { clearStatus, endStatus, startStatus } from 'src/ts/status/requestStatus'
@@ -75,6 +76,16 @@ function safeStatus(fn: () => void): void {
     } catch (err) {
         console.warn('[ModelJobRecovery] status publish failed', err)
     }
+}
+
+// Field diagnostics: recovery decisions are rare and invisible (they run at
+// boot/return with no UI), so every branch outcome is recorded through the
+// syncing log channel — server-side logs.db then shows exactly which path a
+// recovery took when a report comes in.
+function diag(message: string, description?: string): void {
+    try {
+        addLog({ level: 'info', message, description, source: 'model-job-recovery' })
+    } catch { /* diagnostics must never break recovery */ }
 }
 
 function sleep(ms: number): Promise<void> {
@@ -159,7 +170,15 @@ async function locateChat(chatId: string): Promise<LocatedChat | null> {
         if (chat._placeholder) {
             const hydrated = await ensureChatHydrated(char.chats, idx, char.chaId)
             if (!hydrated) throw new Error(`chat ${chatId} could not be hydrated`)
-            chat = hydrated
+            // Re-read through the $state proxy, do NOT use the returned object:
+            // ensureChatHydrated hands back the RAW object it assigned into the
+            // array, and Svelte 5 only tracks writes made through the proxy.
+            // Mutating the raw object fills the message invisibly — no UI
+            // update, no save-tracker signal, text lost on reload (field bug
+            // 2026-07-28: recovered fill stayed empty on screen and on disk).
+            const reIdx = char.chats.findIndex((c) => c?.id === chatId)
+            if (reIdx === -1) throw new Error(`chat ${chatId} vanished during hydration`)
+            chat = char.chats[reIdx]
         }
         if (!Array.isArray(chat.message)) chat.message = []
         return { char, chat }
@@ -281,6 +300,7 @@ export async function recoverTerminalJob(job: ModelJobRecord): Promise<void> {
     if (!loc) {
         // Chat was deleted while the job ran — nothing to slot into.
         console.warn('[ModelJobRecovery] chat missing for job', job.id, '- claiming without slot-in')
+        diag(`recover ${job.id.slice(0, 8)}: chat missing -> claim only`, `chatId=${job.chatId}`)
         await claimJob(job.id)
         return
     }
@@ -296,6 +316,7 @@ export async function recoverTerminalJob(job: ModelJobRecord): Promise<void> {
     if (job.status === 'failed') {
         // With the live message already in the chat the user saw this failure as
         // it happened; an error block on top would only duplicate it.
+        diag(`recover ${job.id.slice(0, 8)}: failed job, existingIdx=${existingIdx}`)
         if (existingIdx === -1) insertJobError(loc, job, job.error ?? 'Model request failed')
         await claimJob(job.id)
         return
@@ -303,10 +324,28 @@ export async function recoverTerminalJob(job: ModelJobRecord): Promise<void> {
     if (job.status !== 'done') return
     const result = await readJobResult(job)
     if (result.ok === true) {
-        if (existingIdx === -1) insertRecoveredMessage(loc, job, result.text)
-        else fillPartialMessage(loc, existingIdx, result.text)
-    } else if (existingIdx === -1) {
-        insertJobError(loc, job, result.error)
+        if (existingIdx === -1) {
+            insertRecoveredMessage(loc, job, result.text)
+            diag(`recover ${job.id.slice(0, 8)}: inserted len=${result.text.length}`)
+        } else {
+            const before = loc.chat.message[existingIdx]?.data?.length ?? 0
+            fillPartialMessage(loc, existingIdx, result.text)
+            const after = loc.chat.message[existingIdx]?.data?.length ?? 0
+            // Independent read-back through a FRESH proxied lookup: proves the
+            // write is visible to the reactive graph, not only to our local
+            // reference (the exact failure mode of the raw-object field bug).
+            let fresh = -1
+            try {
+                for (const c of getDatabase()?.characters ?? []) {
+                    const ch = c?.chats?.find((x) => x?.id === job.chatId)
+                    if (ch) { fresh = ch.message?.[existingIdx]?.data?.length ?? -1; break }
+                }
+            } catch { /* diagnostics only */ }
+            diag(`recover ${job.id.slice(0, 8)}: fill idx=${existingIdx} before=${before} decoded=${result.text.length} after=${after} fresh=${fresh}`)
+        }
+    } else {
+        diag(`recover ${job.id.slice(0, 8)}: journal decode failed, existingIdx=${existingIdx}`, result.error)
+        if (existingIdx === -1) insertJobError(loc, job, result.error)
     }
     await claimJob(job.id)
 }
@@ -331,6 +370,7 @@ export function attachRunningJob(job: ModelJobRecord): void {
     // poll finishes. The live path claims the job itself on completion.
     if (get(generationStates).get(genKey)?.kind === 'live') return
     attachedJobs.add(job.id)
+    diag(`attach ${job.id.slice(0, 8)}: running job reattached`, `chatId=${job.chatId}`)
     // 'background' kind: holds the per-chat send guard without flipping the
     // global doingChat (which would lock every send UI for up to the poll
     // deadline). Survives endAllGenerations cleanup writes for the same reason.
@@ -407,11 +447,13 @@ async function pollRunningJob(
             continue
         }
         if (current.status === 'running') continue
+        diag(`poll ${job.id.slice(0, 8)}: terminal status=${current.status}`)
         if (current.status !== 'aborted') {
             try {
                 await recoverTerminalJob({ ...job, ...current })
             } catch (err) {
                 console.warn('[ModelJobRecovery] slot-in after poll failed', job.id, err)
+                diag(`poll ${job.id.slice(0, 8)}: slot-in threw`, String(err))
             }
         }
         finish(current.status, current.status === 'failed' ? current.error : undefined)
@@ -559,6 +601,9 @@ export async function recoverModelJobs(): Promise<void> {
 async function runDiscovery(): Promise<void> {
     try {
         const [unclaimedJobs, activeJobs] = await Promise.all([listJobs('unclaimed'), listJobs('active')])
+        if (unclaimedJobs.length > 0 || activeJobs.length > 0) {
+            diag(`discovery: unclaimed=${unclaimedJobs.length} active=${activeJobs.length}`)
+        }
         // Sequential on purpose: slot-ins mutate the DB and a failure on one
         // job must not stop the rest.
         for (const job of unclaimedJobs) {
