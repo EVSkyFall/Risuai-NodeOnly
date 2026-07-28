@@ -381,6 +381,19 @@ html {
   scrollbar-color: color-mix(in srgb, var(--color-textcolor2) 35%, transparent) transparent;
 }
 
+/* Touch devices: the chat scroller's scrollbar spans the container's full height,
+   so its thumb rides right beside the sticky composer — and since a tap counts as
+   hover, it lingers there. Mobile scrolls by touch (plus the optional scroll-nav
+   buttons), so hide the bar on coarse pointers; desktop keeps it. */
+@media (pointer: coarse) {
+  .default-chat-screen::-webkit-scrollbar {
+    display: none;
+  }
+  .default-chat-screen {
+    scrollbar-width: none;
+  }
+}
+
 * {
   font-family: var(--risu-font-family);
 }

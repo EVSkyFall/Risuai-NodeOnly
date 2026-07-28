@@ -1260,7 +1260,11 @@ import { isMobile } from 'src/ts/platform'
             {/if}
         {/snippet}
 
-        <div class="h-full w-full flex flex-col-reverse overflow-y-auto relative default-chat-screen"
+        <!-- overscroll-y-contain: without it, repeated overscroll at the chat's end chains the
+             gesture to the viewport; mobile Chrome then collapses its URL bar, the visual viewport
+             resizes, and the sticky composer inside this col-reverse scroller gets misanchored
+             (bar floats up with a gap below). PWA/standalone has no URL bar, hence unaffected. -->
+        <div class="h-full w-full flex flex-col-reverse overflow-y-auto overscroll-y-contain relative default-chat-screen"
             class:nodeonly-standard={DBState.db.theme === ''}
             class:no-chat-width-wide={DBState.db.theme === '' && DBState.db.nodeOnlyStandardChatWidth === 'wide'}
             class:no-chat-width-full={DBState.db.theme === '' && DBState.db.nodeOnlyStandardChatWidth === 'full'}
