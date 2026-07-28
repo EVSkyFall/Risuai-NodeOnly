@@ -29,10 +29,12 @@ import {
     type AdapterCacheContext,
     type AdapterChatMessage, type AdapterChatOptions, type AdapterChatResponse,
     type AdapterChatStreamDelta, type AdapterCredential,
-    type AdapterReasoningPart, type AdapterToolCall, type AdapterToolDef,
+    type AdapterToolCall, type AdapterToolDef,
 } from "src/ts/preset/adapter";
+import { formatReasoningParts } from "src/ts/preset/adapter/reasoning";
 import { TOOL_CAPABLE_ADAPTER_KINDS, VISION_CAPABLE_ADAPTER_KINDS, type AdapterKind, type ModelPreset } from "src/ts/preset/types";
 import { pumpPresetStream } from "./presetStreamPump";
+import { makeJobFetch } from "./jobFetch";
 import { resolveChatModelBinding, buildModelPresetCredential, applyPromptPresetParams } from "./modelPresetBinding";
 import { expandAdapterMessages, toAdapterMessage, toolResponseText } from "./modelPresetMessages";
 import { isLocalNetworkUrl } from "src/ts/network/localNetwork";
@@ -60,6 +62,11 @@ interface requestDataArgument{
     useEmotion?:boolean
     continue?:boolean
     chatId?:string
+    // The REAL chat id (chat.id) of the chat being generated. Distinct from
+    // `chatId` above, which is the per-request generationId (historical name;
+    // see generation-state-keying.md §1-bis). Absent for aux requests
+    // (translate/memory/emotion) — only main chat sends supply it.
+    realChatId?:string
     noMultiGen?:boolean
     schema?:string
     extractJson?:string
@@ -661,25 +668,14 @@ function toAdapterToolDef(tool: MCPTool): AdapterToolDef {
     }
 }
 
-// Render a turn's reasoning for DISPLAY, wrapped in the <Thoughts> tags the chat
-// renderer already parses (mirrors the classic anthropic path). Returns '' when
-// there is nothing to show, so non-reasoning models are byte-identical to before.
-// redacted_thinking has no visible text — surface the same placeholder as classic.
-function formatPresetReasoning(reasoning?: AdapterReasoningPart[]): string {
-    if (!reasoning || reasoning.length === 0) return ''
-    let body = ''
-    for (const part of reasoning) {
-        if (part.redactedData !== undefined) body += '\n{{redacted_thinking}}\n'
-        else if (part.text) body += part.text
-    }
-    if (body.trim().length === 0) return ''
-    return `<Thoughts>\n${body}\n</Thoughts>\n\n`
-}
+// Shared with jobRecovery.ts (recovered text must match a live run byte for
+// byte) — see preset/adapter/reasoning.ts.
+const formatPresetReasoning = formatReasoningParts
 
 async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelPreset, abortSignal:AbortSignal=null, mode:ModelModeExtended='model'):Promise<requestDataResponse> {
     const credential = buildModelPresetCredential(preset)
     const kind = preset.profileSnapshot.adapterKind
-    const fetchImpl = makeProxiedFetch(arg.chatId)
+    const proxiedFetch = makeProxiedFetch(arg.chatId)
     // arg.chatId is the per-request generationId for main chat (sendChat passes
     // it under that name; see generation-state-keying.md §1-bis). Aux requests
     // (translate/memory/emotion/sub) don't supply one, so mint a per-request key
@@ -710,6 +706,37 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
     const tools = (supportsTools && arg.tools && arg.tools.length > 0)
         ? arg.tools.map(toAdapterToolDef)
         : undefined
+
+    // Server-side job routing (Stage 3, model-preset-server-side-requests.md):
+    // toggle ON + no tools (the tool loop stays browser-bound) + not a preview.
+    // The whole send pipeline rides jobs — a send is a sequential chain of
+    // aux/main requests (input translate → memory summarization → main →
+    // translate/emotion), and any link dying kills the send, so all links get
+    // the reconnectable job transport:
+    //   - main (realChatId present): keyed by chat.id, per-chat guard,
+    //     journal recovered at boot as a chat message.
+    //   - aux (no realChatId — design §4 rule 4): relay-only 'aux' job keyed
+    //     by its unique genId (guard is a no-op); NEVER recovered — its
+    //     journal is not a chat message. It rides only for the in-flight
+    //     stream reattach, so a network blip mid-pipeline resumes in place.
+    // makeJobFetch itself falls back to the proxied path when job creation
+    // fails for infra reasons (network/404/5xx — e.g. older server); a 409
+    // (chat already generating) surfaces as an error instead, since falling
+    // back would double-generate. All defaults off → proxiedFetch →
+    // byte-identical to the previous behavior.
+    const useServerJob = getDatabase().nodeOnlyServerSideRequests === true
+        && !tools && !arg.previewBody
+    const fetchImpl = useServerJob
+        ? makeJobFetch({
+            realChatId: arg.realChatId ?? genId,
+            generationId: genId,
+            adapterKind: kind,
+            jobKind: arg.realChatId ? 'main' : 'aux',
+            streaming: resolvePresetStreaming(preset, arg),
+            timeoutMs: (getDatabase().localNetworkTimeoutSec ?? 600) * 1000,
+            fallbackFetch: proxiedFetch,
+        })
+        : proxiedFetch
 
     // Vision gate: send attached images when the adapter implements image wire AND
     // either the profile declares the 'vision' capability OR the user opted in via
@@ -749,6 +776,11 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
                 task: mode,
                 presetId: preset.id,
                 generationId: genId,
+                // Always the direct proxied fetch, never the server-side job
+                // fetch: a job is keyed to the chat (one at a time) and its
+                // journal is replayed as a CHAT response at boot, so cache
+                // housekeeping calls must not become jobs.
+                fetchImpl: proxiedFetch,
             }
         }
     }
@@ -827,7 +859,7 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
         const useStreaming = resolvePresetStreaming(preset, arg)
         const options: AdapterChatOptions = { messages, abortSignal: abortSignal ?? undefined, fetchImpl, generationId: genId, cache }
         if (reportStatus) {
-            safeStatus(() => startStatus(genId, { kind: statusKind, label: preset.name, chatId: arg.chatId, phase: 'connecting', now: Date.now() }))
+            safeStatus(() => startStatus(genId, { kind: statusKind, label: preset.name, chatId: arg.realChatId, phase: 'connecting', now: Date.now() }))
         }
         if(useStreaming){
             const gen = streamModelPreset(kind, preset, options, credential)

@@ -258,7 +258,8 @@ async function deriveHttpError(response: Response): Promise<ModelPresetAdapterEr
         ?? new ModelPresetAdapterError('unknown', message, { status: response.status })
 }
 
-function parseChatCompletion(raw: unknown): AdapterChatResponse {
+// Exported (pure) for job-journal recovery replay (process/request/jobRecovery.ts).
+export function parseChatCompletion(raw: unknown): AdapterChatResponse {
     if (!isPlainObject(raw)) {
         throw new ModelPresetAdapterError('parse', 'OpenAI-compatible response is not an object')
     }
@@ -334,7 +335,8 @@ function extractThoughtSignature(extraContent: unknown): string | undefined {
     return typeof sig === 'string' ? sig : undefined
 }
 
-function parseChatStreamDelta(raw: unknown): AdapterChatStreamDelta | null {
+// Exported (pure) for job-journal recovery replay (process/request/jobRecovery.ts).
+export function parseChatStreamDelta(raw: unknown): AdapterChatStreamDelta | null {
     if (!isPlainObject(raw)) return null
     const choices = raw['choices']
     let textDelta = ''

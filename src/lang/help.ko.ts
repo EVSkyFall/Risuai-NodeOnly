@@ -164,6 +164,7 @@ export const helpKo = {
         "hypaV3EmbeddingRequestsPerMinute": "유사도 검색 시 분당 최대 임베딩 모델 요청 수입니다.",
         "hypaV3EmbeddingMaxConcurrent": "유사도 검색 시 최대 동시 임베딩 모델 요청 수입니다.",
         "nodeOnlyScrollButtonType": "채팅 스크롤 버튼 표시 방식입니다. 4버튼은 맨 위·맨 아래로 이동 버튼을 추가하고, 2버튼은 이전/다음 메시지 이동만, 사용 안 함은 버튼을 숨깁니다.",
+        "nodeOnlyServerSideRequests": "요청을 서버가 대신 보내고 응답을 보존합니다. 화면이 꺼지거나 연결이 끊겨도 생성이 계속되며, 돌아오면 응답이 자동으로 복구됩니다. 모델 프리셋 요청에만 적용되며, 끄면 기존처럼 브라우저가 직접 요청합니다.",
         "confirmReroll": "메시지를 재생성(reroll)할 때 확인 다이얼로그를 띄웁니다. 실수로 응답을 날리는 것을 막고 싶을 때 켜세요.",
         "sendWithEnter": "Enter 키로 메시지를 전송합니다.",
         "sendKeyPC": "PC(데스크톱)에서 메시지를 전송하는 키입니다.",

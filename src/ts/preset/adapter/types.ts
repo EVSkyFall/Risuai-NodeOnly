@@ -169,6 +169,13 @@ export interface AdapterCacheContext {
     // The request's generationId, so the cache layer can key a future
     // hit/savings badge to this exact request (request-status channel).
     generationId?: string
+    // Fetch for the cache lifecycle calls (create/extend/delete), separate from
+    // the chat request's fetchImpl. The server-side job path routes only the
+    // MAIN chat request through a durable job (one job per chat is enforced
+    // server-side, and boot recovery decodes journals as chat responses) — cache
+    // housekeeping must stay on the plain proxied fetch. Falls back to the
+    // chat fetchImpl when absent, so callers that don't set it are unchanged.
+    fetchImpl?: typeof fetch
 }
 
 export interface AdapterChatOptions {
