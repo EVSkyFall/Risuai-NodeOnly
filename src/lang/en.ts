@@ -40,6 +40,8 @@ export const languageEnglish = {
         chatGuardDesc: "Suspicious save patterns blocked. Your changes will be persisted via the safe full-write fallback. If this keeps happening, please report it with browser console logs.",
         chatGuardPersistTitle: "Save aborted to protect existing chat data",
         backgroundGenerationFailed: "Background generation failed ({char}): {error}",
+        modelJobBusy: "This chat is still generating on the server. It will fill in automatically when it finishes — please wait a moment.",
+        modelJobConnectionLost: "The connection dropped, but the server is still generating. It will resume automatically when you come back — no need to send again.",
         chatGuardPersistDesc: "Server detected corrupted chat structure mid-persist and refused to write to disk. Your latest changes may NOT be on disk yet — re-verify before refreshing. Existing data is safe.",
     },
     showHelp: "Show Help",

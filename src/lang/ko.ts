@@ -49,6 +49,10 @@ export const languageKorean = {
     chatGuardPersistDesc:
       "서버에서 손상된 채팅 구조를 감지하여 디스크 기록을 거부했어요. 최근 변경사항이 아직 디스크에 반영되지 않았을 수 있으니 새로고침 전에 다시 확인해주세요. 기존 데이터는 안전합니다.",
     backgroundGenerationFailed: "백그라운드 생성 실패 ({char}): {error}",
+    modelJobBusy:
+      "이 채팅은 서버에서 아직 생성 중이에요. 완료되면 자동으로 채워지니 잠시 기다려주세요.",
+    modelJobConnectionLost:
+      "연결이 끊겼지만 서버에서 계속 생성 중이에요. 다시 돌아오면 자동으로 이어집니다 — 다시 보내지 않아도 돼요.",
   },
   showHelp: "도움말 보기",
   help: helpKo,

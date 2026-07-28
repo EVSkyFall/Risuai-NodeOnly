@@ -151,12 +151,20 @@ function createModelJobs(opts = {}) {
     // SECURITY: no target URL, no request headers, no request body in this
     // schema — auth material lives only in memory for the lifetime of the
     // upstream request. Only non-sensitive job metadata is persisted.
+    //
+    // `kind`: 'main' = a chat generation. Its journal decodes to a chat message,
+    // so it participates in boot recovery and the per-chat single-job guard.
+    // 'aux' = a pipeline side request (translate / memory summarization / …)
+    // riding the job transport ONLY for its reconnectable stream: relay-only,
+    // excluded from recovery lists (its journal is NOT a chat message) and from
+    // the per-chat guard (aux runs sequentially within a send anyway).
     db.exec(`
         CREATE TABLE IF NOT EXISTS model_jobs (
             id TEXT PRIMARY KEY,
             chat_id TEXT NOT NULL,
             generation_id TEXT,
             adapter_kind TEXT,
+            kind TEXT NOT NULL DEFAULT 'main',
             streaming INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL,
             upstream_status INTEGER,
@@ -169,37 +177,47 @@ function createModelJobs(opts = {}) {
         );
         CREATE INDEX IF NOT EXISTS idx_model_jobs_chat ON model_jobs(chat_id, status);
     `);
+    // Pre-`kind` databases (feature-branch builds only; never shipped): add the
+    // column in place. Errors mean it already exists.
+    try {
+        db.exec(`ALTER TABLE model_jobs ADD COLUMN kind TEXT NOT NULL DEFAULT 'main'`);
+    } catch { /* column already present */ }
 
     const stmtInsert = db.prepare(`
-        INSERT INTO model_jobs (id, chat_id, generation_id, adapter_kind, streaming, status, created_at)
-        VALUES (?, ?, ?, ?, ?, 'running', ?)
+        INSERT INTO model_jobs (id, chat_id, generation_id, adapter_kind, kind, streaming, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'running', ?)
     `);
     const stmtGet = db.prepare(`SELECT * FROM model_jobs WHERE id = ?`);
-    const stmtRunningForChat = db.prepare(`SELECT id FROM model_jobs WHERE chat_id = ? AND status = 'running' LIMIT 1`);
+    const stmtRunningForChat = db.prepare(`SELECT id FROM model_jobs WHERE chat_id = ? AND status = 'running' AND kind = 'main' LIMIT 1`);
     const stmtSetUpstream = db.prepare(`UPDATE model_jobs SET upstream_status = ?, content_type = ? WHERE id = ?`);
     const stmtFinalize = db.prepare(`UPDATE model_jobs SET status = ?, error = ?, ended_at = ?, bytes = ? WHERE id = ?`);
     const stmtClaim = db.prepare(`UPDATE model_jobs SET claimed = 1 WHERE id = ?`);
     const stmtDelete = db.prepare(`DELETE FROM model_jobs WHERE id = ?`);
-    const stmtListActive = db.prepare(`SELECT * FROM model_jobs WHERE status = 'running' ORDER BY created_at DESC`);
+    // Recovery views are MAIN-only: an aux journal is not a chat message, so
+    // recovering it would insert garbage into a chat (the failure mode the
+    // Gemini-cache fetch split fixed — see the design note §8-2).
+    const stmtListActive = db.prepare(`SELECT * FROM model_jobs WHERE status = 'running' AND kind = 'main' ORDER BY created_at DESC`);
     const stmtListUnclaimed = db.prepare(`
-        SELECT * FROM model_jobs WHERE status IN ('done', 'failed') AND claimed = 0 ORDER BY created_at DESC
+        SELECT * FROM model_jobs WHERE status IN ('done', 'failed') AND claimed = 0 AND kind = 'main' ORDER BY created_at DESC
     `);
     const stmtMarkRunningFailed = db.prepare(`
         UPDATE model_jobs SET status = 'failed', error = ?, ended_at = ? WHERE status = 'running'
     `);
     // Rotation candidates: terminal jobs beyond the retention cap. Keep order
-    // is unclaimed-first then newest, so OFFSET skips the keepers and returns
-    // the eviction set — claimed jobs and the oldest go first.
+    // is unclaimed-MAIN-first then newest, so OFFSET skips the keepers and
+    // returns the eviction set — aux jobs, claimed jobs and the oldest go
+    // first. (An unclaimed aux job — client died mid-request — is worthless:
+    // nothing ever recovers it, so it must not crowd out unrecovered mains.)
     const stmtTerminalOverflow = db.prepare(`
         SELECT id FROM model_jobs WHERE status IN ('done', 'failed', 'aborted')
-        ORDER BY claimed ASC, ended_at DESC
+        ORDER BY (CASE WHEN claimed = 0 AND kind = 'main' THEN 0 ELSE 1 END) ASC, ended_at DESC
         LIMIT -1 OFFSET ?
     `);
-    // Age expiry only touches CLAIMED rows — an unclaimed terminal job is a
-    // response no client has recovered yet (e.g. offline for a week), so it is
-    // kept until the overflow cap evicts it (keep order is unclaimed-first).
+    // Age expiry only spares unclaimed MAIN rows — a response no client has
+    // recovered yet (e.g. offline for a week) is kept until the overflow cap
+    // evicts it. Claimed rows and aux jobs expire by age.
     const stmtTerminalExpired = db.prepare(`
-        SELECT id FROM model_jobs WHERE status IN ('done', 'failed', 'aborted') AND claimed = 1 AND ended_at < ?
+        SELECT id FROM model_jobs WHERE status IN ('done', 'failed', 'aborted') AND (claimed = 1 OR kind = 'aux') AND ended_at < ?
     `);
 
     // In-memory state for running jobs: abort controller + live byte counter
@@ -247,6 +265,7 @@ function createModelJobs(opts = {}) {
             chatId: row.chat_id,
             generationId: row.generation_id,
             adapterKind: row.adapter_kind,
+            kind: row.kind,
             streaming: !!row.streaming,
             status: row.status,
             upstreamStatus: row.upstream_status,
@@ -378,11 +397,15 @@ function createModelJobs(opts = {}) {
         if (arg.body !== undefined && arg.body !== null && typeof arg.body !== 'string') {
             return { error: 'Body must be a string', httpStatus: 400 };
         }
+        const kind = arg.kind === 'aux' ? 'aux' : 'main';
         // Per-chat single-job guard — one active generation per chat, enforced
-        // server-side at creation time (design §3 "중단").
-        const running = stmtRunningForChat.get(chatId);
-        if (running) {
-            return { error: 'A job is already running for this chat', httpStatus: 409, jobId: running.id };
+        // server-side at creation time (design §3 "중단"). Main jobs only: aux
+        // side requests share the send's chat but are not generations.
+        if (kind === 'main') {
+            const running = stmtRunningForChat.get(chatId);
+            if (running) {
+                return { error: 'A job is already running for this chat', httpStatus: 409, jobId: running.id };
+            }
         }
 
         let bodyBuffer;
@@ -402,6 +425,7 @@ function createModelJobs(opts = {}) {
             chatId,
             typeof arg.generationId === 'string' ? arg.generationId : null,
             typeof arg.adapterKind === 'string' ? arg.adapterKind : null,
+            kind,
             arg.streaming ? 1 : 0,
             Date.now()
         );
@@ -541,6 +565,7 @@ function createModelJobs(opts = {}) {
                 chatId: req.body?.chatId,
                 generationId: req.body?.generationId,
                 adapterKind: req.body?.adapterKind,
+                kind: req.body?.kind,
                 streaming: !!req.body?.streaming,
                 timeoutMs: req.body?.timeoutMs
             });

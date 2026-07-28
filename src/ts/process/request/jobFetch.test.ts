@@ -26,12 +26,17 @@ interface ServerBehavior {
     create?: { status: number, body?: unknown }
     createReject?: Error
     streamChunks?: string[]
+    /** Per-attach chunk sets: successive GET /stream calls consume successive
+     *  entries (the last repeats) — for reconnect tests. Overrides streamChunks. */
+    streamChunksQueue?: string[][]
     /** Defaults to a healthy stream (content-type + upstream-status 200). */
     streamHeaders?: Record<string, string>
     /** Body of the never-closing kind for abort tests. */
     streamNeverEnds?: boolean
     /** GET /api/model-jobs/:id after the stream ends. */
     job?: { status: string, error?: string }
+    /** Successive GET /api/model-jobs/:id responses (last repeats). Overrides job. */
+    jobQueue?: { status: string, error?: string }[]
     jobReject?: Error
 }
 
@@ -51,9 +56,15 @@ function setupServer(behavior: ServerBehavior) {
                 'content-type': 'text/event-stream',
                 'x-model-job-upstream-status': '200',
             }
+            let chunks = behavior.streamChunks ?? []
+            if (behavior.streamChunksQueue) {
+                chunks = behavior.streamChunksQueue.length > 1
+                    ? behavior.streamChunksQueue.shift()!
+                    : behavior.streamChunksQueue[0] ?? []
+            }
             const body = behavior.streamNeverEnds
                 ? new ReadableStream<Uint8Array>({ start() { /* never closes */ } })
-                : streamOf(...(behavior.streamChunks ?? []))
+                : streamOf(...chunks)
             return new Response(body, { status: 200, headers })
         }
         if (url === '/api/model-jobs/job-1' && method === 'DELETE') {
@@ -61,7 +72,11 @@ function setupServer(behavior: ServerBehavior) {
         }
         if (url === '/api/model-jobs/job-1' && method === 'GET') {
             if (behavior.jobReject) throw behavior.jobReject
-            return new Response(JSON.stringify(behavior.job ?? { status: 'done' }), { status: 200 })
+            let job = behavior.job ?? { status: 'done' }
+            if (behavior.jobQueue && behavior.jobQueue.length > 0) {
+                job = behavior.jobQueue.length > 1 ? behavior.jobQueue.shift()! : behavior.jobQueue[0]
+            }
+            return new Response(JSON.stringify(job), { status: 200 })
         }
         if (url === '/api/model-jobs/job-1/claim' && method === 'POST') {
             return new Response('{"success":true}', { status: 200 })
@@ -158,17 +173,42 @@ describe('makeJobFetch', () => {
             .rejects.toThrow(TypeError)
     })
 
-    test('stream end with job still running errors the body (끊김 ≠ 완료), no claim', async () => {
+    test('reattaches after a dropped tail and resumes without duplicating bytes', async () => {
+        const { calls } = setupServer({
+            // First attach delivers a prefix then the connection "drops"; the
+            // reattach replays the journal from byte 0 with more appended.
+            streamChunksQueue: [['hel'], ['hello world']],
+            jobQueue: [{ status: 'running' }, { status: 'done' }],
+        })
+        const res = await makeJobFetch(makeOpts({ reconnectBaseDelayMs: 1 }))('https://provider.example/v1/chat', { method: 'POST', body: '{}' })
+        expect(await res.text()).toBe('hello world') // replayed prefix skipped, not duplicated
+        expect(callsFor(calls, '/api/model-jobs/job-1/stream')).toHaveLength(2)
+        await vi.waitFor(() => {
+            expect(callsFor(calls, '/api/model-jobs/job-1/claim', 'POST')).toHaveLength(1)
+        })
+    })
+
+    test('reattach cycles without progress eventually error the body (끊김 ≠ 완료), no claim', async () => {
+        // Server accepts every reattach but the job never progresses nor
+        // finishes — the no-progress cap must break the loop.
         const { calls } = setupServer({ streamChunks: ['partial tex'], job: { status: 'running' } })
-        const res = await makeJobFetch(makeOpts())('https://provider.example/v1/chat', { method: 'POST', body: '{}' })
+        const res = await makeJobFetch(makeOpts({ reconnectBaseDelayMs: 1 }))('https://provider.example/v1/chat', { method: 'POST', body: '{}' })
         await expect(drain(res)).rejects.toThrow(ModelJobConnectionLostError)
         expect(callsFor(calls, '/api/model-jobs/job-1/claim', 'POST')).toHaveLength(0)
     })
 
     test('unreachable status check after stream end also counts as connection lost', async () => {
         setupServer({ streamChunks: ['partial'], jobReject: new TypeError('network down') })
-        const res = await makeJobFetch(makeOpts())('https://provider.example/v1/chat', { method: 'POST', body: '{}' })
-        await expect(drain(res)).rejects.toThrow('generation continues in background')
+        const res = await makeJobFetch(makeOpts({ reconnectBaseDelayMs: 1 }))('https://provider.example/v1/chat', { method: 'POST', body: '{}' })
+        // Asserted by type, not text: the message is localized (language.errors).
+        await expect(drain(res)).rejects.toThrow(ModelJobConnectionLostError)
+    })
+
+    test('aux jobs forward kind and their own unique key', async () => {
+        const { calls } = setupServer({ streamChunks: ['{"ok":true}'], job: { status: 'done' } })
+        await makeJobFetch(makeOpts({ jobKind: 'aux', realChatId: 'aux-gen-9' }))('https://provider.example/v1/chat', { method: 'POST', body: '{}' })
+        const [create] = callsFor(calls, '/api/model-jobs', 'POST')
+        expect(JSON.parse(create.init?.body as string)).toMatchObject({ kind: 'aux', chatId: 'aux-gen-9' })
     })
 
     test('stream end with failed job errors the body with the job error and claims it', async () => {

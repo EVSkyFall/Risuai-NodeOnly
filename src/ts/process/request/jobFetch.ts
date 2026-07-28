@@ -1,4 +1,5 @@
 import { forageStorage } from 'src/ts/globalApi.svelte'
+import { language } from 'src/lang'
 
 // Server-side model-preset requests — job-based fetchImpl (Stage 3 of
 // .agent/notes/model-preset-server-side-requests.md).
@@ -20,7 +21,8 @@ import { forageStorage } from 'src/ts/globalApi.svelte'
  *  Must NOT fall back to the direct path (would double-generate). */
 export class ModelJobBusyError extends Error {
     constructor() {
-        super('This chat is already generating in the background')
+        // Localized: this surfaces to the user as the generation's error text.
+        super(language.errors.modelJobBusy)
         this.name = 'ModelJobBusyError'
     }
 }
@@ -28,28 +30,48 @@ export class ModelJobBusyError extends Error {
 /** Safety rule 1 (끊김 ≠ 완료): the journal stream ended but the server says
  *  the job is still running — the tail connection was lost, NOT the
  *  generation. The message must not be saved as complete; the job keeps
- *  running server-side and discovery (Stage 4) recovers it. */
+ *  running server-side and discovery (Stage 4) recovers it.
+ *
+ *  Worded as "still generating, it will resume" rather than as a failure: the
+ *  user is looking at what appears to be an error while the generation is in
+ *  fact fine, and a re-send would only hit the per-chat job guard (409). */
 export class ModelJobConnectionLostError extends Error {
     constructor() {
-        super('model job connection lost — generation continues in background')
+        super(language.errors.modelJobConnectionLost)
         this.name = 'ModelJobConnectionLostError'
     }
 }
 
 export interface JobFetchOptions {
-    /** Real chat.id (server enforces one running job per chat on this key). */
+    /** Job key: the real chat.id for main generations (server enforces one
+     *  running main job per chat on it). Aux side requests pass their unique
+     *  per-request genId here instead — the guard never applies to them. */
     realChatId: string
     /** Per-request generationId (idempotency key for Stage 4 slot-in). */
     generationId: string
     adapterKind: string
     streaming: boolean
+    /** 'main' = chat generation (recoverable at boot, per-chat guard).
+     *  'aux' = pipeline side request (translate / memory / …) riding the job
+     *  transport only for its reconnectable stream — relay-only server-side. */
+    jobKind?: 'main' | 'aux'
     /** Upstream request timeout, forwarded to the server job. */
     timeoutMs?: number
+    /** Base delay of the stream-reattach backoff (default 1000ms). Injectable
+     *  so tests do not sleep for real. */
+    reconnectBaseDelayMs?: number
     /** Used when job creation fails for infra reasons (network error / 404 /
      *  5xx — older or misbehaving server): the request transparently falls
      *  back to the direct proxied path. NOT used after the job exists. */
     fallbackFetch: typeof fetch
 }
+
+// Reattach policy. Attempts are per reconnect cycle (reset once a stream is
+// successfully attached); no-progress cycles guard against a pathological
+// middlebox that accepts the stream but closes it before new bytes arrive —
+// without it that would loop forever against a still-running job.
+const RECONNECT_MAX_ATTEMPTS = 5
+const RECONNECT_MAX_NO_PROGRESS_CYCLES = 3
 
 // Same auth mechanism the /proxy2 path uses (fetchViaProxy2). Shared with
 // jobRecovery.ts (all /api/model-jobs endpoints expect it).
@@ -77,6 +99,7 @@ export function makeJobFetch(opts: JobFetchOptions): typeof fetch {
                     chatId: opts.realChatId,
                     generationId: opts.generationId,
                     adapterKind: opts.adapterKind,
+                    kind: opts.jobKind ?? 'main',
                     streaming: opts.streaming,
                     timeoutMs: opts.timeoutMs,
                 }),
@@ -127,53 +150,140 @@ export function makeJobFetch(opts: JobFetchOptions): typeof fetch {
         // 3. Wrap the body: an ended HTTP stream does NOT prove completion
         //    (safety rule 1). On end, confirm with the job record and only
         //    close cleanly when the server says 'done'.
-        const reader = streamRes.body.getReader()
+        //
+        //    While the job is still RUNNING, an ended/broken tail is a lost
+        //    connection, not a lost generation — the journal replays from byte
+        //    0 on every attach, so this reattaches with backoff and skips the
+        //    bytes already delivered. The consumer (adapter parser, and every
+        //    await up the send pipeline) never sees the gap: a network blip
+        //    mid-send resumes in place instead of failing the send. Only when
+        //    reattach attempts are exhausted does the stream error with
+        //    ModelJobConnectionLostError (recovery then takes over at the next
+        //    return/boot for main jobs).
+        let reader = streamRes.body.getReader()
+        let bytesDelivered = 0
+        let skipRemaining = 0
+        let progressSinceAttach = true // first attach counts as progress
+        let noProgressCycles = 0
+        const baseDelay = opts.reconnectBaseDelayMs ?? 1000
+
+        const abortError = () => new DOMException('The operation was aborted.', 'AbortError')
+        const sleepAbortable = (ms: number) => new Promise<void>((resolve, reject) => {
+            const cleanup = () => {
+                clearTimeout(timer)
+                signal?.removeEventListener('abort', onAbort)
+            }
+            const onAbort = () => { cleanup(); reject(abortError()) }
+            const timer = setTimeout(() => { cleanup(); resolve() }, ms)
+            if (signal?.aborted) { onAbort(); return }
+            signal?.addEventListener('abort', onAbort)
+        })
+
+        // Re-attach to the journal stream. True = a fresh reader is installed
+        // (replay from 0; skip what was already delivered). False = job gone
+        // (404), attempts exhausted, or aborted — caller gives up.
+        const tryReattach = async (): Promise<boolean> => {
+            if (progressSinceAttach) {
+                noProgressCycles = 0
+            } else if (++noProgressCycles >= RECONNECT_MAX_NO_PROGRESS_CYCLES) {
+                return false
+            }
+            for (let attempt = 0; attempt < RECONNECT_MAX_ATTEMPTS; attempt++) {
+                try {
+                    await sleepAbortable(baseDelay * 2 ** attempt)
+                    const res = await fetch(`/api/model-jobs/${jobId}/stream`, { headers: await authHeader(), signal })
+                    if (res.status === 404) return false // job rotated/deleted
+                    if (!res.ok || !res.body) continue
+                    reader = res.body.getReader()
+                    skipRemaining = bytesDelivered
+                    progressSinceAttach = false
+                    return true
+                } catch {
+                    if (signal?.aborted) return false
+                }
+            }
+            return false
+        }
+
+        const claim = () => {
+            void (async () => {
+                await fetch(`/api/model-jobs/${jobId}/claim`, { method: 'POST', headers: await authHeader() })
+            })().catch(() => {})
+        }
+
         const wrapped = new ReadableStream<Uint8Array>({
             async pull(controller) {
-                const { done, value } = await reader.read()
-                if (!done) {
-                    controller.enqueue(value)
-                    return
-                }
-                detach()
-                if (signal?.aborted) {
-                    // Local abort raced the stream end — surface the abort.
-                    throw new DOMException('The operation was aborted.', 'AbortError')
-                }
-                let job: { status?: string, error?: string } | null = null
-                try {
-                    const res = await fetch(`/api/model-jobs/${jobId}`, { headers: await authHeader() })
-                    if (res.ok) job = await res.json()
-                } catch {
-                    // Status check unreachable — indistinguishable from a lost
-                    // tail; fall through to connection-lost below.
-                }
-                if (job?.status === 'done') {
-                    controller.close()
-                    // Claim fire-and-forget: marks the job as collected so
-                    // Stage 4's discovery skips it. The tiny crash window
-                    // before the claim lands is covered by genId idempotency.
-                    void (async () => {
-                        await fetch(`/api/model-jobs/${jobId}/claim`, { method: 'POST', headers: await authHeader() })
-                    })().catch(() => {})
-                } else if (job?.status === 'failed' || job?.status === 'aborted') {
-                    if (job.status === 'failed') {
-                        // The user sees this failure live — claim it so the
-                        // next boot's discovery doesn't insert a duplicate
-                        // error into the chat. ('aborted' is excluded from the
-                        // unclaimed list; nothing to do.)
-                        void (async () => {
-                            await fetch(`/api/model-jobs/${jobId}/claim`, { method: 'POST', headers: await authHeader() })
-                        })().catch(() => {})
+                while (true) {
+                    let read: ReadableStreamReadResult<Uint8Array>
+                    try {
+                        read = await reader.read()
+                    } catch (err) {
+                        if (signal?.aborted) { detach(); throw err }
+                        // Mid-stream network error — same treatment as a
+                        // premature end while running: reattach.
+                        if (await tryReattach()) continue
+                        detach()
+                        if (signal?.aborted) throw abortError()
+                        throw new ModelJobConnectionLostError()
                     }
-                    controller.error(new Error(job.error ?? `model job ${job.status}`))
-                } else {
-                    // Still 'running' (or status unknown): the connection was
-                    // lost mid-tail. Error the stream so the normal error path
-                    // reports it instead of saving a truncated message. NO
-                    // retry here — the job is still running (a retry would
-                    // 409); Stage 4's discovery recovers the response.
+                    if (!read.done) {
+                        let chunk = read.value
+                        if (skipRemaining > 0) {
+                            // Replayed prefix we already handed out.
+                            if (chunk.length <= skipRemaining) {
+                                skipRemaining -= chunk.length
+                                continue
+                            }
+                            chunk = chunk.subarray(skipRemaining)
+                            skipRemaining = 0
+                        }
+                        bytesDelivered += chunk.length
+                        progressSinceAttach = true
+                        controller.enqueue(chunk)
+                        return
+                    }
+                    // Stream ended.
+                    if (signal?.aborted) {
+                        // Local abort raced the stream end — surface the abort.
+                        detach()
+                        throw abortError()
+                    }
+                    let job: { status?: string, error?: string } | null = null
+                    try {
+                        const res = await fetch(`/api/model-jobs/${jobId}`, { headers: await authHeader() })
+                        if (res.ok) job = await res.json()
+                    } catch {
+                        // Status check unreachable — same as a lost tail; the
+                        // reattach path below covers it.
+                    }
+                    if (job?.status === 'done') {
+                        detach()
+                        controller.close()
+                        // Claim fire-and-forget: marks the job as collected so
+                        // Stage 4's discovery skips it. The tiny crash window
+                        // before the claim lands is covered by genId idempotency.
+                        claim()
+                        return
+                    }
+                    if (job?.status === 'failed' || job?.status === 'aborted') {
+                        detach()
+                        if (job.status === 'failed') {
+                            // The user sees this failure live — claim it so the
+                            // next boot's discovery doesn't insert a duplicate
+                            // error into the chat. ('aborted' is excluded from
+                            // the unclaimed list; nothing to do.)
+                            claim()
+                        }
+                        controller.error(new Error(job.error ?? `model job ${job.status}`))
+                        return
+                    }
+                    // Still 'running' (or status unknown): the tail was lost,
+                    // not the generation — reattach and resume in place.
+                    if (await tryReattach()) continue
+                    detach()
+                    if (signal?.aborted) throw abortError()
                     controller.error(new ModelJobConnectionLostError())
+                    return
                 }
             },
             cancel(reason) {

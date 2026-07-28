@@ -432,6 +432,63 @@ describe('model-jobs', () => {
         expect(active.status).toBe(200)
         expect(Array.isArray((await active.json()).jobs)).toBe(true)
     })
+
+    it('aux jobs skip the per-chat guard and never appear in the active list', async () => {
+        upstream.chunks = ['data: long\n\n']
+        upstream.delayMs = 20
+        upstream.hang = true // keep both jobs running
+        const chatId = 'chat-aux-guard'
+
+        const main = await createJob({ chatId })
+        expect(main.status).toBe(200)
+        // Aux on the SAME chat is allowed (relay-only, not a generation) …
+        const aux = await createJob({ chatId, kind: 'aux' })
+        expect(aux.status).toBe(200)
+        // … while a second main still trips the guard.
+        const main2 = await createJob({ chatId })
+        expect(main2.status).toBe(409)
+
+        const activeRes = await fetch(`${base}/api/model-jobs?active=1`, {
+            headers: { 'risu-auth': AUTH_TOKEN },
+        })
+        const activeJobs = (await activeRes.json()).jobs as { id: string }[]
+        expect(activeJobs.some((j) => j.id === main.json.jobId)).toBe(true)
+        expect(activeJobs.some((j) => j.id === aux.json.jobId)).toBe(false)
+
+        for (const jobId of [main.json.jobId, aux.json.jobId]) {
+            await fetch(`${base}/api/model-jobs/${jobId}`, {
+                method: 'DELETE',
+                headers: { 'risu-auth': AUTH_TOKEN },
+            })
+            await waitForStatus(base, jobId, ['aborted'])
+        }
+        upstream.hang = false
+    })
+
+    it('a completed aux job stays streamable but is excluded from the unclaimed list', async () => {
+        upstream.chunks = ['data: aux-result\n\n']
+        upstream.delayMs = 5
+        upstream.hang = false
+
+        const aux = await createJob({ kind: 'aux' })
+        expect(aux.status).toBe(200)
+        const meta = await waitForStatus(base, aux.json.jobId, ['done'])
+        expect(meta.kind).toBe('aux')
+
+        // Relay contract: the journal still replays (a reconnecting client
+        // resumes from it) …
+        const streamRes = await fetch(`${base}/api/model-jobs/${aux.json.jobId}/stream`, {
+            headers: { 'risu-auth': AUTH_TOKEN },
+        })
+        expect((await readAll(streamRes)).toString('utf-8')).toBe('data: aux-result\n\n')
+
+        // … but recovery never sees it: an aux journal is not a chat message.
+        const unclaimedRes = await fetch(`${base}/api/model-jobs?unclaimed=1`, {
+            headers: { 'risu-auth': AUTH_TOKEN },
+        })
+        const unclaimedJobs = (await unclaimedRes.json()).jobs as { id: string }[]
+        expect(unclaimedJobs.some((j) => j.id === aux.json.jobId)).toBe(false)
+    })
 })
 
 // Rotation policy is exercised on a dedicated store so seeded rows cannot
@@ -441,16 +498,16 @@ describe('model-jobs rotation', () => {
 
     function seedTerminal(
         saveDir: string,
-        rows: { id: string; claimed: number; endedAt: number }[],
+        rows: { id: string; claimed: number; endedAt: number; kind?: string }[],
     ) {
         const raw = require('better-sqlite3')
         const db = new raw(path.join(saveDir, 'model-jobs.db'))
         const stmt = db.prepare(`
-            INSERT INTO model_jobs (id, chat_id, streaming, status, created_at, ended_at, bytes, claimed)
-            VALUES (?, ?, 0, 'done', ?, ?, 0, ?)
+            INSERT INTO model_jobs (id, chat_id, kind, streaming, status, created_at, ended_at, bytes, claimed)
+            VALUES (?, ?, ?, 0, 'done', ?, ?, 0, ?)
         `)
         for (const row of rows) {
-            stmt.run(row.id, `chat-${row.id}`, row.endedAt - 1000, row.endedAt, row.claimed)
+            stmt.run(row.id, `chat-${row.id}`, row.kind ?? 'main', row.endedAt - 1000, row.endedAt, row.claimed)
         }
         db.close()
     }
@@ -470,6 +527,21 @@ describe('model-jobs rotation', () => {
         // still be able to recover it after more than 7 days.
         expect(store.getJob('old-unclaimed')).not.toBeNull()
         expect(store.getJob('fresh-claimed')).not.toBeNull()
+        store.close()
+        fs.rmSync(dir, { recursive: true, force: true })
+    })
+
+    it('age expiry also deletes unclaimed AUX jobs — nothing ever recovers them', () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'model-jobs-rot-'))
+        const store = createModelJobs({ saveDir: dir })
+        const old = Date.now() - 8 * DAY
+        seedTerminal(dir, [
+            { id: 'old-unclaimed-aux', claimed: 0, endedAt: old, kind: 'aux' },
+            { id: 'old-unclaimed-main', claimed: 0, endedAt: old },
+        ])
+        store.cleanupTerminalJobs()
+        expect(store.getJob('old-unclaimed-aux')).toBeNull()
+        expect(store.getJob('old-unclaimed-main')).not.toBeNull()
         store.close()
         fs.rmSync(dir, { recursive: true, force: true })
     })
