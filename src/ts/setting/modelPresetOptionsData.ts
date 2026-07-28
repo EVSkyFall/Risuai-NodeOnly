@@ -14,6 +14,16 @@ function triggerRegistryResync(db: Database): void {
 
 export const modelPresetOptionsItems: SettingItem[] = [
     {
+        // Default ON (database defaults). Kill switch for the server-side
+        // request relay — placed here (not advanced settings) because it only
+        // affects the model-preset path and needs to be discoverable.
+        id: 'modelPreset.serverSideRequests',
+        type: 'check',
+        labelKey: 'nodeOnlyServerSideRequests',
+        helpKey: 'nodeOnlyServerSideRequests',
+        bindKey: 'nodeOnlyServerSideRequests',
+    },
+    {
         id: 'modelPreset.visibilityLevel',
         type: 'select',
         labelKey: 'profileVisibilityLevel',

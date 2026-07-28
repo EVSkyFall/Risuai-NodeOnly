@@ -400,6 +400,12 @@ export function setDatabase(data:Database){
     // Concrete default so the settings toggle (reads !!value) and the runtime
     // gate (statusEnabled) agree. Default on — see request-status-toast-infra.md.
     data.showRequestStatus ??= true
+    // Server-side requests default ON (2026-07-28 user decision, supersedes the
+    // design note's "first release OFF"): the primary remote-mobile pattern is
+    // exactly what it protects, cache/aux hazards are structurally excluded
+    // from recovery (kind='aux', pinned cache fetch), degraded recovery falls
+    // back to pre-feature behavior, and the toggle remains the kill switch.
+    data.nodeOnlyServerSideRequests ??= true
     if(!data.formatingOrder.includes('personaPrompt')){
         data.formatingOrder.splice(data.formatingOrder.indexOf('main'),0,'personaPrompt')
     }
