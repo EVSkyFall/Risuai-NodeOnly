@@ -15,6 +15,7 @@
     import { getCharImage } from "../../ts/characters";
     import { chatProcessStage, doingChat, sendChat } from "../../ts/process/index.svelte";
     import { abortGeneration, chatGenKey, endGeneration, generationStates, registerAbort } from "../../ts/process/generationState";
+    import { claimPendingSend, clearPendingSend, markResumable, resumableSends, takeResumable } from "../../ts/process/request/pendingSends";
     import { ensureCurrentChatReady } from "../../ts/storage/chatStorage";
     import { sleep } from "../../ts/util";
     import { language } from "../../lang";
@@ -559,6 +560,13 @@ import { isMobile } from 'src/ts/platform'
 
         messageInput = ''
         const genKey = currentChatGenKey()
+        // Mirror sendChat's per-chat guard BEFORE any side effects: a blocked
+        // send must not run the unconditional conclude below, which would tear
+        // down the RUNNING generation's guard entry and tombstone (e.g. Enter
+        // pressed while an auto-resume is streaming).
+        if ($generationStates.has(genKey)) {
+            return false
+        }
         const abortController = new AbortController()
         registerAbort(genKey, abortController)
         let generated = false
@@ -572,11 +580,63 @@ import { isMobile } from 'src/ts/platform'
             alertError(error)
         }
         endGeneration(genKey)
+        // Send concluded on THIS client (success, failure or abort alike) —
+        // drop the resumable-send tombstone so no later boot re-runs it.
+        clearPendingSend(genKey)
         if(DBState.db.playMessage){
             playNotificationSound(DBState.db.messageSound, DBState.db.messageSoundVolume)
         }
         return generated
     }
+
+    // Auto-resume of an interrupted send (pendingSends.ts): discovery flags a
+    // chat whose send died mid-pipeline with no recoverable response; opening
+    // that chat re-runs the send once, as if the user pressed send again on
+    // the same conversation tail. Unlike sendChatMain this must NOT touch
+    // messageInput (a typed draft survives) and adds no new user message —
+    // the original one is already the chat's last message.
+    //
+    // Everything is revalidated at execution time (a macrotask after the
+    // effect): the selection must still point at the flagged chat, nothing may
+    // be generating, the chat must still end on the user's turn, and the
+    // server-side CLAIM must succeed — the atomic claim is what makes the
+    // re-run at-most-once across devices, tabs and reloads.
+    async function resumeInterruptedSend(chatId: string) {
+        if (currentChatGenKey() !== chatId || $generationStates.has(chatId)) {
+            // Not runnable right now (selection moved / something generating)
+            // but not concluded either — restore the flag so returning to the
+            // chat can retry without waiting for another discovery pass (and
+            // without a duplicate notice).
+            markResumable(chatId)
+            return
+        }
+        const char = DBState.db.characters[$selectedCharID]
+        const chat = char?.chats?.[char.chatPage]
+        const last = chat?.message?.[chat.message.length - 1]
+        if (!last || last.role !== 'user') return        // tail changed — concluded
+        if (!await claimPendingSend(chatId)) return      // another client won (or server unreachable)
+        if (currentChatGenKey() !== chatId || $generationStates.has(chatId)) return
+        const abortController = new AbortController()
+        registerAbort(chatId, abortController)
+        try {
+            await sendChat(-1, { signal: abortController.signal })
+        } catch (error) {
+            console.error(error)
+        }
+        endGeneration(chatId)
+        clearPendingSend(chatId)
+    }
+
+    // One-shot via takeResumable; the timeout escapes the effect before the
+    // send mutates tracked state.
+    $effect(() => {
+        const char = DBState.db.characters[$selectedCharID]
+        const chatId = char?.chats?.[char.chatPage]?.id
+        if (!chatId || !$resumableSends.has(chatId)) return
+        if ($generationStates.has(chatGenKey(chatId))) return
+        if (!takeResumable(chatId)) return
+        setTimeout(() => { void resumeInterruptedSend(chatId) }, 0)
+    })
 
     function abortChat(){
         abortGeneration(currentChatGenKey())

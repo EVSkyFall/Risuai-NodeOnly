@@ -1941,6 +1941,7 @@ export const languageKorean = {
   scrollButtonTypeTwo: "2버튼",
   scrollButtonTypeOff: "사용 안 함",
   nodeOnlyServerSideRequests: "서버 사이드 요청",
+  pendingSendNotice: "완료되지 못한 전송: {chars} — 해당 채팅을 열면 이어서 보냅니다.",
   // 원격 접속 (Cloudflare Quick Tunnel)
   remoteAccess: "원격 접속",
   remoteAccessDesc:

@@ -2,11 +2,12 @@ import { get } from 'svelte/store'
 import { v4 as uuidv4 } from 'uuid'
 import { getDatabase, type Chat, type Database, type Message } from 'src/ts/storage/database.svelte'
 import { ensureChatHydrated } from 'src/ts/storage/chatStorage'
-import { notifyError } from 'src/ts/alert'
+import { notifyError, notifyInfo } from 'src/ts/alert'
 import { language } from 'src/lang'
 import { chatGenKey, endGeneration, generationStates, registerAbort, startGeneration } from 'src/ts/process/generationState'
 import { clearStatus, endStatus, startStatus } from 'src/ts/status/requestStatus'
 import { authHeader } from './jobFetch'
+import { clearPendingSend, listPendingSends, markResumable, resumableSends, type PendingSendRecord } from './pendingSends'
 import { parseSseStream } from 'src/ts/preset/adapter/sse'
 import { parseChatCompletion, parseChatStreamDelta } from 'src/ts/preset/adapter/openaiCompatible'
 import { parseAnthropicMessage, parseAnthropicStreamDelta } from 'src/ts/preset/adapter/anthropicMessages'
@@ -283,8 +284,14 @@ export async function recoverTerminalJob(job: ModelJobRecord): Promise<void> {
         await claimJob(job.id)
         return
     }
+    // Secondary match on the message-level chatId (the live push stamps it
+    // with the generationId and it is never rewritten): a continue restamps
+    // generationInfo to the NEW generation, which would otherwise orphan an
+    // unclaimed job of the ORIGINAL one and insert its full response as a
+    // duplicate message.
     const existingIdx = job.generationId
-        ? loc.chat.message.findIndex((m) => m?.generationInfo?.generationId === job.generationId)
+        ? loc.chat.message.findIndex((m) => m?.generationInfo?.generationId === job.generationId
+            || m?.chatId === job.generationId)
         : -1
     if (job.status === 'failed') {
         // With the live message already in the chat the user saw this failure as
@@ -432,6 +439,108 @@ async function listJobs(filter: 'unclaimed' | 'active'): Promise<ModelJobRecord[
     return Array.isArray(parsed?.jobs) ? parsed.jobs : []
 }
 
+// --- pending sends (resumable-send evaluation) ------------------------------
+
+// Records younger than this are never evaluated: a fresh record most likely
+// belongs to a send still running somewhere (the pre-request pipeline shows no
+// job in jobChatIds — translate/hypa ride relay-only aux jobs keyed by their
+// own ids), possibly on ANOTHER device. Past this age any real pipeline has
+// long since either fired its main job or died.
+export const PENDING_SEND_MIN_AGE_MS = 3 * 60 * 1000
+
+// Decide what an interrupted send's tombstone means, AFTER the job passes of
+// the same discovery ran (their slot-ins feed the checks below).
+//
+// The record is NOT consumed here. Concluded outcomes clear it; a resumable
+// one stays on the server until the resume path atomically CLAIMS it
+// (claimPendingSend) right before re-running — that claim is what makes the
+// re-run at-most-once across devices and reloads, and a flag lost to a reload
+// simply gets re-flagged by the next discovery instead of evaporating.
+//
+// Returns the chat's display name when it was NEWLY flagged (for the notice),
+// null otherwise.
+export async function evaluatePendingSend(
+    record: PendingSendRecord,
+    jobChatIds: Set<string>,
+): Promise<string | null> {
+    // A LIVE send in this tab still owns the chat: the record is protecting an
+    // in-flight send (discovery fires on tab-return mid-send). Touch nothing.
+    if (get(generationStates).get(chatGenKey(record.chatId))?.kind === 'live') return null
+    if (typeof record.createdAt === 'number'
+        && Date.now() - record.createdAt < PENDING_SEND_MIN_AGE_MS) {
+        return null // possibly still running (maybe on another device) — let it age
+    }
+    const loc = await locateChat(record.chatId)
+    if (!loc) {
+        clearPendingSend(record.chatId) // chat deleted — nothing to resume
+        return null
+    }
+    // Concluded: the send's message made it into the chat (live save or job
+    // recovery slot-in — the fill path also stamps this generationId; the
+    // message-level chatId covers a continue that restamped generationInfo).
+    if (record.generationId
+        && loc.chat.message.some((m) => m?.generationInfo?.generationId === record.generationId
+            || m?.chatId === record.generationId)) {
+        clearPendingSend(record.chatId)
+        return null
+    }
+    // A job for this chat exists (running or awaiting recovery): the main
+    // request DID fire, so job recovery owns the outcome — a re-run here would
+    // double-generate.
+    if (jobChatIds.has(record.chatId)) {
+        clearPendingSend(record.chatId)
+        return null
+    }
+    // Resumable only while the chat still ends with the user's turn. Anything
+    // after it (a reply, an error block, an edit) means the send concluded or
+    // the user moved on — never resend over their changes.
+    const last = loc.chat.message.length > 0 ? loc.chat.message[loc.chat.message.length - 1] : undefined
+    if (!last || last.role !== 'user') {
+        clearPendingSend(record.chatId)
+        return null
+    }
+    const alreadyFlagged = get(resumableSends).has(record.chatId)
+    markResumable(record.chatId, record.generationId ?? undefined)
+    if (alreadyFlagged) return null
+    return (loc.char as { name?: string }).name || loc.chat.name || record.chatId
+}
+
+// A record deferred by the min-age gate gets exactly one scheduled re-check
+// when it comes of age — without this, a desktop tab that stays visible would
+// never re-run discovery and the resume would be missed for the session.
+let deferredDiscoveryTimer: ReturnType<typeof setTimeout> | null = null
+function scheduleDeferredDiscovery(delayMs: number): void {
+    if (deferredDiscoveryTimer !== null) clearTimeout(deferredDiscoveryTimer)
+    deferredDiscoveryTimer = setTimeout(() => {
+        deferredDiscoveryTimer = null
+        void recoverModelJobs()
+    }, delayMs)
+}
+
+async function discoverPendingSends(jobChatIds: Set<string>): Promise<string[]> {
+    const records = await listPendingSends()
+    const newNames: string[] = []
+    for (const record of records) {
+        try {
+            const name = await evaluatePendingSend(record, jobChatIds)
+            if (name !== null) newNames.push(name)
+        } catch (err) {
+            console.warn('[ModelJobRecovery] pending-send evaluation failed', record?.chatId, err)
+        }
+    }
+    const remaining = records
+        .map((r) => typeof r.createdAt === 'number'
+            ? PENDING_SEND_MIN_AGE_MS - (Date.now() - r.createdAt) : 0)
+        // Clamp: a future createdAt (server/client clock skew) must not
+        // stretch the deferral beyond one full gate period.
+        .map((ms) => Math.min(ms, PENDING_SEND_MIN_AGE_MS))
+        .filter((ms) => ms > 0)
+    if (remaining.length > 0) {
+        scheduleDeferredDiscovery(Math.min(...remaining) + 5_000)
+    }
+    return newNames
+}
+
 let recoveryInFlight: Promise<void> | null = null
 
 // Discovery pass. Never throws, and is a no-op when the job API is unreachable
@@ -465,6 +574,20 @@ async function runDiscovery(): Promise<void> {
             } catch (err) {
                 console.warn('[ModelJobRecovery] reattach failed for job', job?.id, err)
             }
+        }
+        // Pending sends AFTER the job passes: their slot-ins/attachments feed
+        // the concluded-checks in evaluatePendingSend.
+        const jobChatIds = new Set([...unclaimedJobs, ...activeJobs]
+            .map((job) => job?.chatId).filter((id): id is string => typeof id === 'string'))
+        const newNames = await discoverPendingSends(jobChatIds)
+        if (newNames.length > 0) {
+            // NEWLY flagged only — repeated discovery passes (every tab
+            // return) must not re-toast flags the user already saw. Not gated
+            // on showRequestStatus: this explains a generation that will start
+            // by itself, which is functional, not cosmetic. The flagged chat
+            // resumes when opened (DefaultChatScreen's effect).
+            safeStatus(() => notifyInfo(
+                language.pendingSendNotice.replace('{chars}', newNames.join(', '))))
         }
     } catch (err) {
         console.warn('[ModelJobRecovery] discovery failed', err)
