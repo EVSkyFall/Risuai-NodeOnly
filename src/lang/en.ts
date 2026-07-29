@@ -1798,6 +1798,9 @@ export const languageEnglish = {
     nanoGPTSelectFromList: "Select from List",
     nanoGPTManualInput: "Manual Input",
     nanoGPTManualModelSelect: "Manual Model Select",
+    searchSettingsPlaceholder: "Search settings...",
+    searchSettingsNoResults: "No matching settings found",
+    searchSettingsHint: "Search by setting name or keyword",
     // Remote Access (Cloudflare Quick Tunnel)
     remoteAccess: "Remote Access",
     remoteAccessDesc: "Use a remote access link to connect to this PocketRisu server from another device.",
