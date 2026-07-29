@@ -700,6 +700,8 @@ export function setDatabase(data:Database){
     data.showPresetInSidebar ??= true
     data.showPersonaInSidebar ??= true
     data.nodeOnlyModelModeLock ??= 'none'
+    data.moduleModelBindingsEnabled ??= false
+    data.moduleModelBindings ??= {}
     data.disableMobileDragDrop ??= false
     data.disableToggleBinding ??= false
     data.hideAllImages ??= false
@@ -1414,6 +1416,21 @@ export interface Database{
     // falling back to useModelPresetByDefault for chats that never chose. Read
     // by resolveChatModelBinding (the runtime regime chokepoint).
     nodeOnlyModelModeLock?: 'legacy' | 'preset' | 'none'
+    // Per-module model override (moduleId -> ModelPreset id). A module's own
+    // LLM calls (Lua/Python `LLMMain`/`simpleLLM`/`axLLMMain`, trigger
+    // `runLLM`/`runAxLLM`/`sendAIprompt`/`v2RunLLM`) dispatch via the bound
+    // preset instead of the chat's main/sub model, regardless of request mode.
+    //
+    // Deliberately stored OUTSIDE the module object: modules are exported and
+    // shared as .risum, and a preset id only means something in the environment
+    // that created it. Dangling ids (deleted preset / uninstalled module) are
+    // never auto-cleared, matching the P4 policy — a re-imported preset or
+    // re-installed module reconnects on its own.
+    //
+    // moduleModelBindingsEnabled is the master switch. Off (default) skips the
+    // override branch entirely, so behaviour is byte-identical to before.
+    moduleModelBindingsEnabled?: boolean
+    moduleModelBindings?: Record<string, string>
     modelPresetMigrationVersion?: number
     modelPresetMigrationAppliedAt?: number
     modelPresetMigrationReport?: ModelPresetMigrationSummary
