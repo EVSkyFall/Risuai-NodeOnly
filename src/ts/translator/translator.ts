@@ -151,7 +151,9 @@ async function translateMain(text:string, arg:{from:string, to:string, host:stri
                 "Authorization": "DeepL-Auth-Key " + db.deeplOptions.key,
                 "Content-Type": "application/json"
             },
-            body: body
+            body: body,
+            logCategory: 'translate',
+            logSource: 'translate',
         })
 
         if(!f.ok){
@@ -187,7 +189,7 @@ async function translateMain(text:string, arg:{from:string, to:string, host:stri
         if(db.deeplXOptions.token.trim() !== '') { headers["Authorization"] = "Bearer " + db.deeplXOptions.token}
         
         //Since the DeepLX API is non-CORS restricted, we can use the plain fetch function
-        const f = await globalFetch(url, { method: "POST", headers: headers, body: body, plainFetchForce:true })
+        const f = await globalFetch(url, { method: "POST", headers: headers, body: body, plainFetchForce:true, logCategory: 'translate', logSource: 'translate' })
 
         if(!f.ok){ return 'ERR::DeepLX API Error' + (await f.data) }
 
@@ -214,6 +216,8 @@ async function translateMain(text:string, arg:{from:string, to:string, host:stri
                         "Accept": "*/*",
                     },
                     method: "GET",
+                    logCategory: 'translate',
+                    logSource: 'translate',
                 })
                 const parser = new DOMParser()
                 const dom = parser.parseFromString(d.data, 'text/html')

@@ -241,6 +241,20 @@ export const searchManifestEntries: ManualSearchEntry[] = [
         subTab: SystemTab.Logs,
     },
     {
+        id: 'manual.system.requestLogs',
+        label: () => language.requestLogsTab,
+        keywords: ['request log', 'prompt', 'response', 'api call', '리퀘스트 로그', '요청 기록', '프롬프트'],
+        route: SettingsRoute.System,
+        subTab: SystemTab.RequestLogs,
+    },
+    {
+        id: 'manual.system.usage',
+        label: () => language.usageTab,
+        keywords: ['usage', 'token', 'statistics', 'cost', '사용량', '토큰', '통계'],
+        route: SettingsRoute.System,
+        subTab: SystemTab.Usage,
+    },
+    {
         id: 'manual.system.pluginStorage',
         label: () => language.pluginStorageTab,
         keywords: ['plugin storage', '플러그인 저장소'],

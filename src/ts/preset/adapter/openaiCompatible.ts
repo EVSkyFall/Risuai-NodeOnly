@@ -162,6 +162,13 @@ async function prepareOpenAiBody(
     prepared.body.messages = options.messages.map(toWireMessage)
     prepared.body.model = modelId
     prepared.body.stream = stream
+    // Streaming responses carry no usage unless it is requested. Only set when
+    // the user opted in: a strict OpenAI-compatible server can 400 on an
+    // unknown field, and that would break the generation, not just the stats.
+    // Left untouched when off, so a customBody-provided value still applies.
+    if (stream && options.collectStreamUsage) {
+        prepared.body.stream_options = { include_usage: true }
+    }
     // `tools` is a wire invariant when the caller supplies them: the request
     // builder must own tool declaration so customBody cannot smuggle a
     // conflicting list. When absent, leave any profile-declared tools untouched.
@@ -376,6 +383,16 @@ function parseUsage(raw: unknown): AdapterUsage | undefined {
         usage.completionTokens = raw['completion_tokens'] as number
     }
     if (typeof raw['total_tokens'] === 'number') usage.totalTokens = raw['total_tokens'] as number
+    // Cached prompt tokens and reasoning tokens are reported in detail objects
+    // and are already counted inside prompt_tokens / completion_tokens.
+    const promptDetails = raw['prompt_tokens_details']
+    if (isPlainObject(promptDetails) && typeof promptDetails['cached_tokens'] === 'number') {
+        usage.cachedTokens = promptDetails['cached_tokens'] as number
+    }
+    const completionDetails = raw['completion_tokens_details']
+    if (isPlainObject(completionDetails) && typeof completionDetails['reasoning_tokens'] === 'number') {
+        usage.reasoningTokens = completionDetails['reasoning_tokens'] as number
+    }
     if (
         usage.promptTokens === undefined
         && usage.completionTokens === undefined

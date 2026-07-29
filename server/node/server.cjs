@@ -30,6 +30,7 @@ const {
     addLogBatch, queryLogs, clearLogs, countLogs,
     logger, installProcessHandlers, expressErrorMiddleware,
 } = require('./logs.cjs');
+const { createRequestLogs } = require('./request-logs.cjs');
 const { applyPatch } = require('fast-json-patch');
 const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, normalizeForwardHeaders, hasRemoteBlocks } = require('./utils.cjs');
 const { spawn, execSync } = require('child_process');
@@ -3465,6 +3466,13 @@ app.delete('/api/logs', async (req, res, next) => {
         next(error);
     }
 });
+
+// ─── /api/request-logs — provider request log + token usage statistics ───────
+// Own SQLite file (save/request-logs.db) with its own rotation policy; see
+// server/node/request-logs.cjs. Registered with the same auth the /api/logs
+// endpoints use.
+const requestLogs = createRequestLogs({ saveDir: savePath });
+requestLogs.registerRoutes(app, { auth: checkAuth, activeSession: checkActiveSession });
 
 app.post('/api/write', async (req, res, next) => {
     if(!await checkAuth(req, res)){

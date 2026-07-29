@@ -1,5 +1,5 @@
 import { get } from "svelte/store"
-import { alertMd, alertSelect, alertWait, doingAlert, alertRequestLogs } from "./alert"
+import { alertMd, alertSelect, alertWait, doingAlert } from "./alert"
 import { getDatabase  } from "./storage/database.svelte"
 import { alertStore, DBState, MobileGUIStack, MobileSideBar, openPersonaList, personaSelectCallback, openPresetList, openHypaV3PresetList, openThemePresetList, OpenRealmStore, PlaygroundStore, QuickSettings, SafeModeStore, selectedCharID, settingsOpen } from "./stores.svelte"
 import { language } from "src/lang"
@@ -8,6 +8,7 @@ import { defaultHotkeys } from "./defaulthotkeys"
 import { doingChat, previewBody, sendChat } from "./process/index.svelte"
 import { endAllGenerations } from "./process/generationState"
 import { RISU_SIDEBAR_DRAG_TYPE } from "./dragTypes"
+import { openSettings, SettingsRoute, SystemTab } from "./routing"
 
 export function initHotkey(){
     document.addEventListener('keydown', async (ev) => {
@@ -146,7 +147,7 @@ export function initHotkey(){
                     return
                 }
                 case 'toggleLog':{
-                    alertRequestLogs()
+                    openSettings(SettingsRoute.System, SystemTab.RequestLogs)
                     break
                 }
                 case 'quickSettings':{

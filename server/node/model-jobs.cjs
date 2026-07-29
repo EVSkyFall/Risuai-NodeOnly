@@ -164,6 +164,8 @@ function createModelJobs(opts = {}) {
             chat_id TEXT NOT NULL,
             generation_id TEXT,
             adapter_kind TEXT,
+            model TEXT,
+            target_origin TEXT,
             kind TEXT NOT NULL DEFAULT 'main',
             streaming INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL,
@@ -182,6 +184,16 @@ function createModelJobs(opts = {}) {
     try {
         db.exec(`ALTER TABLE model_jobs ADD COLUMN kind TEXT NOT NULL DEFAULT 'main'`);
     } catch { /* column already present */ }
+    // Added for request-log parity on recovered jobs. `target_origin` is
+    // origin+pathname ONLY — the query string is dropped because that is where
+    // Gemini and query-auth profiles carry the API key, so the SECURITY rule
+    // above (no credentials at rest) still holds.
+    try {
+        db.exec(`ALTER TABLE model_jobs ADD COLUMN model TEXT`);
+    } catch { /* column already present */ }
+    try {
+        db.exec(`ALTER TABLE model_jobs ADD COLUMN target_origin TEXT`);
+    } catch { /* column already present */ }
 
     // Resumable sends: one tombstone per chat marking "a send was started here
     // and has not concluded". Holds NO pipeline state — the send's durable
@@ -198,8 +210,8 @@ function createModelJobs(opts = {}) {
     `);
 
     const stmtInsert = db.prepare(`
-        INSERT INTO model_jobs (id, chat_id, generation_id, adapter_kind, kind, streaming, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, 'running', ?)
+        INSERT INTO model_jobs (id, chat_id, generation_id, adapter_kind, model, target_origin, kind, streaming, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)
     `);
     const stmtGet = db.prepare(`SELECT * FROM model_jobs WHERE id = ?`);
     const stmtRunningForChat = db.prepare(`SELECT id FROM model_jobs WHERE chat_id = ? AND status = 'running' AND kind = 'main' LIMIT 1`);
@@ -289,6 +301,8 @@ function createModelJobs(opts = {}) {
             chatId: row.chat_id,
             generationId: row.generation_id,
             adapterKind: row.adapter_kind,
+            model: row.model ?? undefined,
+            targetOrigin: row.target_origin ?? undefined,
             kind: row.kind,
             streaming: !!row.streaming,
             status: row.status,
@@ -484,6 +498,8 @@ function createModelJobs(opts = {}) {
             chatId,
             typeof arg.generationId === 'string' ? arg.generationId : null,
             typeof arg.adapterKind === 'string' ? arg.adapterKind : null,
+            typeof arg.model === 'string' ? arg.model.slice(0, 128) : null,
+            parsedTarget.origin + parsedTarget.pathname,
             kind,
             arg.streaming ? 1 : 0,
             Date.now()
