@@ -25,6 +25,8 @@ import type { OpenAIChat } from "src/ts/process/index.svelte";
 import { authorizeIllustrationV3Plugin, createIllustrationV3CapabilityIfAuthorized, type AuthorizedIllustrationV3Bridge } from "src/ts/process/illustrationJobs/v3Bridge";
 import { createPluginAtomicSandboxApi } from "src/ts/process/pluginPrimitives/pluginAtomic";
 import { createDefaultPluginImagesApi } from "src/ts/process/pluginPrimitives/pluginImages";
+import { createDefaultPluginInlayMediaApi } from "src/ts/process/pluginPrimitives/pluginInlayMedia";
+import { createDefaultComfySandboxApi } from "src/ts/process/pluginPrimitives/comfyOrchestrator";
 import { createAuthorizedIllustrationV3HostBridge } from "src/ts/process/illustrationJobs/v3BridgeHost";
 import { tokenize as tokenizerTokenize, tokenizeAccurate as tokenizerTokenizeAccurate, encodeWithTokenizer, tokenizerList } from "src/ts/tokenizer";
 import { getModuleLorebooks } from "src/ts/process/modules";
@@ -822,6 +824,8 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
     // scheduling, and both halves already exist in the core — this is the one
     // capability a plugin has no other way to reach.
     const pluginImagesApi = createDefaultPluginImagesApi();
+    const pluginInlayMediaApi = createDefaultPluginInlayMediaApi();
+    const comfyApi = createDefaultComfySandboxApi();
 
     return {
 
@@ -1455,6 +1459,15 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
         _generatePluginImageToInlay: (input: any) => pluginImagesApi.generateToInlay(input),
         _removePluginInlay: (input: any) => pluginImagesApi.remove(input),
         _readPluginInlay: (input: any) => pluginImagesApi.read(input),
+        _readPluginInlayMedia: (input: any) => pluginInlayMediaApi.readMedia(input),
+        _submitComfy: (input: any) => comfyApi.submit(input),
+        _pollComfy: (input: any) => comfyApi.poll(input),
+        _findComfyByOperationKey: (input: any) => comfyApi.findByOperationKey(input),
+        _cancelComfy: (input: any) => comfyApi.cancel(input),
+        _listComfyTemplates: () => comfyApi.listTemplates(),
+        _getComfyConfig: () => comfyApi.getConfig(),
+        _updateComfyEndpoint: (input: any) => comfyApi.updateEndpoint(input),
+        _getComfyHealth: () => comfyApi.getHealth(),
         getCapabilities: async () => {
             // Generic, illustration-agnostic capability handshake (request §3).
             // Additive only — the illustration bridge keeps its own separate
@@ -1464,6 +1477,8 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
                 pluginAtomicV1: 1,
                 pluginImagesV1: 1,
                 pluginInlaysV1: 1,
+                pluginInlaysMediaV1: 1,
+                comfyOrchestratorV1: 1,
                 // Aggregate readiness marker: every primitive advertised in
                 // this handshake is wired and usable.
                 pluginPrimitiveSuiteV1: { epoch: 1, ready: true },
@@ -1517,6 +1532,17 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
                 'pluginInlays':{
                     'remove': '_removePluginInlay',
                     'read': '_readPluginInlay',
+                    'readMedia': '_readPluginInlayMedia',
+                },
+                'comfy':{
+                    'submit': '_submitComfy',
+                    'poll': '_pollComfy',
+                    'findByOperationKey': '_findComfyByOperationKey',
+                    'cancel': '_cancelComfy',
+                    'listTemplates': '_listComfyTemplates',
+                    'getConfig': '_getComfyConfig',
+                    'updateEndpoint': '_updateComfyEndpoint',
+                    'getHealth': '_getComfyHealth',
                 },
                 ...(illustrationBridge?.aliases ?? {})
             }

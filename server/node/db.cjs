@@ -6,6 +6,7 @@ const fs = require('fs');
 const { createChunkStore } = require('./chunkStore.cjs');
 const { createIllustrationAtomicStore } = require('./illustrationAtomicStore.cjs');
 const { createPluginAtomicStore } = require('./pluginAtomicStore.cjs');
+const { createComfyStore } = require('./comfy/store.cjs');
 
 const saveDir = path.join(process.cwd(), 'save');
 if (!fs.existsSync(saveDir)) {
@@ -117,6 +118,14 @@ const illustrationAtomic = createIllustrationAtomicStore(db);
 // same wiring pattern as chunkStore. It has no kv dependency: unlike the
 // illustration store it performs no lazy legacy import.
 const pluginAtomic = createPluginAtomicStore(db);
+
+// ─── ComfyUI orchestration storage (Phase A) ────────────────────────────────
+// Jobs, immutable operation receipts, and endpoint configuration share the
+// server database so restart reconciliation has the same durability boundary
+// as the other server-authoritative stores.
+const comfyStore = createComfyStore(db, {
+    defaultTemplateDir: path.join(__dirname, 'comfy', 'templates'),
+});
 
 // ─── KV operations ────────────────────────────────────────────────────────────
 // kv reads/writes for the DB blob route through chunkStore (get/put/size/copy);
@@ -238,4 +247,6 @@ module.exports = {
     illustrationAtomic,
     // Generic plugin atomic storage (Pure Plugin Primitives V1)
     pluginAtomic,
+    // ComfyUI orchestration storage (Phase A)
+    comfyStore,
 };

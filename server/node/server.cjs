@@ -26,7 +26,7 @@ const getVips = () => {
 const { kvGet, kvSet, kvDel, kvList,
         kvDelPrefix, kvListWithSizes, kvSize, kvGetUpdatedAt, kvCopyValue, clearEntities, checkpointWal,
         gcChunks, reclaimableChunkBytes, isDbBlobChunked, snapshotFootprint, illustrationAtomic,
-        pluginAtomic,
+        pluginAtomic, comfyStore,
         db: sqliteDb } = require('./db.cjs');
 const { MUTATING_OPS: ILLUSTRATION_ATOMIC_MUTATING_OPS } = require('./illustrationAtomicStore.cjs');
 const {
@@ -1257,6 +1257,29 @@ if (existsSync(instanceIdPath)) {
 
 const authCodePath = path.join(process.cwd(), 'save', '__authcode')
 const inlayDir = path.join(savePath, 'inlays')
+const { createTemplateRegistry } = require('./comfy/templateRegistry.cjs')
+const { createComfyAssetStore } = require('./comfy/assetStore.cjs')
+const { createComfyOrchestrator } = require('./comfy/orchestrator.cjs')
+const { createComfyWorldReplacementGate } = require('./comfy/worldReplacementGate.cjs')
+const { isComfyError } = require('./comfy/errors.cjs')
+const comfyTemplateRegistry = createTemplateRegistry({
+    templateDir: comfyStore.getConfig().templateDir,
+})
+const comfyAssetStore = createComfyAssetStore({
+    inlayDir,
+    stagingDir: path.join(savePath, 'comfy-staging'),
+    kvSet,
+    kvDel,
+})
+const comfyOrchestrator = createComfyOrchestrator({
+    store: comfyStore,
+    registry: comfyTemplateRegistry,
+    assets: comfyAssetStore,
+    logger,
+})
+const comfyWorldReplacementGate = createComfyWorldReplacementGate({
+    orchestrator: comfyOrchestrator,
+})
 const inlayMigrationMarker = path.join(inlayDir, '.migrated_to_fs')
 const hexRegex = /^[0-9a-fA-F]+$/;
 const BACKUP_IMPORT_MAX_BYTES = Number(process.env.RISU_BACKUP_IMPORT_MAX_BYTES ?? '0');
@@ -2539,6 +2562,13 @@ async function parseBackupChunk(buffer, onEntry) {
 // ─── Shared backup import logic ─────────────────────────────────────────────
 // Accepts any async iterable of Buffer chunks (HTTP request body, file stream, etc.)
 async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0, onProgress = null } = {}) {
+    return comfyWorldReplacementGate.withWorldReplacement(() => importBackupFromSourceUnlocked(
+        dataSource,
+        { maxBytes, totalBytes, onProgress },
+    ))
+}
+
+async function importBackupFromSourceUnlocked(dataSource, { maxBytes = 0, totalBytes = 0, onProgress = null } = {}) {
     const BATCH_SIZE = 5000;
     // Defer Buffer.concat until enough bytes for the next entry are buffered.
     // Concatenating on every chunk arrival is O(n²) when a single entry (e.g.
@@ -2629,6 +2659,7 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
     // Runs inside the explicit BEGIN above — better-sqlite3 turns the store's
     // nested db.transaction into a SAVEPOINT, so it rolls back with the import.
     pluginAtomic.purgeForRestore();
+    comfyOrchestrator.purgeForWorldReplacement();
     clearEntities();
 
     try {
@@ -4609,6 +4640,99 @@ app.post('/api/plugin/atomic', async (req, res, next) => {
     }
 });
 
+// ─── ComfyUI orchestration relay (Phase A) ──────────────────────────────────
+// Plugins send only a template id plus typed slots. The endpoint URL and graph
+// bytes stay server-owned; this route is an authenticated, typed relay over the
+// durable single-worker orchestrator.
+app.post('/api/comfy/orchestrator', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    try {
+        return await comfyWorldReplacementGate.withRelayOperation(async () => {
+            const body = req.body;
+            if (!body || typeof body !== 'object' || body.protocolVersion !== 1 || typeof body.op !== 'string') {
+                return res.status(400).json({
+                    ok: false,
+                    code: 'COMFY_REQUEST_INVALID',
+                    message: 'Comfy relay request is invalid',
+                    uncertain: false,
+                });
+            }
+            switch (body.op) {
+                case 'submit': {
+                    const job = await comfyOrchestrator.submit({
+                        operationKey: body.operationKey,
+                        template: body.template,
+                        slots: body.slots,
+                        target: body.target,
+                    });
+                    return res.json({ ok: true, jobId: job.jobId });
+                }
+                case 'poll':
+                    if (typeof body.jobId !== 'string') {
+                        return res.status(400).json({
+                            ok: false,
+                            code: 'COMFY_REQUEST_INVALID',
+                            message: 'Comfy relay request is invalid',
+                            uncertain: false,
+                        });
+                    }
+                    return res.json({ ok: true, job: await comfyOrchestrator.poll(body.jobId) });
+                case 'findByOperationKey':
+                    if (typeof body.operationKey !== 'string') {
+                        return res.status(400).json({
+                            ok: false,
+                            code: 'COMFY_REQUEST_INVALID',
+                            message: 'Comfy relay request is invalid',
+                            uncertain: false,
+                        });
+                    }
+                    return res.json({
+                        ok: true,
+                        job: await comfyOrchestrator.findByOperationKey(body.operationKey),
+                    });
+                case 'cancel':
+                    if (typeof body.jobId !== 'string') {
+                        return res.status(400).json({
+                            ok: false,
+                            code: 'COMFY_REQUEST_INVALID',
+                            message: 'Comfy relay request is invalid',
+                            uncertain: false,
+                        });
+                    }
+                    return res.json({ ok: true, job: await comfyOrchestrator.cancel(body.jobId) });
+                case 'listTemplates':
+                    return res.json({ ok: true, templates: await comfyOrchestrator.listTemplates() });
+                case 'getConfig':
+                    return res.json({ ok: true, config: await comfyOrchestrator.getConfig() });
+                case 'updateEndpoint':
+                    return res.json({
+                        ok: true,
+                        config: await comfyOrchestrator.updateEndpoint(body.url),
+                    });
+                case 'getHealth':
+                    return res.json({ ok: true, health: await comfyOrchestrator.getHealth() });
+                default:
+                    return res.status(400).json({
+                        ok: false,
+                        code: 'COMFY_OPERATION_INVALID',
+                        message: 'Unknown Comfy relay operation',
+                        uncertain: false,
+                    });
+            }
+        });
+    } catch (error) {
+        if (isComfyError(error)) {
+            return res.status(error.httpStatus || 400).json({
+                ok: false,
+                code: error.code,
+                message: error.message,
+                uncertain: error.uncertain === true,
+            });
+        }
+        next(error);
+    }
+});
+
 app.post('/api/db/flush', sessionAuthMiddleware, async (req, res, next) => {    try {
         await queueStorageOperation(async () => {
             await flushPendingDb();
@@ -5744,6 +5868,7 @@ function clearExistingData() {
     // whole database blob, so plugin_atomic must not survive it forward-moving.
     // (Save folders carry no plugin_atomic entry, so this is purge-only.)
     pluginAtomic.purgeForRestore();
+    comfyOrchestrator.purgeForWorldReplacement();
     clearEntities();
 }
 
@@ -5847,7 +5972,9 @@ app.post('/api/migrate/save-folder/execute', async (req, res, next) => {
             res.status(400).json({ error: 'Cannot access directory' });
             return;
         }
-        const result = await importHexFilesFromDir(resolved);
+        const result = await comfyWorldReplacementGate.withWorldReplacement(
+            () => importHexFilesFromDir(resolved),
+        );
         res.json({ ok: true, imported: result.imported });
     } catch (error) {
         res.status(400).json({ error: error.message || 'Import failed' });
@@ -5906,7 +6033,9 @@ app.post('/api/migrate/save-folder/upload', async (req, res, next) => {
             return;
         }
 
-        const result = await importHexEntries(entries);
+        const result = await comfyWorldReplacementGate.withWorldReplacement(
+            () => importHexEntries(entries),
+        );
         res.json({ ok: true, imported: result.imported });
     } catch (error) {
         res.status(400).json({ error: error.message || 'Import failed' });
@@ -6510,7 +6639,7 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
         if (!blob) {
             return res.status(404).json({ error: 'Snapshot not found' });
         }
-        await queueStorageOperation(async () => {
+        await comfyWorldReplacementGate.withWorldReplacement(() => queueStorageOperation(async () => {
             // Drain any pending debounced persist first — same pattern as
             // /api/db/optimize. Without this, an in-flight save could land
             // after kvCopyValue and overwrite the restored snapshot.
@@ -6523,6 +6652,7 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
             // every outstanding change cursor into a typed cursor_expired.
             // Snapshots carry no plugin_atomic payload, so this is purge-only.
             pluginAtomic.purgeForRestore();
+            comfyOrchestrator.purgeForWorldReplacement();
             // Snapshot may pre-date the remote-block migration. Clear the marker
             // so migrateRemoteBlocksIfNeeded re-evaluates against the restored
             // bytes instead of skipping based on the prior post-migration state.
@@ -6548,7 +6678,7 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
             } catch (e) {
                 logger.warn('[Snapshot restore] post-restore decode failed:', e?.message || e);
             }
-        });
+        }));
         res.json({ ok: true });
     } catch (err) { next(err); }
 });
@@ -8474,6 +8604,11 @@ async function startServer() {
     try {
         await migrateInlaysToFilesystem();
         await migrateRemoteBlocksIfNeeded();
+        try {
+            await comfyOrchestrator.start();
+        } catch (error) {
+            logger.error('[Comfy] Failed to initialize; relay is running in degraded mode:', error);
+        }
         initializeNaiBrokerRestartHardening();
         const port = process.env.PORT || 6001;
         const httpsOptions = await getHttpsOptions();
@@ -8509,6 +8644,7 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
     process.on(sig, async () => {
         console.log(`[Server] Received ${sig}, flushing pending data...`);
         stopTunnel();
+        try { await comfyOrchestrator.stop(); } catch (e) { logger.error('[Server] Comfy stop error:', e); }
         try { await flushPendingDb(); } catch (e) { logger.error('[Server] Flush error:', e); }
         try { checkpointWal('TRUNCATE'); } catch { /* non-fatal */ }
         process.exit(0);

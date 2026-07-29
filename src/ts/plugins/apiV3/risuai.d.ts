@@ -1338,6 +1338,125 @@ type ProviderFunction = (
 /**
  * Provider options
  */
+type PluginInlayMediaReadResult =
+    | {
+        status: 'succeeded';
+        result: {
+            assetId: string;
+            data: Blob;
+            mediaType: 'image' | 'video';
+            mimeType: string;
+            ext: string;
+            name: string;
+            width?: number;
+            height?: number;
+        };
+    }
+    | { status: 'definite_failure'; error: string; code: string };
+
+interface PluginInlaysAPI {
+    remove(input: { operationKey: string; assetId: string }): Promise<any>;
+    read(input: { assetId: string }): Promise<any>;
+    /** Optional V1 extension that returns image or video bytes as a Blob. */
+    readMedia?(input: { assetId: string }): Promise<PluginInlayMediaReadResult>;
+}
+
+type ComfyJobState =
+    | 'queued'
+    | 'submitting'
+    | 'remote_queued'
+    | 'running'
+    | 'materializing'
+    | 'succeeded'
+    | 'cancel_requested'
+    | 'cancelled'
+    | 'failed'
+    | 'unknown'
+    | 'orphaned';
+
+interface ComfyJobSnapshot {
+    jobId: string;
+    operationKey: string;
+    template: string;
+    templateHash: string;
+    endpointGeneration: number;
+    target?: { charId?: string; chatId?: string };
+    promptId?: string;
+    state: ComfyJobState;
+    revision: number;
+    error?: { code: string; message: string };
+    resultAssetId?: string;
+    mimeType?: string;
+    createdAt: number;
+    updatedAt: number;
+    startedAt?: number;
+    finishedAt?: number;
+    deadlineAt: number;
+}
+
+interface ComfyFailure {
+    ok: false;
+    code: string;
+    message: string;
+    /** True means the caller must recover by operationKey and must not auto-retry. */
+    uncertain: boolean;
+}
+
+type ComfyResult<T> = ({ ok: true } & T) | ComfyFailure;
+
+interface ComfyHealth {
+    reachable: boolean;
+    latencyMs?: number;
+    endpointGeneration?: number;
+    stats?: unknown;
+    error?: { code: string; message: string };
+}
+
+interface ComfyConfig {
+    url: string;
+    configured: boolean;
+    timeoutMs: number;
+    templateDir: string;
+    endpointGeneration: number;
+    health?: ComfyHealth;
+}
+
+interface ComfyOrchestratorAPI {
+    submit(input: {
+        operationKey: string;
+        template: string;
+        slots: { positive: string; input_image: string; seed: number };
+        target?: { charId?: string; chatId?: string };
+    }): Promise<ComfyResult<{ jobId: string }>>;
+    poll(input: { jobId: string }): Promise<ComfyResult<{ job: ComfyJobSnapshot }>>;
+    findByOperationKey(input: {
+        operationKey: string;
+    }): Promise<ComfyResult<{ job: ComfyJobSnapshot | null }>>;
+    cancel(input: { jobId: string }): Promise<ComfyResult<{ job: ComfyJobSnapshot }>>;
+    listTemplates(): Promise<ComfyResult<{
+        templates: Array<
+            | {
+                id: string;
+                hash: string;
+                slots: Array<{
+                    name: string;
+                    type: 'string' | 'imageAsset' | 'integer';
+                    required: true;
+                    minimum?: number;
+                    maximum?: number;
+                }>;
+            }
+            | {
+                id: string;
+                error: { code: string; message: string };
+            }
+        >;
+    }>>;
+    getConfig(): Promise<ComfyResult<{ config: ComfyConfig }>>;
+    updateEndpoint(input: { url: string }): Promise<ComfyResult<{ config: ComfyConfig }>>;
+    getHealth(): Promise<ComfyResult<{ health: ComfyHealth }>>;
+}
+
 interface ProviderOptions {
     /** Tokenizer name (e.g., 'gpt-4') */
     tokenizer?: string;
@@ -1528,6 +1647,12 @@ interface RisuaiPluginAPI {
      */
     pluginAtomic: PluginAtomicStorage;
 
+    /** Existing inlay operations plus the optional video-capable media reader. */
+    pluginInlays: PluginInlaysAPI;
+
+    /** Present when `getCapabilities().comfyOrchestratorV1 === 1`. */
+    comfy?: ComfyOrchestratorAPI;
+
     /** Device-specific storage (shared between plugins) */
     safeLocalStorage: SafeLocalStorage;
 
@@ -1535,10 +1660,11 @@ interface RisuaiPluginAPI {
      * Reports which generic Core primitives this host build provides, so a
      * plugin can fail closed on an older Core instead of half-working.
      *
-     * @returns A map of capability name to contract version, e.g.
-     *          `{ pluginAtomicV1: 1 }`
+     * @returns Numeric contract versions by capability name, plus the optional
+     *          `pluginPrimitiveSuiteV1` readiness descriptor, e.g.
+     *          `{ pluginAtomicV1: 1, pluginPrimitiveSuiteV1: { epoch: 1, ready: true } }`
      */
-    getCapabilities(): Promise<Record<string, number>>;
+    getCapabilities(): Promise<Record<string, number> & { pluginPrimitiveSuiteV1?: { epoch: number; ready: boolean } }>;
 
     /**
      * Gets a device-local storage instance shared between plugins
