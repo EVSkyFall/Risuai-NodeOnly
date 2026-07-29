@@ -56,6 +56,7 @@ import { allBasicParameterItems } from './botSettingsParamsData';
 import { languageSettingsItems } from './languageSettingsData.svelte';
 import { inlayImageSettingsItems } from './inlayImageSettingsData';
 import { modelPresetOptionsItems } from './modelPresetOptionsData';
+import { moduleModelBindingItems } from './moduleModelBindingData';
 import {
     promptPresetBasicInfoItems,
     promptPresetPromptItems,
@@ -97,6 +98,7 @@ const declarativeSources: DeclarativeSource[] = [
     // Model Preset list-view Options tab (list view shows when no preset is
     // being edited, which is the state a fresh navigation lands in)
     { items: modelPresetOptionsItems, route: SettingsRoute.ModelPreset, subTab: 2, tabLabel: () => language.modelPresetTabOptions },
+    { items: moduleModelBindingItems, route: SettingsRoute.ModelPreset, subTab: 3, tabLabel: () => language.modelPresetTabModules },
     { items: promptPresetBasicInfoItems, route: SettingsRoute.PromptPreset, subTab: 0, tabLabel: () => language.basicInfo },
     { items: promptPresetPromptItems, route: SettingsRoute.PromptPreset, subTab: 1, tabLabel: () => language.prompt },
     { items: promptPresetParameterItems, route: SettingsRoute.PromptPreset, subTab: 2, tabLabel: () => language.parameters },

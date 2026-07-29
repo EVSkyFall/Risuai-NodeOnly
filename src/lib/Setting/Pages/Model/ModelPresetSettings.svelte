@@ -15,6 +15,8 @@
     import ModelPresetBasicInfo from "./ModelPresetBasicInfo.svelte";
     import ApiKeyPoolManager from "./ApiKeyPoolManager.svelte";
     import ModelPresetOptions from "./ModelPresetOptions.svelte";
+    import SettingRenderer from "../../SettingRenderer.svelte";
+    import { moduleModelBindingItems } from "src/ts/setting/moduleModelBindingData";
     import RegistryNoticeModal from "./RegistryNoticeModal.svelte";
     import { language } from "src/lang";
     import { DBState, openModelProfileBrowser, modelProfileReplaceTarget, openModelPresetEditId, ModelPresetListTabIndex } from "src/ts/stores.svelte";
@@ -422,6 +424,7 @@
             tabs={[
                 { label: language.modelPresetTabPresets, value: 0 },
                 { label: language.apiKeyManagerMenu, value: 1 },
+                { label: language.modelPresetTabModules, value: 3 },
                 { label: language.modelPresetTabOptions, value: 2 },
             ]}
             bind:selected={$ModelPresetListTabIndex}
@@ -431,6 +434,8 @@
             <ApiKeyPoolManager />
         {:else if $ModelPresetListTabIndex === 2}
             <ModelPresetOptions />
+        {:else if $ModelPresetListTabIndex === 3}
+            <SettingRenderer items={moduleModelBindingItems} layout="row" />
         {:else}
             {#if noticeN > 0}
                 <ShAlert variant="info" className="mb-4">

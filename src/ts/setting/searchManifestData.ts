@@ -201,6 +201,17 @@ export const searchManifestEntries: ManualSearchEntry[] = [
         route: SettingsRoute.ModelPreset,
     },
     {
+        // Tab-name entry. The tab's settings are indexed declaratively
+        // (moduleModelBindingItems), but a tab label is only breadcrumb text
+        // there — without this, searching the name shown on the tab finds nothing.
+        id: 'manual.modelPreset.moduleBinding',
+        label: () => language.modelPresetTabModules,
+        help: () => language.help.moduleModelBindingEnable,
+        keywords: ['module binding', 'per-module', 'module', 'lua', 'trigger', 'script', '모듈 분리 바인딩', '모듈분리바인딩', '모듈 바인딩', '모듈별', '분리', '바인딩'],
+        route: SettingsRoute.ModelPreset,
+        subTab: 3,
+    },
+    {
         id: 'manual.page.remoteAccess',
         label: () => language.remoteAccess,
         keywords: ['remote', 'network', 'share', 'tailscale', 'lan', '원격', '원격 접속', '공유'],
