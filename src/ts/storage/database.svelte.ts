@@ -19,11 +19,14 @@ import { v4 as uuidv4 } from 'uuid';
 import { applyModelPresetDefaults } from '../preset/dbDefaults';
 import type { ApiKeyPoolEntry, ModelBindingFields, ModelBindingSet, ModelPreset, ModelPresetMigrationSummary, RegistryCache } from '../preset/types';
 import { emptyModelBinding } from '../preset/types';
+import { isChatStub } from './chatStub';
 
 //APP_VERSION_POINT is to locate the app version in the database file for version bumping
 export let appVer = "2026.2.291" //<APP_VERSION_POINT>
 export let webAppSubVer = ''
 export const nodeOnlyVer: string = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '0.0.0'
+
+export type StreamingDisplayOptimizationMode = 'off'|'balanced'|'strong'
 
 // 'custom' was a deprecated experimental theme (kwaroran's "not for real use now",
 // 2024-10) whose select option had been hidden but still reachable through legacy
@@ -743,7 +746,20 @@ export function setDatabase(data:Database){
     data.moveInsteadOfCopyOnCMPConvert ??= false
     data.chatLoadInitialPages = normalizeChatLoadPages(data.chatLoadInitialPages, DEFAULT_CHAT_LOAD_INITIAL_PAGES)
     data.chatLoadAdditionalPages = normalizeChatLoadPages(data.chatLoadAdditionalPages, DEFAULT_CHAT_LOAD_ADDITIONAL_PAGES)
+    data.streamingDisplayOptimizationMode ??= (data as {largeChatPerformanceMode?: StreamingDisplayOptimizationMode}).largeChatPerformanceMode ?? 'off'
+    delete (data as {largeChatPerformanceMode?: unknown}).largeChatPerformanceMode
     data.fixedChatTextarea ??= true
+    for(const char of data.characters){
+        for(const chat of char.chats ?? []){
+            // Stubs (lazy-loaded chats) carry no streaming flags; skip them so
+            // we don't graft chat-only fields onto stub objects.
+            if(!chat || isChatStub(chat)){
+                continue
+            }
+            chat.isStreaming = false
+            chat.activeStreamingDisplayOptimizationMode = undefined
+        }
+    }
     applyModelPresetDefaults(data)
     changeLanguage(data.language)
     setDatabaseLite(data)
@@ -1447,6 +1463,7 @@ export interface Database{
     moveInsteadOfCopyOnCMPConvert?:boolean
     chatLoadInitialPages?: number
     chatLoadAdditionalPages?: number
+    streamingDisplayOptimizationMode?: StreamingDisplayOptimizationMode
     ImagenModel:string
     ImagenImageSize:string
     ImagenAspectRatio:string
@@ -2057,6 +2074,7 @@ export interface Chat{
     sdData?:string
     suggestMessages?:string[]
     isStreaming?:boolean
+    activeStreamingDisplayOptimizationMode?:StreamingDisplayOptimizationMode
     scriptstate?:{[key:string]:string|number|boolean}
     modules?:string[]
     id?:string
