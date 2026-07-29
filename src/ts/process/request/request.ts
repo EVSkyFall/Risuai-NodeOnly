@@ -80,6 +80,11 @@ interface requestDataArgument{
     forceStreaming?: boolean
     blockPlugins?: boolean
     forceLocalNetwork?: boolean
+    // Set when this request originates from a module's own LLM call (module
+    // Lua/Python script or module trigger). Lets resolveChatModelBinding route
+    // it to the ModelPreset bound to that module (db.moduleModelBindings).
+    // Absent for character-owned scripts and normal chat sends.
+    moduleId?: string
 }
 
 export interface RequestDataArgumentExtended extends requestDataArgument{
@@ -390,7 +395,7 @@ export async function requestChatDataMain(arg:requestDataArgument, model:ModelMo
     // is forced — fallbacks are classic model ids.
     if(!arg.staticModel){
         const currentChat = getCurrentChat()
-        const binding = resolveChatModelBinding(currentChat, model)
+        const binding = resolveChatModelBinding(currentChat, model, arg.moduleId)
         if(binding.kind === 'modelPreset'){
             return requestModelPreset(targ, applyPromptPresetParams(binding.preset, currentChat, model), abortSignal, model)
         }
