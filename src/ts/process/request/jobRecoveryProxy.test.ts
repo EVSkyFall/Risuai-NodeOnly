@@ -12,6 +12,9 @@ import { makeStateProxy, observeReactive } from './proxyFixture.svelte'
 const mocks = vi.hoisted(() => ({
     db: null as any,
     hydrate: null as any,
+    // Captures what the post-slot-in save would serialize — a raw-object write
+    // would leave this snapshot empty even when the local reference looks right.
+    saved: [] as any[],
 }))
 
 vi.mock('src/ts/globalApi.svelte', () => ({
@@ -22,6 +25,9 @@ vi.mock('src/ts/storage/database.svelte', () => ({
 }))
 vi.mock('src/ts/storage/chatStorage', () => ({
     ensureChatHydrated: (...args: unknown[]) => mocks.hydrate(...args),
+    saveChatToServer: async (chaId: string, index: number, chatId: string, chat: any) => {
+        mocks.saved.push({ chaId, index, chatId, chat: JSON.parse(JSON.stringify(chat)) })
+    },
 }))
 vi.mock('src/ts/alert', () => ({
     notifyError: vi.fn(),
@@ -64,6 +70,7 @@ function stubServer() {
 
 afterEach(() => {
     vi.unstubAllGlobals()
+    mocks.saved = []
 })
 
 async function loadRecovery() {
@@ -122,6 +129,12 @@ describe('recovery against a real $state proxy (field-bug pin)', () => {
         // Reactive visibility (what the UI/save tracker need):
         expect(obs.current).toBe('Hello from the journal')
         expect(obs.runs).toBeGreaterThan(1)
+        // Persisted: the save watcher only tracks the ON-SCREEN chat, so
+        // recovery has to save this itself or the text dies on the next reload
+        // (field bug 2026-07-29).
+        expect(mocks.saved).toHaveLength(1)
+        expect(mocks.saved[0]).toMatchObject({ chaId: 'cha-1', index: 0, chatId: 'chat-1' })
+        expect(mocks.saved[0].chat.message[1].data).toBe('Hello from the journal')
         obs.stop()
     })
 
@@ -150,6 +163,8 @@ describe('recovery against a real $state proxy (field-bug pin)', () => {
         expect(mocks.db.characters[0].chats[0].message).toHaveLength(2)
         expect(mocks.db.characters[0].chats[0].message[1].data).toBe('Hello from the journal')
         expect(obs.current).toBe(2) // reactive observer saw the push
+        expect(mocks.saved).toHaveLength(1)
+        expect(mocks.saved[0].chat.message).toHaveLength(2)
         obs.stop()
     })
 })

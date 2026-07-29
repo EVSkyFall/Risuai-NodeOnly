@@ -1,7 +1,7 @@
 import { get } from 'svelte/store'
 import { v4 as uuidv4 } from 'uuid'
 import { getDatabase, type Chat, type Database, type Message } from 'src/ts/storage/database.svelte'
-import { ensureChatHydrated } from 'src/ts/storage/chatStorage'
+import { ensureChatHydrated, saveChatToServer } from 'src/ts/storage/chatStorage'
 import { notifyError, notifyInfo } from 'src/ts/alert'
 import { addLog } from 'src/ts/log'
 import { recordRequestLog } from 'src/ts/requestLog'
@@ -221,6 +221,53 @@ function bumpReload(loc: LocatedChat): void {
     loc.char.reloadKeys = (loc.char.reloadKeys ?? 0) + 1
 }
 
+// Does this chat need saving after the slot-in?
+//
+// Save when this pass wrote something — and ALSO when a message for this job
+// is already in the chat. A retry within the same session (discovery re-runs on
+// every tab return) finds the message a FAILED save left behind, so the fill
+// becomes a no-op while the text is still memory-only; without this it would
+// claim the job and lose the response for good. A redundant chat save costs one
+// request; a skipped one costs the message.
+function needsSave(mutated: boolean, existingIdx: number): boolean {
+    return mutated || existingIdx !== -1
+}
+
+// Persist a chat a slot-in touched.
+//
+// The save loop only marks the chat that is ON SCREEN dirty (globalApi
+// .svelte.ts activeChat effect) — chat bodies are excluded from database.bin
+// entirely, so a chat nobody is looking at has nothing watching it. Recovery
+// runs at boot/return and fills chats the user is not on, so its writes were
+// reactive but never saved: the text appeared on return and was gone after the
+// next reload, and every boot re-filled the same message from the journal
+// (field bug 2026-07-29, `before=0` on every recovery in logs.db).
+//
+// Same call shape and placeholder guard as the tracked path
+// (globalApi.svelte.ts:843). Returns false when the save failed — the caller
+// then leaves the job UNCLAIMED so the next discovery retries the whole
+// slot-in, which is idempotent (generationId match → fill, and a fill no
+// longer than the current text is a no-op).
+async function persistRecoveredChat(loc: LocatedChat, job: ModelJobRecord): Promise<boolean> {
+    try {
+        const chaId = loc.char.chaId
+        if (!chaId) throw new Error('character has no chaId')
+        // Re-resolve the index instead of caching it: hydration and preceding
+        // slot-ins can reorder the chats array between locate and save.
+        const index = loc.char.chats.findIndex((c) => c?.id === job.chatId)
+        if (index === -1) throw new Error('chat vanished before save')
+        const chat = loc.char.chats[index]
+        if (!chat || chat._placeholder) throw new Error('chat is a placeholder')
+        await saveChatToServer(chaId, index, job.chatId, chat)
+        diag(`recover ${job.id.slice(0, 8)}: chat saved idx=${index}`)
+        return true
+    } catch (err) {
+        console.warn('[ModelJobRecovery] chat save after slot-in failed', job.id, err)
+        diag(`recover ${job.id.slice(0, 8)}: chat save failed -> left unclaimed`, String(err))
+        return false
+    }
+}
+
 async function claimJob(jobId: string): Promise<void> {
     try {
         await fetch(`/api/model-jobs/${jobId}/claim`, { method: 'POST', headers: await authHeader() })
@@ -251,12 +298,15 @@ function insertRecoveredMessage(loc: LocatedChat, job: ModelJobRecord, text: str
 // message is an unrelated completed reply, so appending would corrupt it. The
 // generationInfo lets future idempotency scans match this insert. With
 // inlayErrorResponse off, a toast naming the character.
-function insertJobError(loc: LocatedChat, job: ModelJobRecord, error: string): void {
+//
+// Returns whether the chat was mutated (false on the toast-only branch, which
+// needs no save).
+function insertJobError(loc: LocatedChat, job: ModelJobRecord, error: string): boolean {
     if (!getDatabase()?.inlayErrorResponse) {
         const charName = (loc.char as { name?: string }).name || loc.chat.name || 'chat'
         notifyError(language.errors.backgroundGenerationFailed
             .replace('{char}', charName).replace('{error}', error), { source: 'model-job' })
-        return
+        return false
     }
     const message: Message = {
         role: 'char',
@@ -267,6 +317,7 @@ function insertJobError(loc: LocatedChat, job: ModelJobRecord, error: string): v
     if (job.generationId) message.generationInfo = { generationId: job.generationId }
     loc.chat.message.push(message)
     bumpReload(loc)
+    return true
 }
 
 // Read a done job's journal and decode it to the final text. Non-2xx upstream
@@ -354,11 +405,15 @@ async function readJobResult(job: ModelJobRecord): Promise<{ ok: true, text: str
 // test unreliable; the residual trade-off is that a completed message whose
 // claim was lost AND which post-processing shortened could be restored to raw
 // text. That window is far smaller than the partial-response loss it prevents.
-function fillPartialMessage(loc: LocatedChat, index: number, text: string): void {
+//
+// Returns whether the message was actually filled (false on the leave-alone
+// path, which needs no save).
+function fillPartialMessage(loc: LocatedChat, index: number, text: string): boolean {
     const message = loc.chat.message[index]
-    if (!message || (message.data?.length ?? 0) >= text.length) return
+    if (!message || (message.data?.length ?? 0) >= text.length) return false
     message.data = text
     bumpReload(loc)
+    return true
 }
 
 // Slot one terminal job into its chat. Idempotent (design §4 safety rule 2):
@@ -386,7 +441,8 @@ export async function recoverTerminalJob(job: ModelJobRecord): Promise<void> {
         // With the live message already in the chat the user saw this failure as
         // it happened; an error block on top would only duplicate it.
         diag(`recover ${job.id.slice(0, 8)}: failed job, existingIdx=${existingIdx}`)
-        if (existingIdx === -1) insertJobError(loc, job, job.error ?? 'Model request failed')
+        const mutated = existingIdx === -1 && insertJobError(loc, job, job.error ?? 'Model request failed')
+        if (needsSave(mutated, existingIdx) && !(await persistRecoveredChat(loc, job))) return
         await claimJob(job.id)
         return
     }
@@ -397,13 +453,15 @@ export async function recoverTerminalJob(job: ModelJobRecord): Promise<void> {
     // design — the server never persists it, since it carries the provider
     // credential — so the entry holds the response and the outcome only.
     recordJobRecoveryLog(job, result)
+    let mutated = false
     if (result.ok === true) {
         if (existingIdx === -1) {
             insertRecoveredMessage(loc, job, result.text)
+            mutated = true
             diag(`recover ${job.id.slice(0, 8)}: inserted len=${result.text.length}`)
         } else {
             const before = loc.chat.message[existingIdx]?.data?.length ?? 0
-            fillPartialMessage(loc, existingIdx, result.text)
+            mutated = fillPartialMessage(loc, existingIdx, result.text)
             const after = loc.chat.message[existingIdx]?.data?.length ?? 0
             // Independent read-back through a FRESH proxied lookup: proves the
             // write is visible to the reactive graph, not only to our local
@@ -419,8 +477,9 @@ export async function recoverTerminalJob(job: ModelJobRecord): Promise<void> {
         }
     } else {
         diag(`recover ${job.id.slice(0, 8)}: journal decode failed, existingIdx=${existingIdx}`, result.error)
-        if (existingIdx === -1) insertJobError(loc, job, result.error)
+        if (existingIdx === -1) mutated = insertJobError(loc, job, result.error)
     }
+    if (needsSave(mutated, existingIdx) && !(await persistRecoveredChat(loc, job))) return
     await claimJob(job.id)
 }
 

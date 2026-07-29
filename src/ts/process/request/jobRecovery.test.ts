@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => ({
     notifyError: vi.fn(),
     notifyInfo: vi.fn(),
     ensureChatHydrated: vi.fn(),
+    saveChatToServer: vi.fn(async () => {}),
 }))
 
 vi.mock('src/ts/globalApi.svelte', () => ({
@@ -23,6 +24,7 @@ vi.mock('src/ts/storage/database.svelte', () => ({
 }))
 vi.mock('src/ts/storage/chatStorage', () => ({
     ensureChatHydrated: mocks.ensureChatHydrated,
+    saveChatToServer: mocks.saveChatToServer,
 }))
 vi.mock('src/ts/alert', () => ({
     notifyError: mocks.notifyError,
@@ -153,6 +155,8 @@ beforeEach(() => {
     mocks.notifyError.mockReset()
     mocks.notifyInfo.mockReset()
     mocks.ensureChatHydrated.mockReset()
+    mocks.saveChatToServer.mockReset()
+    mocks.saveChatToServer.mockResolvedValue(undefined)
 })
 
 afterEach(() => {
@@ -352,6 +356,117 @@ describe('recoverTerminalJob', () => {
 
         expect(chat.message).toHaveLength(1)
         expect(chat.message[0].data).toContain('```risuerror')
+        expect(claims()).toEqual(['/api/model-jobs/job-1/claim'])
+    })
+})
+
+// --- persistence of the slot-in ---------------------------------------------
+//
+// The save loop only tracks the chat on screen, so a slot-in into any other
+// chat is memory-only unless recovery saves it itself (field bug 2026-07-29:
+// recovered text rendered on return and vanished on reload).
+
+describe('recovered chat is persisted', () => {
+    test('an inserted message is saved to the server before the job is claimed', async () => {
+        const { recovery } = await loadModules()
+        const chat = makeChat()
+        mocks.db.characters = [makeChar(chat)]
+        const { claims } = setupServer({ journals: { 'job-1': OPENAI_SSE } })
+
+        await recovery.recoverTerminalJob(makeJob() as any)
+
+        expect(mocks.saveChatToServer).toHaveBeenCalledTimes(1)
+        expect(mocks.saveChatToServer).toHaveBeenCalledWith('cha-1', 0, 'chat-1', chat)
+        expect(claims()).toEqual(['/api/model-jobs/job-1/claim'])
+    })
+
+    test('a filled partial message is saved too', async () => {
+        const { recovery } = await loadModules()
+        const chat = makeChat({ message: [{ role: 'char', data: 'Hel', generationInfo: { generationId: 'gen-1' } }] })
+        mocks.db.characters = [makeChar(chat)]
+        setupServer({ journals: { 'job-1': OPENAI_SSE } })
+
+        await recovery.recoverTerminalJob(makeJob() as any)
+
+        expect(mocks.saveChatToServer).toHaveBeenCalledTimes(1)
+        expect((mocks.saveChatToServer.mock.calls[0] as any)[3].message[0].data).toBe('Hello')
+    })
+
+    test('an error block inserted into the chat is saved', async () => {
+        const { recovery } = await loadModules()
+        const chat = makeChat({ message: [{ role: 'user', data: 'hi' }] })
+        mocks.db.characters = [makeChar(chat)]
+        setupServer({})
+
+        await recovery.recoverTerminalJob(makeJob({ status: 'failed', error: 'boom' }) as any)
+
+        expect(mocks.saveChatToServer).toHaveBeenCalledTimes(1)
+    })
+
+    test('a chat already carrying this job\'s message is saved anyway (an earlier save may have failed)', async () => {
+        const { recovery } = await loadModules()
+        // Complete message already present → left untouched (idempotency), but
+        // it may be the memory-only leftover of a failed save.
+        const chat = makeChat({ message: [{ role: 'char', data: 'Hello, and then some more', generationInfo: { generationId: 'gen-1' } }] })
+        mocks.db.characters = [makeChar(chat)]
+        const { claims } = setupServer({ journals: { 'job-1': OPENAI_SSE } })
+
+        await recovery.recoverTerminalJob(makeJob() as any)
+
+        expect(chat.message[0].data).toBe('Hello, and then some more') // untouched
+        expect(mocks.saveChatToServer).toHaveBeenCalledTimes(1)
+        expect(claims()).toEqual(['/api/model-jobs/job-1/claim'])
+    })
+
+    test('a chat with nothing written for this job is not saved', async () => {
+        const { recovery } = await loadModules()
+        mocks.db.characters = [makeChar(makeChat({ id: 'other-chat' }))] // job's chat is gone
+        setupServer({})
+
+        await recovery.recoverTerminalJob(makeJob() as any)
+
+        expect(mocks.saveChatToServer).not.toHaveBeenCalled()
+    })
+
+    test('the toast-only failure branch touches no chat, so it does not save', async () => {
+        const { recovery } = await loadModules()
+        mocks.db.inlayErrorResponse = false
+        mocks.db.characters = [makeChar(makeChat())]
+        setupServer({})
+
+        await recovery.recoverTerminalJob(makeJob({ status: 'failed', error: 'boom' }) as any)
+
+        expect(mocks.saveChatToServer).not.toHaveBeenCalled()
+    })
+
+    test('a failed save leaves the job UNCLAIMED so the next boot retries', async () => {
+        const { recovery } = await loadModules()
+        const chat = makeChat()
+        mocks.db.characters = [makeChar(chat)]
+        mocks.saveChatToServer.mockRejectedValue(new Error('saveChatContent error: 507'))
+        const { claims } = setupServer({ journals: { 'job-1': OPENAI_SSE } })
+
+        await recovery.recoverTerminalJob(makeJob() as any)
+
+        expect(chat.message).toHaveLength(1) // memory write stands
+        expect(claims()).toEqual([])         // but the job stays recoverable
+    })
+
+    test('a retry after a failed save fills instead of duplicating, and claims once saved', async () => {
+        const { recovery } = await loadModules()
+        const chat = makeChat()
+        mocks.db.characters = [makeChar(chat)]
+        mocks.saveChatToServer.mockRejectedValueOnce(new Error('saveChatContent error: 507'))
+        const { claims } = setupServer({ journals: { 'job-1': OPENAI_SSE } })
+
+        await recovery.recoverTerminalJob(makeJob() as any) // save fails, no claim
+        await recovery.recoverTerminalJob(makeJob() as any) // tab return: same job again
+
+        expect(chat.message).toHaveLength(1) // matched on generationId → fill, no duplicate
+        expect(chat.message[0].data).toBe('Hello')
+        // The retry re-saves even though the fill was a no-op — otherwise the
+        // text the first pass failed to save would be claimed away.
+        expect(mocks.saveChatToServer).toHaveBeenCalledTimes(2)
         expect(claims()).toEqual(['/api/model-jobs/job-1/claim'])
     })
 })
