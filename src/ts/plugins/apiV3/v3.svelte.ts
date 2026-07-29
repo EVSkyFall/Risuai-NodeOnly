@@ -56,6 +56,7 @@ import {
 */
 
 const pluginChannel = new Map<string, Function>();
+const documentEventListeners: Array<{type: string, listener: EventListenerOrEventListenerObject, options: any}> = [];
 
 class SafeElement {
     #element: HTMLElement;
@@ -315,6 +316,7 @@ class SafeElement {
                 listener(trimEvent(event))
             }
             this.#eventIdMap.set(id, modifiedListener)
+            documentEventListeners.push({type, listener: modifiedListener as EventListenerOrEventListenerObject, options: realOptions})
             document.addEventListener(type, modifiedListener, realOptions)
             return id;
         }
@@ -329,6 +331,7 @@ class SafeElement {
                 }, delay);
             }
             this.#eventIdMap.set(id, modifiedListener)
+            documentEventListeners.push({type, listener: modifiedListener as EventListenerOrEventListenerObject, options: realOptions})
             document.addEventListener(type, modifiedListener, realOptions);
             return id;
         }
@@ -342,6 +345,8 @@ class SafeElement {
         if(listener){
             const realOptions = typeof options === 'boolean' ? { capture: options } : options || {};
             document.removeEventListener(type, listener as EventListenerOrEventListenerObject, realOptions);
+            const idx = documentEventListeners.findIndex(e => e.listener === listener);
+            if(idx !== -1) documentEventListeners.splice(idx, 1);
             this.#eventIdMap.delete(id);
         }
     }
@@ -475,6 +480,10 @@ class SafeMutationObserver {
             this.#observer.observe(rawElement, options);
             element.setAttribute('x-identifier', '');
         }
+    }
+
+    disconnect() {
+        this.#observer.disconnect();
     }
 
 }
@@ -1249,7 +1258,11 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             console.log(`[RisuAI Plugin: ${plugin.name}] ${message}`);
         },
         createMutationObserver(callback: SafeMutationCallback): SafeMutationObserver {
-            return new SafeMutationObserver(callback)
+            const observer = new SafeMutationObserver(callback)
+            addPluginUnloadCallback(plugin.name, () => {
+                observer.disconnect()
+            })
+            return observer
         },
         onUnload: (callback: () => void) => {
             addPluginUnloadCallback(plugin.name, callback);
@@ -1442,6 +1455,9 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
         },
         addPluginChannelListener: (channelName: string, callback: Function) => {
             pluginChannel.set(plugin.name + channelName, callback);
+            addPluginUnloadCallback(plugin.name, () => {
+                pluginChannel.delete(plugin.name + channelName);
+            })
         },
         postPluginChannelMessage: (pluginName: string, channelName: string, message: any) => {
 
@@ -1491,6 +1507,12 @@ export async function loadV3Plugins(plugins:RisuPlugin[]){
     await Promise.all(v3PluginInstances.map(async (instance) => {
         await unloadV3Plugin(instance.name);
     }));
+
+    for(const entry of documentEventListeners){
+        document.removeEventListener(entry.type, entry.listener, entry.options);
+    }
+    documentEventListeners.length = 0;
+
     const loadPromises = plugins.map(plugin => executePluginV3(plugin));
     await Promise.all(loadPromises);
 }
