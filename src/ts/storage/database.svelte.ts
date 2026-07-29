@@ -19,11 +19,14 @@ import { v4 as uuidv4 } from 'uuid';
 import { applyModelPresetDefaults } from '../preset/dbDefaults';
 import type { ApiKeyPoolEntry, ModelBindingFields, ModelBindingSet, ModelPreset, ModelPresetMigrationSummary, RegistryCache } from '../preset/types';
 import { emptyModelBinding } from '../preset/types';
+import { isChatStub } from './chatStub';
 
 //APP_VERSION_POINT is to locate the app version in the database file for version bumping
 export let appVer = "2026.2.291" //<APP_VERSION_POINT>
 export let webAppSubVer = ''
 export const nodeOnlyVer: string = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '0.0.0'
+
+export type StreamingDisplayOptimizationMode = 'off'|'balanced'|'strong'
 
 // 'custom' was a deprecated experimental theme (kwaroran's "not for real use now",
 // 2024-10) whose select option had been hidden but still reachable through legacy
@@ -33,6 +36,7 @@ export function normalizeTheme(theme: string | undefined | null): string {
     if (theme === undefined || theme === null || theme === 'custom') return ''
     return theme
 }
+
 
 export function setDatabase(data:Database){
     if(checkNullish(data.characters)){
@@ -205,6 +209,9 @@ export function setDatabase(data:Database){
     }
     if(checkNullish(data.themePresetsId)){
         data.themePresetsId = 0
+    }
+    if(Array.isArray(data.promptTemplate)){
+        data.promptTemplate = normalizePromptTemplate(data.promptTemplate)
     }
     if(checkNullish(data.sdProvider)){
         data.sdProvider = ''
@@ -518,6 +525,9 @@ export function setDatabase(data:Database){
     }
     if (data.botPresets) {
         for (const preset of data.botPresets) {
+            if(Array.isArray(preset.promptTemplate)){
+                preset.promptTemplate = normalizePromptTemplate(preset.promptTemplate)
+            }
             if (typeof preset.openrouterProvider === 'string') {
                 const oldProvider = preset.openrouterProvider as unknown as string;
                 preset.openrouterProvider = {
@@ -736,7 +746,22 @@ export function setDatabase(data:Database){
     data.moveInsteadOfCopyOnCMPConvert ??= false
     data.chatLoadInitialPages = normalizeChatLoadPages(data.chatLoadInitialPages, DEFAULT_CHAT_LOAD_INITIAL_PAGES)
     data.chatLoadAdditionalPages = normalizeChatLoadPages(data.chatLoadAdditionalPages, DEFAULT_CHAT_LOAD_ADDITIONAL_PAGES)
+    // NodeOnly default: 'balanced' (upstream defaults to 'off') — remote/mobile
+    // usage benefits from coalesced streaming updates out of the box.
+    data.streamingDisplayOptimizationMode ??= (data as {largeChatPerformanceMode?: StreamingDisplayOptimizationMode}).largeChatPerformanceMode ?? 'balanced'
+    delete (data as {largeChatPerformanceMode?: unknown}).largeChatPerformanceMode
     data.fixedChatTextarea ??= true
+    for(const char of data.characters){
+        for(const chat of char.chats ?? []){
+            // Stubs (lazy-loaded chats) carry no streaming flags; skip them so
+            // we don't graft chat-only fields onto stub objects.
+            if(!chat || isChatStub(chat)){
+                continue
+            }
+            chat.isStreaming = false
+            chat.activeStreamingDisplayOptimizationMode = undefined
+        }
+    }
     applyModelPresetDefaults(data)
     changeLanguage(data.language)
     setDatabaseLite(data)
@@ -1440,6 +1465,7 @@ export interface Database{
     moveInsteadOfCopyOnCMPConvert?:boolean
     chatLoadInitialPages?: number
     chatLoadAdditionalPages?: number
+    streamingDisplayOptimizationMode?: StreamingDisplayOptimizationMode
     ImagenModel:string
     ImagenImageSize:string
     ImagenAspectRatio:string
@@ -2050,6 +2076,7 @@ export interface Chat{
     sdData?:string
     suggestMessages?:string[]
     isStreaming?:boolean
+    activeStreamingDisplayOptimizationMode?:StreamingDisplayOptimizationMode
     scriptstate?:{[key:string]:string|number|boolean}
     modules?:string[]
     id?:string
@@ -2452,7 +2479,7 @@ export function saveCurrentPreset(){
         proxyRequestModel: db.proxyRequestModel,
         openrouterRequestModel: db.openrouterRequestModel,
         NAISettings: safeStructuredClone(db.NAIsettings),
-        promptTemplate: db.promptTemplate ?? null,
+        promptTemplate: normalizePromptTemplate(db.promptTemplate) ?? null,
         NAIadventure: db.NAIadventure ?? false,
         NAIappendName: db.NAIappendName ?? false,
         localStopStrings: db.localStopStrings,
@@ -2570,7 +2597,7 @@ export function setPreset(db:Database, newPres: botPreset){
     db.autoSuggestPrompt = newPres.autoSuggestPrompt ?? db.autoSuggestPrompt
     db.autoSuggestPrefix = newPres.autoSuggestPrefix ?? db.autoSuggestPrefix
     db.autoSuggestClean = newPres.autoSuggestClean ?? db.autoSuggestClean
-    db.promptTemplate = newPres.promptTemplate
+    db.promptTemplate = normalizePromptTemplate(newPres.promptTemplate)
     db.NAIadventure = newPres.NAIadventure
     db.NAIappendName = newPres.NAIappendName
     db.NAIsettings.cfg_scale ??= 1
@@ -2929,6 +2956,9 @@ export async function importPreset(f:{
         pre = {...presetTemplate,...(JSON.parse(Buffer.from(f.data).toString('utf-8')))}
         console.log(pre)
     }
+    if(pre?.promptTemplate !== undefined){
+        pre.promptTemplate = normalizePromptTemplate(pre.promptTemplate)
+    }
     let db = getDatabase()
     if(pre.presetVersion && pre.presetVersion >= 3){
         //NAI preset
@@ -3055,6 +3085,7 @@ export async function importPreset(f:{
                 role: 'bot'
             })
         }
+        pr.promptTemplate = normalizePromptTemplate(pr.promptTemplate)
         pr.name = "Imported ST Preset"
         pr.id = uuidv4()
         db.botPresets.push(pr)
@@ -3066,4 +3097,58 @@ export async function importPreset(f:{
         db.botPresets = []
     }
     db.botPresets.push(pre)
+}
+
+function normalizePromptRole(role: unknown): 'user'|'bot'|'system'|null {
+    if(role === 'user' || role === 'bot' || role === 'system'){
+        return role
+    }
+    if(role === 'assistant' || role === 'char'){
+        return 'bot'
+    }
+    return null
+}
+
+function normalizeCacheRole(role: unknown): 'user'|'assistant'|'system'|'all' {
+    if(role === 'user' || role === 'assistant' || role === 'system' || role === 'all'){
+        return role
+    }
+    if(role === 'bot' || role === 'char'){
+        return 'assistant'
+    }
+    return 'all'
+}
+
+function normalizePromptTemplate(template: PromptItem[]|null|undefined): PromptItem[]|null {
+    if(!Array.isArray(template)){
+        return null
+    }
+    const normalized = safeStructuredClone(template) as any[]
+    for(const item of normalized){
+        if(!item || typeof item !== 'object'){
+            continue
+        }
+        switch(item.type){
+            case 'plain':
+            case 'jailbreak':
+            case 'cot':{
+                item.role = normalizePromptRole(item.role) ?? 'system'
+                break
+            }
+            case 'persona':
+            case 'description':
+            case 'authornote':
+            case 'memory':{
+                if(item.role2 !== undefined && item.role2 !== null){
+                    item.role2 = normalizePromptRole(item.role2) ?? 'system'
+                }
+                break
+            }
+            case 'cache':{
+                item.role = normalizeCacheRole(item.role)
+                break
+            }
+        }
+    }
+    return normalized as PromptItem[]
 }

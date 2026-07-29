@@ -24,6 +24,25 @@ export const modelPresetOptionsItems: SettingItem[] = [
         bindKey: 'nodeOnlyServerSideRequests',
     },
     {
+        // Global display setting (applies to every streamed response, not
+        // per-preset) — surfaced here instead of advanced settings so users
+        // actually find it.
+        id: 'modelPreset.streamingDisplayOpt',
+        type: 'select',
+        labelKey: 'streamingDisplayOptimizationMode',
+        bindKey: 'streamingDisplayOptimizationMode',
+        helpKey: 'streamingDisplayOptimizationMode',
+        options: {
+            // Intensity-ordered; the NodeOnly default is 'balanced'
+            // (set in setDatabase), diverging from the first-option convention.
+            selectOptions: [
+                { value: 'off', labelKey: 'streamingDisplayOptimizationOff' },
+                { value: 'balanced', labelKey: 'streamingDisplayOptimizationBalanced' },
+                { value: 'strong', labelKey: 'streamingDisplayOptimizationStrong' }
+            ]
+        }
+    },
+    {
         id: 'modelPreset.visibilityLevel',
         type: 'select',
         labelKey: 'profileVisibilityLevel',

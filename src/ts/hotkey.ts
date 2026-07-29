@@ -7,6 +7,7 @@ import { updateTextThemeAndCSS } from "./gui/colorscheme"
 import { defaultHotkeys } from "./defaulthotkeys"
 import { doingChat, previewBody, sendChat } from "./process/index.svelte"
 import { endAllGenerations } from "./process/generationState"
+import { RISU_SIDEBAR_DRAG_TYPE } from "./dragTypes"
 
 export function initHotkey(){
     document.addEventListener('keydown', async (ev) => {
@@ -231,7 +232,7 @@ export function initHotkey(){
     document.addEventListener('dragover', (ev) => {
         if (ev.ctrlKey && !ev.shiftKey && !ev.altKey) {
             const types = ev.dataTransfer?.types || []
-            const isCharacterDrag = types.includes('application/x-risu-internal')
+            const isCharacterDrag = types.includes(RISU_SIDEBAR_DRAG_TYPE)
             
             if (isCharacterDrag) {
                 const db = getDatabase()

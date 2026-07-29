@@ -1,5 +1,5 @@
 import { get } from "svelte/store";
-import { type character, type MessageGenerationInfo, type Chat, type MessagePresetInfo, changeToPreset, setCurrentChat, type Message, normalizeChat } from "../storage/database.svelte";
+import { type character, type MessageGenerationInfo, type Chat, type MessagePresetInfo, changeToPreset, setCurrentChat, type Message, normalizeChat, type StreamingDisplayOptimizationMode } from "../storage/database.svelte";
 import { DBState } from '../stores.svelte';
 import { CharEmotion, selectedCharID } from "../stores.svelte";
 import { ChatTokenizer, tokenize, tokenizeNum } from "../tokenizer";
@@ -390,6 +390,10 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         unformated.globalNote.push(...formatPrompt(risuChatParser(currentChar.replaceGlobalNote?.replaceAll('{{original}}', DBState.db.globalNote) || DBState.db.globalNote, {chara:currentChar})))
     }
 
+    let baseDescriptionPrompt:OpenAIChat|null = null
+    let beforeDescriptionPrompts:OpenAIChat[] = []
+    let afterDescriptionPrompts:OpenAIChat[] = []
+
     if(currentChat.note){
         unformated.authorNote.push({
             role: 'system',
@@ -427,10 +431,11 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             description += risuChatParser("\n\nCircumstances and context of the dialogue: " + currentChar.scenario, {chara: currentChar})
         }
 
-        unformated.description.push({
+        baseDescriptionPrompt = {
             role: 'system',
             content: description
-        })
+        }
+        unformated.description.push(baseDescriptionPrompt)
 
     }
 
@@ -487,9 +492,11 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             content: risuChatParser(resolvePosition(lorebook.prompt), {chara: currentChar})
         }
         if(lorebook.pos === 'before_desc'){
+            beforeDescriptionPrompts.unshift(c)
             unformated.description.unshift(c)
         }
         else{
+            afterDescriptionPrompts.push(c)
             unformated.description.push(c)
         }
     }
@@ -583,6 +590,34 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     }
 
     let hasCachePoint = false
+    const convertPromptRole = {
+        "system": "system",
+        "user": "user",
+        "bot": "assistant",
+    } as const
+
+    function applyPromptBlockRole(chats:OpenAIChat[], role?: 'user'|'bot'|'system'){
+        console.log("Applying ", chats, role)
+        if(!role){
+            return
+        }
+        for(const chat of chats){
+            chat.role = convertPromptRole[role]
+        }
+    }
+
+    function getDescriptionPrompts(role?: 'user'|'bot'|'system'){
+        const pmt = [
+            ...safeStructuredClone(beforeDescriptionPrompts),
+            ...(baseDescriptionPrompt ? [safeStructuredClone(baseDescriptionPrompt)] : []),
+            ...safeStructuredClone(afterDescriptionPrompts)
+        ]
+        if(baseDescriptionPrompt){
+            applyPromptBlockRole([pmt[beforeDescriptionPrompts.length]], role)
+        }
+        return pmt
+    }
+
     if(promptTemplate){
         const template = promptTemplate
 
@@ -597,6 +632,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             switch(card.type){
                 case 'persona':{
                     let pmt = safeStructuredClone(unformated.personaPrompt)
+                    applyPromptBlockRole(pmt, card.role2)
                     if(card.innerFormat && pmt.length > 0){
                         for(let i=0;i<pmt.length;i++){
                             pmt[i].content = risuChatParser(positionParser(card.innerFormat,card.type), {chara: currentChar}).replace('{{slot}}', pmt[i].content)
@@ -607,7 +643,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     break
                 }
                 case 'description':{
-                    let pmt = safeStructuredClone(unformated.description)
+                    let pmt = getDescriptionPrompts(card.role2)
                     if(card.innerFormat && pmt.length > 0){
                         for(let i=0;i<pmt.length;i++){
                             pmt[i].content = risuChatParser(positionParser(card.innerFormat,card.type), {chara: currentChar}).replace('{{slot}}', pmt[i].content)
@@ -619,6 +655,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 }
                 case 'authornote':{
                     let pmt = safeStructuredClone(unformated.authorNote)
+                    applyPromptBlockRole(pmt, card.role2)
                     if(card.innerFormat && pmt.length > 0){
                         for(let i=0;i<pmt.length;i++){
                             pmt[i].content = risuChatParser(positionParser(card.innerFormat,card.type), {chara: currentChar}).replace('{{slot}}', pmt[i].content || card.defaultText || '')
@@ -652,12 +689,6 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                         continue
                     }
 
-                    const convertRole = {
-                        "system": "system",
-                        "user": "user",
-                        "bot": "assistant"
-                    } as const
-
                     const posType = card.type === 'plain' ? card.type2 : card.type
                     let content = positionParser(card.text, posType)
 
@@ -679,7 +710,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     }
 
                     const prompt:OpenAIChat ={
-                        role: convertRole[card.role],
+                        role: convertPromptRole[card.role],
                         content: content
                     }
 
@@ -1130,6 +1161,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             switch(card.type){
                 case 'persona':{
                     let pmt = safeStructuredClone(unformated.personaPrompt)
+                    applyPromptBlockRole(pmt, card.role2)
                     if(card.innerFormat && pmt.length > 0){
                         for(let i=0;i<pmt.length;i++){
                             pmt[i].content = risuChatParser(positionParser(card.innerFormat,card.type), {chara: currentChar}).replace('{{slot}}', pmt[i].content)
@@ -1144,7 +1176,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     break
                 }
                 case 'description':{
-                    let pmt = safeStructuredClone(unformated.description)
+                    let pmt = getDescriptionPrompts(card.role2)
                     if(card.innerFormat && pmt.length > 0){
                         for(let i=0;i<pmt.length;i++){
                             pmt[i].content = risuChatParser(positionParser(card.innerFormat,card.type), {chara: currentChar}).replace('{{slot}}', pmt[i].content)
@@ -1160,6 +1192,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 }
                 case 'authornote':{
                     let pmt = safeStructuredClone(unformated.authorNote)
+                    applyPromptBlockRole(pmt, card.role2)
                     if(card.innerFormat && pmt.length > 0){
                         for(let i=0;i<pmt.length;i++){
                             pmt[i].content = risuChatParser(positionParser(card.innerFormat,card.type), {chara: currentChar}).replace('{{slot}}', pmt[i].content || card.defaultText || '')
@@ -1197,12 +1230,6 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                         continue
                     }
 
-                    const convertRole = {
-                        "system": "system",
-                        "user": "user",
-                        "bot": "assistant"
-                    } as const
-
                     const posType = card.type === 'plain' ? card.type2 : card.type
                     let content = positionParser(card.text, posType)
 
@@ -1223,7 +1250,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     }
 
                     const prompt:OpenAIChat ={
-                        role: convertRole[card.role],
+                        role: convertPromptRole[card.role],
                         content: content
                     }
 
@@ -1287,6 +1314,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 }
                 case 'memory':{
                     let pmt = safeStructuredClone(memories)
+                    applyPromptBlockRole(pmt, card.role2)
                     if(card.innerFormat && pmt.length > 0){
                         for(let i=0;i<pmt.length;i++){
                             pmt[i].content = risuChatParser(card.innerFormat, {chara: currentChar}).replace('{{slot}}', pmt[i].content)
@@ -1480,10 +1508,76 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 chatId: generationId,
             })
         }
+        const performanceMode: StreamingDisplayOptimizationMode = DBState.db.streamingDisplayOptimizationMode ?? 'balanced'
         DBState.db.characters[selectedChar].chats[selectedChat].isStreaming = true
+        DBState.db.characters[selectedChar].chats[selectedChat].activeStreamingDisplayOptimizationMode = performanceMode
         DBState.db.characters[selectedChar].reloadKeys += 1
         let lastResponseChunk:{[key:string]:string} = {}
         let streamAborted:boolean = abortSignal.aborted
+        let receivedStreamingResult = false
+        const deferStreamingPostProcessing = performanceMode === 'strong'
+        const coalesceStreamingDisplay = performanceMode === 'balanced' || performanceMode === 'strong'
+        const streamingDisplayFlushDelay = 125
+        let pendingStreamingResult: string | null = null
+        let streamingFlushTimer: ReturnType<typeof setTimeout> | null = null
+        let streamingFlushFrame: number | null = null
+        let streamingFlushPromise: Promise<void> | null = null
+        let streamingFlushQueued = false
+        let streamingFlushError: unknown = null
+        const clearStreamingFlushSchedule = () => {
+            if(streamingFlushTimer !== null){
+                clearTimeout(streamingFlushTimer)
+                streamingFlushTimer = null
+            }
+            if(streamingFlushFrame !== null){
+                cancelAnimationFrame(streamingFlushFrame)
+                streamingFlushFrame = null
+            }
+        }
+        const flushStreamingDisplay = async () => {
+            clearStreamingFlushSchedule()
+            if(streamingFlushPromise){
+                streamingFlushQueued = true
+                return streamingFlushPromise
+            }
+            streamingFlushPromise = (async () => {
+                do {
+                    streamingFlushQueued = false
+                    const nextResult = pendingStreamingResult
+                    pendingStreamingResult = null
+                    if(nextResult === null){
+                        continue
+                    }
+                    if(deferStreamingPostProcessing){
+                        DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = reformatContent(prefix + nextResult)
+                        DBState.db.characters[selectedChar].reloadKeys += 1
+                        continue
+                    }
+                    let result2 = await processScriptFull(nowChatroom, reformatContent(prefix + nextResult), 'editoutput', msgIndex)
+                    DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = result2.data
+                    emoChanged = result2.emoChanged
+                    DBState.db.characters[selectedChar].reloadKeys += 1
+                } while(streamingFlushQueued || pendingStreamingResult !== null)
+            })().finally(() => {
+                streamingFlushPromise = null
+            })
+            return streamingFlushPromise
+        }
+        const scheduleStreamingDisplayFlush = () => {
+            if(streamingFlushTimer !== null || streamingFlushFrame !== null){
+                return
+            }
+            streamingFlushTimer = setTimeout(() => {
+                streamingFlushTimer = null
+                streamingFlushFrame = requestAnimationFrame(() => {
+                    streamingFlushFrame = null
+                    void flushStreamingDisplay().catch((error) => {
+                        streamingFlushError ??= error
+                        void reader.cancel().catch(() => {})
+                    })
+                })
+            }, streamingDisplayFlushDelay)
+        }
         const abortReader = () => {
             streamAborted = true
             void reader.cancel().catch(() => {})
@@ -1503,6 +1597,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     throw error
                 }
                 if(readed.value){
+                    receivedStreamingResult = true
                     lastResponseChunk = readed.value
                     const firstChunkKey = Object.keys(lastResponseChunk)[0]
                     result = lastResponseChunk[firstChunkKey]
@@ -1512,10 +1607,16 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     if(DBState.db.removeIncompleteResponse){
                         result = trimUntilPunctuation(result)
                     }
-                    let result2 = await processScriptFull(nowChatroom, reformatContent(prefix + result), 'editoutput', msgIndex)
-                    DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = result2.data
-                    emoChanged = result2.emoChanged
-                    DBState.db.characters[selectedChar].reloadKeys += 1
+                    if(coalesceStreamingDisplay){
+                        pendingStreamingResult = result
+                        scheduleStreamingDisplayFlush()
+                    }
+                    else{
+                        let result2 = await processScriptFull(nowChatroom, reformatContent(prefix + result), 'editoutput', msgIndex)
+                        DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = result2.data
+                        emoChanged = result2.emoChanged
+                        DBState.db.characters[selectedChar].reloadKeys += 1
+                    }
                 }
                 if(readed.done){
                     break
@@ -1524,9 +1625,30 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
         finally {
             abortSignal.removeEventListener('abort', abortReader)
-            DBState.db.characters[selectedChar].chats[selectedChat].isStreaming = false
-            DBState.db.characters[selectedChar].reloadKeys += 1
-            void reader.cancel().catch(() => {})
+            try {
+                if(coalesceStreamingDisplay){
+                    try {
+                        await flushStreamingDisplay()
+                    }
+                    catch(error){
+                        streamingFlushError ??= error
+                    }
+                }
+                if(streamingFlushError !== null){
+                    throw streamingFlushError
+                }
+                if(deferStreamingPostProcessing && receivedStreamingResult){
+                    let result2 = await processScriptFull(nowChatroom, reformatContent(prefix + result), 'editoutput', msgIndex)
+                    DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = result2.data
+                    emoChanged = result2.emoChanged
+                }
+            }
+            finally {
+                DBState.db.characters[selectedChar].chats[selectedChat].isStreaming = false
+                DBState.db.characters[selectedChar].chats[selectedChat].activeStreamingDisplayOptimizationMode = undefined
+                DBState.db.characters[selectedChar].reloadKeys += 1
+                void reader.cancel().catch(() => {})
+            }
         }
 
         if(streamAborted || abortSignal.aborted){
