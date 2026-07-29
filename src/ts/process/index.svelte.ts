@@ -1508,7 +1508,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 chatId: generationId,
             })
         }
-        const performanceMode: StreamingDisplayOptimizationMode = DBState.db.streamingDisplayOptimizationMode ?? 'off'
+        const performanceMode: StreamingDisplayOptimizationMode = DBState.db.streamingDisplayOptimizationMode ?? 'balanced'
         DBState.db.characters[selectedChar].chats[selectedChat].isStreaming = true
         DBState.db.characters[selectedChar].chats[selectedChat].activeStreamingDisplayOptimizationMode = performanceMode
         DBState.db.characters[selectedChar].reloadKeys += 1

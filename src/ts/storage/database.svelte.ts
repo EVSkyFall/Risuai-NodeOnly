@@ -746,7 +746,9 @@ export function setDatabase(data:Database){
     data.moveInsteadOfCopyOnCMPConvert ??= false
     data.chatLoadInitialPages = normalizeChatLoadPages(data.chatLoadInitialPages, DEFAULT_CHAT_LOAD_INITIAL_PAGES)
     data.chatLoadAdditionalPages = normalizeChatLoadPages(data.chatLoadAdditionalPages, DEFAULT_CHAT_LOAD_ADDITIONAL_PAGES)
-    data.streamingDisplayOptimizationMode ??= (data as {largeChatPerformanceMode?: StreamingDisplayOptimizationMode}).largeChatPerformanceMode ?? 'off'
+    // NodeOnly default: 'balanced' (upstream defaults to 'off') — remote/mobile
+    // usage benefits from coalesced streaming updates out of the box.
+    data.streamingDisplayOptimizationMode ??= (data as {largeChatPerformanceMode?: StreamingDisplayOptimizationMode}).largeChatPerformanceMode ?? 'balanced'
     delete (data as {largeChatPerformanceMode?: unknown}).largeChatPerformanceMode
     data.fixedChatTextarea ??= true
     for(const char of data.characters){

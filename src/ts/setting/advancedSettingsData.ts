@@ -117,23 +117,6 @@ export const advancedSettingsItems: SettingItem[] = [
     { id: 'adv.autoFill', type: 'check', labelKey: 'autoFillRequestURL', bindKey: 'autofillRequestUrl', helpKey: 'autoFillRequestURL', classes: 'mt-4' },
     { id: 'adv.autoCont', type: 'check', labelKey: 'autoContinueChat', bindKey: 'autoContinueChat', helpKey: 'autoContinueChat', classes: 'mt-4' },
     { id: 'adv.remIncomp', type: 'check', labelKey: 'removeIncompleteResponse', bindKey: 'removeIncompleteResponse', helpKey: 'removeIncompleteResponse', classes: 'mt-4' },
-    {
-        id: 'adv.streamingDisplayOpt',
-        type: 'segmented',
-        labelKey: 'streamingDisplayOptimizationMode',
-        bindKey: 'streamingDisplayOptimizationMode',
-        helpKey: 'streamingDisplayOptimizationMode',
-        condition: (ctx) => ctx.db.useExperimental,
-        showExperimental: true,
-        classes: 'mt-4',
-        options: {
-            segmentOptions: [
-                { value: 'off', labelKey: 'streamingDisplayOptimizationOff' },
-                { value: 'balanced', labelKey: 'streamingDisplayOptimizationBalanced' },
-                { value: 'strong', labelKey: 'streamingDisplayOptimizationStrong' }
-            ]
-        }
-    },
     { id: 'adv.newOai', type: 'check', labelKey: 'newOAIHandle', bindKey: 'newOAIHandle', helpKey: 'newOAIHandle', classes: 'mt-4' },
     { id: 'adv.noWaitTrans', type: 'check', labelKey: 'noWaitForTranslate', bindKey: 'noWaitForTranslate', helpKey: 'noWaitForTranslate', classes: 'mt-4' },
     { id: 'adv.newImgBeta', type: 'check', labelKey: 'newImageHandlingBeta', bindKey: 'newImageHandlingBeta', helpKey: 'newImageHandlingBeta', classes: 'mt-4' },

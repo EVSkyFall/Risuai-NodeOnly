@@ -95,11 +95,7 @@ export const helpEn = {
         sayNothing: "If enabled, it will input 'say nothing' when no string inputed.",
         showUnrecommended: "If enabled, it will show unrecommended, deprecated settings. it is NOT RECOMMENDED to use these settings.",
         streamingDisplayOptimizationMode:
-            "Reduces display lag when long responses are streamed with heavy post-processing, such as regex-based scripts. This can help on mobile or low-end devices.\n\n" +
-            "Off keeps the normal behavior, but post-processing runs on every token and can add significant overhead.\n\n" +
-            "Balanced lowers the load by trying post-processing only at short intervals, about every 0.125 seconds.\n\n" +
-            "Strong is similar to Balanced, but skips post-processing while streaming and runs it only once after the stream finishes.\n\n" +
-            "This is an experimental feature, and some features may behave unexpectedly because of it.",
+            "Controls how the screen updates while streaming to reduce lag.\n• Off: update + run scripts on every token\n• Update every 0.1s: batch screen updates into 0.1s intervals\n• Apply after finish: show raw text while streaming, then run scripts once at the end",
         allowV2Plugin: "Warning: This enables deprecated V2.0 plugin execution. V2.0 plugins bypass the V2.1 safety check and may be unsafe. Leave this disabled unless you explicitly trust the plugin and cannot migrate it to V3 yet.",
         imageCompression: "If enabled, it will compress images when exporting character. if animated images doesn't works, try disabling this option.",
         inlayImageLossless: "If enabled, inlay images will be saved as lossless PNG instead of compressed WebP. This preserves original quality but uses significantly more storage.",
