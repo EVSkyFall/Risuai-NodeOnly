@@ -17,7 +17,7 @@
     import ModelPresetOptions from "./ModelPresetOptions.svelte";
     import RegistryNoticeModal from "./RegistryNoticeModal.svelte";
     import { language } from "src/lang";
-    import { DBState, openModelProfileBrowser, modelProfileReplaceTarget, openModelPresetEditId } from "src/ts/stores.svelte";
+    import { DBState, openModelProfileBrowser, modelProfileReplaceTarget, openModelPresetEditId, ModelPresetListTabIndex } from "src/ts/stores.svelte";
     import { alertConfirm, notifySuccess } from "src/ts/alert";
     import { testModelPreset, type ModelPresetTestResult } from "src/ts/process/request/request";
     import { getOfficialRegistry, getPresetUpdateStatus, syncRemoteRegistry } from "src/ts/preset/registry";
@@ -34,8 +34,9 @@
     let testMessage = $state(language.modelPresetTestDefault);
     let testing = $state(false);
     let testResult = $state<ModelPresetTestResult | null>(null);
-    // Top-level page tabs (hidden while editing a preset): 0=presets, 1=keys, 2=settings.
-    let page = $state(0);
+    // Top-level page tabs (hidden while editing a preset): 0=presets, 1=keys,
+    // 2=settings — $ModelPresetListTabIndex, a store so settings search can
+    // deep-link to the Options tab.
 
     // Catalog "new/updated models" notice. Fetch the remote registry on menu
     // entry (debounced), then diff the official registry against the seen-map.
@@ -423,12 +424,12 @@
                 { label: language.apiKeyManagerMenu, value: 1 },
                 { label: language.modelPresetTabOptions, value: 2 },
             ]}
-            bind:selected={page}
+            bind:selected={$ModelPresetListTabIndex}
         />
 
-        {#if page === 1}
+        {#if $ModelPresetListTabIndex === 1}
             <ApiKeyPoolManager />
-        {:else if page === 2}
+        {:else if $ModelPresetListTabIndex === 2}
             <ModelPresetOptions />
         {:else}
             {#if noticeN > 0}
