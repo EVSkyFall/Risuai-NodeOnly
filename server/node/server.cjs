@@ -1961,10 +1961,21 @@ function parseInlaySidecarBackupName(name) {
     return { id };
 }
 
+// Upstream (#1484) writes cold storage backup entries as flat
+// coldstorage_<uuid>.json names; older backups and the runtime KV use
+// coldstorage/<uuid>. Match upstream's UUID pattern for the flat form so
+// ordinary assets that merely start with "coldstorage_" are not captured.
+const COLD_STORAGE_FLAT_NAME_RE = /^coldstorage_([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?:\.json)?$/;
+
 function normalizeColdStorageStorageKey(nameOrKey) {
     let key = nameOrKey;
     if (key.startsWith('coldstorage/')) {
         key = key.slice('coldstorage/'.length);
+    } else {
+        const flat = COLD_STORAGE_FLAT_NAME_RE.exec(key);
+        if (flat) {
+            key = flat[1];
+        }
     }
     if (key.endsWith('.json')) {
         key = key.slice(0, -'.json'.length);
@@ -2099,9 +2110,10 @@ function resolveBackupStorageKey(name) {
         return name;
     }
 
-    // Upstream backups transport cold storage as coldstorage/<uuid>.json.
+    // Upstream backups transport cold storage as coldstorage/<uuid>.json
+    // (pre-#1484) or flat coldstorage_<uuid>.json (#1484 onwards).
     // Normalize back to the runtime KV key: coldstorage/<uuid>.
-    if (name.startsWith('coldstorage/')) {
+    if (name.startsWith('coldstorage/') || COLD_STORAGE_FLAT_NAME_RE.test(name)) {
         return normalizeColdStorageStorageKey(name);
     }
 
