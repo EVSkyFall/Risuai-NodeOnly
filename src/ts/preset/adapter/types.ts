@@ -132,8 +132,13 @@ export interface AdapterUsage {
     completionTokens?: number
     totalTokens?: number
     // Prompt tokens served from a context cache (Gemini usageMetadata
-    // .cachedContentTokenCount). Basis for the hit/savings display.
+    // .cachedContentTokenCount, Anthropic cache_read_input_tokens, OpenAI
+    // prompt_tokens_details.cached_tokens). Basis for the hit/savings display.
+    // Always a SUBSET of promptTokens, never an addition to it.
     cachedTokens?: number
+    // Tokens spent on reasoning/thinking, when the provider reports them
+    // separately. Already included in completionTokens.
+    reasoningTokens?: number
 }
 
 export interface AdapterChatResponse {
@@ -183,6 +188,11 @@ export interface AdapterChatOptions {
     tools?: AdapterToolDef[]             // when present, enables tool use on the request
     abortSignal?: AbortSignal
     fetchImpl?: typeof fetch
+    /** Ask the provider to report token usage on a streamed response
+     *  (OpenAI-compatible `stream_options.include_usage`). Off unless the user
+     *  opted in — a strict server can reject the field with a 400. The adapter
+     *  never reads the database itself, so the caller passes this in. */
+    collectStreamUsage?: boolean
     // Per-request identifier (= the message generationId issued in sendChat).
     // Threaded through so request-status / context-cache consumers can key
     // status and badges to this exact request. Optional and side-effect free:

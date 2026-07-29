@@ -4,6 +4,7 @@ import { getDatabase, type Chat, type Database, type Message } from 'src/ts/stor
 import { ensureChatHydrated } from 'src/ts/storage/chatStorage'
 import { notifyError, notifyInfo } from 'src/ts/alert'
 import { addLog } from 'src/ts/log'
+import { recordRequestLog } from 'src/ts/requestLog'
 import { language } from 'src/lang'
 import { chatGenKey, endGeneration, generationStates, registerAbort, startGeneration } from 'src/ts/process/generationState'
 import { clearStatus, endStatus, startStatus } from 'src/ts/status/requestStatus'
@@ -15,7 +16,7 @@ import { parseAnthropicMessage, parseAnthropicStreamDelta } from 'src/ts/preset/
 import { parseGeminiResponse, parseGeminiStreamDelta } from 'src/ts/preset/adapter/googleGemini'
 import { extractErrorMessage } from 'src/ts/preset/adapter/error'
 import { formatReasoningParts } from 'src/ts/preset/adapter/reasoning'
-import type { AdapterChatStreamDelta } from 'src/ts/preset/adapter/types'
+import type { AdapterChatStreamDelta, AdapterUsage } from 'src/ts/preset/adapter/types'
 
 // Bootstrap recovery for server-side model jobs (Stage 4 of
 // .agent/notes/model-preset-server-side-requests.md, §3 "복귀" / §5 row 4).
@@ -47,6 +48,12 @@ export interface ModelJobRecord {
     chatId: string
     generationId?: string | null
     adapterKind?: string | null
+    /** Model id, recorded at job creation (absent on jobs from older builds). */
+    model?: string | null
+    /** origin+pathname of the provider endpoint — never the query string. */
+    targetOrigin?: string | null
+    createdAt?: number
+    endedAt?: number
     streaming?: boolean
     status: 'running' | 'done' | 'failed' | 'aborted'
     upstreamStatus?: number | null
@@ -106,12 +113,25 @@ function anthropicStreamErrorMessage(data: string): string {
 // delta parsers a live run uses, accumulating text/reasoning exactly like
 // presetStreamPump's buildChunk (reasoning-prefixed final text). Unknown kinds
 // fall back to the OpenAI-compatible wire (the most common dialect).
+export interface DecodedJournal {
+    text: string
+    usage?: AdapterUsage
+}
+
 export async function decodeStreamingJournal(
     kind: string | null | undefined,
     body: ReadableStream<Uint8Array>,
 ): Promise<string> {
+    return (await decodeStreamingJournalDetailed(kind, body)).text
+}
+
+export async function decodeStreamingJournalDetailed(
+    kind: string | null | undefined,
+    body: ReadableStream<Uint8Array>,
+): Promise<DecodedJournal> {
     let fullText = ''
     let reasoningText = ''
+    let usage: AdapterUsage | undefined
     for await (const event of parseSseStream(body)) {
         let delta: AdapterChatStreamDelta | null = null
         if (kind === 'anthropic-messages') {
@@ -131,21 +151,31 @@ export async function decodeStreamingJournal(
             delta = parseChatStreamDelta(JSON.parse(event.data))
         }
         if (!delta) continue
+        // Merge, don't replace: Anthropic splits usage across message_start
+        // (input) and message_delta (output), same as the live pump does.
+        if (delta.usage) usage = usage ? { ...usage, ...delta.usage } : delta.usage
         if (delta.reasoningDelta) reasoningText += delta.reasoningDelta
         fullText += delta.textDelta
     }
-    return (reasoningText.length > 0 ? formatReasoningParts([{ text: reasoningText }]) : '') + fullText
+    return {
+        text: (reasoningText.length > 0 ? formatReasoningParts([{ text: reasoningText }]) : '') + fullText,
+        usage,
+    }
 }
 
 // Decode a NON-STREAMING journal (one JSON body) with the per-kind response
 // parser, mirroring requestModelPreset's non-streaming return
 // (formatPresetReasoning(reasoning) + text).
 export function decodeJsonJournal(kind: string | null | undefined, text: string): string {
+    return decodeJsonJournalDetailed(kind, text).text
+}
+
+export function decodeJsonJournalDetailed(kind: string | null | undefined, text: string): DecodedJournal {
     const raw: unknown = JSON.parse(text)
     const response = kind === 'anthropic-messages' ? parseAnthropicMessage(raw)
         : kind === 'google-gemini' ? parseGeminiResponse(raw)
         : parseChatCompletion(raw)
-    return formatReasoningParts(response.reasoning) + response.text
+    return { text: formatReasoningParts(response.reasoning) + response.text, usage: response.usage }
 }
 
 // --- chat lookup / slot-in --------------------------------------------------
@@ -243,7 +273,46 @@ function insertJobError(loc: LocatedChat, job: ModelJobRecord, error: string): v
 // means the provider answered with an HTTP error the recorder faithfully
 // journaled — surface it as a failure, not a message. Throws (leaving the job
 // unclaimed for the next boot) only when the journal itself is unreachable.
-async function readJobResult(job: ModelJobRecord): Promise<{ ok: true, text: string } | { ok: false, error: string }> {
+function recordJobRecoveryLog(
+    job: ModelJobRecord,
+    result: { ok: true, text: string, usage?: AdapterUsage } | { ok: false, error: string },
+): void {
+    recordRequestLog({
+        timestamp: Date.now(),
+        category: 'llm',
+        // Recovered jobs are always main chat generations — aux jobs are
+        // excluded from recovery by design (kind='aux').
+        source: 'main',
+        chatId: job.generationId ?? undefined,
+        generationId: job.generationId ?? undefined,
+        // The server stores origin+pathname (never the query string, which is
+        // where query-auth providers put the key), so a recovered entry shows
+        // the same endpoint a live one does. Older jobs predating that column
+        // fall back to the adapter kind.
+        url: job.targetOrigin ?? `https://model-job.local/${job.adapterKind ?? 'unknown'}`,
+        model: job.model,
+        method: 'POST',
+        status: job.upstreamStatus ?? undefined,
+        success: result.ok === true,
+        route: 'job',
+        streaming: job.streaming === true,
+        // The server timed the upstream request; without this a recovered row
+        // shows no duration while a live one does.
+        durationMs: (typeof job.endedAt === 'number' && typeof job.createdAt === 'number')
+            ? job.endedAt - job.createdAt
+            : undefined,
+        responseBody: result.ok === true ? result.text : undefined,
+        errorMessage: result.ok === false ? result.error : undefined,
+        // Harvested from the journal by the same adapter parsers a live run
+        // uses, so a recovered generation counts in the usage statistics.
+        inputTokens: result.ok === true ? result.usage?.promptTokens : undefined,
+        outputTokens: result.ok === true ? result.usage?.completionTokens : undefined,
+        cachedTokens: result.ok === true ? result.usage?.cachedTokens : undefined,
+        reasoningTokens: result.ok === true ? result.usage?.reasoningTokens : undefined,
+    })
+}
+
+async function readJobResult(job: ModelJobRecord): Promise<{ ok: true, text: string, usage?: AdapterUsage } | { ok: false, error: string }> {
     const res = await fetch(`/api/model-jobs/${job.id}/stream`, { headers: await authHeader() })
     if (!res.ok || !res.body) {
         throw new Error(`model job journal unavailable (HTTP ${res.status})`)
@@ -258,13 +327,13 @@ async function readJobResult(job: ModelJobRecord): Promise<{ ok: true, text: str
         return { ok: false, error: extractErrorMessage(bodyText) ?? `HTTP ${upstreamStatus ?? 'error'}` }
     }
     try {
-        const text = job.streaming
-            ? await decodeStreamingJournal(job.adapterKind, res.body)
-            : decodeJsonJournal(job.adapterKind, await res.text())
-        if (text.trim().length === 0) {
+        const decoded = job.streaming
+            ? await decodeStreamingJournalDetailed(job.adapterKind, res.body)
+            : decodeJsonJournalDetailed(job.adapterKind, await res.text())
+        if (decoded.text.trim().length === 0) {
             return { ok: false, error: 'Recovered response was empty' }
         }
-        return { ok: true, text }
+        return { ok: true, text: decoded.text, usage: decoded.usage }
     } catch (err) {
         return { ok: false, error: err instanceof Error ? err.message : String(err) }
     }
@@ -323,6 +392,11 @@ export async function recoverTerminalJob(job: ModelJobRecord): Promise<void> {
     }
     if (job.status !== 'done') return
     const result = await readJobResult(job)
+    // A job recovered at boot never reached the live path's log flush (the tab
+    // died mid-request), so record it here. The request body is absent by
+    // design — the server never persists it, since it carries the provider
+    // credential — so the entry holds the response and the outcome only.
+    recordJobRecoveryLog(job, result)
     if (result.ok === true) {
         if (existingIdx === -1) {
             insertRecoveredMessage(loc, job, result.text)

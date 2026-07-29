@@ -407,6 +407,14 @@ export function setDatabase(data:Database){
     // Concrete default so the settings toggle (reads !!value) and the runtime
     // gate (statusEnabled) agree. Default on — see request-status-toast-infra.md.
     data.showRequestStatus ??= true
+    // Request logging default ON. Bodies live in save/request-logs.db (never in
+    // the .bin export) under a byte budget, and the log is the only way to see
+    // what a server-side job actually sent — see request-log-usage.md.
+    data.requestLogEnabled ??= true
+    // Off by default: asking for usage on a streamed request means sending
+    // stream_options, which a strict OpenAI-compatible server can reject with
+    // a 400 and break the generation. Opt-in, per provider tolerance.
+    data.requestLogStreamUsage ??= false
     // Server-side requests default ON (2026-07-28 user decision, supersedes the
     // design note's "first release OFF"): the primary remote-mobile pattern is
     // exactly what it protects, cache/aux hazards are structurally excluded
@@ -1370,6 +1378,13 @@ export interface Database{
     // Show the floating request-status toast (phase / thinking+response tokens /
     // tok/s / stall) for model-preset requests. Memory-only UI feature; default on.
     showRequestStatus: boolean
+    // Persist outgoing provider requests (body + assembled response + tokens)
+    // to save/request-logs.db. Default on; the token usage statistics come from
+    // the same write, so turning it off stops both.
+    requestLogEnabled: boolean
+    // Send `stream_options: {include_usage: true}` on streaming OpenAI-compatible
+    // requests so token counts reach the usage statistics. Default off.
+    requestLogStreamUsage: boolean
     chatCompression: boolean
     claudeRetrivalCaching: boolean
     outputImageModal: boolean

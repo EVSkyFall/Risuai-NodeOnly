@@ -29,6 +29,9 @@ vi.mock('src/ts/alert', () => ({
 }))
 vi.mock('src/ts/log', () => ({
     addLog: vi.fn(),
+    // Recovery records the recovered job in the request log, which stamps the
+    // client id onto the entry.
+    getClientId: vi.fn(() => 'test'),
 }))
 
 const OPENAI_SSE =

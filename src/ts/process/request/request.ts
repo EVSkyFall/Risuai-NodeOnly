@@ -29,7 +29,7 @@ import {
     type AdapterCacheContext,
     type AdapterChatMessage, type AdapterChatOptions, type AdapterChatResponse,
     type AdapterChatStreamDelta, type AdapterCredential,
-    type AdapterToolCall, type AdapterToolDef,
+    type AdapterToolCall, type AdapterToolDef, type AdapterUsage,
 } from "src/ts/preset/adapter";
 import { formatReasoningParts } from "src/ts/preset/adapter/reasoning";
 import { TOOL_CAPABLE_ADAPTER_KINDS, VISION_CAPABLE_ADAPTER_KINDS, type AdapterKind, type ModelPreset } from "src/ts/preset/types";
@@ -38,6 +38,7 @@ import { makeJobFetch } from "./jobFetch";
 import { resolveChatModelBinding, buildModelPresetCredential, applyPromptPresetParams } from "./modelPresetBinding";
 import { expandAdapterMessages, toAdapterMessage, toolResponseText } from "./modelPresetMessages";
 import { isLocalNetworkUrl } from "src/ts/network/localNetwork";
+import { createRequestLogScope, type RequestLogRoute, type RequestLogSource, type RequestLogUsage } from "src/ts/requestLog";
 import {
     startStatus, appendText, endStatus, setStatusTokenCounter, addBadge,
     type RequestKind,
@@ -91,6 +92,9 @@ export interface RequestDataArgumentExtended extends requestDataArgument{
     key?:string
     additionalOutput?:string
     saveSignatures?:boolean
+    /** Overrides the request log's `source` tag. Used by the preset editor's
+     *  test request so trial sends don't count as chat usage. */
+    logSource?:RequestLogSource
 }
 
 export type requestDataResponse = {
@@ -546,10 +550,14 @@ function previewModelPreset(
 // chatId (= the message generationId) is threaded into fetchNative so the
 // request is recorded in the fetch log against the message — otherwise the
 // per-message "view log" shows "deleted log" for binding requests.
-function makeProxiedFetch(chatId?: string): typeof fetch {
+function makeProxiedFetch(chatId?: string, onRoute?: (route: RequestLogRoute) => void): typeof fetch {
     return ((input: RequestInfo | URL, init?: RequestInit) => {
         const url = typeof input === 'string' ? input : input.toString()
         return fetchNative(url, {
+            // fetchNative decides direct-vs-proxy at request time (it tries a
+            // direct fetch and falls back to /proxy2 on CORS/network failure),
+            // so the route is reported back rather than assumed here.
+            onLogRoute: onRoute,
             method: (init?.method as 'POST' | 'GET' | 'PUT' | 'DELETE') ?? 'POST',
             headers: (init?.headers as Record<string, string>) ?? {},
             body: init?.body as string,
@@ -621,6 +629,23 @@ function safeStatus(fn: () => void): void {
 // Map the request pipeline's mode to the status-channel chip kind. submodel and
 // otherAx collapse to 'sub' (both are internal aux calls the user rarely
 // distinguishes; see the toast infra note).
+// The request log reuses RequestKind's vocabulary for its `source` tag, so the
+// part of the app that issued a request reads the same in the log as it does
+// in the request-status toast.
+function toLogSource(mode: ModelModeExtended): RequestLogSource {
+    return toRequestKind(mode)
+}
+
+function toLogUsage(usage: AdapterUsage | undefined): RequestLogUsage | undefined {
+    if (!usage) return undefined
+    return {
+        inputTokens: usage.promptTokens,
+        outputTokens: usage.completionTokens,
+        cachedTokens: usage.cachedTokens,
+        reasoningTokens: usage.reasoningTokens,
+    }
+}
+
 function toRequestKind(mode: ModelModeExtended): RequestKind {
     switch (mode) {
         case 'translate': return 'translate'
@@ -675,7 +700,6 @@ const formatPresetReasoning = formatReasoningParts
 async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelPreset, abortSignal:AbortSignal=null, mode:ModelModeExtended='model'):Promise<requestDataResponse> {
     const credential = buildModelPresetCredential(preset)
     const kind = preset.profileSnapshot.adapterKind
-    const proxiedFetch = makeProxiedFetch(arg.chatId)
     // arg.chatId is the per-request generationId for main chat (sendChat passes
     // it under that name; see generation-state-keying.md §1-bis). Aux requests
     // (translate/memory/emotion/sub) don't supply one, so mint a per-request key
@@ -686,6 +710,23 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
     const genId = arg.chatId ?? `aux-${uuidv4()}`
     const statusKind = toRequestKind(mode)
     const reportStatus = statusEnabled() && !!genId
+
+    // Request logging wraps the transport, so the direct path and the
+    // server-side job path are recorded identically — the job path had no
+    // logging at all before, which is why a backend-call generation showed
+    // "log deleted" in its per-message viewer. chatId carries genId because
+    // that is the key the per-message viewer looks up (alertRequestData sends
+    // genInfo.generationId).
+    const logScope = createRequestLogScope({
+        category: 'llm',
+        source: arg.logSource ?? (arg.previewBody ? 'preview' : toLogSource(mode)),
+        chatId: genId,
+        generationId: genId,
+        model: preset.profileSnapshot.modelId,
+        provider: preset.profileSnapshot.providerBaseId,
+        streaming: resolvePresetStreaming(preset, arg),
+    })
+    const proxiedFetch = makeProxiedFetch(arg.chatId, (route) => logScope.setRoute(route))
 
     // Tool gating. Three guards:
     //  1) Per-preset opt-in (preset.toolUse, default OFF) — the hard regression
@@ -726,17 +767,29 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
     // byte-identical to the previous behavior.
     const useServerJob = getDatabase().nodeOnlyServerSideRequests === true
         && !tools && !arg.previewBody
-    const fetchImpl = useServerJob
+    const transportFetch = useServerJob
         ? makeJobFetch({
             realChatId: arg.realChatId ?? genId,
             generationId: genId,
             adapterKind: kind,
+            model: preset.profileSnapshot.modelId,
             jobKind: arg.realChatId ? 'main' : 'aux',
             streaming: resolvePresetStreaming(preset, arg),
             timeoutMs: (getDatabase().localNetworkTimeoutSec ?? 600) * 1000,
             fallbackFetch: proxiedFetch,
         })
         : proxiedFetch
+
+    // Request logging wraps the transport, so the direct path and the
+    // server-side job path are recorded identically — the job path had no
+    // logging at all before, which is why a backend-call generation showed
+    // "log deleted" in its per-message viewer. chatId carries genId because
+    // that is the key the per-message viewer looks up (alertRequestData sends
+    // genInfo.generationId). Cache housekeeping deliberately stays outside the
+    // scope: it rides proxiedFetch directly, and admitting it would let a
+    // cachedContents call land where the chat request's usage belongs.
+    if (useServerJob) logScope.setRoute('job')
+    const fetchImpl = logScope.wrap(transportFetch)
 
     // Vision gate: send attached images when the adapter implements image wire AND
     // either the profile declares the 'vision' capability OR the user opted in via
@@ -779,8 +832,10 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
                 // Always the direct proxied fetch, never the server-side job
                 // fetch: a job is keyed to the chat (one at a time) and its
                 // journal is replayed as a CHAT response at boot, so cache
-                // housekeeping calls must not become jobs.
-                fetchImpl: proxiedFetch,
+                // housekeeping calls must not become jobs. Built without the
+                // route reporter so a cachedContents call cannot relabel the
+                // chat request's log entries.
+                fetchImpl: makeProxiedFetch(arg.chatId),
             }
         }
     }
@@ -843,6 +898,8 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
             }
         } catch (err) {
             return { type: 'fail', result: err instanceof Error ? err.message : String(err), model: preset.name }
+        } finally {
+            void logScope.close()
         }
     }
 
@@ -853,11 +910,19 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
         // for the tool path in v1 (it bypasses the pump); see the toast infra note.
         if (tools) {
             const { result, toolsExecuted } = await runModelPresetToolLoop(arg, preset, kind, credential, fetchImpl, messages, tools, abortSignal)
+            // The tool loop issues one request per turn; each is its own log
+            // entry and all of them flush together here.
+            void logScope.close()
             return { type: 'success', result, model: preset.name, toolExecuted: toolsExecuted }
         }
 
         const useStreaming = resolvePresetStreaming(preset, arg)
-        const options: AdapterChatOptions = { messages, abortSignal: abortSignal ?? undefined, fetchImpl, generationId: genId, cache }
+        const options: AdapterChatOptions = {
+            messages, abortSignal: abortSignal ?? undefined, fetchImpl, generationId: genId, cache,
+            // Opt-in (System > Request Logs): without it a streamed response
+            // reports no tokens at all, so chat usage statistics stay empty.
+            collectStreamUsage: getDatabase().requestLogStreamUsage === true,
+        }
         if (reportStatus) {
             safeStatus(() => startStatus(genId, { kind: statusKind, label: preset.name, chatId: arg.realChatId, phase: 'connecting', now: Date.now() }))
         }
@@ -877,25 +942,32 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
                             if (delta.reasoningDelta) appendText(genId, { thinking: delta.reasoningDelta }, now)
                             if (delta.textDelta) appendText(genId, { response: delta.textDelta }, now)
                         }) : undefined,
-                        onFinish: reportStatus ? (outcome, lastUsage) => safeStatus(() => {
-                            // A stream that ends via abort throws inside the
-                            // generator → 'failed'; reclassify as 'aborted' so the
-                            // toast shows "Cancelled" rather than an error.
-                            const finalOutcome = outcome === 'failed' && abortSignal?.aborted ? 'aborted' : outcome
-                            // Confirmed cache hit (usageMetadata.cachedContentTokenCount
-                            // > 0) → savings badge on the status toast. Gated on the
-                            // cache context so behavior is unchanged with caching off.
-                            const cachedTokens = lastUsage?.cachedTokens ?? 0
-                            if (cache && cachedTokens > 0) {
-                                addBadge(genId, { key: 'cache', text: language.requestStatus.cacheHit.replace('{n}', cachedTokens.toLocaleString()), tone: 'success' })
-                            }
-                            endStatus(genId, finalOutcome, {
-                                now: Date.now(),
-                                usage: lastUsage?.completionTokens !== undefined
-                                    ? { responseTokens: lastUsage.completionTokens }
-                                    : undefined,
+                        // Always registered: the request log needs the stream's
+                        // end to attach the adapter's authoritative usage and
+                        // flush, independent of whether the status toast is on.
+                        onFinish: (outcome, lastUsage) => {
+                            if (reportStatus) safeStatus(() => {
+                                // A stream that ends via abort throws inside the
+                                // generator → 'failed'; reclassify as 'aborted' so the
+                                // toast shows "Cancelled" rather than an error.
+                                const finalOutcome = outcome === 'failed' && abortSignal?.aborted ? 'aborted' : outcome
+                                // Confirmed cache hit (usageMetadata.cachedContentTokenCount
+                                // > 0) → savings badge on the status toast. Gated on the
+                                // cache context so behavior is unchanged with caching off.
+                                const cachedTokens = lastUsage?.cachedTokens ?? 0
+                                if (cache && cachedTokens > 0) {
+                                    addBadge(genId, { key: 'cache', text: language.requestStatus.cacheHit.replace('{n}', cachedTokens.toLocaleString()), tone: 'success' })
+                                }
+                                endStatus(genId, finalOutcome, {
+                                    now: Date.now(),
+                                    usage: lastUsage?.completionTokens !== undefined
+                                        ? { responseTokens: lastUsage.completionTokens }
+                                        : undefined,
+                                })
                             })
-                        }) : undefined,
+                            logScope.setUsage(toLogUsage(lastUsage))
+                            void logScope.close()
+                        },
                     })
                 }
             })
@@ -914,6 +986,8 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
             return { type: 'streaming', result: stream, model: preset.name }
         }
         const response = await sendModelPreset(kind, preset, options, credential)
+        logScope.setUsage(toLogUsage(response.usage))
+        void logScope.close()
         if (reportStatus) {
             safeStatus(() => {
                 // Cache-hit badge: same rule as the streaming onFinish above.
@@ -932,6 +1006,9 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
         return { type: 'success', result: formatPresetReasoning(response.reasoning) + response.text, model: preset.name }
     } catch (err) {
         console.error('[ModelPreset] request failed', describeModelPresetError(err))
+        // A throw before the stream started (or instead of it) means onFinish
+        // never fires, so the failed entry is flushed here.
+        void logScope.close()
         if (reportStatus) {
             // Distinguish a user cancel from a real failure for the status toast.
             const outcome = abortSignal?.aborted ? 'aborted' : 'failed'
@@ -961,6 +1038,9 @@ export async function testModelPreset(preset: ModelPreset, message: string, abor
         formated: [{ role: 'user', content: message }],
         bias: {},
         useStreaming: false,
+        // Trial sends from the preset editor are tagged apart so they don't
+        // land in the chat usage statistics.
+        logSource: 'test',
     }
     const start = performance.now()
     const res = await requestModelPreset(arg, preset, abortSignal)
@@ -1138,6 +1218,9 @@ async function requestNovelAI(arg:RequestDataArgumentExtended):Promise<requestDa
     }
 
     const da = await globalFetch(aiModel === 'novelai_kayra' ? "https://text.novelai.net/ai/generate" : "https://api.novelai.net/ai/generate", {
+        logCategory: 'llm',
+        logSource: 'main',
+        logModel: aiModel,
         body: body,
         headers: {
             "Authorization": "Bearer " + (arg.key ?? db.novelai.token)
@@ -1265,6 +1348,8 @@ async function requestOobaLegacy(arg:RequestDataArgumentExtended):Promise<reques
     }
 
     const res = await globalFetch(blockingUrl, {
+        logCategory: 'llm',
+        logSource: 'main',
         body: bodyTemplate,
         headers: headers,
         abortSignal,
@@ -1346,6 +1431,8 @@ async function requestOoba(arg:RequestDataArgumentExtended):Promise<requestDataR
     }
 
     const response = await globalFetch(urlStr, {
+        logCategory: 'llm',
+        logSource: 'main',
         body: bodyTemplate,
         chatId: arg.chatId,
         abortSignal: arg.abortSignal
@@ -1508,6 +1595,8 @@ async function requestKobold(arg:RequestDataArgumentExtended):Promise<requestDat
     }
     
     const da = await globalFetch(url.toString(), {
+        logCategory: 'llm',
+        logSource: 'main',
         method: "POST",
         body: body,
         headers: {
@@ -1585,6 +1674,8 @@ async function requestNovelList(arg:RequestDataArgumentExtended):Promise<request
         }
     }
     const response = await globalFetch(arg.customURL ?? api_server_url + '/api', {
+        logCategory: 'llm',
+        logSource: 'main',
         method: 'POST',
         headers: headers,
         body: send_body,
@@ -1760,6 +1851,8 @@ async function requestCohere(arg:RequestDataArgumentExtended):Promise<requestDat
     }
 
     const res = await globalFetch(arg.customURL ?? 'https://api.cohere.com/v1/chat', {
+        logCategory: 'llm',
+        logSource: 'main',
         method: "POST",
         headers: {
             "Authorization": "Bearer " + (arg.key ?? db.cohereAPIKey),

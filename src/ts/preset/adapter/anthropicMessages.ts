@@ -379,6 +379,16 @@ export function parseAnthropicStreamDelta(eventName: string | undefined, raw: un
         }
         return null
     }
+    // Anthropic reports input_tokens (and the cache counters) ONLY on
+    // message_start; message_delta carries output_tokens. Without this the
+    // usage statistics lose the prompt side of every streamed request.
+    if (eventName === 'message_start') {
+        const message = raw['message']
+        if (!isPlainObject(message)) return null
+        const usage = parseAnthropicUsage(message['usage'])
+        if (!usage) return null
+        return { textDelta: '', usage, raw }
+    }
     if (eventName === 'message_delta') {
         const delta = raw['delta']
         const finishReason = isPlainObject(delta) && typeof delta['stop_reason'] === 'string'
@@ -396,6 +406,17 @@ function parseAnthropicUsage(raw: unknown): AdapterUsage | undefined {
     const usage: AdapterUsage = {}
     if (typeof raw['input_tokens'] === 'number') usage.promptTokens = raw['input_tokens'] as number
     if (typeof raw['output_tokens'] === 'number') usage.completionTokens = raw['output_tokens'] as number
+    // Prompt caching: reads are billed at a discount, writes at a premium.
+    // Anthropic reports both OUTSIDE input_tokens, so fold them in to keep
+    // promptTokens comparable with providers that report one total.
+    const cacheRead = typeof raw['cache_read_input_tokens'] === 'number'
+        ? raw['cache_read_input_tokens'] as number : 0
+    const cacheWrite = typeof raw['cache_creation_input_tokens'] === 'number'
+        ? raw['cache_creation_input_tokens'] as number : 0
+    if (cacheRead > 0 || cacheWrite > 0) {
+        usage.promptTokens = (usage.promptTokens ?? 0) + cacheRead + cacheWrite
+        usage.cachedTokens = cacheRead
+    }
     if (
         usage.promptTokens === undefined
         && usage.completionTokens === undefined

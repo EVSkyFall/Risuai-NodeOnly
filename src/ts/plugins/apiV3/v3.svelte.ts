@@ -1272,19 +1272,22 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             addPluginUnloadCallback(plugin.name, callback);
         },
         getFetchLogs: async () => {
-            const unsafeFetchLog = getFetchLogs()
             const conf = await getPluginPermission(plugin.name, 'fetchLogs');
             if(!conf){
                 return null;
             }
+            // Reads the server request log; the shape returned to plugins is
+            // unchanged from when this came from the in-memory fetch log.
+            const unsafeFetchLog = await getFetchLogs()
             return unsafeFetchLog.map(log => {
 
                 const url = new URL(log.url);
                 return {
                     url: url.origin + url.pathname,
-                    body: log.body,
+                    body: log.requestBody ?? '',
                     status: log.status,
-                    response: log.response,
+                    response: log.responseBody,
+                    timestamp: log.timestamp,
                 }
             })
         },

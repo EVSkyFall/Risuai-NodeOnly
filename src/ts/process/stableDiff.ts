@@ -70,6 +70,8 @@ export async function generateAIImage(genPrompt:string, currentChar:character, n
         uri.pathname = '/sdapi/v1/txt2img'
         try {
             const da = await globalFetch(uri.toString(), {
+                logCategory: 'image',
+                logSource: 'image',
                 body: {
                     "width": db.sdConfig.width,
                     "height": db.sdConfig.height,
@@ -353,7 +355,7 @@ export async function generateAIImage(genPrompt:string, currentChar:character, n
            
         }
         try {
-            const da = await globalFetch(db.NAIImgUrl, reqlist)   
+            const da = await globalFetch(db.NAIImgUrl, { ...reqlist, logCategory: 'image', logSource: 'image' })   
 
             if(returnSdData === 'inlay'){
                 if(da.ok){
@@ -388,6 +390,8 @@ export async function generateAIImage(genPrompt:string, currentChar:character, n
     }
     if(db.sdProvider === 'dalle'){
         const da = await globalFetch("https://api.openai.com/v1/images/generations", {
+            logCategory: 'image',
+            logSource: 'image',
             body: {
                 "prompt": genPrompt,
                 "model": "dall-e-3",
@@ -494,7 +498,10 @@ export async function generateAIImage(genPrompt:string, currentChar:character, n
 
         const fetchWrapper = async (url: string, options = {}) => {
             console.log(url)
-            const response = await globalFetch(url, options)
+            // ComfyUI job submission (/prompt, /object_info). The /history
+            // poll and the /view image download bypass this wrapper and stay
+            // unlogged on purpose.
+            const response = await globalFetch(url, { ...options, logCategory: 'image', logSource: 'image' })
             if (!response.ok) {
                 console.log(JSON.stringify(response.data))
                 throw new Error(JSON.stringify(response.data))
@@ -612,6 +619,8 @@ export async function generateAIImage(genPrompt:string, currentChar:character, n
         }
 
         const res = await globalFetch('https://fal.run/' + model, {
+            logCategory: 'image',
+            logSource: 'image',
             headers: {
                 "Authorization": "Key " + token,
                 "Content-Type": "application/json"
@@ -668,6 +677,8 @@ export async function generateAIImage(genPrompt:string, currentChar:character, n
         const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:predict?key=${db.google.accessToken}`
 
         const res = await globalFetch(url, {
+            logCategory: 'image',
+            logSource: 'image',
             headers: {
                 "Content-Type": "application/json"
             },
@@ -717,6 +728,8 @@ export async function generateAIImage(genPrompt:string, currentChar:character, n
         }
 
         const da = await globalFetch(config.url, {
+            logCategory: 'image',
+            logSource: 'image',
             body: body,
             headers: headers
         })
@@ -795,6 +808,8 @@ export async function generateAIImage(genPrompt:string, currentChar:character, n
             // First: submit task
             const requestEndpoint = `https://api.wavespeed.ai/api/v3/${config.model}`
             const requestResponse = await globalFetch(requestEndpoint, {
+                logCategory: 'image',
+                logSource: 'image',
                 body: body,
                 headers: {
                     "Content-Type": "application/json",

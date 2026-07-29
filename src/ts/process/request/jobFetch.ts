@@ -50,6 +50,9 @@ export interface JobFetchOptions {
     /** Per-request generationId (idempotency key for Stage 4 slot-in). */
     generationId: string
     adapterKind: string
+    /** Model id, persisted with the job so a recovered generation can be
+     *  logged with the model it actually used. */
+    model?: string
     streaming: boolean
     /** 'main' = chat generation (recoverable at boot, per-chat guard).
      *  'aux' = pipeline side request (translate / memory / …) riding the job
@@ -99,6 +102,7 @@ export function makeJobFetch(opts: JobFetchOptions): typeof fetch {
                     chatId: opts.realChatId,
                     generationId: opts.generationId,
                     adapterKind: opts.adapterKind,
+                    model: opts.model,
                     kind: opts.jobKind ?? 'main',
                     streaming: opts.streaming,
                     timeoutMs: opts.timeoutMs,

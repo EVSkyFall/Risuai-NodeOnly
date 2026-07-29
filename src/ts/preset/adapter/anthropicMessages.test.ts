@@ -2,7 +2,7 @@ import { describe, expect, test } from 'vitest'
 import { loadBundledRegistry } from '../registry/loader'
 import { resolveSnapshot } from '../registry/snapshot'
 import type { ModelPreset, ResolvedModelProfileSnapshot } from '../types'
-import { sendAnthropicChatRequest, streamAnthropicChatRequest } from './anthropicMessages'
+import { parseAnthropicStreamDelta, sendAnthropicChatRequest, streamAnthropicChatRequest } from './anthropicMessages'
 import { ModelPresetAdapterError } from './error'
 import type { AdapterChatMessage } from './types'
 
@@ -680,5 +680,35 @@ describe('vision (Stage 3)', () => {
         )
         const wire = calls[0].body.messages as Array<Record<string, unknown>>
         expect(wire[0]).toEqual({ role: 'user', content: [{ type: 'text', text: 'plain' }] })
+    })
+})
+
+describe('streaming usage across events', () => {
+    test('reads input tokens from message_start', () => {
+        // Anthropic sends input_tokens only on message_start; message_delta
+        // carries output_tokens. Losing either half breaks usage statistics.
+        const delta = parseAnthropicStreamDelta('message_start', {
+            message: { usage: { input_tokens: 1200, output_tokens: 0 } },
+        })
+        expect(delta?.usage?.promptTokens).toBe(1200)
+    })
+
+    test('folds cache counters reported outside input_tokens', () => {
+        const delta = parseAnthropicStreamDelta('message_start', {
+            message: {
+                usage: {
+                    input_tokens: 100,
+                    cache_read_input_tokens: 900,
+                    cache_creation_input_tokens: 50,
+                    output_tokens: 0,
+                },
+            },
+        })
+        expect(delta?.usage?.promptTokens).toBe(1050)
+        expect(delta?.usage?.cachedTokens).toBe(900)
+    })
+
+    test('returns null for a message_start without usage', () => {
+        expect(parseAnthropicStreamDelta('message_start', { message: {} })).toBeNull()
     })
 })
