@@ -230,6 +230,52 @@ describe('Comfy input asset admission', () => {
     )).resolves.toEqual(result)
   })
 
+  it('normalizes Windows backslash subfolders from Comfy while still rejecting traversal', async () => {
+    // Live incident 2026-07-30: Windows-hosted ComfyUI reports history output
+    // subfolders with backslashes (e.g. "WanVideo\\2026_07_30\\원본"), which
+    // the validator treated as unsafe and the completed clip was never fetched.
+    const root = await mkdtemp(path.join(tmpdir(), 'comfy-winpath-'))
+    dirs.push(root)
+    const inlayDir = path.join(root, 'inlays')
+    const stagingDir = path.join(root, 'staging')
+    const kv = new Map<string, Buffer>()
+    let requestedUrl = ''
+    const mp4 = Buffer.from('000000186674797069736F6D0000000069736F6D', 'hex')
+    const assets = createComfyAssetStore({
+      inlayDir,
+      stagingDir,
+      fetchImpl: (async (url: string | URL | Request) => {
+        requestedUrl = String(url)
+        return new Response(mp4, {
+          status: 200,
+          headers: { 'content-type': 'video/mp4', 'content-length': String(mp4.length) },
+        })
+      }) as typeof fetch,
+      kvSet: (key, value) => kv.set(key, value),
+      kvDel: key => kv.delete(key),
+    })
+
+    const result = await assets.materializeOutput(
+      'http://127.0.0.1:8188',
+      '55555555-5555-4555-8555-555555555555',
+      { filename: 'clip.mp4', subfolder: 'WanVideo\\2026_07_30\\원본', type: 'output' },
+    )
+
+    expect(requestedUrl).toBe(
+      'http://127.0.0.1:8188/view?filename=clip.mp4'
+      + `&subfolder=${encodeURIComponent('WanVideo/2026_07_30/원본')}&type=output`,
+    )
+    expect(result.mimeType).toBe('video/mp4')
+
+    for (const traversal of ['..\\up', 'WanVideo\\..\\..\\etc', 'C:\\abs', '\\\\server\\share', '/abs']) {
+      await expect(assets.materializeOutput(
+        'http://127.0.0.1:8188',
+        '55555555-5555-4555-8555-555555555555',
+        { filename: 'clip.mp4', subfolder: traversal, type: 'output' },
+      )).rejects.toMatchObject({ code: 'COMFY_UPLOAD_RESPONSE_INVALID' })
+    }
+  })
+
   it('rejects symlinked roots and declared transfers above the byte cap', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'comfy-bounds-'))
     dirs.push(root)

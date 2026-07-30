@@ -144,12 +144,20 @@ function isSafeRemoteSegment(value) {
 }
 
 function normalizeRemoteSubfolder(value) {
-    if (typeof value !== 'string' || value.includes('\0') || value.includes('\\') || path.posix.isAbsolute(value)) {
-        throw comfyError('COMFY_UPLOAD_RESPONSE_INVALID', 'Comfy returned an unsafe upload subfolder');
+    // Windows-hosted ComfyUI reports subfolders with backslash separators
+    // (e.g. "WanVideo\2026_07_30\원본") — treat them as separators, not as
+    // hostility. Absolute paths (posix, drive-letter, UNC) and dot segments
+    // stay fatal.
+    if (typeof value !== 'string' || value.includes('\0')) {
+        throw comfyError('COMFY_UPLOAD_RESPONSE_INVALID', 'Comfy returned an unsafe subfolder');
     }
-    const parts = value.split('/').filter(Boolean);
+    const normalized = value.replace(/\\/g, '/');
+    if (path.posix.isAbsolute(normalized) || /^[A-Za-z]:/.test(normalized)) {
+        throw comfyError('COMFY_UPLOAD_RESPONSE_INVALID', 'Comfy returned an unsafe subfolder');
+    }
+    const parts = normalized.split('/').filter(Boolean);
     if (parts.some(part => part === '.' || part === '..')) {
-        throw comfyError('COMFY_UPLOAD_RESPONSE_INVALID', 'Comfy returned an unsafe upload subfolder');
+        throw comfyError('COMFY_UPLOAD_RESPONSE_INVALID', 'Comfy returned an unsafe subfolder');
     }
     return parts.join('/');
 }
