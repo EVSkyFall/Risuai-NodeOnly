@@ -51,6 +51,21 @@ describe('Comfy template registry', () => {
           },
         ],
       },
+      {
+        id: 'wan22-flf2v-loop',
+        hash: '670EE9EEE68033A4F03C154A862ADF26CADDF9AA911016C3F71A04903B0AC8CB',
+        slots: [
+          { name: 'input_image', type: 'imageAsset', required: true },
+          { name: 'positive', type: 'string', required: true },
+          {
+            name: 'seed',
+            type: 'integer',
+            required: true,
+            minimum: 0,
+            maximum: Number.MAX_SAFE_INTEGER,
+          },
+        ],
+      },
     ])
 
     const literal = '"quoted"\n유니코드\\path {{seed}} remains data'
@@ -74,6 +89,20 @@ describe('Comfy template registry', () => {
     })
     expect(pristine.prompt['6'].inputs.text).toBe('second')
     expect(pristine.prompt['335'].inputs.seed).toBe(7)
+
+    const loop = await registry.instantiate('wan22-flf2v-loop', {
+      positive: 'loop',
+      input_image: 'risu-comfy/keyframe.png',
+      seed: 81,
+    })
+    expect(loop.templateHash).toBe('670EE9EEE68033A4F03C154A862ADF26CADDF9AA911016C3F71A04903B0AC8CB')
+    expect(loop.prompt['6'].inputs.text).toBe('loop')
+    expect(loop.prompt['52'].inputs.image).toBe('risu-comfy/keyframe.png')
+    expect(loop.prompt['335'].inputs.seed).toBe(81)
+    expect(loop.prompt['396'].inputs.start_image).toEqual(['382', 0])
+    expect(loop.prompt['396'].inputs.end_image).toEqual(['382', 0])
+    expect(loop.outputNodeId).toBe('63')
+    expect(loop.outputKey).toBe('gifs')
   })
 
   it('rejects missing, unknown, fractional, negative, and unsafe seed slots', async () => {
