@@ -193,6 +193,11 @@ export interface AdapterChatOptions {
      *  opted in — a strict server can reject the field with a 400. The adapter
      *  never reads the database itself, so the caller passes this in. */
     collectStreamUsage?: boolean
+    /** Extend Anthropic prompt-cache breakpoints to the 1-hour TTL instead of the
+     *  default 5 minutes. Same database flag the classic path reads
+     *  (`db.claude1HourCaching`); passed in because adapters never touch the
+     *  database. Ignored by every other adapter. */
+    anthropicCache1h?: boolean
     // Per-request identifier (= the message generationId issued in sendChat).
     // Threaded through so request-status / context-cache consumers can key
     // status and badges to this exact request. Optional and side-effect free:

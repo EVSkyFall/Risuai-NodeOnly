@@ -895,7 +895,12 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
     // classic adapters' previewBody handling.
     if (arg.previewBody) {
         try {
-            const prepared = await previewModelPreset(kind, preset, { messages, tools, fetchImpl }, credential)
+            // Mirror the real request's options so the preview shows the body that
+            // would actually be sent (cache breakpoints included).
+            const prepared = await previewModelPreset(kind, preset, {
+                messages, tools, fetchImpl,
+                anthropicCache1h: getDatabase().claude1HourCaching === true,
+            }, credential)
             return {
                 type: 'success',
                 result: JSON.stringify({ url: prepared.url, body: prepared.body, headers: prepared.headers }),
@@ -927,6 +932,9 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
             // Opt-in (System > Request Logs): without it a streamed response
             // reports no tokens at all, so chat usage statistics stay empty.
             collectStreamUsage: getDatabase().requestLogStreamUsage === true,
+            // Prompt-cache breakpoints ride on message.cachePoint; this only picks
+            // the TTL, matching the classic Anthropic path.
+            anthropicCache1h: getDatabase().claude1HourCaching === true,
         }
         if (reportStatus) {
             safeStatus(() => startStatus(genId, { kind: statusKind, label: preset.name, chatId: arg.realChatId, phase: 'connecting', now: Date.now() }))
@@ -1085,7 +1093,12 @@ async function runModelPresetToolLoop(
         abortSignal: abortSignal ?? undefined,
         send: (convo) => sendModelPreset(
             kind, preset,
-            { messages: convo, tools, abortSignal: abortSignal ?? undefined, fetchImpl },
+            {
+                messages: convo, tools, abortSignal: abortSignal ?? undefined, fetchImpl,
+                // Tool turns are ordinary billed requests: without this the cache
+                // TTL silently drops back to 5 minutes for the whole tool loop.
+                anthropicCache1h: getDatabase().claude1HourCaching === true,
+            },
             credential,
         ),
         executeTool: async (call) => {
