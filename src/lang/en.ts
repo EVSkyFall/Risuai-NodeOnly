@@ -2184,6 +2184,22 @@ export const languageEnglish = {
     backupLocalDownloadDesc: "Generate a fresh backup from current data and download it directly to your device.",
     backupLocalRestoreDesc: "Restore from a backup file on your device.",
 
+    backupSettingsOnly: "Export settings only",
+    backupSettingsOnlyDesc: "Export settings without characters, chats or inlay images. Modules, plugins, prompt presets, personas, lorebooks, theme and API keys are all included. Use this to seed a new instance.",
+    backupSettingsOnlyEstimating: "Calculating size...",
+    backupSettingsOnlyConfirm: (size: string) =>
+        `Build a settings backup to carry over to a new instance. About ${size}.\n\n• Included: settings, API keys, modules, plugins, presets, personas, lorebooks, theme\n• Left out: characters, chat history, inlay images\n\nRestoring overwrites the existing data on that device. Prefer a fresh instance over one that already has characters.`,
+    backupSettingsOnlyBreakdown: (
+        baseSize: string,
+        moduleCount: number,
+        assetCount: number,
+        moduleSize: string,
+    ) =>
+        `Build a settings backup to carry over to a new instance. Characters, chat history and inlay images are left out.\n\n• Settings, API keys, modules, plugins, presets, personas, lorebooks, theme: ${baseSize}\n• Module assets (${moduleCount} module(s), ${assetCount.toLocaleString()} images): ${moduleSize}\n\nLeaving the assets out still carries the modules themselves. Their images will be blank until you re-download those modules on the new instance.`,
+    backupSettingsOnlyWithModuleAssets: (size: string) => `Include module assets (${size})`,
+    backupSettingsOnlyWithoutModuleAssets: (size: string) => `Settings only (${size})`,
+    backupSettingsOnlyModuleAssetsSkipped: "Settings backup saved.\n\n**Module assets were not included.** The restored instance will show your modules and their settings, but their images will be blank. Re-download those modules there to fill them back in.",
+
     relatedGithub: "GitHub",
     relatedGithubDesc: "Star this project to show your support.",
     relatedFeedbackForm: "Feedback Form",

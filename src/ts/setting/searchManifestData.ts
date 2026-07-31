@@ -234,6 +234,18 @@ export const searchManifestEntries: ManualSearchEntry[] = [
         subTab: SystemTab.Backups,
     },
     {
+        id: 'manual.system.backups.settingsOnly',
+        label: () => language.backupSettingsOnly,
+        help: () => language.backupSettingsOnlyDesc,
+        keywords: [
+            'settings only', 'settings backup', 'seed', 'new instance', 'migrate settings',
+            'export settings', 'without characters',
+            '설정만', '설정 백업', '설정 내보내기', '시드', '새 인스턴스', '인스턴스',
+        ],
+        route: SettingsRoute.System,
+        subTab: SystemTab.Backups,
+    },
+    {
         id: 'manual.system.logs',
         label: () => language.systemLogs,
         keywords: ['log', 'error log', 'debug', '로그', '오류'],

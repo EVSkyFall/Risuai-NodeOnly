@@ -2391,6 +2391,24 @@ export const languageKorean = {
     "현재 데이터로 새 백업을 만들어 사용자 기기로 즉시 다운로드합니다.",
   backupLocalRestoreDesc: "사용자 기기의 백업 파일에서 복원합니다.",
 
+  backupSettingsOnly: "설정만 내보내기",
+  backupSettingsOnlyDesc:
+    "캐릭터와 채팅 기록, 인레이 이미지를 빼고 설정만 내보냅니다. 모듈, 플러그인, 프리셋, 페르소나, 로어북, 테마, API 키는 그대로 담깁니다. 새 인스턴스를 세팅할 때 쓰세요.",
+  backupSettingsOnlyEstimating: "용량 확인 중...",
+  backupSettingsOnlyConfirm: (size: string) =>
+    `새 인스턴스에 옮길 설정 백업을 만듭니다. 약 ${size}입니다.\n\n• 담기는 것: 설정, API 키, 모듈, 플러그인, 프리셋, 페르소나, 로어북, 테마\n• 빠지는 것: 캐릭터, 채팅 기록, 인레이 이미지\n\n복원하면 그 기기의 기존 데이터를 덮어씁니다. 캐릭터가 있는 기기보다는 새 인스턴스에 쓰는 것을 권장합니다.`,
+  backupSettingsOnlyBreakdown: (
+    baseSize: string,
+    moduleCount: number,
+    assetCount: number,
+    moduleSize: string,
+  ) =>
+    `새 인스턴스에 옮길 설정 백업을 만듭니다. 캐릭터와 채팅 기록, 인레이 이미지는 빠집니다.\n\n• 설정, API 키, 모듈, 플러그인, 프리셋, 페르소나, 로어북, 테마: ${baseSize}\n• 모듈 에셋 (모듈 ${moduleCount}개, 이미지 ${assetCount.toLocaleString()}장): ${moduleSize}\n\n에셋을 빼도 모듈 자체는 그대로 옮겨집니다. 다만 이미지가 비어 보이며, 새 인스턴스에서 해당 모듈을 다시 받으면 채워집니다.`,
+  backupSettingsOnlyWithModuleAssets: (size: string) => `모듈 에셋 포함 (${size})`,
+  backupSettingsOnlyWithoutModuleAssets: (size: string) => `설정만 (${size})`,
+  backupSettingsOnlyModuleAssetsSkipped:
+    "설정 백업을 저장했습니다.\n\n**모듈 에셋은 담기지 않았습니다.** 복원한 인스턴스에서 모듈 목록과 설정은 그대로 보이지만 이미지는 비어 있습니다. 해당 모듈을 다시 받으면 채워집니다.",
+
   relatedGithub: "GitHub",
   relatedGithubDesc: "Star를 눌러 프로젝트를 응원해주세요.",
   relatedFeedbackForm: "의견 보내기",
