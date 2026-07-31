@@ -298,10 +298,17 @@ async function generateAIImageInternal(
                     "deliberate_euler_ancestral_bug": false,
                     "skip_cfg_above_sigma": null,
                     //add character reference
-                    "director_reference_images": [],
-                    "director_reference_descriptions": [],
-                    "director_reference_information_extracted": [],
-                    "director_reference_strength_values": [],
+                    // Absent, not empty. A model without the director-reference
+                    // feature rejects the whole request with HTTP 400 "model <name>
+                    // doesn't support director reference images" as soon as these
+                    // keys are present, and `[]` still counts as present — measured
+                    // on nai-diffusion-4-full with Image Reference set to None.
+                    // They are filled in below only when a reference image is really
+                    // attached; until then JSON.stringify drops them from the body.
+                    "director_reference_images": undefined as string[] | undefined,
+                    "director_reference_descriptions": undefined as object[] | undefined,
+                    "director_reference_information_extracted": undefined as number[] | undefined,
+                    "director_reference_strength_values": undefined as number[] | undefined,
                 }
             },
             headers:{

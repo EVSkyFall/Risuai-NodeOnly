@@ -161,3 +161,91 @@ describe('generateAIImage NAI compatibility wrapper', () => {
         )
     })
 })
+
+describe('NAI director reference fields', () => {
+    const DIRECTOR_REFERENCE_KEYS = [
+        'director_reference_images',
+        'director_reference_descriptions',
+        'director_reference_information_extracted',
+        'director_reference_strength_values',
+    ]
+
+    // globalFetch serialises the body with JSON.stringify, so what the provider
+    // actually receives is the round-tripped object, not the literal we build.
+    function sentParameters() {
+        const [, arg] = mocks.globalFetch.mock.calls[0] as [string, { body: unknown }]
+        return JSON.parse(JSON.stringify(arg.body)).parameters as Record<string, unknown>
+    }
+
+    it('sends no director reference key when the reference mode is None', async () => {
+        mocks.globalFetch.mockResolvedValue(fetchResult({}))
+
+        await generateAIImage('prompt', currentChar, 'negative', 'inlay')
+
+        const parameters = sentParameters()
+        for (const key of DIRECTOR_REFERENCE_KEYS) {
+            expect(parameters).not.toHaveProperty(key)
+        }
+    })
+
+    it('sends no director reference key while vibe transfer is active', async () => {
+        mocks.db.NAIImgConfig.reference_mode = 'vibe'
+        mocks.db.NAIImgConfig.reference_strength_multiple = [0.6]
+        mocks.db.NAIImgConfig.vibe_data = {
+            encodings: {
+                v4full: {
+                    'encoding-a': { encoding: 'ENCODED_VIBE', params: { information_extracted: 1 } },
+                },
+            },
+        }
+        mocks.globalFetch.mockResolvedValue(fetchResult({}))
+
+        await generateAIImage('prompt', currentChar, 'negative', 'inlay')
+
+        const parameters = sentParameters()
+        expect(parameters.reference_image_multiple).toEqual(['ENCODED_VIBE'])
+        expect(parameters.reference_strength_multiple).toEqual([0.6])
+        for (const key of DIRECTOR_REFERENCE_KEYS) {
+            expect(parameters).not.toHaveProperty(key)
+        }
+    })
+
+    it('sends no director reference key on a v4.5 model that has no reference attached', async () => {
+        mocks.db.NAIImgModel = 'nai-diffusion-4-5-full'
+        mocks.globalFetch.mockResolvedValue(fetchResult({}))
+
+        await generateAIImage('prompt', currentChar, 'negative', 'inlay')
+
+        const parameters = sentParameters()
+        for (const key of DIRECTOR_REFERENCE_KEYS) {
+            expect(parameters).not.toHaveProperty(key)
+        }
+    })
+
+    it('still attaches all four keys when a v4.5 character reference is in use', async () => {
+        // The resize step waits on Image.onload, which never fires in happy-dom.
+        vi.stubGlobal('Image', class {
+            onload: (() => void) | null = null
+            set src(_value: string) {
+                queueMicrotask(() => this.onload?.())
+            }
+        })
+        mocks.db.NAIImgModel = 'nai-diffusion-4-5-full'
+        mocks.db.NAIImgConfig.reference_mode = 'character'
+        mocks.db.NAIImgConfig.character_image = 'stored-reference'
+        mocks.db.NAIImgConfig.character_base64image = 'QkFTRTY0'
+        mocks.globalFetch.mockResolvedValue(fetchResult({}))
+
+        try {
+            await generateAIImage('prompt', currentChar, 'negative', 'inlay')
+        } finally {
+            vi.unstubAllGlobals()
+        }
+
+        const parameters = sentParameters()
+        expect(parameters.director_reference_images).toHaveLength(1)
+        expect(parameters.director_reference_information_extracted).toEqual([1])
+        expect(parameters.director_reference_strength_values).toEqual([1])
+        expect(parameters.director_reference_descriptions).toHaveLength(1)
+    })
+})
