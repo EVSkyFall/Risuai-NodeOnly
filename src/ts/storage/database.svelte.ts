@@ -337,6 +337,20 @@ export function setDatabase(data:Database){
             style_aware: false,
         }
     }
+    //add NAI character reference / vibe (기존 save 보정)
+    // The block above only runs when NAIImgConfig is missing entirely, so saves that
+    // predate these fields never received them. Bound UI controls then read undefined
+    // — reference_strength_multiple[0] in particular throws on the vibe panel.
+    if(!checkNullish(data.NAIImgConfig)){
+        data.NAIImgConfig.reference_mode ??= ''
+        data.NAIImgConfig.character_image ??= ''
+        data.NAIImgConfig.character_base64image ??= ''
+        data.NAIImgConfig.style_aware ??= false
+        data.NAIImgConfig.InfoExtracted ??= 1
+        if(!Array.isArray(data.NAIImgConfig.reference_strength_multiple)){
+            data.NAIImgConfig.reference_strength_multiple = [0.7]
+        }
+    }
     //add NAI v4 (사용중인 사람용 추가 DB Init)
     if(checkNullish(data.NAIImgConfig.v4_prompt)){
         data.NAIImgConfig.autoSmea = false;

@@ -534,6 +534,11 @@ async function translateLLM(text:string, arg:{to:string, from:string, regenerate
             return persistedCacheMatch
         }
     }
+    // The cache is looked up (above) with the original text, so it must be stored
+    // under the same key. `text` gets mutated below for the request; storing under
+    // the mutated string made every <style>-bearing message a permanent cache miss
+    // that re-billed the LLM and piled up orphan entries.
+    const cacheKey = text
     const styleDecodeRegex = /\<risu-style\>(.+?)\<\/risu-style\>/gms
     let styleDecodes:string[] = []
     text = text.replace(styleDecodeRegex, (match, p1) => {
@@ -595,8 +600,8 @@ async function translateLLM(text:string, arg:{to:string, from:string, regenerate
     const result = rq.result.replace(/<style-data style-index="(\d+)" ?\/?>/g, (match, p1) => {
         return styleDecodes[parseInt(p1)] ?? ''
     }).replace(/<\/style-data>/g, '')
-    llmTranslateCache.set(text, result)
-    void setPersistentLLMCache(text, result)
+    llmTranslateCache.set(cacheKey, result)
+    void setPersistentLLMCache(cacheKey, result)
     arg.onCacheState?.(false)
     return result
 }

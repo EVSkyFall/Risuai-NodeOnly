@@ -1,7 +1,7 @@
 import { get } from "svelte/store"
-import { alertMd, alertSelect, alertWait, doingAlert } from "./alert"
+import { alertClear, alertMd, alertSelect, alertWait, doingAlert } from "./alert"
 import { getDatabase  } from "./storage/database.svelte"
-import { alertStore, DBState, MobileGUIStack, MobileSideBar, openPersonaList, personaSelectCallback, openPresetList, openHypaV3PresetList, openThemePresetList, OpenRealmStore, PlaygroundStore, QuickSettings, SafeModeStore, selectedCharID, settingsOpen } from "./stores.svelte"
+import { alertStore, DBState, MobileGUIStack, MobileSideBar, openPersonaList, personaSelectCallback, openPresetList, openModelPresetList, openHypaV3PresetList, openThemePresetList, OpenRealmStore, PlaygroundStore, QuickSettings, SafeModeStore, selectedCharID, settingsOpen } from "./stores.svelte"
 import { language } from "src/lang"
 import { updateTextThemeAndCSS } from "./gui/colorscheme"
 import { defaultHotkeys } from "./defaulthotkeys"
@@ -87,6 +87,10 @@ export function initHotkey(){
                     personaSelectCallback.set(null)
                     break
                 }
+                case 'modelSelect':{
+                    openModelPresetList.set(!get(openModelPresetList))
+                    break
+                }
                 case 'toggleCSS':{
                     SafeModeStore.set(!get(SafeModeStore))
                     updateTextThemeAndCSS()
@@ -131,15 +135,27 @@ export function initHotkey(){
                     alertWait("Loading...")
                     ev.preventDefault()
                     ev.stopPropagation()
-                    await sendChat(-1, {
-                        previewPrompt: true
-                    })
+                    try {
+                        await sendChat(-1, {
+                            previewPrompt: true
+                        })
 
-                    let md = ''
-                    md += '### Prompt\n'
-                    md += '```json\n' + JSON.stringify(JSON.parse(previewBody), null, 2).replaceAll('```', '\\`\\`\\`') + '\n```\n'
-                    endAllGenerations()
-                    alertMd(md)
+                        let md = ''
+                        md += '### Prompt\n'
+                        md += '```json\n' + JSON.stringify(JSON.parse(previewBody), null, 2).replaceAll('```', '\\`\\`\\`') + '\n```\n'
+                        alertMd(md)
+                    } catch (error) {
+                        // alertWait above opens a deliberately non-closable dialog
+                        // (no X, ESC and outside click blocked). On the success path
+                        // alertMd replaces it, but a throw would otherwise leave the
+                        // user trapped in it until a reload.
+                        alertClear()
+                        throw error
+                    } finally {
+                        // Without this a throw from sendChat/JSON.parse left the
+                        // generation state locked.
+                        endAllGenerations()
+                    }
                     return
                 }
                 case 'toggleLog':{
