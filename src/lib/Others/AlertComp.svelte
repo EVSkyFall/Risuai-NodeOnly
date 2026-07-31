@@ -712,7 +712,7 @@
     }}
 >
     <div class="overflow-y-auto">
-        <span class="chattext prose chattext2" class:prose-invert={$ColorSchemeTypeStore}>
+        <span class="chattext prose chattext2" class:prose-invert={$ColorSchemeTypeStore === 'dark'}>
             {#await ParseMarkdown($alertStore.msg) then msg}
                 {@html msg}
             {/await}

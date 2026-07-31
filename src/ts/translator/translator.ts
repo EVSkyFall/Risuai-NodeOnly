@@ -676,7 +676,13 @@ function applyEdittransRegex(
       if (charArg === '') return text
 
       let scripts: customscript[] = []
-      scripts = (getModuleRegexScripts() ?? []).concat(alwaysExistChar?.customscript ?? [])
+      // Preset-level regex scripts count too, otherwise an 'edittrans' script
+      // registered on a preset silently never runs. (Order stays preset -> module ->
+      // char, which differs from processScriptFull; left as-is to avoid changing
+      // which script wins on overlapping matches.)
+      scripts = (getDatabase().presetRegex ?? [])
+          .concat(getModuleRegexScripts() ?? [])
+          .concat(alwaysExistChar?.customscript ?? [])
 
       for (const script of scripts) {
           if (script.type === 'edittrans') {

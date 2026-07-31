@@ -97,10 +97,7 @@ export function initHotkey(){
                         return {name: v.name, i}
                     }).sort((a, b) => a.name.localeCompare(b.name))
                     const currentIndex = sorted.findIndex(v => v.i === get(selectedCharID))
-                    if(currentIndex === 0){
-                        return
-                    }
-                    if(currentIndex >= sorted.length - 1){
+                    if(currentIndex <= 0){
                         return
                     }
                     selectedCharID.set(sorted[currentIndex - 1].i)
@@ -113,12 +110,11 @@ export function initHotkey(){
                         return {name: v.name, i}
                     }).sort((a, b) => a.name.localeCompare(b.name))
                     const currentIndex = sorted.findIndex(v => v.i === get(selectedCharID))
-                    if(currentIndex === 0){
-                        return
-                    }
                     if(currentIndex >= sorted.length - 1){
                         return
                     }
+                    // currentIndex === -1 (nothing selected) intentionally falls through
+                    // to sorted[0], matching the previous behaviour.
                     selectedCharID.set(sorted[currentIndex + 1].i)
                     PlaygroundStore.set(0)
                     OpenRealmStore.set(false)
