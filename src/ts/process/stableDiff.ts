@@ -299,12 +299,13 @@ async function generateAIImageInternal(
                     "skip_cfg_above_sigma": null,
                     //add character reference
                     // Absent, not empty. A model without the director-reference
-                    // feature rejects the whole request with HTTP 400 "model <name>
-                    // doesn't support director reference images" as soon as these
-                    // keys are present, and `[]` still counts as present — measured
-                    // on nai-diffusion-4-full with Image Reference set to None.
-                    // They are filled in below only when a reference image is really
-                    // attached; until then JSON.stringify drops them from the body.
+                    // feature answers HTTP 400 "model <name> doesn't support director
+                    // reference images" while these keys are present, and `[]` counts
+                    // as present: nai-diffusion-4-full was rejected that way with
+                    // Image Reference set to None, back when the keys went out
+                    // unconditionally. They are filled in below only when a reference
+                    // image is really attached; until then JSON.stringify, which drops
+                    // undefined, keeps them off the wire entirely.
                     "director_reference_images": undefined as string[] | undefined,
                     "director_reference_descriptions": undefined as object[] | undefined,
                     "director_reference_information_extracted": undefined as number[] | undefined,

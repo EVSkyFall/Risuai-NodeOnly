@@ -172,9 +172,15 @@ describe('NAI director reference fields', () => {
 
     // globalFetch serialises the body with JSON.stringify, so what the provider
     // actually receives is the round-tripped object, not the literal we build.
-    function sentParameters() {
+    // Asserting on the literal would pass on an `undefined` own key, which is
+    // exactly the state this suite has to tell apart from a real omission.
+    function sentBody() {
         const [, arg] = mocks.globalFetch.mock.calls[0] as [string, { body: unknown }]
-        return JSON.parse(JSON.stringify(arg.body)).parameters as Record<string, unknown>
+        return JSON.parse(JSON.stringify(arg.body)) as Record<string, any>
+    }
+
+    function sentParameters() {
+        return sentBody().parameters as Record<string, unknown>
     }
 
     it('sends no director reference key when the reference mode is None', async () => {
@@ -212,6 +218,63 @@ describe('NAI director reference fields', () => {
 
     it('sends no director reference key on a v4.5 model that has no reference attached', async () => {
         mocks.db.NAIImgModel = 'nai-diffusion-4-5-full'
+        mocks.globalFetch.mockResolvedValue(fetchResult({}))
+
+        await generateAIImage('prompt', currentChar, 'negative', 'inlay')
+
+        const parameters = sentParameters()
+        for (const key of DIRECTOR_REFERENCE_KEYS) {
+            expect(parameters).not.toHaveProperty(key)
+        }
+    })
+
+    it('sends no director reference key when a stale character mode survives a model switch', async () => {
+        // Changing the image model leaves reference_mode untouched, so a choice
+        // made during a v4.5 session still reads 'character' on v4-full. The model
+        // gate guarding the fill-in below is the only thing keeping the keys off
+        // the wire here — deleting it would bring the 400 straight back.
+        mocks.db.NAIImgConfig.reference_mode = 'character'
+        mocks.db.NAIImgConfig.character_image = 'stored-reference'
+        mocks.db.NAIImgConfig.character_base64image = 'QkFTRTY0'
+        // Stubbed so that dropping the model gate fails this test on the assertion
+        // rather than hanging on an onload that happy-dom never fires.
+        vi.stubGlobal('Image', class {
+            onload: (() => void) | null = null
+            set src(_value: string) {
+                queueMicrotask(() => this.onload?.())
+            }
+        })
+        mocks.globalFetch.mockResolvedValue(fetchResult({}))
+
+        try {
+            await generateAIImage('prompt', currentChar, 'negative', 'inlay')
+        } finally {
+            vi.unstubAllGlobals()
+        }
+
+        const parameters = sentParameters()
+        for (const key of DIRECTOR_REFERENCE_KEYS) {
+            expect(parameters).not.toHaveProperty(key)
+        }
+    })
+
+    it('sends no director reference key on the img2img path', async () => {
+        mocks.db.NAII2I = true
+        mocks.db.NAIImgConfig.image = 'stored-i2i'
+        mocks.db.NAIImgConfig.base64image = 'SU1BR0U='
+        mocks.globalFetch.mockResolvedValue(fetchResult({}))
+
+        await generateAIImage('prompt', currentChar, 'negative', 'inlay')
+
+        const body = sentBody()
+        expect(body.action).toBe('img2img')
+        for (const key of DIRECTOR_REFERENCE_KEYS) {
+            expect(body.parameters).not.toHaveProperty(key)
+        }
+    })
+
+    it('sends no director reference key on legacy v3 models', async () => {
+        mocks.db.NAIImgModel = 'nai-diffusion-3'
         mocks.globalFetch.mockResolvedValue(fetchResult({}))
 
         await generateAIImage('prompt', currentChar, 'negative', 'inlay')
