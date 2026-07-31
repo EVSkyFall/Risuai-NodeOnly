@@ -819,6 +819,11 @@
     {#snippet title()}
         {$alertStore.msg}
     {/snippet}
+    {#snippet description()}
+        {#if $alertStore.submsg}
+            <span class="whitespace-pre-wrap">{$alertStore.submsg}</span>
+        {/if}
+    {/snippet}
     {#if $alertStore.type === 'confirmMulti'}
         {@const actions = $alertStore.actions ?? []}
         <div class="flex flex-col gap-2">
