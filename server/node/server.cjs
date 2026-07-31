@@ -4827,6 +4827,10 @@ function clearExistingData() {
     // stitch in stale cross-user data. Wiping here ensures only payloads
     // that arrived in this import survive.
     kvDelPrefix('remotes/');
+    // Cold-storage rows belong to the previous user's chats. The .bin import path
+    // (importBackupFromSource) already clears these; the save-folder path did not,
+    // leaving orphans that no dashboard or Optimize pass ever reclaims.
+    kvDelPrefix('coldstorage/');
     // Clear remote-block migration marker — newly imported database.bin may
     // contain REMOTE blocks (it usually does, since save-folder imports
     // preserve upstream's split-character format) and we want the migration

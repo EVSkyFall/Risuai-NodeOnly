@@ -223,8 +223,11 @@ function createModelJobs(opts = {}) {
     // recovering it would insert garbage into a chat (the failure mode the
     // Gemini-cache fetch split fixed — see the design note §8-2).
     const stmtListActive = db.prepare(`SELECT * FROM model_jobs WHERE status = 'running' AND kind = 'main' ORDER BY created_at DESC`);
+    // Oldest first: recovery appends each job's message to the chat in the order
+    // returned, so newest-first would insert a later reply above an earlier one
+    // when more than one unclaimed job piled up for the same chat.
     const stmtListUnclaimed = db.prepare(`
-        SELECT * FROM model_jobs WHERE status IN ('done', 'failed') AND claimed = 0 AND kind = 'main' ORDER BY created_at DESC
+        SELECT * FROM model_jobs WHERE status IN ('done', 'failed') AND claimed = 0 AND kind = 'main' ORDER BY created_at ASC
     `);
     const stmtMarkRunningFailed = db.prepare(`
         UPDATE model_jobs SET status = 'failed', error = ?, ended_at = ? WHERE status = 'running'
