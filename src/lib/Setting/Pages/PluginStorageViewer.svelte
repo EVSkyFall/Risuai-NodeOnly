@@ -3,7 +3,7 @@
     // "plugin-storage-viewer" plugin. Plugin data is stored in a single global
     // namespace (not per-plugin), so this is a flat key/value manager over the
     // three backends a plugin can write to:
-    //   - save:  db.pluginCustomStorage  (travels with the save file)
+    //   - save:  pluginCustomKv / plugin-custom-storage (normal pluginStorage)
     //   - local: localStorage `safe_plugin_*`  (device-local, strings only)
     //   - idb:   SafeLocalPluginStorage  (IndexedDB, device-local, JSON)
     // Origin plugin is best-effort: new V3 writes are tagged into a sidecar
@@ -22,24 +22,36 @@
         SaveIcon,
     } from '@lucide/svelte'
     import { alertConfirm, notifyError, notifySuccess } from 'src/ts/alert'
-    import { getDatabase } from 'src/ts/storage/database.svelte'
     import { SafeLocalStorage, SafeLocalPluginStorage } from 'src/ts/plugins/pluginSafeClass'
     import { getOwners, removeOwner } from 'src/ts/plugins/pluginStorageMeta'
+    import { pluginCustomKv } from 'src/ts/plugins/pluginKvStorage'
+    import {
+        PLUGIN_STORAGE_PREVIEW_CHARS,
+        canCommitDetailMutation,
+        canMutateDetail,
+        createBoundedValuePreview,
+        createPluginStorageBackendAdapter,
+        isCurrentStorageOperation,
+        matchesBoundedValue,
+        type PluginStorageDetailGuard,
+        type PluginStorageViewerBackend,
+        type PluginStorageValuePreview,
+    } from 'src/ts/plugins/pluginStorageViewer'
     import { language } from 'src/lang'
 
-    type BackendId = 'save' | 'local' | 'idb'
+    type BackendId = PluginStorageViewerBackend
 
     // Sentinel filter value for entries with no recorded origin plugin.
     const UNKNOWN = '__risu_unknown__'
 
     interface Entry {
         key: string
-        raw: unknown
-        str: string
-        size: number
+        size: number | null
         type: string
         owner?: string
     }
+
+    interface DetailState extends PluginStorageDetailGuard, PluginStorageValuePreview {}
 
     const BACKENDS: { id: BackendId; label: () => string; desc: () => string }[] = [
         { id: 'save', label: () => language.pluginStorageBackendSave, desc: () => language.pluginStorageBackendSaveDesc },
@@ -49,6 +61,12 @@
 
     const safeLocal = new SafeLocalStorage()
     const idb = new SafeLocalPluginStorage()
+    const storage = createPluginStorageBackendAdapter({
+        custom: pluginCustomKv,
+        local: safeLocal,
+        idb,
+        removeOwner,
+    })
 
     let backendIndex = $state(0)
     const backend = $derived(BACKENDS[backendIndex].id)
@@ -62,21 +80,34 @@
     let loadToken = 0
     let searchKey = $state('')
     let searchVal = $state('')
+    let valueSearchMatches = $state<Set<string> | null>(null)
+    let valueSearching = $state(false)
+    let valueSearchProgress = $state(0)
+    let valueSearchTotal = $state(0)
+    let valueSearchError = $state<string | null>(null)
+    let valueSearchToken = 0
+    let valueSearchTimer: ReturnType<typeof setTimeout> | null = null
     let ownerFilter = $state('')   // '' = all; UNKNOWN = no recorded origin; else plugin name
 
     let detailOpen = $state(false)
     let selected = $state<Entry | null>(null)
+    let detailState = $state<DetailState | null>(null)
+    let detailText = $state('')
+    let detailLoading = $state(false)
+    let detailError = $state<string | null>(null)
+    let detailToken = 0
     let editing = $state(false)
     let editText = $state('')
     let saving = $state(false)
+    let saveToken = 0
 
     const filtered = $derived.by(() => {
         const k = searchKey.trim().toLowerCase()
-        const v = searchVal.trim().toLowerCase()
+        const v = searchVal.trim()
         const f = ownerFilter
         return entries.filter((e) => {
             const keyMatch = !k || e.key.toLowerCase().includes(k)
-            const valMatch = !v || e.str.toLowerCase().includes(v)
+            const valMatch = !v || valueSearchMatches?.has(e.key) === true
             const ownerMatch =
                 !f || (f === UNKNOWN ? !e.owner : e.owner === f)
             return keyMatch && valMatch && ownerMatch
@@ -96,147 +127,146 @@
         return [...set].sort((a, b) => a.localeCompare(b))
     })
     const hasUnknown = $derived(entries.some((e) => !e.owner))
+    const detailCanMutate = $derived.by(() => {
+        if (!selected || !detailState) return false
+        return canMutateDetail(detailState, {
+            backend,
+            key: selected.key,
+            generation: detailToken,
+        })
+    })
 
     // ── helpers ────────────────────────────────────────────────────────────
-    function valueToString(val: unknown): string {
-        if (typeof val === 'string') return val
-        if (val === null || val === undefined) return ''
-        try {
-            return JSON.stringify(val)
-        } catch {
-            return String(val)
-        }
-    }
-
-    function detectType(raw: string): string {
-        if (!raw) return 'empty'
-        try {
-            const parsed = JSON.parse(raw)
-            if (Array.isArray(parsed)) return 'array'
-            if (typeof parsed === 'object' && parsed !== null) return 'object'
-            return typeof parsed
-        } catch {
-            return 'string'
-        }
-    }
-
-    function prettyPrint(raw: string): string {
-        try {
-            return JSON.stringify(JSON.parse(raw), null, 2)
-        } catch {
-            return raw
-        }
-    }
-
-    function formatSize(bytes: number): string {
+    function formatSize(bytes: number | null): string {
+        if (bytes === null) return '—'
         if (bytes < 1024) return bytes + ' B'
         if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB'
         return (bytes / (1024 * 1024)).toFixed(1) + ' MB'
     }
 
-    // ── backend access ───────────────────────────────────────────────────────
-    async function backendSet(key: string, value: unknown): Promise<void> {
-        if (backend === 'save') {
-            const db = getDatabase()
-            db.pluginCustomStorage ??= {}
-            db.pluginCustomStorage[key] = value
-            return
-        }
-        if (backend === 'local') {
-            safeLocal.setItem(key, value as string)
-            return
-        }
-        await idb.setItem(key, value)
+    function detailSize(): string {
+        if (!detailState) return '—'
+        if (detailState.totalCharsExact) return formatSize(detailState.totalChars * 2)
+        return `${formatSize(PLUGIN_STORAGE_PREVIEW_CHARS * 2)}+`
     }
 
-    async function backendRemove(key: string): Promise<void> {
-        // Drop the value, then its origin record so the sidecar doesn't keep a
-        // dangling entry. (The idb instance here has no owner, so its own
-        // removeItem won't touch meta — we clean it explicitly.)
-        if (backend === 'save') {
-            const db = getDatabase()
-            db.pluginCustomStorage ??= {}
-            delete db.pluginCustomStorage[key]
-        } else if (backend === 'local') {
-            safeLocal.removeItem(key)
-        } else {
-            await idb.removeItem(key)
+    function clearDetailState() {
+        detailToken++
+        saveToken++
+        selected = null
+        detailState = null
+        detailText = ''
+        editText = ''
+        detailLoading = false
+        detailError = null
+        editing = false
+        saving = false
+    }
+
+    function closeDetail() {
+        detailOpen = false
+        clearDetailState()
+    }
+
+    function onDetailOpenChange(open: boolean) {
+        detailOpen = open
+        if (!open) clearDetailState()
+    }
+
+    function cancelValueSearch() {
+        valueSearchToken++
+        if (valueSearchTimer !== null) {
+            clearTimeout(valueSearchTimer)
+            valueSearchTimer = null
         }
-        await removeOwner(backend, key)
+        valueSearching = false
+        valueSearchProgress = 0
+        valueSearchTotal = 0
+        valueSearchMatches = null
+        valueSearchError = null
     }
 
     // ── actions ────────────────────────────────────────────────────────────
     async function load() {
         const token = ++loadToken
+        const requestedBackend = backend
+        cancelValueSearch()
+        closeDetail()
         loading = true
         loadError = null
         loadProgress = 0
         loadTotal = 0
         entries = []
         try {
-            // Resolve the key list and a per-key value reader ONCE. Previously
-            // the save backend re-snapshotted the entire DB on every key, which
-            // froze the UI on large saves before anything could paint.
-            let keys: string[]
-            let read: (key: string) => unknown | Promise<unknown>
-            if (backend === 'save') {
-                const store = $state.snapshot(getDatabase().pluginCustomStorage ?? {}) as Record<string, unknown>
-                keys = Object.keys(store)
-                read = (k) => store[k] ?? null
-            } else if (backend === 'local') {
-                keys = safeLocal.keys()
-                read = (k) => safeLocal.getItem(k)
-            } else {
-                keys = await idb.keys()
-                read = (k) => idb.getItem(k)
-            }
-            if (token !== loadToken) return
+            const keys = await storage.keys(requestedBackend)
+            if (!isCurrentStorageOperation(token, loadToken, requestedBackend, backend)) return
             loadTotal = keys.length
 
             // Best-effort origin map (key → plugin name). Empty for legacy/V2
             // keys written before tagging existed.
-            const owners = await getOwners(backend)
-            if (token !== loadToken) return
-
-            // Yield once so the page shell paints before the stringify loop.
-            await new Promise((r) => setTimeout(r))
+            const owners = await getOwners(requestedBackend)
+            if (!isCurrentStorageOperation(token, loadToken, requestedBackend, backend)) return
 
             const list: Entry[] = []
             for (let i = 0; i < keys.length; i++) {
                 const key = keys[i]
-                const raw = await read(key)
-                const str = valueToString(raw)
-                list.push({ key, raw, str, size: str.length * 2, type: detectType(str), owner: owners[key] })
+                const summary = storage.summary(requestedBackend, key)
+                list.push({ key, ...summary, owner: owners[key] })
                 loadProgress = i + 1
-                // Periodically yield to keep the UI responsive and let the
-                // progress bar update.
                 if ((i & 63) === 63) {
                     await new Promise((r) => setTimeout(r))
-                    if (token !== loadToken) return
+                    if (!isCurrentStorageOperation(token, loadToken, requestedBackend, backend)) return
                 }
             }
-            if (token !== loadToken) return
+            if (!isCurrentStorageOperation(token, loadToken, requestedBackend, backend)) return
             list.sort((a, b) => a.key.localeCompare(b.key))
             entries = list
         } catch (e) {
-            if (token !== loadToken) return
+            if (!isCurrentStorageOperation(token, loadToken, requestedBackend, backend)) return
             loadError = e instanceof Error ? e.message : String(e)
             entries = []
         } finally {
-            if (token === loadToken) loading = false
+            if (isCurrentStorageOperation(token, loadToken, requestedBackend, backend)) loading = false
         }
     }
 
-    function openDetail(entry: Entry) {
+    async function openDetail(entry: Entry) {
+        const requestedBackend = backend
+        const token = ++detailToken
         selected = entry
+        detailState = null
+        detailText = ''
+        editText = ''
+        detailError = null
+        detailLoading = true
         editing = false
-        editText = prettyPrint(entry.str)
         detailOpen = true
+        try {
+            const raw = await storage.read(requestedBackend, entry.key)
+            if (
+                !isCurrentStorageOperation(token, detailToken, requestedBackend, backend)
+                || !detailOpen
+                || selected?.key !== entry.key
+            ) return
+            const preview = createBoundedValuePreview(raw)
+            detailState = {
+                ...preview,
+                backend: requestedBackend,
+                key: entry.key,
+                generation: token,
+            }
+            detailText = preview.text
+        } catch (e) {
+            if (!isCurrentStorageOperation(token, detailToken, requestedBackend, backend)) return
+            detailError = e instanceof Error ? e.message : String(e)
+        } finally {
+            if (isCurrentStorageOperation(token, detailToken, requestedBackend, backend)) detailLoading = false
+        }
     }
 
     function startEdit() {
-        if (!selected) return
-        editText = prettyPrint(selected.str)
+        if (!selected || !detailState || !detailCanMutate) return
+        editText = detailText
         editing = true
     }
 
@@ -249,11 +279,15 @@
     }
 
     async function saveEdit() {
-        if (!selected) return
+        if (!selected || !detailState || !detailCanMutate) return
+        const context = { ...detailState }
+        const savedKey = context.key
+        const savedBackend = context.backend
+        const token = ++saveToken
         saving = true
         try {
             let saveValue: unknown
-            if (backend === 'local') {
+            if (savedBackend === 'local') {
                 // localStorage holds strings; normalize valid JSON, keep raw otherwise.
                 saveValue = editText
                 try {
@@ -267,27 +301,40 @@
                     saveValue = editText
                 }
             }
-            await backendSet(selected.key, saveValue)
-            const savedKey = selected.key
+            if (!canCommitDetailMutation(token, saveToken, context, {
+                backend,
+                key: selected.key,
+                generation: detailToken,
+            })) return
+            await storage.write(savedBackend, savedKey, saveValue)
+            if (!canCommitDetailMutation(token, saveToken, context, {
+                backend,
+                key: selected?.key ?? '',
+                generation: detailToken,
+            })) return
+            saving = false
             await load()
-            selected = entries.find((e) => e.key === savedKey) ?? null
-            editing = false
-            if (!selected) detailOpen = false
+            if (savedBackend !== backend) return
+            const refreshed = entries.find((e) => e.key === savedKey)
+            if (refreshed) await openDetail(refreshed)
             notifySuccess(language.pluginStorageSaved(savedKey))
         } catch (e) {
-            notifyError(e instanceof Error ? e.message : String(e))
+            if (token === saveToken) notifyError(e instanceof Error ? e.message : String(e))
         } finally {
-            saving = false
+            if (token === saveToken) saving = false
         }
     }
 
     async function removeEntry(entry: Entry) {
+        if (loading || valueSearching) return
+        const requestedBackend = backend
         const ok = await alertConfirm(language.pluginStorageDeleteConfirm(entry.key))
         if (!ok) return
+        cancelValueSearch()
+        if (selected?.key === entry.key) closeDetail()
         try {
-            await backendRemove(entry.key)
-            if (selected?.key === entry.key) detailOpen = false
-            await load()
+            await storage.remove(requestedBackend, entry.key)
+            if (requestedBackend === backend) await load()
             notifySuccess(language.pluginStorageDeleted)
         } catch (e) {
             notifyError(e instanceof Error ? e.message : String(e))
@@ -298,6 +345,8 @@
     // owner filter). With no filter this is the whole backend, so one button
     // serves both partial and full clears. The label reflects which it is.
     async function removeFiltered() {
+        if (loading || valueSearching) return
+        const requestedBackend = backend
         // Snapshot before load() swaps `entries` out from under `filtered`.
         const targets = filtered.slice()
         if (targets.length === 0) return
@@ -310,26 +359,93 @@
         const ok = await alertConfirm(msg)
         if (!ok) return
 
+        cancelValueSearch()
+        closeDetail()
         try {
-            if (backend === 'save') {
-                // Drop all values in one pass to avoid re-resolving the reactive
-                // DB per key, then clean up the origin records.
-                const db = getDatabase()
-                db.pluginCustomStorage ??= {}
-                for (const e of targets) delete db.pluginCustomStorage[e.key]
-                for (const e of targets) await removeOwner('save', e.key)
-            } else {
-                for (const e of targets) await backendRemove(e.key)
-            }
-            detailOpen = false
-            await load()
+            await storage.removeMany(requestedBackend, targets.map((entry) => entry.key))
+            if (requestedBackend === backend) await load()
             notifySuccess(language.pluginStorageBulkDeleted(targets.length))
         } catch (e) {
             notifyError(e instanceof Error ? e.message : String(e))
             // Re-sync the UI to whatever actually got removed on partial failure.
-            await load()
+            if (requestedBackend === backend) await load()
         }
     }
+
+    async function runValueSearch(
+        token: number,
+        requestedBackend: BackendId,
+        query: string,
+        candidates: Entry[],
+    ) {
+        const matches = new Set<string>()
+        try {
+            for (let i = 0; i < candidates.length; i++) {
+                const entry = candidates[i]
+                const raw = await storage.read(requestedBackend, entry.key)
+                if (!isCurrentStorageOperation(token, valueSearchToken, requestedBackend, backend)) return
+                if (matchesBoundedValue(raw, query)) matches.add(entry.key)
+                valueSearchProgress = i + 1
+                if ((i & 7) === 7) {
+                    await new Promise((resolve) => setTimeout(resolve))
+                    if (!isCurrentStorageOperation(token, valueSearchToken, requestedBackend, backend)) return
+                }
+            }
+            if (!isCurrentStorageOperation(token, valueSearchToken, requestedBackend, backend)) return
+            valueSearchMatches = matches
+        } catch (e) {
+            if (!isCurrentStorageOperation(token, valueSearchToken, requestedBackend, backend)) return
+            valueSearchMatches = new Set()
+            valueSearchError = e instanceof Error ? e.message : String(e)
+        } finally {
+            if (isCurrentStorageOperation(token, valueSearchToken, requestedBackend, backend)) {
+                valueSearching = false
+            }
+        }
+    }
+
+    // Debounced, capped value search. Matches stay private until the complete
+    // current scan finishes so bulk delete can never act on partial results.
+    $effect(() => {
+        const query = searchVal.trim().toLocaleLowerCase()
+        const requestedBackend = backend
+        const currentEntries = entries
+        const keyFilter = searchKey.trim().toLocaleLowerCase()
+        const currentOwner = ownerFilter
+        const waitingForLoad = loading
+        const token = ++valueSearchToken
+
+        if (valueSearchTimer !== null) clearTimeout(valueSearchTimer)
+        valueSearchTimer = null
+        valueSearchMatches = null
+        valueSearchProgress = 0
+        valueSearchTotal = 0
+        valueSearchError = null
+        valueSearching = false
+
+        if (!query || requestedBackend === 'idb' || waitingForLoad) return
+
+        const candidates = currentEntries.filter((entry) => {
+            const keyMatch = !keyFilter || entry.key.toLocaleLowerCase().includes(keyFilter)
+            const ownerMatch =
+                !currentOwner
+                || (currentOwner === UNKNOWN ? !entry.owner : entry.owner === currentOwner)
+            return keyMatch && ownerMatch
+        })
+        valueSearching = true
+        valueSearchTotal = candidates.length
+        valueSearchTimer = setTimeout(() => {
+            valueSearchTimer = null
+            void runValueSearch(token, requestedBackend, query, candidates)
+        }, 250)
+
+        return () => {
+            if (valueSearchTimer !== null) {
+                clearTimeout(valueSearchTimer)
+                valueSearchTimer = null
+            }
+        }
+    })
 
     // Load on mount and whenever the backend tab changes; reset search per tab.
     let loadedIndex = -1
@@ -340,7 +456,9 @@
         searchKey = ''
         searchVal = ''
         ownerFilter = ''
-        load()
+        cancelValueSearch()
+        closeDetail()
+        void load()
     })
 </script>
 
@@ -366,9 +484,21 @@
 
 <!-- Search -->
 <div class="flex flex-col sm:flex-row gap-2 mb-3">
-    <ShInput bind:value={searchKey} placeholder={language.pluginStorageSearchKey} />
-    <ShInput bind:value={searchVal} placeholder={language.pluginStorageSearchValue} />
+    <ShInput bind:value={searchKey} placeholder={language.pluginStorageSearchKey} disabled={loading} />
+    <ShInput
+        bind:value={searchVal}
+        placeholder={language.pluginStorageSearchValue}
+        disabled={loading || backend === 'idb'}
+    />
 </div>
+{#if backend === 'idb'}
+    <p class="text-textcolor2 text-xs mb-3 opacity-70">{language.pluginStorageValueSearchDisabled}</p>
+{:else}
+    <p class="text-textcolor2 text-xs mb-3 opacity-70">{language.pluginStorageValueSearchLimited(formatSize(PLUGIN_STORAGE_PREVIEW_CHARS * 2))}</p>
+{/if}
+{#if valueSearchError}
+    <p class="text-red-400 text-xs mb-3">{language.pluginStorageValueSearchError}: {valueSearchError}</p>
+{/if}
 
 <!-- Origin filter: System-Logs-style toggle chips. No chip selected = all.
      Clicking the active chip clears back to all (keeps pressed in sync with
@@ -401,15 +531,15 @@
             variant="destructive"
             size="sm"
             onclick={removeFiltered}
-            disabled={loading || filtered.length === 0}
+            disabled={loading || valueSearching || filtered.length === 0}
         >
             <Trash2Icon size={14} />
             {isFiltered
                 ? language.pluginStorageBulkDeleteShown(filtered.length)
                 : language.pluginStorageBulkDeleteAll(filtered.length)}
         </ShButton>
-        <ShButton variant="ghost" size="sm" onclick={load} disabled={loading}>
-            <RefreshCwIcon size={14} class={loading ? 'animate-spin' : ''} />
+        <ShButton variant="ghost" size="sm" onclick={load} disabled={loading || valueSearching}>
+            <RefreshCwIcon size={14} class={loading || valueSearching ? 'animate-spin' : ''} />
             {language.pluginStorageRefresh}
         </ShButton>
     </div>
@@ -417,13 +547,20 @@
 
 <!-- List -->
 <div class="flex flex-col gap-1 max-h-[60vh] overflow-y-auto rounded-md border border-darkborderc/50 p-1">
-    {#if loading}
+    {#if loading || valueSearching}
         <div class="flex flex-col items-center gap-3 text-textcolor2 text-sm py-12">
             <RefreshCwIcon size={20} class="animate-spin" />
-            <span class="tabular-nums">{loadTotal > 0 ? `${loadProgress} / ${loadTotal}` : language.systemLogsLoading}</span>
-            {#if loadTotal > 0}
+            <span class="tabular-nums">
+                {(loading ? loadTotal : valueSearchTotal) > 0
+                    ? `${loading ? loadProgress : valueSearchProgress} / ${loading ? loadTotal : valueSearchTotal}`
+                    : language.systemLogsLoading}
+            </span>
+            {#if (loading ? loadTotal : valueSearchTotal) > 0}
                 <div class="w-48 h-1 rounded-full bg-darkborderc/50 overflow-hidden">
-                    <div class="h-full bg-primary transition-[width] duration-150" style="width: {Math.round((loadProgress / loadTotal) * 100)}%"></div>
+                    <div
+                        class="h-full bg-primary transition-[width] duration-150"
+                        style="width: {Math.round(((loading ? loadProgress : valueSearchProgress) / (loading ? loadTotal : valueSearchTotal)) * 100)}%"
+                    ></div>
                 </div>
             {/if}
         </div>
@@ -452,6 +589,7 @@
                 <button
                     class="shrink-0 text-textcolor2 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer p-1"
                     aria-label={language.remove}
+                    disabled={loading || valueSearching}
                     onclick={(e) => { e.stopPropagation(); removeEntry(entry) }}
                 >
                     <Trash2Icon size={15} />
@@ -463,51 +601,75 @@
 
 <!-- Detail / edit dialog. tier="base" (z-40) so the delete confirm popup
      (alert tier, z-50) renders above this management dialog. -->
-<ShDialog bind:open={detailOpen} size="xl" tier="base">
+<ShDialog bind:open={detailOpen} onOpenChange={onDetailOpenChange} size="xl" tier="base">
     {#snippet title()}
         <span class="font-mono break-all">{selected?.key ?? ''}</span>
     {/snippet}
     {#if selected}
         <div class="flex flex-wrap gap-x-6 gap-y-1 text-xs mb-3">
-            <span class="text-textcolor2">{language.pluginStorageMetaType}: <span class="text-textcolor font-mono">{selected.type}</span></span>
-            <span class="text-textcolor2">{language.pluginStorageMetaSize}: <span class="text-textcolor font-mono">{formatSize(selected.size)}</span></span>
-            <span class="text-textcolor2">{language.pluginStorageMetaChars}: <span class="text-textcolor font-mono">{selected.str.length.toLocaleString()}</span></span>
+            <span class="text-textcolor2">{language.pluginStorageMetaType}: <span class="text-textcolor font-mono">{detailState?.type ?? selected.type}</span></span>
+            <span class="text-textcolor2">{language.pluginStorageMetaSize}: <span class="text-textcolor font-mono">{detailState ? detailSize() : formatSize(selected.size)}</span></span>
+            <span class="text-textcolor2">
+                {language.pluginStorageMetaChars}:
+                <span class="text-textcolor font-mono">
+                    {detailState
+                        ? `${detailState.totalCharsExact ? '' : '≥ '}${detailState.totalChars.toLocaleString()}`
+                        : '—'}
+                </span>
+            </span>
             <span class="text-textcolor2">{language.pluginStorageOwner}: <span class="text-textcolor font-mono">{selected.owner ?? language.pluginStorageOwnerUnknown}</span></span>
         </div>
 
-        {#if editing}
+        {#if detailLoading}
+            <div class="flex h-[50vh] items-center justify-center gap-2 text-textcolor2 text-sm">
+                <RefreshCwIcon size={18} class="animate-spin" />
+                {language.systemLogsLoading}
+            </div>
+        {:else if detailError}
+            <div class="flex h-[50vh] items-center justify-center text-red-400 text-sm">{detailError}</div>
+        {:else if editing}
             <textarea
                 bind:value={editText}
                 class="w-full h-[50vh] resize-none rounded-md border border-darkborderc bg-black/40 p-3 font-mono text-xs leading-relaxed text-textcolor outline-none focus-visible:border-borderc whitespace-pre"
                 spellcheck="false"
             ></textarea>
         {:else}
-            <pre class="w-full h-[50vh] overflow-auto rounded-md border border-darkborderc bg-black/40 p-3 font-mono text-xs leading-relaxed text-textcolor2 whitespace-pre-wrap break-all">{prettyPrint(selected.str)}</pre>
+            <pre class="w-full h-[50vh] overflow-auto rounded-md border border-darkborderc bg-black/40 p-3 font-mono text-xs leading-relaxed text-textcolor2 whitespace-pre-wrap break-all">{detailText}</pre>
+            {#if detailState?.truncated}
+                <p class="mt-2 text-amber-300 text-xs">
+                    {detailState.totalCharsExact
+                        ? language.pluginStoragePreviewTruncatedExact(
+                            formatSize(PLUGIN_STORAGE_PREVIEW_CHARS * 2),
+                            formatSize(detailState.totalChars * 2),
+                        )
+                        : language.pluginStoragePreviewTruncatedUnknown(formatSize(PLUGIN_STORAGE_PREVIEW_CHARS * 2))}
+                </p>
+            {/if}
         {/if}
     {/if}
     {#snippet footer()}
         <div class="flex justify-end gap-2">
             {#if editing}
-                <ShButton variant="outline" onclick={formatJson} disabled={saving}>
+                <ShButton variant="outline" onclick={formatJson} disabled={saving || !detailCanMutate}>
                     <AlignLeftIcon size={14} />
                     {language.pluginStorageFormatJson}
                 </ShButton>
-                <ShButton variant="outline" onclick={() => (editing = false)} disabled={saving}>
+                <ShButton variant="outline" onclick={() => { editing = false; editText = detailText }} disabled={saving}>
                     {language.cancel}
                 </ShButton>
-                <ShButton variant="primary" onclick={saveEdit} disabled={saving}>
+                <ShButton variant="primary" onclick={saveEdit} disabled={saving || !detailCanMutate}>
                     <SaveIcon size={14} />
                     {language.pluginStorageSave}
                 </ShButton>
             {:else}
-                <ShButton variant="destructive" onclick={() => selected && removeEntry(selected)}>
+                <ShButton variant="destructive" onclick={() => selected && removeEntry(selected)} disabled={saving || loading || valueSearching}>
                     <Trash2Icon size={14} />
                     {language.remove}
                 </ShButton>
-                <ShButton variant="outline" onclick={() => (detailOpen = false)}>
+                <ShButton variant="outline" onclick={closeDetail}>
                     {language.close}
                 </ShButton>
-                <ShButton variant="primary" onclick={startEdit}>
+                <ShButton variant="primary" onclick={startEdit} disabled={!detailCanMutate}>
                     <PencilIcon size={14} />
                     {language.edit}
                 </ShButton>

@@ -149,3 +149,17 @@ describe('SafeLocalPluginStorage.getMany', () => {
         await expect(store.getMany([requested])).rejects.toThrow(/unrequested key/)
     })
 })
+
+describe('SafeLocalPluginStorage.getItemUncached', () => {
+    test('reads a fresh value without warming the shared plugin cache', async () => {
+        const key = uniqueKey('uncached')
+        seed(key, { version: 1 })
+        const store = new SafeLocalPluginStorage()
+
+        await expect(store.getItemUncached(key)).resolves.toEqual({ version: 1 })
+        seed(key, { version: 2 })
+        await expect(store.getItemUncached(key)).resolves.toEqual({ version: 2 })
+
+        expect(fake.counters.perKeyReads).toBe(2)
+    })
+})

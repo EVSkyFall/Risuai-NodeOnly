@@ -68,6 +68,9 @@ export class SafeLocalPluginStorage {
         }
         return payload;
     }
+    async getItemUncached<T>(key: string): Promise<T | null> {
+        return await readPersistentJson<T>(makeEncodedStorageKey(pluginStoragePrefix, key));
+    }
     async getMany<T>(keys: string[]): Promise<(T | null)[]> {
         if (keys.length === 0) {
             return [];

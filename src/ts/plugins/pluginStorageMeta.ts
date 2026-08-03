@@ -103,7 +103,10 @@ export function clearOwners(backend: PluginStorageBackend): void | Promise<void>
 export async function getOwners(backend: PluginStorageBackend): Promise<Record<string, string>> {
     const out: Record<string, string> = {};
     if (backend === "save") {
-        const meta = getDatabase({ snapshot: true }).pluginStorageMeta ?? {};
+        // Read only the small sidecar map. Snapshotting getDatabase() here
+        // cloned the entire save just to list owners and could exhaust memory
+        // before the storage viewer rendered its first row.
+        const meta = getDatabase().pluginStorageMeta ?? {};
         for (const key of Object.keys(meta)) {
             if (meta[key]?.plugin) out[key] = meta[key].plugin;
         }
