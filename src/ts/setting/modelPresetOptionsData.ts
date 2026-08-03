@@ -14,6 +14,50 @@ function triggerRegistryResync(db: Database): void {
 
 export const modelPresetOptionsItems: SettingItem[] = [
     {
+        // Which model system chats use. Lives here rather than accessibility
+        // because it decides whether the model preset system is in play at all.
+        id: 'modelPreset.modelModeLock',
+        type: 'radio',
+        labelKey: 'modelModeLockLabel',
+        bindKey: 'nodeOnlyModelModeLock',
+        helpKey: 'modelModeLock',
+        options: {
+            selectOptions: [
+                { value: 'legacy', labelKey: 'modelModeLockLegacy', descriptionKey: 'modelModeLockLegacyDesc' },
+                { value: 'preset', labelKey: 'modelModeLockPreset', descriptionKey: 'modelModeLockPresetDesc' },
+                { value: 'none', labelKey: 'modelModeLockNone', descriptionKey: 'modelModeLockNoneDesc' },
+            ],
+        },
+        keywords: ['model', 'mode', 'legacy', 'preset', 'binding', 'lock', 'sidebar'],
+    },
+    {
+        id: 'modelPreset.newChatModelMode',
+        type: 'select',
+        labelKey: 'newChatModelModeLabel',
+        helpKey: 'newChatModelMode',
+        condition: (ctx) => (ctx.db.nodeOnlyModelModeLock ?? 'none') === 'none',
+        // Backed by the existing boolean useModelPresetByDefault (preset=true).
+        getValue: (db) => (db.useModelPresetByDefault ? 'preset' : 'legacy'),
+        setValue: (db, val) => { db.useModelPresetByDefault = val === 'preset'; },
+        options: {
+            selectOptions: [
+                { value: 'legacy', labelKey: 'modelModeLegacy' },
+                { value: 'preset', labelKey: 'modelModePreset' },
+            ],
+        },
+        keywords: ['model', 'mode', 'new', 'chat', 'default', 'legacy', 'preset'],
+    },
+    {
+        // Kill switch for the server-side request relay — placed here (not
+        // advanced settings) because it only affects the model-preset path and
+        // needs to be discoverable. Undefined remains off by default.
+        id: 'modelPreset.serverSideRequests',
+        type: 'check',
+        labelKey: 'nodeOnlyServerSideRequests',
+        helpKey: 'nodeOnlyServerSideRequests',
+        bindKey: 'nodeOnlyServerSideRequests',
+    },
+    {
         id: 'modelPreset.visibilityLevel',
         type: 'select',
         labelKey: 'profileVisibilityLevel',

@@ -90,7 +90,6 @@
         const roomId = getCurrentChatRoomId() ?? 'noroom';
         let loadStart = messages.length - 1
         let loadEnd = messages.length - loadPages
-
         // Find the last real (non-comment, non-disabled) char message index
         // Only show reroll if it's the actual last non-disabled message
         let lastRealCharIdx = -1;

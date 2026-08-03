@@ -1,4 +1,4 @@
-import { get, writable } from "svelte/store";
+import { get } from "svelte/store";
 import { type character, type MessageGenerationInfo, type Chat, type MessagePresetInfo, changeToPreset, setCurrentChat, type Message, normalizeChat } from "../storage/database.svelte";
 import { DBState } from '../stores.svelte';
 import { CharEmotion, selectedCharID } from "../stores.svelte";
@@ -30,6 +30,8 @@ import { getModuleAssets, getModuleToggles } from "./modules";
 import { getCurrentTurnId, readImage, setCurrentTurnId } from "../globalApi.svelte";
 import { stripIllustrationControlNodes, stripIllustrationControlNodesFromPrompt } from "./illustrationJobs/controlNodes";
 import { finalizeIllustrationRootTurn } from "./illustrationJobs/terminalCapture";
+import { chatGenKey, chatProcessStage, endGeneration, isChatGenerating, setGenerationStage, startGeneration } from "./generationState";
+import { clearPendingSend, registerPendingSend } from "./request/pendingSends";
 
 export interface OpenAIChat{
     role: 'system'|'user'|'assistant'|'function'
@@ -55,9 +57,7 @@ export interface requestTokenPart{
     tokens:number
 }
 
-export const doingChat = writable(false)
-export const chatProcessStage = writable(0)
-export const abortChat = writable(false)
+export { doingChat, chatProcessStage } from "./generationState"
 export let requestTokenParts:{[key:string]:requestTokenPart[]} = {}
 export let previewFormated:OpenAIChat[] = []
 export let previewBody:string = ''
@@ -179,16 +179,28 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
     }
 
-    let isDoing = get(doingChat)
+    // Concurrency guard, per chat: block a new send only when THIS chat is
+    // already generating. Keyed by the real chat id (chat.id); legacy chats
+    // without an id share one fallback key. See generationState.ts.
+    const guardChar = DBState.db.characters[get(selectedCharID)]
+    const realChatId = guardChar?.chats?.[guardChar.chatPage]?.id
+    const genKey = chatGenKey(realChatId)
 
-    if(isDoing){
+    if(isChatGenerating(genKey)){
         if(chatProcessIndex === -1){
             return false
         }
     }
+    const generationId = v4()
+    startGeneration(genKey, generationId)
+    // Resumable-send tombstone (pendingSends.ts): registered before the
+    // pipeline so an interrupted tab leaves a recoverable marker. Preview
+    // requests never register because they do not create a message.
+    if (realChatId && !arg.preview && !arg.previewPrompt) {
+        registerPendingSend(realChatId, generationId)
+    }
     setCurrentTurnId(turnId)
     try {
-    doingChat.set(true)
 
     if(chatProcessIndex === -1 && DBState.db.presetChain){
         const names = DBState.db.presetChain.split(',').map((v) => v.trim())
@@ -215,7 +227,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     // Block send if chat is still a placeholder (hydration not complete)
     if (nowChatroom.chats[nowChatroom.chatPage]?._placeholder) {
         alertError('Chat is still loading. Please wait a moment.')
-        doingChat.set(false)
+        endGeneration(genKey)
+        if (realChatId) clearPendingSend(realChatId, generationId)
         return false
     }
     nowChatroom.chats[nowChatroom.chatPage].message = nowChatroom.chats[nowChatroom.chatPage].message.map((v) => {
@@ -295,7 +308,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     let outputTokens:number
 
     if(!arg.replayRequest){
-    chatProcessStage.set(1)
+    setGenerationStage(genKey, 1)
     stageTimings.stage1Start = Date.now()
     let unformated = {
         'main':([] as OpenAIChat[]),
@@ -390,6 +403,10 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         unformated.globalNote.push(...formatPrompt(risuChatParser(currentChar.replaceGlobalNote?.replaceAll('{{original}}', DBState.db.globalNote) || DBState.db.globalNote, {chara:currentChar})))
     }
 
+    let baseDescriptionPrompt:OpenAIChat|null = null
+    let beforeDescriptionPrompts:OpenAIChat[] = []
+    let afterDescriptionPrompts:OpenAIChat[] = []
+
     if(currentChat.note){
         unformated.authorNote.push({
             role: 'system',
@@ -427,10 +444,11 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             description += risuChatParser("\n\nCircumstances and context of the dialogue: " + currentChar.scenario, {chara: currentChar})
         }
 
-        unformated.description.push({
+        baseDescriptionPrompt = {
             role: 'system',
             content: description
-        })
+        }
+        unformated.description.push(baseDescriptionPrompt)
 
     }
 
@@ -487,9 +505,11 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             content: risuChatParser(resolvePosition(lorebook.prompt), {chara: currentChar})
         }
         if(lorebook.pos === 'before_desc'){
+            beforeDescriptionPrompts.unshift(c)
             unformated.description.unshift(c)
         }
         else{
+            afterDescriptionPrompts.push(c)
             unformated.description.push(c)
         }
     }
@@ -583,6 +603,34 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     }
 
     let hasCachePoint = false
+    const convertPromptRole = {
+        "system": "system",
+        "user": "user",
+        "bot": "assistant",
+        "assistant": "assistant",
+    } as const
+
+    function applyPromptBlockRole(chats:OpenAIChat[], role?: 'user'|'bot'|'system'|'assistant'){
+        if(!role){
+            return
+        }
+        for(const chat of chats){
+            chat.role = convertPromptRole[role]
+        }
+    }
+
+    function getDescriptionPrompts(role?: 'user'|'bot'|'system'|'assistant'){
+        const pmt = [
+            ...safeStructuredClone(beforeDescriptionPrompts),
+            ...(baseDescriptionPrompt ? [safeStructuredClone(baseDescriptionPrompt)] : []),
+            ...safeStructuredClone(afterDescriptionPrompts)
+        ]
+        if(baseDescriptionPrompt){
+            applyPromptBlockRole([pmt[beforeDescriptionPrompts.length]], role)
+        }
+        return pmt
+    }
+
     if(promptTemplate){
         const template = promptTemplate
 
@@ -597,6 +645,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             switch(card.type){
                 case 'persona':{
                     let pmt = safeStructuredClone(unformated.personaPrompt)
+                    applyPromptBlockRole(pmt, card.role2)
                     if(card.innerFormat && pmt.length > 0){
                         for(let i=0;i<pmt.length;i++){
                             pmt[i].content = risuChatParser(positionParser(card.innerFormat,card.type), {chara: currentChar}).replace('{{slot}}', pmt[i].content)
@@ -607,7 +656,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     break
                 }
                 case 'description':{
-                    let pmt = safeStructuredClone(unformated.description)
+                    let pmt = getDescriptionPrompts(card.role2)
                     if(card.innerFormat && pmt.length > 0){
                         for(let i=0;i<pmt.length;i++){
                             pmt[i].content = risuChatParser(positionParser(card.innerFormat,card.type), {chara: currentChar}).replace('{{slot}}', pmt[i].content)
@@ -619,6 +668,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 }
                 case 'authornote':{
                     let pmt = safeStructuredClone(unformated.authorNote)
+                    applyPromptBlockRole(pmt, card.role2)
                     if(card.innerFormat && pmt.length > 0){
                         for(let i=0;i<pmt.length;i++){
                             pmt[i].content = risuChatParser(positionParser(card.innerFormat,card.type), {chara: currentChar}).replace('{{slot}}', pmt[i].content || card.defaultText || '')
@@ -652,12 +702,6 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                         continue
                     }
 
-                    const convertRole = {
-                        "system": "system",
-                        "user": "user",
-                        "bot": "assistant"
-                    } as const
-
                     const posType = card.type === 'plain' ? card.type2 : card.type
                     let content = positionParser(card.text, posType)
 
@@ -679,7 +723,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     }
 
                     const prompt:OpenAIChat ={
-                        role: convertRole[card.role],
+                        role: convertPromptRole[card.role],
                         content: content
                     }
 
@@ -806,7 +850,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         ms = makeMs(currentChat)
         currentTokens += triggerResult.tokens
         if(triggerResult.stopSending){
-            doingChat.set(false)
+            endGeneration(genKey)
+            if (realChatId) clearPendingSend(realChatId, generationId)
             return false
         }
     }
@@ -967,7 +1012,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     
     if((currentChat.supaMemory ?? nowChatroom.supaMemory) && DBState.db.hypaV3){
         stageTimings.stage1Duration = Date.now() - stageTimings.stage1Start
-        chatProcessStage.set(2)
+        setGenerationStage(genKey, 2)
         stageTimings.stage2Start = Date.now()
         console.log("Current chat's hypaV3 Data: ", currentChat.hypaV3Data)
         chats = stripIllustrationControlNodesFromPrompt(chats)
@@ -980,6 +1025,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             }
             console.log(sp)
             throwError(sp.error)
+            if (realChatId) clearPendingSend(realChatId, generationId)
             return false
         }
         chats = sp.chats
@@ -990,7 +1036,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         currentChat = DBState.db.characters[selectedChar].chats[selectedChat];
         console.log("[Expected to be updated] chat's HypaV3Data: ", currentChat.hypaV3Data)
         stageTimings.stage2Duration = Date.now() - stageTimings.stage2Start
-        chatProcessStage.set(1)
+        setGenerationStage(genKey, 1)
     }
     else{
         stageTimings.stage1Duration = Date.now() - stageTimings.stage1Start
@@ -998,6 +1044,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             if(chats.length <= 1){
                 throwError(language.errors.toomuchtoken + "\n\nRequired Tokens: " + currentTokens)
 
+                if (realChatId) clearPendingSend(realChatId, generationId)
                 return false
             }
 
@@ -1128,6 +1175,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             switch(card.type){
                 case 'persona':{
                     let pmt = safeStructuredClone(unformated.personaPrompt)
+                    applyPromptBlockRole(pmt, card.role2)
                     if(card.innerFormat && pmt.length > 0){
                         for(let i=0;i<pmt.length;i++){
                             pmt[i].content = risuChatParser(positionParser(card.innerFormat,card.type), {chara: currentChar}).replace('{{slot}}', pmt[i].content)
@@ -1142,7 +1190,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     break
                 }
                 case 'description':{
-                    let pmt = safeStructuredClone(unformated.description)
+                    let pmt = getDescriptionPrompts(card.role2)
                     if(card.innerFormat && pmt.length > 0){
                         for(let i=0;i<pmt.length;i++){
                             pmt[i].content = risuChatParser(positionParser(card.innerFormat,card.type), {chara: currentChar}).replace('{{slot}}', pmt[i].content)
@@ -1158,6 +1206,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 }
                 case 'authornote':{
                     let pmt = safeStructuredClone(unformated.authorNote)
+                    applyPromptBlockRole(pmt, card.role2)
                     if(card.innerFormat && pmt.length > 0){
                         for(let i=0;i<pmt.length;i++){
                             pmt[i].content = risuChatParser(positionParser(card.innerFormat,card.type), {chara: currentChar}).replace('{{slot}}', pmt[i].content || card.defaultText || '')
@@ -1195,12 +1244,6 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                         continue
                     }
 
-                    const convertRole = {
-                        "system": "system",
-                        "user": "user",
-                        "bot": "assistant"
-                    } as const
-
                     const posType = card.type === 'plain' ? card.type2 : card.type
                     let content = positionParser(card.text, posType)
 
@@ -1221,7 +1264,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     }
 
                     const prompt:OpenAIChat ={
-                        role: convertRole[card.role],
+                        role: convertPromptRole[card.role],
                         content: content
                     }
 
@@ -1285,6 +1328,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 }
                 case 'memory':{
                     let pmt = safeStructuredClone(memories)
+                    applyPromptBlockRole(pmt, card.role2)
                     if(card.innerFormat && pmt.length > 0){
                         for(let i=0;i<pmt.length;i++){
                             pmt[i].content = risuChatParser(card.innerFormat, {chara: currentChar}).replace('{{slot}}', pmt[i].content)
@@ -1367,6 +1411,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         while(inputTokens > maxContextTokens){
             if(pointer >= formated.length){
                 throwError(language.errors.toomuchtoken + "\n\nAt token rechecking. Required Tokens: " + inputTokens)
+                if (realChatId) clearPendingSend(realChatId, generationId)
                 return false
             }
             if(formated[pointer].removable){
@@ -1402,7 +1447,6 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             outputTokens = maxContextTokens - inputTokens
         }
     }
-    const generationId = v4()
     let terminalMessageId = generationId
     let terminalMessageReference: Message | undefined
     const captureIllustrationRootTurn = () => {
@@ -1439,7 +1483,17 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
     }
 
-    chatProcessStage.set(3)
+    // Continue writes into the previous reply: stamp it with THIS
+    // generation's id up front so recovery attributes a mid-continue death to
+    // the continued message (fill/skip) instead of inserting a duplicate.
+    if(arg.continue && !arg.preview && !arg.previewPrompt){
+        const contMsgs = DBState.db.characters[selectedChar].chats[selectedChat].message
+        if(contMsgs.length > 0){
+            contMsgs[contMsgs.length - 1].generationInfo = generationInfo
+        }
+    }
+
+    setGenerationStage(genKey, 3)
     stageTimings.stage3Start = Date.now()
     if(arg.preview){
         previewFormated = formated
@@ -1458,6 +1512,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         bias: {},
         continue: arg.continue,
         chatId: generationId,
+        realChatId: realChatId,
         imageResponse: DBState.db.outputImageModal,
         previewBody: arg.previewPrompt,
         escape: nowChatroom.type === 'character' && nowChatroom.escapeOutput,
@@ -1470,7 +1525,10 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     // Commit the staged replay snapshot only for responses that will actually
     // land in the chat — a failed attempt keeps the previous snapshot valid.
     if(req.type === 'success' || req.type === 'streaming' || req.type === 'multiline'){
-        commitMainRequestSnapshot(generationId)
+        const messageChatId = arg.continue
+            ? DBState.db.characters[selectedChar].chats[selectedChat].message.at(-1)?.chatId ?? generationId
+            : generationId
+        commitMainRequestSnapshot(generationId, messageChatId)
     }
 
     console.log(req)
@@ -1494,10 +1552,12 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     let resendChat = false
     
     if(abortSignal.aborted === true){
+        if (realChatId) clearPendingSend(realChatId, generationId)
         return false
     }
     if(req.type === 'fail'){
         throwError(req.result)
+        if (realChatId) clearPendingSend(realChatId, generationId)
         return false
     }
     else if(req.type === 'streaming'){
@@ -1635,6 +1695,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
 
         if(streamAborted || abortSignal.aborted){
+            if (realChatId) clearPendingSend(realChatId, generationId)
             return false
         }
 
@@ -1690,7 +1751,9 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     time: Date.now(),
                     generationInfo,
                     promptInfo,
-                    chatId: generationId,
+                    // Keep the original message identity: older jobs match on it
+                    // (jobRecovery secondary match) — see the continue restamp note.
+                    chatId: DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex]?.chatId ?? generationId,
                 }
                 terminalMessageReference = DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex]
                 if(inlayResult.promise){
@@ -1762,7 +1825,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     }
 
     if(needsAutoContinue){
-        doingChat.set(false)
+        endGeneration(genKey, { keepPendingAbort: true })
         return await sendChat(chatProcessIndex, {
             chatAdditonalTokens: arg.chatAdditonalTokens,
             continue: true,
@@ -1789,7 +1852,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     if(generationInfo.stageTiming) {
         generationInfo.stageTiming.stage3 = stageTimings.stage3Duration
     }
-    chatProcessStage.set(4)
+    setGenerationStage(genKey, 4)
     stageTimings.stage4Start = Date.now()
 
     if(resendChat){
@@ -1807,7 +1870,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             DBState.db.characters[selectedChar].chats[selectedChat].message[lastMessageIndex].generationInfo = generationInfo
         }
         
-        doingChat.set(false)
+        endGeneration(genKey, { keepPendingAbort: true })
         return await sendChat(chatProcessIndex, {
             signal: abortSignal,
             copilotTurnId: turnId
@@ -1916,6 +1979,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 
 
                 captureIllustrationRootTurn()
+                if (realChatId) clearPendingSend(realChatId, generationId)
                 return true
             }
 
@@ -1977,6 +2041,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             }, 'emotion', abortSignal)
 
             if(rq.type === 'fail'){
+                if (realChatId) clearPendingSend(realChatId, generationId)
                 if(abortSignal.aborted){
                     captureIllustrationRootTurn()
                     return true
@@ -1986,6 +2051,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 return true
             }
             if(rq.type === 'streaming' || rq.type === 'multiline'){
+                if (realChatId) clearPendingSend(realChatId, generationId)
                 if(abortSignal.aborted){
                     captureIllustrationRootTurn()
                     return true
@@ -2034,11 +2100,13 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 } catch (error) {
                     throwError(language.errors.httpError + `${error}`)
                     captureIllustrationRootTurn()
+                    if (realChatId) clearPendingSend(realChatId, generationId)
                     return true
                 }
             }
             
             captureIllustrationRootTurn()
+            if (realChatId) clearPendingSend(realChatId, generationId)
             return true
 
 
@@ -2076,6 +2144,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     }
 
     captureIllustrationRootTurn()
+    if (realChatId) clearPendingSend(realChatId, generationId)
     return true
     } finally {
         if (getCurrentTurnId() === turnId) setCurrentTurnId(null)

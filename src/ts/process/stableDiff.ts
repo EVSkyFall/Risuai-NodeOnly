@@ -843,7 +843,21 @@ async function generateAIImageInternal(
                 }
                 await new Promise(r => setTimeout(r, 1000))
             } // Check history until the generation is complete.
-            const genImgInfo = Object.values(item.outputs).flatMap((output: any) => output.images)[0];
+            // A history entry also appears when the workflow failed, but then it carries
+            // no outputs — surface the reported cause instead of dying on undefined.
+            const failure = (item?.status?.messages ?? []).find((m: any) =>
+                Array.isArray(m) && (m[0] === 'execution_error' || m[0] === 'execution_interrupted'))
+            if(failure){
+                const info = failure[1] ?? {}
+                const detail = [info.node_type ?? info.node_id, info.exception_type, info.exception_message].filter(Boolean).join(': ')
+                alertError(`Error: ComfyUI ${failure[0]}${detail ? ` (${detail})` : ''}`)
+                return false
+            }
+            const genImgInfo = Object.values(item?.outputs ?? {}).flatMap((output: any) => Array.isArray(output?.images) ? output.images : [])[0];
+            if(!genImgInfo?.filename){
+                alertError("Error: ComfyUI returned no image. Check that the workflow has a SaveImage output node.")
+                return false
+            }
 
             const imgResponse = await fetchNative(createUrl('/view', {
                 filename: genImgInfo.filename,

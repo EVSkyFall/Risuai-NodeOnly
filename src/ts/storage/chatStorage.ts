@@ -113,7 +113,11 @@ export function restoreChatShapeAfterRebase(
                 && (c as Chat)._placeholder !== true
                 && (c as any)._stub !== true
                 && Array.isArray((c as Chat).message))
-            if (localFull) char.chats[i] = localFull as Chat
+            if (localFull) {
+                const hydratedChat = localFull as Chat
+                hydratedChat.isStreaming = false
+                char.chats[i] = hydratedChat
+            }
         }
     }
 }
@@ -212,6 +216,11 @@ export async function ensureChatHydrated(
                 console.error(`[chatStorage] hydrate failed: chat not found on server (${key})`)
                 return null
             }
+
+            // Clear stale streaming flags: if the app died mid-stream after a
+            // save, the server copy can carry isStreaming=true forever.
+            // (setDatabase does the same for chats present at boot.)
+            full.isStreaming = false
 
             const currentIndex = chats.findIndex(chat => chat?.id === chatId)
             if (currentIndex === -1) {

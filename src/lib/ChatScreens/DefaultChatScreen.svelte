@@ -13,8 +13,10 @@
     import { type Chat as ChatData, type Message } from "../../ts/storage/database.svelte";
     import { DBState } from 'src/ts/stores.svelte';
     import { getCharImage } from "../../ts/characters";
-    import { chatProcessStage, doingChat, sendChat } from "../../ts/process/index.svelte";
+    import { chatProcessStage, sendChat } from "../../ts/process/index.svelte";
     import { getReplayableSnapshot, type MainRequestSnapshot } from '../../ts/process/request/requestReplay';
+    import { abortGeneration, chatGenKey, endGeneration, generationStates, registerAbort } from "../../ts/process/generationState";
+    import { clearPendingSend, resumableSends, resumePendingSend, takeResumable } from "../../ts/process/request/pendingSends";
     import { ensureCurrentChatReady } from "../../ts/storage/chatStorage";
     import { sleep } from "../../ts/util";
     import { language } from "../../lang";
@@ -328,7 +330,7 @@ import { isMobile } from 'src/ts/platform'
 
     async function sendMain(continueResponse:boolean) {
         let selectedChar = $selectedCharID
-        if($doingChat){
+        if($generationStates.has(currentChatGenKey())){
             return
         }
 
@@ -447,7 +449,7 @@ import { isMobile } from 'src/ts/platform'
     }
 
     async function reroll(exact = false) {
-        if($doingChat) return
+        if($generationStates.has(currentChatGenKey())) return
         const lastMsg = getLastCharMsg()
         if (!lastMsg) return
         const replayRequest = exact ? getReplayableSnapshot(lastMsg.chatId) ?? undefined : undefined
@@ -504,7 +506,7 @@ import { isMobile } from 'src/ts/platform'
     }
 
     async function unReroll() {
-        if($doingChat) return
+        if($generationStates.has(currentChatGenKey())) return
         const lastMsg = getLastCharMsg()
         if (!lastMsg || !lastMsg.swipes || lastMsg.swipeId === undefined) return
 
@@ -541,34 +543,109 @@ import { isMobile } from 'src/ts/platform'
         DBState.db.characters[$selectedCharID].reloadKeys += 1
     }
 
-    let abortController:null|AbortController = null
+    // The abort controller lives in the per-chat generation-state registry so
+    // the Stop button aborts the generation of the chat it is shown for (not
+    // whatever this screen instance last started). See generationState.ts.
+    function currentChatId(){
+        const char = DBState.db.characters[$selectedCharID]
+        return char?.chats?.[char.chatPage]?.id
+    }
+
+    function currentChatGenKey(){
+        return chatGenKey(currentChatId())
+    }
+
+    // Stop affordance is per-chat: shown when the CURRENTLY SELECTED chat has
+    // a generation entry (live or background), so the button always targets
+    // the chat it is rendered for — generate in A, switch to B, and B shows
+    // Send while A (revisited) still shows a working Stop. Recomputes on chat
+    // switch because currentChatGenKey reads the selected char/chatPage.
+    let currentChatGenerating = $derived($generationStates.has(currentChatGenKey()))
 
     async function sendChatMain(continued:boolean = false, replayRequest?:MainRequestSnapshot) {
 
         messageInput = ''
-        abortController = new AbortController()
+        const chatId = currentChatId()
+        const genKey = chatGenKey(chatId)
+        // Mirror sendChat's per-chat guard BEFORE any side effects: a blocked
+        // send must not run the unconditional conclude below, which would tear
+        // down the RUNNING generation's guard entry and tombstone (e.g. Enter
+        // pressed while an auto-resume is streaming).
+        if ($generationStates.has(genKey)) {
+            return false
+        }
+        const abortController = new AbortController()
+        registerAbort(genKey, abortController)
         let generated = false
+        let generationId: string | undefined
         try {
-            generated = await sendChat(-1, {
+            const sendPromise = sendChat(-1, {
                 signal:abortController.signal,
                 continue:continued,
                 ...(replayRequest ? { replayRequest } : {})
             })
+            generationId = $generationStates.get(genKey)?.generationId
+            generated = await sendPromise
         } catch (error) {
             console.error(error)
             alertError(error)
         }
-        $doingChat = false
+        endGeneration(genKey)
+        // Send concluded on THIS client (success, failure or abort alike) —
+        // drop the resumable-send tombstone so no later boot re-runs it.
+        if (chatId && generationId) clearPendingSend(chatId, generationId)
         if(DBState.db.playMessage){
             playNotificationSound(DBState.db.messageSound, DBState.db.messageSoundVolume)
         }
         return generated
     }
 
+    // Auto-resume of an interrupted send (pendingSends.ts): discovery flags a
+    // chat whose send died mid-pipeline with no recoverable response; opening
+    // that chat re-runs the send once, as if the user pressed send again on
+    // the same conversation tail. Unlike sendChatMain this must NOT touch
+    // messageInput (a typed draft survives) and adds no new user message —
+    // the original one is already the chat's last message.
+    //
+    // Everything is revalidated at execution time (a macrotask after the
+    // effect): the selection must still point at the flagged chat, nothing may
+    // be generating, the chat must still end on the user's turn, and the
+    // server-side CLAIM must succeed — the atomic claim is what makes the
+    // re-run at-most-once across devices, tabs and reloads.
+    async function resumeInterruptedSend(chatId: string, generationId?: string) {
+        const genKey = chatGenKey(chatId)
+        await resumePendingSend({
+            chatId,
+            generationId,
+            generationKey: genKey,
+            isRunnable: () => currentChatId() === chatId && !$generationStates.has(genKey),
+            endsOnUser: () => {
+                const char = DBState.db.characters[$selectedCharID]
+                const chat = char?.chats?.[char.chatPage]
+                const last = chat?.message?.[chat.message.length - 1]
+                return last?.role === 'user'
+            },
+            beginGeneration: registerAbort,
+            endGeneration,
+            send: (signal) => sendChat(-1, { signal }),
+            onError: (error) => { console.error(error) },
+        })
+    }
+
+    // One-shot via takeResumable; the timeout escapes the effect before the
+    // send mutates tracked state.
+    $effect(() => {
+        const char = DBState.db.characters[$selectedCharID]
+        const chatId = char?.chats?.[char.chatPage]?.id
+        if (!chatId || !$resumableSends.has(chatId)) return
+        if ($generationStates.has(chatGenKey(chatId))) return
+        const record = takeResumable(chatId)
+        if (!record) return
+        setTimeout(() => { void resumeInterruptedSend(chatId, record.generationId) }, 0)
+    })
+
     function abortChat(){
-        if(abortController){
-            abortController.abort()
-        }
+        abortGeneration(currentChatGenKey())
     }
 
     let { userIconPortrait, currentUsername, userIcon } = $derived.by(() => {
@@ -1079,7 +1156,7 @@ import { isMobile } from 'src/ts/platform'
                     <Maximize2 size={18} />
                 </button>
 
-                {#if $doingChat || doingChatInputTranslate}
+                {#if currentChatGenerating || doingChatInputTranslate}
                     <button
                             aria-labelledby="cancel"
                             class="order-2 shrink-0 flex justify-center items-center w-9 h-9 rounded-full text-textcolor hover:bg-primary/20 transition-colors" onclick={abortChat}
@@ -1189,7 +1266,11 @@ import { isMobile } from 'src/ts/platform'
             {/if}
         {/snippet}
 
-        <div class="h-full w-full flex flex-col-reverse overflow-y-auto relative default-chat-screen"
+        <!-- overscroll-y-contain: without it, repeated overscroll at the chat's end chains the
+             gesture to the viewport; mobile Chrome then collapses its URL bar, the visual viewport
+             resizes, and the sticky composer inside this col-reverse scroller gets misanchored
+             (bar floats up with a gap below). PWA/standalone has no URL bar, hence unaffected. -->
+        <div class="h-full w-full flex flex-col-reverse overflow-y-auto overscroll-y-contain relative default-chat-screen"
             class:nodeonly-standard={DBState.db.theme === ''}
             class:no-chat-width-wide={DBState.db.theme === '' && DBState.db.nodeOnlyStandardChatWidth === 'wide'}
             class:no-chat-width-full={DBState.db.theme === '' && DBState.db.nodeOnlyStandardChatWidth === 'full'}

@@ -241,7 +241,6 @@ await (async function() {
             const fn = callbackRegistry.get(data.id);
             const response = { type: 'CALLBACK_RETURN', reqId: data.reqId };
             const usedAbortIds = [];
-
             try {
                 if (!fn) throw new Error("Callback not found or released");
                 const deserializedArgs = (data.args || []).map(function(a) {
@@ -366,6 +365,7 @@ export class SandboxHost {
 
     private instanceRegistry = new Map<string, any>();
     private abortControllers = new Map<string, AbortController>();
+    private messageHandlerRef: ((event: MessageEvent) => void) | null = null;
     private callbackWrapperCache = new Map<string, Function>();
 
     private pendingCallbacks = new Map<string, { resolve: Function, reject: Function }>();
@@ -660,7 +660,6 @@ export class SandboxHost {
             if (data.type === 'CALL_ROOT' || data.type === 'CALL_INSTANCE') {
                 const response: RpcMessage = { type: 'RESPONSE', reqId: data.reqId };
                 const usedAbortIds: string[] = [];
-
                 try {
 
                     const args = this.deserializeArgs(data.args || [], usedAbortIds);
@@ -723,7 +722,8 @@ export class SandboxHost {
             }
         };
 
-        window.addEventListener('message', messageHandler);
+        this.messageHandlerRef = messageHandler;
+        window.addEventListener('message', this.messageHandlerRef);
 
 
         const html = `
@@ -756,12 +756,7 @@ export class SandboxHost {
         this.iframe.srcdoc = html;
 
         return () => {
-            window.removeEventListener('message', messageHandler);
-            this.iframe.remove();
-            this.instanceRegistry.clear();
-            this.rejectPendingCallbacks('plugin unloaded');
-            this.abortControllers.clear();
-            this.callbackWrapperCache.clear();
+            this.terminate();
         };
     }
 
@@ -776,6 +771,10 @@ export class SandboxHost {
     }
 
     public terminate() {
+        if (this.messageHandlerRef) {
+            window.removeEventListener('message', this.messageHandlerRef);
+            this.messageHandlerRef = null;
+        }
         if (this.iframe) {
             this.iframe.remove();
         }

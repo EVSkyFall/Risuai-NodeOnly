@@ -59,6 +59,26 @@ export interface PatchItemResult {
     chatGuardRejected?: boolean
 }
 
+export interface ExportBackupOptions {
+    /** Strip NodeOnly-only inlay namespaces so upstream RisuAI can import it. */
+    target?: 'upstream'
+    /** Drop characters, chats and inlay images — a seed for a fresh instance. */
+    mode?: 'settings'
+    /**
+     * Carry asset-pack module images. Defaults to true; set false to leave out
+     * what is usually the bulk of a settings backup. Only meaningful with
+     * `mode: 'settings'`.
+     */
+    moduleAssets?: boolean
+}
+
+/** Size breakdown backing the settings-only confirm dialog. */
+export interface SettingsBackupEstimate {
+    dbBytes: number
+    baseAssets: { count: number, bytes: number }
+    moduleAssets: { count: number, bytes: number, moduleCount: number }
+}
+
 export class NodeStorage{
     private static readonly BULK_WRITE_CLIENT_BATCH = 20
 
@@ -426,13 +446,22 @@ export class NodeStorage{
         }
     }
 
-    async exportBackup(opts?: { target?: 'upstream' }): Promise<Response> {
-        const url = opts?.target === 'upstream'
-            ? '/api/backup/export?target=upstream'
-            : '/api/backup/export'
+    async exportBackup(opts?: ExportBackupOptions): Promise<Response> {
+        const params = new URLSearchParams()
+        if (opts?.target === 'upstream') params.set('target', 'upstream')
+        if (opts?.mode === 'settings') params.set('mode', 'settings')
+        if (opts?.moduleAssets === false) params.set('moduleAssets', '0')
+        const query = params.toString()
+        const url = query ? `/api/backup/export?${query}` : '/api/backup/export'
         const da = await this.authFetch(url)
         if (da.status < 200 || da.status >= 300) throw `backup export error: ${da.status}`
         return da
+    }
+
+    async settingsBackupEstimate(): Promise<SettingsBackupEstimate> {
+        const da = await this.authFetch('/api/backup/export/settings-estimate')
+        if (da.status < 200 || da.status >= 300) throw `settings estimate error: ${da.status}`
+        return await da.json()
     }
 
     async prepareImport(size: number): Promise<void> {

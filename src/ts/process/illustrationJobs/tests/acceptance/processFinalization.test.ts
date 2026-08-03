@@ -167,6 +167,7 @@ const lockModule = await import('../../locks')
 const operationLockModule = await import('../../operationLock')
 const storeModule = await import('../../store')
 const processModule = await import('../../../index.svelte')
+const generationStateModule = await import('../../../generationState')
 
 const { setIllustrationFeatureEnabled } = featureModule
 const { writeDurableCaptureMode } = capturePolicyModule
@@ -179,7 +180,8 @@ const {
     setIllustrationOperationLockManagerAccessorForTests,
 } = operationLockModule
 const { illustrationJobStore } = storeModule
-const { doingChat, sendChat } = processModule
+const { sendChat } = processModule
+const { endAllGenerations } = generationStateModule
 
 function installDatabase(emotionProcesser: string) {
     harness.database = {
@@ -274,7 +276,7 @@ beforeEach(async () => {
     ])
     harness.selectedChar.set(0)
     harness.charEmotion.set({})
-    doingChat.set(false)
+    endAllGenerations()
     const lockManager = new InMemoryLockManager()
     setIllustrationLockManagerAccessorForTests(() => lockManager)
     setIllustrationOperationLockManagerAccessorForTests(() => lockManager)
@@ -285,7 +287,7 @@ beforeEach(async () => {
 })
 
 afterEach(() => {
-    doingChat.set(false)
+    endAllGenerations()
     resetIllustrationLockManagerAccessorForTests()
     resetIllustrationOperationLockManagerAccessorForTests()
 })

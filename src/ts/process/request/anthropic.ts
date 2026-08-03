@@ -510,6 +510,8 @@ export async function requestClaude(arg:RequestDataArgumentExtended):Promise<req
         }
 
         const res = await globalFetch(url, {
+            logCategory: 'llm',
+            logSource: 'main',
             method: "POST",
             body: params,
             headers: signed.headers,
@@ -749,7 +751,6 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
     copilotTaskId = applyCopilotTaskHeaders(headers, replacerURL, copilotTaskId, isContinuation)
     
     if(arg.useStreaming){
-
         let res: Response
         let lastErrText = ''
         const STREAM_MAX_RETRIES = 5
@@ -758,6 +759,8 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
         for(let attempt = 0; attempt < STREAM_MAX_RETRIES; attempt++){
             try {
                 res = await fetchNative(replacerURL, {
+                    logCategory: 'llm',
+                    logSource: 'main',
                     body: JSON.stringify(body),
                     headers: headers,
                     method: "POST",
@@ -964,6 +967,8 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
                                     text = ''
                                     reader.cancel()
                                     const res = await fetchNative(replacerURL, {
+                                        logCategory: 'llm',
+                                        logSource: 'sub',
                                         body: JSON.stringify(body),
                                         headers: headers,
                                         method: "POST",
@@ -1246,6 +1251,8 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
     const RETRY_DELAYS_MS = [3000, 6000, 12000, 20000, 30000]
     for(let attempt = 0; attempt < MAX_RETRIES; attempt++){
         res = await globalFetch(replacerURL, {
+            logCategory: 'llm',
+            logSource: 'main',
             body: body,
             headers: headers,
             method: "POST",

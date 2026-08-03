@@ -248,6 +248,16 @@ describe('restoreChatShapeAfterRebase', () => {
         expect((merged[0].chats[1] as any)._placeholder).toBe(true)
     })
 
+    test('clears stale streaming state on a locally hydrated rebase graft', () => {
+        const hydrated = { ...fullChat('c1', 'partial stream'), isStreaming: true }
+        const merged = [{ chaId: 'A', chats: [rawStub('c1')] }]
+        const local = [{ chaId: 'A', chats: [hydrated] }]
+
+        restoreChatShapeAfterRebase(merged, local)
+
+        expect((merged[0].chats[0] as any).isStreaming).toBe(false)
+    })
+
     test('never grafts a local stub or placeholder over the slot', () => {
         const merged = [{ chaId: 'A', chats: [rawStub('c1'), rawStub('c2')] }]
         const local = [{

@@ -113,7 +113,8 @@
                 {/if}
             </div>
             {#if plugin.version === 2 || plugin.version === "2.1"}
-                <button class="text-yellow-400 hover:gray-200 cursor-pointer" onclick={() => {
+                <button class="text-yellow-400 hover:gray-200 cursor-pointer" onclick={(e) => {
+                    e.stopPropagation()
                     alertMd(language.pluginV2Warning);
                 }} >
                     <TriangleAlert />
@@ -129,6 +130,7 @@
                             rel="nofollow noopener noreferrer"
                             class="text-textcolor2 hover:text-textcolor cursor-pointer"
                             title={link.hoverText}
+                            onclick={(e) => e.stopPropagation()}
                         >
                             <LinkIcon></LinkIcon>
                         </a>
@@ -141,7 +143,8 @@
                     {#if updateInfo}
                         <button
                             class="text-green-400 hover:gray-200 cursor-pointer"
-                            onclick={async () => {
+                            onclick={async (e) => {
+                                e.stopPropagation()
                                 const v = await alertConfirm(
                                     language.pluginUpdateFoundInstallIt
                                 );
@@ -159,6 +162,7 @@
             <button
                 class="textcolor2 hover:gray-200 cursor-pointer"
                 onclick={async (e) => {
+                    e.stopPropagation()
                     plugin.enabled = !plugin.enabled
                     DBState.db.plugins[i] = plugin
                     loadPlugins()
@@ -193,7 +197,8 @@
             <!--Also, remove button.-->
             <button
                 class="textcolor2 hover:gray-200 cursor-pointer"
-                onclick={async () => {
+                onclick={async (e) => {
+                    e.stopPropagation()
                     const v = await alertConfirm(
                         language.removeConfirm +
                             (plugin.displayName ?? plugin.name),

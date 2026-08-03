@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { commitMainRequestSnapshot, getReplayableSnapshot, stageMainRequestSnapshot } from './requestReplay'
+import {
+    commitMainRequestSnapshot,
+    getReplayableSnapshot,
+    shouldStageMainRequestSnapshot,
+    stageMainRequestSnapshot,
+} from './requestReplay'
 
 const snap = (id: string) => ({
     formated: [{ role: 'user' as const, content: 'hello' }],
@@ -40,9 +45,23 @@ describe('request replay snapshot', () => {
         commitMainRequestSnapshot('generation-a')
 
         stageMainRequestSnapshot(snap('generation-b'))
-        // e.g. a preview/continue send reaches the commit site without staging
+        // e.g. a preview send reaches the commit site without staging
         commitMainRequestSnapshot('generation-preview')
         expect(getReplayableSnapshot('generation-b')).toBeNull()
         expect(getReplayableSnapshot('generation-a')).toBe(a)
+    })
+
+    it('indexes a continued response by the message identity that remains in chat', () => {
+        const continued = snap('generation-continue')
+        expect(shouldStageMainRequestSnapshot('model', {
+            chatId: continued.forGenerationId,
+            continue: true,
+        })).toBe(true)
+        stageMainRequestSnapshot(continued)
+
+        commitMainRequestSnapshot('generation-continue', 'original-message-id')
+
+        expect(getReplayableSnapshot('generation-continue')).toBeNull()
+        expect(getReplayableSnapshot('original-message-id')).toBe(continued)
     })
 })

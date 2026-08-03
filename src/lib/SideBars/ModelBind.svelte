@@ -1,9 +1,9 @@
 <script lang="ts">
-    import { DBState, selectedCharID } from "src/ts/stores.svelte";
+    import { DBState, ModelPresetListTabIndex, selectedCharID } from "src/ts/stores.svelte";
     import { language } from "src/lang";
     import { ChevronDownIcon, SettingsIcon } from "@lucide/svelte";
     import { alertConfirm, notifySuccess } from "src/ts/alert";
-    import { openSettings, SettingsRoute, AccessibilityTab } from "src/ts/routing";
+    import { openSettings, SettingsRoute } from "src/ts/routing";
     import ModelList from "../UI/ModelList.svelte";
     import ModelPresetList from "../UI/ModelPresetList.svelte";
     import ShSwitch from "../UI/GUI/ShSwitch.svelte";
@@ -58,7 +58,8 @@
     }
 
     function openModelModeSettings() {
-        openSettings(SettingsRoute.Accessibility, undefined, AccessibilityTab.Sidebar);
+        openSettings(SettingsRoute.ModelPreset);
+        ModelPresetListTabIndex.set(2);
     }
 
     async function confirmSetAsDefault() {

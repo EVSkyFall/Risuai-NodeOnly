@@ -40,6 +40,11 @@ interface BasicScriptingEngineState {
     // read these state fields, refreshed at the start of every run.
     stopSending?: boolean;
     char?: character|simpleCharacterArgument;
+
+    // Engines persist in the (bucket, code) cache. moduleId is per-run state;
+    // async work escaping the mutex can observe a later run's value, so model
+    // calls must stay inside runExclusive.
+    moduleId?: string;
 }
 
 type LuaHandlerName = 'onInput' | 'onOutput' | 'onStart' | 'onButtonClick' | 'callListenMain';
@@ -164,7 +169,8 @@ export async function runScripted(code:string, arg:{
     lowLevelAccess?: boolean,
     meta?: object,
     mode?: string,
-    type?: 'lua'|'py'
+    type?: 'lua'|'py',
+    moduleId?: string
 }){
     const type: 'lua'|'py' = arg.type ?? 'lua'
     const char = arg.char ?? getCurrentCharacter()
@@ -191,6 +197,7 @@ export async function runScripted(code:string, arg:{
         ScriptingEngineState.getVar = getVar
         ScriptingEngineState.stopSending = false
         ScriptingEngineState.char = char
+        ScriptingEngineState.moduleId = arg.moduleId
         if (code !== ScriptingEngineState.code) {
             const initStart = performance.now()
             let declareAPI:(name: string, func:Function) => void
@@ -665,6 +672,7 @@ export async function runScripted(code:string, arg:{
                     useStreaming: options.streaming === true,
                     forceStreaming: options.streaming === true,
                     noMultiGen: true,
+                    moduleId: ScriptingEngineState.moduleId,
                 }, 'model')
 
                 if(result.type === 'fail'){
@@ -713,6 +721,7 @@ export async function runScripted(code:string, arg:{
                     bias: {},
                     useStreaming: false,
                     noMultiGen: true,
+                    moduleId: ScriptingEngineState.moduleId,
                 }, 'model')
 
                 if(result.type === 'fail'){
@@ -1025,6 +1034,7 @@ export async function runScripted(code:string, arg:{
                     useStreaming: options.streaming === true,
                     forceStreaming: options.streaming === true,
                     noMultiGen: true,
+                    moduleId: ScriptingEngineState.moduleId,
                 }, 'otherAx')
 
                 if(result.type === 'fail'){
@@ -1617,7 +1627,8 @@ export async function runLuaButtonTrigger(char:character|simpleCharacterArgument
                     char: char,
                     lowLevelAccess: trigger.lowLevelAccess,
                     mode: 'onButtonClick',
-                    data: data
+                    data: data,
+                    moduleId: trigger.moduleId,
                 })
             }
         }

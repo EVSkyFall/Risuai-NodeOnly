@@ -17,22 +17,34 @@ export interface MainRequestSnapshot {
 // snapshot. getReplayableSnapshot therefore reads only the committed slot.
 let pending: MainRequestSnapshot | null = null
 let committed: MainRequestSnapshot | null = null
+let committedMessageChatId: string | null = null
 
 export function stageMainRequestSnapshot(s: MainRequestSnapshot){
     pending = s
 }
 
-// generationId gates the commit: preview/continue sends pass through the same
-// dispatch site without staging, and must not commit a stale pending left
-// behind by an earlier failed send.
-export function commitMainRequestSnapshot(generationId: string){
+export function shouldStageMainRequestSnapshot(
+    model: string,
+    arg: { chatId?: string; previewBody?: boolean; continue?: boolean },
+): boolean {
+    // A continuation still produces replayable request bytes; only the
+    // persisted message identity differs from this dispatch's generationId.
+    return model === 'model' && !!arg.chatId && !arg.previewBody
+}
+
+// generationId gates the commit: preview sends pass through the same dispatch
+// site without staging, and must not commit a stale pending left behind by an
+// earlier failed send. Continue sends are staged and committed under the
+// message chatId that remains in the chat.
+export function commitMainRequestSnapshot(generationId: string, messageChatId = generationId){
     if(pending && pending.forGenerationId === generationId){
         committed = pending
+        committedMessageChatId = messageChatId
     }
     pending = null
 }
 
-export function getReplayableSnapshot(generationId: string|undefined): MainRequestSnapshot | null {
-    if(!generationId || !committed) return null
-    return committed.forGenerationId === generationId ? committed : null
+export function getReplayableSnapshot(messageChatId: string|undefined): MainRequestSnapshot | null {
+    if(!messageChatId || !committed) return null
+    return committedMessageChatId === messageChatId ? committed : null
 }

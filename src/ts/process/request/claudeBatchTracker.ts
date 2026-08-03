@@ -257,6 +257,8 @@ export async function submitClaudeBatch(
     await loadPending()
     const customId = v4().replace(/-/g, '').substring(0, 60) // satisfy ^[a-zA-Z0-9_-]{1,64}$
     const submitRes = await fetchNative(replacerURL + '/batches', {
+        logCategory: 'llm',
+        logSource: 'main',
         body: JSON.stringify({
             requests: [{ custom_id: customId, params: body }],
         }),

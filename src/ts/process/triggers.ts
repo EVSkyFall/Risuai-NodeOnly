@@ -24,6 +24,13 @@ export interface triggerscript{
     conditions: triggerCondition[]
     effect:triggerEffect[]
     lowLevelAccess?: boolean
+    /**
+     * Runtime-only: set by getModuleTriggers() on the copy it hands out, so LLM
+     * calls made by this trigger can be attributed to the module that shipped
+     * it (db.moduleModelBindings). Never persisted — character-owned triggers
+     * leave it undefined.
+     */
+    moduleId?: string
 }
 
 export type triggerCondition = triggerConditionsVar|triggerConditionsExists|triggerConditionsChatIndex
@@ -1461,6 +1468,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         bias: {},
                         useStreaming: false,
                         noMultiGen: true,
+                        moduleId: trigger.moduleId,
                     }, 'model')
 
                     if(result.type === 'fail' || result.type === 'streaming' || result.type === 'multiline'){
@@ -1541,6 +1549,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         getVar: getVar,
                         char: char,
                         chat: chat,
+                        moduleId: trigger.moduleId,
                     })
 
                     if(triggerCodeResult.stopSending){
@@ -1906,6 +1915,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         bias: {},
                         useStreaming: effect.streaming ?? false,
                         noMultiGen: true,
+                        moduleId: trigger.moduleId,
                     }, effect.model)
 
                     if(result.type === 'fail' || result.type === 'multiline'){

@@ -13,10 +13,12 @@ import { checkCharOrder, forageStorage, getFetchLogs } from "src/ts/globalApi.sv
 import { changeColorScheme, updateColorScheme, updateTextThemeAndCSS, type ColorScheme } from "src/ts/gui/colorscheme";
 import { get } from "svelte/store";
 import { registerMCPModule, unregisterMCPModule } from "src/ts/process/mcp/pluginmcp";
+import { getInlayAsset } from "src/ts/process/files/inlays";
 import { getLLMCache, searchLLMCache } from "src/ts/translator/translator";
 import { hasher } from "src/ts/parser/parser.svelte";
 import { LLMFlags, LLMFormat, LLMProvider, LLMTokenizer, type LLMModel } from "src/ts/model/types";
 import { readPersistentJson, removePersistentKey, writePersistentJson } from "src/ts/storage/persistentKv";
+import { endAllGenerations } from "src/ts/process/generationState";
 import { sendChat as processSendChat, doingChat } from "src/ts/process/index.svelte";
 import { getModelInfo } from "src/ts/model/modellist";
 import type { ModelModeExtended } from "src/ts/process/request/shared";
@@ -62,6 +64,7 @@ import {
 */
 
 const pluginChannel = new Map<string, Function>();
+const documentEventListeners: Array<{type: string, listener: EventListenerOrEventListenerObject, options: any}> = [];
 
 class SafeElement {
     #element: HTMLElement;
@@ -328,6 +331,8 @@ class SafeElement {
             const detachIfStale = (e: any) => {
                 if (!String(e?.message ?? e).includes('stale callback stub')) return false;
                 document.removeEventListener(type, modifiedListener, realOptions);
+                const idx = documentEventListeners.findIndex(entry => entry.listener === modifiedListener);
+                if(idx !== -1) documentEventListeners.splice(idx, 1);
                 this.#eventIdMap.delete(id);
                 return true;
             }
@@ -342,6 +347,7 @@ class SafeElement {
                 }
             }
             this.#eventIdMap.set(id, modifiedListener)
+            documentEventListeners.push({type, listener: modifiedListener as EventListenerOrEventListenerObject, options: realOptions})
             document.addEventListener(type, modifiedListener, realOptions)
             return id;
         }
@@ -349,6 +355,8 @@ class SafeElement {
             const detachIfStale = (e: any) => {
                 if (!String(e?.message ?? e).includes('stale callback stub')) return false;
                 document.removeEventListener(type, modifiedListener, realOptions);
+                const idx = documentEventListeners.findIndex(entry => entry.listener === modifiedListener);
+                if(idx !== -1) documentEventListeners.splice(idx, 1);
                 this.#eventIdMap.delete(id);
                 return true;
             }
@@ -369,6 +377,7 @@ class SafeElement {
                 }, delay);
             }
             this.#eventIdMap.set(id, modifiedListener)
+            documentEventListeners.push({type, listener: modifiedListener as EventListenerOrEventListenerObject, options: realOptions})
             document.addEventListener(type, modifiedListener, realOptions);
             return id;
         }
@@ -382,6 +391,8 @@ class SafeElement {
         if(listener){
             const realOptions = typeof options === 'boolean' ? { capture: options } : options || {};
             document.removeEventListener(type, listener as EventListenerOrEventListenerObject, realOptions);
+            const idx = documentEventListeners.findIndex(e => e.listener === listener);
+            if(idx !== -1) documentEventListeners.splice(idx, 1);
             this.#eventIdMap.delete(id);
         }
     }
@@ -515,6 +526,10 @@ class SafeMutationObserver {
             this.#observer.observe(rawElement, options);
             element.setAttribute('x-identifier', '');
         }
+    }
+
+    disconnect() {
+        this.#observer.disconnect();
     }
 
 }
@@ -878,7 +893,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
         tokenizers: () => tokenizerList.map(([id, label]) => ({ id, label })),
         getChar: oldApis.getChar,
         setChar: oldApis.setChar,
-        addProvider: (name: string, func: (arg: PluginV2ProviderArgument, abortSignal?: AbortSignal) => Promise<{ success: boolean, content: string }>, options?: PluginV3ProviderOptions) => {
+        addProvider: (name: string, func: (arg: PluginV2ProviderArgument, abortSignal?: AbortSignal) => Promise<{ success: boolean, content: string | ReadableStream<string> }>, options?: PluginV3ProviderOptions) => {
             console.warn(`[WARN] addProvider is a powerful API that can potentially be unsafe if used incorrectly. addProvider's functionality might be limited or changed in future updates to ensure security. please use other APIs if possible.`);
             let provs = get(customProviderStore)
             provs.push(name)
@@ -938,6 +953,9 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
         setDatabase: oldApis.setDatabase,
         loadPlugins: oldApis.loadPlugins,
         readImage: oldApis.readImage,
+        readInlay: async (id: string) => {
+            return await getInlayAsset(id);
+        },
         saveAsset: oldApis.saveAsset,
         //Same functionality, but new implementation
         getDatabase: async (includeOnly:string[]|'all' = 'all') => {
@@ -1340,25 +1358,32 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
             console.log(`[RisuAI Plugin: ${plugin.name}] ${message}`);
         },
         createMutationObserver(callback: SafeMutationCallback): SafeMutationObserver {
-            return new SafeMutationObserver(callback)
+            const observer = new SafeMutationObserver(callback)
+            addPluginUnloadCallback(plugin.name, () => {
+                observer.disconnect()
+            })
+            return observer
         },
         onUnload: (callback: () => void) => {
             addPluginUnloadCallback(plugin.name, callback);
         },
         getFetchLogs: async () => {
-            const unsafeFetchLog = getFetchLogs()
             const conf = await getPluginPermission(plugin.name, 'fetchLogs');
             if(!conf){
                 return null;
             }
+            // Reads the server request log; the shape returned to plugins is
+            // unchanged from when this came from the in-memory fetch log.
+            const unsafeFetchLog = await getFetchLogs()
             return unsafeFetchLog.map(log => {
 
                 const url = new URL(log.url);
                 return {
                     url: url.origin + url.pathname,
-                    body: log.body,
+                    body: log.requestBody ?? '',
                     status: log.status,
-                    response: log.response,
+                    response: log.responseBody,
+                    timestamp: log.timestamp,
                 }
             })
         },
@@ -1611,13 +1636,16 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
             } finally {
                 // Plugin API path does not pass through the UI unlock logic,
                 // so release doingChat here on both success and failure.
-                doingChat.set(false);
+                endAllGenerations();
             }
 
             return true;
         },
         addPluginChannelListener: (channelName: string, callback: Function) => {
             pluginChannel.set(plugin.name + channelName, callback);
+            addPluginUnloadCallback(plugin.name, () => {
+                pluginChannel.delete(plugin.name + channelName);
+            })
         },
         postPluginChannelMessage: (pluginName: string, channelName: string, message: any) => {
 
@@ -1680,6 +1708,12 @@ export async function loadV3Plugins(plugins:RisuPlugin[]){
         await unloadV3Plugin(instance.name);
     }));
     if(loadGeneration !== v3LoadGeneration) return;
+
+    for(const entry of documentEventListeners){
+        document.removeEventListener(entry.type, entry.listener, entry.options);
+    }
+    documentEventListeners.length = 0;
+
     const loadPromises = plugins.map(plugin => executePluginV3(plugin, loadGeneration));
     await Promise.all(loadPromises);
 }

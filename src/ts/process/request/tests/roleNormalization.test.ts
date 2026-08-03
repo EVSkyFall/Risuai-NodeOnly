@@ -100,7 +100,6 @@ vi.mock('src/ts/plugins/plugins.svelte', () => ({
 vi.mock('src/ts/globalApi.svelte', () => ({
     globalFetch: harness.globalFetch,
     fetchNative: vi.fn(),
-    addFetchLog: vi.fn(),
     textifyReadableStream: vi.fn(),
 }))
 
