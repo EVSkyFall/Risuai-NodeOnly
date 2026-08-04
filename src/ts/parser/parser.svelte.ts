@@ -717,7 +717,7 @@ export function parseInlayAssets(data:string){
                     data = data.replace(inlay, `${prefix}<img src="${url}"/>${postfix}`)
                     break
                 case 'video':
-                    data = data.replace(inlay, `${prefix}<video controls><source src="${url}" type="video/mp4"></video>${postfix}`)
+                    data = data.replace(inlay, `${prefix}<video controls autoplay muted loop playsinline><source src="${url}" type="video/mp4"></video>${postfix}`)
                     break
                 case 'audio':
                     data = data.replace(inlay, `${prefix}<audio controls><source src="${url}" type="audio/mpeg"></audio>${postfix}`)
@@ -790,6 +790,10 @@ async function processInlayQueue() {
                                     blobUrlCache.set(id, { url, type: 'video' })
                                     const video = document.createElement('video')
                                     video.controls = true
+                                    video.autoplay = true
+                                    video.muted = true
+                                    video.loop = true
+                                    video.playsInline = true
                                     const src = document.createElement('source')
                                     src.src = url; src.type = ct
                                     video.appendChild(src)
@@ -814,6 +818,10 @@ async function processInlayQueue() {
                     case 'video': {
                         const video = document.createElement('video')
                         video.controls = true
+                        video.autoplay = true
+                        video.muted = true
+                        video.loop = true
+                        video.playsInline = true
                         const source = document.createElement('source')
                         source.src = url
                         source.type = 'video/mp4'
