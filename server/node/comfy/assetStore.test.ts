@@ -23,6 +23,7 @@ const { createComfyAssetStore, validateOutputDescriptor } = pkg as {
     uploadInput: (endpointUrl: string, jobId: string, input: any) => Promise<string>
     materializeOutput: (endpointUrl: string, jobId: string, output: any, options?: any) => Promise<any>
     recoverMaterialization: (jobId: string, options?: any) => Promise<any>
+    removeMaterializedAsset: (assetId: string) => Promise<void>
   }
   validateOutputDescriptor: (output: any) => any
 }
@@ -228,6 +229,106 @@ describe('Comfy input asset admission', () => {
     await expect(assets.recoverMaterialization(
       '33333333-3333-4333-8333-333333333333',
     )).resolves.toEqual(result)
+  })
+
+  it.each([
+    ['png', 'image/png', Buffer.from('89504E470D0A1A0A0000000D49484452', 'hex')],
+    ['jpg', 'image/jpeg', Buffer.from('FFD8FFE000104A4649460001', 'hex')],
+    ['webp', 'image/webp', Buffer.from('52494646040000005745425056503820', 'hex')],
+  ])('materializes and crash-recovers allowlisted %s images with exact sidecars', async (ext, mimeType, bytes) => {
+    const root = await mkdtemp(path.join(tmpdir(), `comfy-image-${ext}-`))
+    dirs.push(root)
+    const inlayDir = path.join(root, 'inlays')
+    const stagingDir = path.join(root, 'staging')
+    let failPayloadRename = true
+    const assets = createComfyAssetStore({
+      inlayDir,
+      stagingDir,
+      fetchImpl: (async () => new Response(bytes, {
+        headers: { 'content-type': mimeType },
+      })) as typeof fetch,
+      rename: async (from, to) => {
+        if (failPayloadRename && String(to).endsWith(`.${ext}`)) {
+          failPayloadRename = false
+          throw new Error('simulated image payload publish crash')
+        }
+        await rename(from, to)
+      },
+    })
+    const jobId = `image-${ext}`
+    const output = { filename: `result.${ext}`, subfolder: 'images', type: 'output' }
+
+    await expect(assets.materializeOutput(
+      'http://127.0.0.1:8188',
+      jobId,
+      output,
+      { mediaType: mimeType },
+    )).rejects.toMatchObject({ code: 'COMFY_OUTPUT_PUBLISH_RETRY', retryMaterialization: true })
+
+    const recovered = await assets.recoverMaterialization(jobId, { mediaType: mimeType, output })
+    expect(recovered).toMatchObject({ mimeType, resultAssetId: `comfy-${jobId}` })
+    expect(await readFile(path.join(inlayDir, `${recovered.resultAssetId}.${ext}`))).toEqual(bytes)
+    expect(JSON.parse(await readFile(
+      path.join(inlayDir, `${recovered.resultAssetId}.meta.json`),
+      'utf8',
+    ))).toEqual({ ext, name: `result.${ext}`, type: 'image' })
+
+    await assets.removeMaterializedAsset(recovered.resultAssetId)
+    await expect(access(path.join(inlayDir, `${recovered.resultAssetId}.${ext}`))).rejects.toMatchObject({
+      code: 'ENOENT',
+    })
+  })
+
+  it('rejects disagreement between descriptor media type, extension, response MIME, and magic', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'comfy-image-mismatch-'))
+    dirs.push(root)
+    const assets = createComfyAssetStore({
+      inlayDir: path.join(root, 'inlays'),
+      stagingDir: path.join(root, 'staging'),
+      fetchImpl: (async () => new Response(
+        Buffer.from('89504E470D0A1A0A0000000D49484452', 'hex'),
+        { headers: { 'content-type': 'image/png' } },
+      )) as typeof fetch,
+    })
+    await expect(assets.materializeOutput(
+      'http://127.0.0.1:8188',
+      'mismatch-image',
+      { filename: 'result.webp', subfolder: '', type: 'output' },
+      { mediaType: 'image/png' },
+    )).rejects.toMatchObject({ code: 'COMFY_OUTPUT_DESCRIPTOR_INVALID' })
+  })
+
+  it('rejects an image recovery marker that disagrees with the snapshotted history filename and extension', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'comfy-image-marker-mismatch-'))
+    dirs.push(root)
+    const bytes = Buffer.from('FFD8FFE000104A4649460001', 'hex')
+    let failPayloadRename = true
+    const assets = createComfyAssetStore({
+      inlayDir: path.join(root, 'inlays'),
+      stagingDir: path.join(root, 'staging'),
+      fetchImpl: (async () => new Response(bytes, {
+        headers: { 'content-type': 'image/jpeg' },
+      })) as typeof fetch,
+      rename: async (from, to) => {
+        if (failPayloadRename && String(to).endsWith('.jpg')) {
+          failPayloadRename = false
+          throw new Error('leave ready marker for mismatch test')
+        }
+        await rename(from, to)
+      },
+    })
+    const jobId = 'image-marker-mismatch'
+    await expect(assets.materializeOutput(
+      'http://127.0.0.1:8188',
+      jobId,
+      { filename: 'original.jpg', subfolder: '', type: 'output' },
+      { mediaType: 'image/jpeg' },
+    )).rejects.toMatchObject({ code: 'COMFY_OUTPUT_PUBLISH_RETRY' })
+
+    await expect(assets.recoverMaterialization(jobId, {
+      mediaType: 'image/jpeg',
+      output: { filename: 'different.jpeg', subfolder: '', type: 'output' },
+    })).rejects.toMatchObject({ code: 'COMFY_OUTPUT_MARKER_INVALID' })
   })
 
   it('normalizes Windows backslash subfolders from Comfy while still rejecting traversal', async () => {

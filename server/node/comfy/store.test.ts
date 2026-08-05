@@ -306,6 +306,12 @@ describe('Comfy durable submission receipts', () => {
     expect(store.findByOperationKey('legacy-operation')).toMatchObject({
       timeoutMs: 4_321,
       target: null,
+      templateKind: 'video',
+      templateSlots: null,
+      outputDescriptor: null,
+      inputAssets: { input_image: { assetId: 'source', hash: 'INPUT' } },
+      remoteInputs: {},
+      promptAttemptedAt: null,
       materializeAttempts: 0,
       materializeRetryAt: null,
     })
@@ -315,6 +321,52 @@ describe('Comfy durable submission receipts', () => {
         'target_json',
         'materialize_attempts',
         'materialize_retry_at',
+        'template_kind',
+        'template_slots_json',
+        'output_descriptor_json',
+        'input_assets_json',
+        'remote_inputs_json',
+        'prompt_attempted_at',
       ]))
+  })
+
+  it('stores zero-input job sentinels and retains immutable custom templates when jobs are purged', () => {
+    const db = new Database(':memory:')
+    dbs.push(db)
+    const store = createComfyStore(db, {
+      now: () => 20_000,
+      randomUUID: () => '44444444-4444-4444-8444-444444444444',
+    }) as any
+    const custom = {
+      id: 'a'.repeat(64),
+      name: 'Still',
+      kind: 'image',
+      mode: 't2i',
+      graphJson: '{"save":{"class_type":"SaveImage","inputs":{}}}',
+      slots: { positive: { nodeId: 'text', inputName: 'text' }, inputImages: [], seeds: [] },
+      outputDescriptor: { nodeId: 'save', classType: 'SaveImage', historyKey: 'images', mediaType: 'image/png' },
+      promptProfile: 'image-tags',
+    }
+    expect(store.createCustomTemplate(custom)).toMatchObject({ created: true, template: custom })
+    const job = store.createOrReplayJob({
+      operationKey: 'zero-input',
+      binding: { templateId: custom.id, slots: { positive: 'x' } },
+      job: {
+        templateId: custom.id,
+        templateHash: 'HASH',
+        templateJson: custom.graphJson,
+        templateKind: 'image',
+        templateSlots: custom.slots,
+        outputDescriptor: custom.outputDescriptor,
+        slots: { positive: 'x' },
+        inputAssets: {},
+        endpointUrl: 'http://127.0.0.1:8188',
+        endpointGeneration: 1,
+        timeoutMs: 10_000,
+      },
+    }).job
+    expect(job).toMatchObject({ inputAssetId: '', inputHash: '', inputAssets: {} })
+    expect(store.purgeForRestore()).toBe(1)
+    expect(store.getCustomTemplate(custom.id)).toMatchObject(custom)
   })
 })

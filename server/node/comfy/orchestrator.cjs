@@ -103,6 +103,7 @@ function toPublicJob(job) {
         operationKey: job.operationKey,
         template: job.templateId,
         templateHash: job.templateHash,
+        templateKind: job.templateKind,
         endpointGeneration: job.endpointGeneration,
         state: job.state,
         revision: job.revision,
@@ -289,12 +290,9 @@ function createComfyOrchestrator(options) {
         const target = normalizeTarget(input.target);
         const prior = store.findByOperationKey(input.operationKey);
         if (prior) {
-            const slots = input.slots;
-            const sameSlots = Object.keys(slots).length === 3
-                && slots.positive === prior.slots.positive
-                && slots.input_image === prior.slots.input_image
-                && slots.seed === prior.slots.seed;
-            if (input.template !== prior.templateId || !sameSlots || !sameTarget(target, prior.target)) {
+            const requested = store.computeBindingHash({ templateId: input.template, slots: input.slots, target });
+            const stored = store.computeBindingHash({ templateId: prior.templateId, slots: prior.slots, target: prior.target });
+            if (requested !== stored || !sameTarget(target, prior.target)) {
                 throw comfyError(
                     'COMFY_OPERATION_KEY_CONFLICT',
                     'operationKey was already used with different immutable inputs',
@@ -304,16 +302,26 @@ function createComfyOrchestrator(options) {
             return toPublicJob(prior);
         }
         const template = await registry.loadTemplate(input.template);
-        await registry.instantiate(input.template, input.slots);
-        const inputAsset = await assets.readInputAsset(input.slots.input_image);
+        registry.instantiateSnapshot(
+            template.sourceText,
+            template.hash,
+            input.slots,
+            template.id,
+            { templateSlots: template.templateSlots, outputDescriptor: template.outputDescriptor },
+        );
+        const inputAssets = {};
+        for (const imageSlot of template.templateSlots.inputImages ?? []) {
+            const assetId = input.slots[imageSlot.name];
+            const inputAsset = await assets.readInputAsset(assetId);
+            inputAssets[imageSlot.name] = { assetId, hash: inputAsset.hash };
+        }
         const config = store.getConfig();
         const endpointGeneration = config.endpointGeneration;
         const binding = {
             templateId: input.template,
             templateHash: template.hash,
             slots: input.slots,
-            inputAssetId: input.slots.input_image,
-            inputHash: inputAsset.hash,
+            inputAssets,
             endpointGeneration,
             target,
         };
@@ -330,9 +338,11 @@ function createComfyOrchestrator(options) {
                 templateId: input.template,
                 templateHash: template.hash,
                 templateJson: template.sourceText,
+                templateKind: template.kind,
+                templateSlots: template.templateSlots,
+                outputDescriptor: template.outputDescriptor,
                 slots: input.slots,
-                inputAssetId: input.slots.input_image,
-                inputHash: inputAsset.hash,
+                inputAssets,
                 endpointUrl,
                 endpointGeneration,
                 timeoutMs: config.timeoutMs,
@@ -386,29 +396,40 @@ function createComfyOrchestrator(options) {
         if (!current || generation !== localGeneration) return;
 
         try {
-            let remoteInputName = current.remoteInputName;
-            if (!remoteInputName) {
-                const input = await assets.readInputAsset(current.inputAssetId);
-                if (input.hash !== current.inputHash) {
+            const remoteInputs = { ...(current.remoteInputs ?? {}) };
+            for (const [slotName, snapshot] of Object.entries(current.inputAssets ?? {})) {
+                if (remoteInputs[slotName]) continue;
+                const input = await assets.readInputAsset(snapshot.assetId);
+                if (input.hash !== snapshot.hash) {
                     return failJob(current, 'COMFY_INPUT_CHANGED', 'Input asset changed after submission');
                 }
                 if (generation !== localGeneration || !store.getJob(current.jobId)) return;
-                remoteInputName = await assets.uploadInput(
+                remoteInputs[slotName] = await assets.uploadInput(
                     current.endpointUrl,
                     current.jobId,
                     input,
                     { signal },
                 );
-                current = store.updateJob(current.jobId, current.revision, 'submitting', { remoteInputName });
+                current = store.updateJob(current.jobId, current.revision, 'submitting', {
+                    remoteInputs,
+                    remoteInputName: Object.values(remoteInputs)[0] ?? null,
+                });
                 if (!current || generation !== localGeneration) return;
             }
 
+            const compiledSlots = { ...current.slots };
+            for (const [slotName, remoteName] of Object.entries(remoteInputs)) compiledSlots[slotName] = remoteName;
             const compiled = registry.instantiateSnapshot(
                 current.templateJson,
                 current.templateHash,
-                { ...current.slots, input_image: remoteInputName },
+                compiledSlots,
                 current.templateId,
+                { templateSlots: current.templateSlots, outputDescriptor: current.outputDescriptor },
             );
+            current = store.updateJob(current.jobId, current.revision, 'submitting', {
+                promptAttemptedAt: now(),
+            });
+            if (!current || generation !== localGeneration) return;
             let response;
             try {
                 response = await requestJson(current.endpointUrl, '/prompt', {
@@ -457,15 +478,26 @@ function createComfyOrchestrator(options) {
     }
 
     function selectOutput(job, entry) {
-        const compiled = registry.instantiateSnapshot(
-            job.templateJson,
-            job.templateHash,
-            { ...job.slots, input_image: job.remoteInputName ?? 'recovery/input.png' },
-            job.templateId,
-        );
-        const candidates = entry?.outputs?.[compiled.outputNodeId]?.[compiled.outputKey];
+        let outputDescriptor = job.outputDescriptor;
+        if (!outputDescriptor) {
+            const compiled = registry.instantiateSnapshot(
+                job.templateJson,
+                job.templateHash,
+                { ...job.slots, input_image: job.remoteInputName ?? 'recovery/input.png' },
+                job.templateId,
+            );
+            outputDescriptor = compiled.outputDescriptor;
+        }
+        const nodeOutput = entry?.outputs
+            && Object.prototype.hasOwnProperty.call(entry.outputs, outputDescriptor.nodeId)
+            ? entry.outputs[outputDescriptor.nodeId]
+            : null;
+        const candidates = nodeOutput
+            && Object.prototype.hasOwnProperty.call(nodeOutput, outputDescriptor.historyKey)
+            ? nodeOutput[outputDescriptor.historyKey]
+            : null;
         if (!Array.isArray(candidates) || candidates.length !== 1) {
-            throw comfyError('COMFY_NO_OUTPUT', 'Completed Comfy history has no unique expected video output');
+            throw comfyError('COMFY_NO_OUTPUT', 'Completed Comfy history has no unique expected output');
         }
         return candidates[0];
     }
@@ -520,13 +552,19 @@ function createComfyOrchestrator(options) {
             materialized = await assets.recoverMaterialization(job.jobId, {
                 signal,
                 target: job.target,
+                mediaType: job.outputDescriptor?.mediaType ?? 'video/mp4',
+                output: job.remoteOutput,
             });
             if (!materialized) {
                 materialized = await assets.materializeOutput(
                     job.endpointUrl,
                     job.jobId,
                     job.remoteOutput,
-                    { signal, target: job.target },
+                    {
+                        signal,
+                        target: job.target,
+                        mediaType: job.outputDescriptor?.mediaType ?? 'video/mp4',
+                    },
                 );
             }
         } catch (error) {
@@ -847,7 +885,8 @@ function createComfyOrchestrator(options) {
         if (
             job.state === 'submitting'
             && job.promptId == null
-            && job.remoteInputName == null
+            && job.promptAttemptedAt == null
+            && (job.templateSlots != null || job.remoteInputName == null)
         ) {
             return store.updateJob(job.jobId, job.revision, 'submitting', {
                 state: 'queued',
@@ -877,7 +916,8 @@ function createComfyOrchestrator(options) {
         if (
             job.state === 'submitting'
             && job.promptId == null
-            && job.remoteInputName == null
+            && job.promptAttemptedAt == null
+            && (job.templateSlots != null || job.remoteInputName == null)
         ) {
             return store.updateJob(job.jobId, job.revision, 'submitting', {
                 state: 'queued',
@@ -1043,9 +1083,24 @@ function createComfyOrchestrator(options) {
         return toPublicConfig(config, await probe(endpointUrl));
     }
 
-    async function listTemplates() {
+    async function analyzeTemplate(graphJson) {
         assertAvailable();
-        return registry.listTemplates();
+        return registry.analyzeTemplate(graphJson);
+    }
+
+    async function registerTemplate(input) {
+        assertAvailable();
+        return registry.registerTemplate(input);
+    }
+
+    async function removeTemplate(templateId) {
+        assertAvailable();
+        return registry.removeTemplate(templateId);
+    }
+
+    async function listTemplates(kind = null) {
+        assertAvailable();
+        return registry.listTemplates(kind);
     }
 
     async function getConfig() {
@@ -1074,6 +1129,9 @@ function createComfyOrchestrator(options) {
         poll,
         findByOperationKey,
         cancel,
+        analyzeTemplate,
+        registerTemplate,
+        removeTemplate,
         listTemplates,
         getConfig,
         updateEndpoint,

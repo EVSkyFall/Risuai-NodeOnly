@@ -32,10 +32,36 @@ afterEach(async () => {
 })
 
 describe('Comfy template registry', () => {
+  it('keeps both built-in compiled prompts byte-for-byte equivalent to the legacy compiler', async () => {
+    const registry = createTemplateRegistry({ templateDir })
+    for (const templateId of ['wan-i2v', 'wan22-flf2v-loop']) {
+      const source = JSON.parse(await readFile(path.join(templateDir, `${templateId}.json`), 'utf8'))
+      const legacy = structuredClone(source)
+      legacy['6'].inputs.text = 'golden prompt'
+      legacy['52'].inputs.image = 'risu-comfy/golden.png'
+      legacy['335'].inputs.seed = 987654321
+
+      const compiled = await registry.instantiate(templateId, {
+        positive: 'golden prompt',
+        input_image: 'risu-comfy/golden.png',
+        seed: 987654321,
+      })
+      expect(compiled.prompt).toEqual(legacy)
+      expect(JSON.stringify(compiled.prompt)).toBe(JSON.stringify(legacy))
+      expect(compiled.prompt['364'].inputs.noise_seed).toEqual(['335', 0])
+      expect(compiled.outputDescriptor).toEqual({
+        nodeId: '63',
+        classType: 'VHS_VideoCombine',
+        historyKey: 'gifs',
+        mediaType: 'video/mp4',
+      })
+    }
+  })
+
   it('lists and instantiates the reviewed WAN template from pristine bytes', async () => {
     const registry = createTemplateRegistry({ templateDir })
 
-    await expect(registry.listTemplates()).resolves.toEqual([
+    await expect(registry.listTemplates()).resolves.toMatchObject([
       {
         id: 'wan-i2v',
         hash: 'E483AA30B02FA88842CF2FA036C3CA2B848474AEF5BF7632E5FEFE4C214E374D',
@@ -202,7 +228,7 @@ describe('Comfy template registry', () => {
     await writeFile(path.join(root, 'broken.json'), JSON.stringify(source))
     const registry = createTemplateRegistry({ templateDir: root })
 
-    await expect(registry.listTemplates()).resolves.toEqual([
+    await expect(registry.listTemplates()).resolves.toMatchObject([
       {
         id: 'broken',
         error: {

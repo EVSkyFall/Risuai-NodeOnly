@@ -117,6 +117,41 @@ describe('Comfy relay over the real NodeOnly server', { timeout: 30_000 }, () =>
       })
     }
 
+    const registrationGraph = {
+      text: { class_type: 'CLIPTextEncode', inputs: { text: '{{positive}}' } },
+      sampler: { class_type: 'SamplerCustom', inputs: { seed: 1 } },
+      save: { class_type: 'SaveImage', inputs: { images: ['sampler', 0] } },
+    }
+    expect(await relay(client, { op: 'analyzeTemplate', graphJson: registrationGraph })).toMatchObject({
+      status: 200,
+      body: {
+        ok: true,
+        errors: [],
+        slots: { positive: { nodeId: 'text', inputName: 'text' } },
+        output: { nodeId: 'save', classType: 'SaveImage', historyKey: 'images', mediaType: 'image/png' },
+      },
+    })
+    const registered = await relay(client, {
+      op: 'registerTemplate',
+      name: 'Relay still',
+      kind: 'image',
+      mode: 't2i',
+      graphJson: registrationGraph,
+      promptProfile: 'image-tags',
+    })
+    expect(registered).toMatchObject({
+      status: 200,
+      body: { ok: true, template: { id: expect.any(String), source: 'custom', kind: 'image' } },
+    })
+    expect(await relay(client, { op: 'listTemplates', kind: 'image' })).toMatchObject({
+      status: 200,
+      body: { ok: true, templates: [{ id: registered.body.template.id, source: 'custom' }] },
+    })
+    expect(await relay(client, { op: 'removeTemplate', id: registered.body.template.id })).toEqual({
+      status: 200,
+      body: { ok: true, removed: true, id: registered.body.template.id },
+    })
+
     const updated = await relay(client, { op: 'updateEndpoint', url: mock.url })
     expect(updated.status).toBe(200)
     expect(updated.body).toMatchObject({

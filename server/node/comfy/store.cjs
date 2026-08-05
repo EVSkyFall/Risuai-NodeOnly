@@ -29,6 +29,8 @@ const COLUMN_BY_FIELD = Object.freeze({
     deadlineAt: 'deadline_at',
     materializeAttempts: 'materialize_attempts',
     materializeRetryAt: 'materialize_retry_at',
+    remoteInputs: 'remote_inputs_json',
+    promptAttemptedAt: 'prompt_attempted_at',
 });
 
 function canonicalJson(value) {
@@ -69,6 +71,10 @@ function isSafeDirectory(value) {
 
 function rowToJob(row) {
     if (!row) return null;
+    const inputAssets = parseJson(row.input_assets_json)
+        ?? (row.input_asset_id ? { input_image: { assetId: row.input_asset_id, hash: row.input_hash } } : {});
+    const remoteInputs = parseJson(row.remote_inputs_json)
+        ?? (row.remote_input_name ? { input_image: row.remote_input_name } : {});
     return {
         jobId: row.job_id,
         operationKey: row.operation_key,
@@ -76,9 +82,13 @@ function rowToJob(row) {
         templateId: row.template_id,
         templateHash: row.template_hash,
         templateJson: row.template_json,
+        templateKind: row.template_kind ?? 'video',
+        templateSlots: parseJson(row.template_slots_json),
+        outputDescriptor: parseJson(row.output_descriptor_json),
         slots: parseJson(row.slots_json),
         inputAssetId: row.input_asset_id,
         inputHash: row.input_hash,
+        inputAssets,
         endpointUrl: row.endpoint_url,
         endpointGeneration: row.endpoint_generation,
         timeoutMs: row.timeout_ms,
@@ -87,6 +97,8 @@ function rowToJob(row) {
         revision: row.revision,
         promptId: row.prompt_id,
         remoteInputName: row.remote_input_name,
+        remoteInputs,
+        promptAttemptedAt: row.prompt_attempted_at,
         remoteOutput: parseJson(row.remote_output_json),
         resultAssetId: row.result_asset_id,
         resultMimeType: row.result_mime_type,
@@ -104,6 +116,21 @@ function rowToJob(row) {
         updatedAt: row.updated_at,
         startedAt: row.started_at,
         finishedAt: row.finished_at,
+    };
+}
+
+function rowToCustomTemplate(row) {
+    if (!row) return null;
+    return {
+        id: row.id,
+        name: row.name,
+        kind: row.kind,
+        mode: row.mode,
+        graphJson: row.graph_json,
+        slots: parseJson(row.slots_json),
+        outputDescriptor: parseJson(row.output_descriptor_json),
+        promptProfile: row.prompt_profile,
+        createdAt: row.created_at,
     };
 }
 
@@ -131,9 +158,13 @@ function createComfyStore(db, options = {}) {
         template_id          TEXT NOT NULL,
         template_hash        TEXT NOT NULL,
         template_json        TEXT NOT NULL,
+        template_kind        TEXT,
+        template_slots_json  TEXT,
+        output_descriptor_json TEXT,
         slots_json           TEXT NOT NULL,
         input_asset_id       TEXT NOT NULL,
         input_hash           TEXT NOT NULL,
+        input_assets_json    TEXT,
         endpoint_url         TEXT NOT NULL,
         endpoint_generation  INTEGER NOT NULL,
         timeout_ms            INTEGER NOT NULL DEFAULT 600000,
@@ -142,6 +173,8 @@ function createComfyStore(db, options = {}) {
         revision             INTEGER NOT NULL DEFAULT 0,
         prompt_id            TEXT,
         remote_input_name    TEXT,
+        remote_inputs_json   TEXT,
+        prompt_attempted_at  INTEGER,
         remote_output_json   TEXT,
         result_asset_id      TEXT,
         result_mime_type     TEXT,
@@ -166,6 +199,18 @@ function createComfyStore(db, options = {}) {
         binding_hash  TEXT NOT NULL,
         job_id        TEXT NOT NULL REFERENCES comfy_jobs(job_id) ON DELETE CASCADE,
         created_at    INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS comfy_custom_templates (
+        id                     TEXT PRIMARY KEY,
+        name                   TEXT NOT NULL,
+        kind                   TEXT NOT NULL,
+        mode                   TEXT NOT NULL,
+        graph_json             TEXT NOT NULL,
+        slots_json             TEXT NOT NULL,
+        output_descriptor_json TEXT NOT NULL,
+        prompt_profile         TEXT NOT NULL,
+        created_at             INTEGER NOT NULL
       );
 
       CREATE INDEX IF NOT EXISTS comfy_jobs_state_created
@@ -226,6 +271,24 @@ function createComfyStore(db, options = {}) {
         if (!jobColumns.has('materialize_retry_at')) {
             db.exec('ALTER TABLE comfy_jobs ADD COLUMN materialize_retry_at INTEGER');
         }
+        if (!jobColumns.has('template_kind')) {
+            db.exec('ALTER TABLE comfy_jobs ADD COLUMN template_kind TEXT');
+        }
+        if (!jobColumns.has('template_slots_json')) {
+            db.exec('ALTER TABLE comfy_jobs ADD COLUMN template_slots_json TEXT');
+        }
+        if (!jobColumns.has('output_descriptor_json')) {
+            db.exec('ALTER TABLE comfy_jobs ADD COLUMN output_descriptor_json TEXT');
+        }
+        if (!jobColumns.has('input_assets_json')) {
+            db.exec('ALTER TABLE comfy_jobs ADD COLUMN input_assets_json TEXT');
+        }
+        if (!jobColumns.has('remote_inputs_json')) {
+            db.exec('ALTER TABLE comfy_jobs ADD COLUMN remote_inputs_json TEXT');
+        }
+        if (!jobColumns.has('prompt_attempted_at')) {
+            db.exec('ALTER TABLE comfy_jobs ADD COLUMN prompt_attempted_at INTEGER');
+        }
     });
     migrateJobs();
 
@@ -262,13 +325,20 @@ function createComfyStore(db, options = {}) {
         if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
             throw comfyError('COMFY_TIMEOUT_INVALID', 'timeoutMs must be a positive integer');
         }
+        const inputAssets = input.job.inputAssets ?? (
+            input.job.inputAssetId
+                ? { input_image: { assetId: input.job.inputAssetId, hash: input.job.inputHash } }
+                : {}
+        );
+        const firstInput = Object.values(inputAssets)[0] ?? { assetId: '', hash: '' };
         const jobId = randomUUID();
         db.prepare(`
           INSERT INTO comfy_jobs (
             job_id, operation_key, binding_hash, template_id, template_hash, template_json,
-            slots_json, input_asset_id, input_hash, endpoint_url, endpoint_generation,
+            template_kind, template_slots_json, output_descriptor_json,
+            slots_json, input_asset_id, input_hash, input_assets_json, endpoint_url, endpoint_generation,
             timeout_ms, target_json, state, revision, deadline_at, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?)
         `).run(
             jobId,
             input.operationKey,
@@ -276,9 +346,13 @@ function createComfyStore(db, options = {}) {
             input.job.templateId,
             input.job.templateHash,
             input.job.templateJson,
+            input.job.templateKind ?? 'video',
+            input.job.templateSlots == null ? null : canonicalJson(input.job.templateSlots),
+            input.job.outputDescriptor == null ? null : canonicalJson(input.job.outputDescriptor),
             canonicalJson(input.job.slots),
-            input.job.inputAssetId,
-            input.job.inputHash,
+            firstInput.assetId,
+            firstInput.hash,
+            canonicalJson(inputAssets),
             input.job.endpointUrl,
             input.job.endpointGeneration,
             timeoutMs,
@@ -328,7 +402,11 @@ function createComfyStore(db, options = {}) {
             const column = COLUMN_BY_FIELD[field];
             if (!column) throw comfyError('COMFY_PATCH_INVALID', `Unsupported job patch field: ${field}`);
             assignments.push(`${column} = ?`);
-            values.push(field === 'remoteOutput' && value != null ? canonicalJson(value) : value);
+            values.push(
+                ['remoteOutput', 'remoteInputs'].includes(field) && value != null
+                    ? canonicalJson(value)
+                    : value,
+            );
         }
         assignments.push('revision = revision + 1', 'updated_at = ?');
         values.push(now());
@@ -375,6 +453,64 @@ function createComfyStore(db, options = {}) {
         return getConfig();
     }
 
+    const readCustomTemplate = db.prepare('SELECT * FROM comfy_custom_templates WHERE id = ?');
+
+    function createCustomTemplate(input) {
+        const slotsJson = canonicalJson(input.slots);
+        const outputDescriptorJson = canonicalJson(input.outputDescriptor);
+        const createdAt = now();
+        const result = db.prepare(`
+          INSERT OR IGNORE INTO comfy_custom_templates (
+            id, name, kind, mode, graph_json, slots_json,
+            output_descriptor_json, prompt_profile, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+            input.id,
+            input.name,
+            input.kind,
+            input.mode,
+            input.graphJson,
+            slotsJson,
+            outputDescriptorJson,
+            input.promptProfile,
+            createdAt,
+        );
+        const stored = rowToCustomTemplate(readCustomTemplate.get(input.id));
+        if (!stored) {
+            throw comfyError('COMFY_TEMPLATE_STORE_FAILED', 'Custom template could not be stored', { httpStatus: 500 });
+        }
+        const identical = stored.name === input.name
+            && stored.kind === input.kind
+            && stored.mode === input.mode
+            && stored.graphJson === input.graphJson
+            && canonicalJson(stored.slots) === slotsJson
+            && canonicalJson(stored.outputDescriptor) === outputDescriptorJson
+            && stored.promptProfile === input.promptProfile;
+        if (!identical) {
+            throw comfyError(
+                'COMFY_TEMPLATE_CONFLICT',
+                'The same graph is already registered with different immutable metadata',
+                { httpStatus: 409 },
+            );
+        }
+        return { created: result.changes === 1, template: stored };
+    }
+
+    function getCustomTemplate(id) {
+        return rowToCustomTemplate(readCustomTemplate.get(id));
+    }
+
+    function listCustomTemplates(kind = null) {
+        const rows = kind == null
+            ? db.prepare('SELECT * FROM comfy_custom_templates ORDER BY created_at ASC, id ASC').all()
+            : db.prepare('SELECT * FROM comfy_custom_templates WHERE kind = ? ORDER BY created_at ASC, id ASC').all(kind);
+        return rows.map(rowToCustomTemplate);
+    }
+
+    function removeCustomTemplate(id) {
+        return db.prepare('DELETE FROM comfy_custom_templates WHERE id = ?').run(id).changes === 1;
+    }
+
     function purgeForRestore() {
         const run = db.transaction(() => {
             const jobs = db.prepare('DELETE FROM comfy_jobs').run().changes;
@@ -397,6 +533,10 @@ function createComfyStore(db, options = {}) {
         updateJob,
         getConfig,
         updateConfig,
+        createCustomTemplate,
+        getCustomTemplate,
+        listCustomTemplates,
+        removeCustomTemplate,
         purgeForRestore,
         computeBindingHash,
         isTerminalState: state => TERMINAL_STATES.has(state),

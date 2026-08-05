@@ -1265,6 +1265,7 @@ const { createComfyWorldReplacementGate } = require('./comfy/worldReplacementGat
 const { isComfyError } = require('./comfy/errors.cjs')
 const comfyTemplateRegistry = createTemplateRegistry({
     templateDir: comfyStore.getConfig().templateDir,
+    store: comfyStore,
 })
 const comfyAssetStore = createComfyAssetStore({
     inlayDir,
@@ -4711,8 +4712,26 @@ app.post('/api/comfy/orchestrator', async (req, res, next) => {
                         });
                     }
                     return res.json({ ok: true, job: await comfyOrchestrator.cancel(body.jobId) });
+                case 'analyzeTemplate':
+                    return res.json(await comfyOrchestrator.analyzeTemplate(body.graphJson));
+                case 'registerTemplate': {
+                    const registered = await comfyOrchestrator.registerTemplate({
+                        name: body.name,
+                        kind: body.kind,
+                        mode: body.mode,
+                        graphJson: body.graphJson,
+                        slotResolution: body.slotResolution,
+                        outputDescriptor: body.outputDescriptor,
+                        promptProfile: body.promptProfile,
+                    });
+                    return res.json({ ok: true, ...registered });
+                }
+                case 'removeTemplate': {
+                    const removed = await comfyOrchestrator.removeTemplate(body.id);
+                    return res.json({ ok: true, ...removed });
+                }
                 case 'listTemplates':
-                    return res.json({ ok: true, templates: await comfyOrchestrator.listTemplates() });
+                    return res.json({ ok: true, templates: await comfyOrchestrator.listTemplates(body.kind ?? null) });
                 case 'getConfig':
                     return res.json({ ok: true, config: await comfyOrchestrator.getConfig() });
                 case 'updateEndpoint':

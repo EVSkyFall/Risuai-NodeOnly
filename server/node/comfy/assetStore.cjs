@@ -19,6 +19,13 @@ const IMAGE_MIME_BY_EXT = Object.freeze({
     avif: 'image/avif',
     bmp: 'image/bmp',
 });
+const OUTPUT_MEDIA_TYPES = Object.freeze({
+    'video/mp4': Object.freeze({ extensions: new Set(['mp4']), defaultExt: 'mp4', assetType: 'video' }),
+    'image/png': Object.freeze({ extensions: new Set(['png']), defaultExt: 'png', assetType: 'image' }),
+    'image/jpeg': Object.freeze({ extensions: new Set(['jpg', 'jpeg']), defaultExt: 'jpg', assetType: 'image' }),
+    'image/webp': Object.freeze({ extensions: new Set(['webp']), defaultExt: 'webp', assetType: 'image' }),
+});
+const OUTPUT_EXTENSIONS = Object.freeze(['mp4', 'png', 'jpg', 'jpeg', 'webp']);
 
 function isSafeAssetId(id) {
     return typeof id === 'string'
@@ -103,6 +110,14 @@ function hasImageMagic(ext, bytes) {
     if (ext === 'bmp') return bytes.length >= 2 && bytes.toString('ascii', 0, 2) === 'BM';
     if (ext === 'avif') return bytes.length >= 12 && bytes.toString('ascii', 4, 8) === 'ftyp' && bytes.toString('ascii', 8, 12).includes('avif');
     return false;
+}
+
+function hasOutputMagic(mediaType, bytes) {
+    if (mediaType === 'video/mp4') {
+        return bytes.length >= 12 && bytes.toString('ascii', 4, 8) === 'ftyp';
+    }
+    const ext = OUTPUT_MEDIA_TYPES[mediaType]?.defaultExt;
+    return Boolean(ext) && hasImageMagic(ext, bytes);
 }
 
 async function readCappedBytes(response, maxBytes, tooLargeCode) {
@@ -205,18 +220,25 @@ async function hashFile(pathname, maxBytes) {
     }
 }
 
-function validateOutputDescriptor(output) {
+function validateOutputDescriptor(output, mediaType = 'video/mp4') {
+    const media = OUTPUT_MEDIA_TYPES[mediaType];
+    if (!media) {
+        throw comfyError('COMFY_OUTPUT_DESCRIPTOR_INVALID', 'Comfy output media type is unsupported');
+    }
     if (!isSafeRemoteSegment(output?.filename)) {
         throw comfyError('COMFY_OUTPUT_DESCRIPTOR_INVALID', 'Comfy output filename is unsafe');
     }
     const ext = normalizeExt(path.posix.extname(output.filename).slice(1));
-    if (ext !== 'mp4' || output.type !== 'output') {
-        throw comfyError('COMFY_OUTPUT_DESCRIPTOR_INVALID', 'Comfy output must be an output MP4');
+    if (!media.extensions.has(ext) || output.type !== 'output') {
+        throw comfyError('COMFY_OUTPUT_DESCRIPTOR_INVALID', 'Comfy output extension or type does not match its descriptor');
     }
     return {
         filename: output.filename,
         subfolder: normalizeRemoteSubfolder(output.subfolder ?? ''),
         type: 'output',
+        ext,
+        mediaType,
+        assetType: media.assetType,
     };
 }
 
@@ -327,9 +349,12 @@ function createComfyAssetStore(options) {
         return subfolder ? path.posix.join(subfolder, result.name) : result.name;
     }
 
-    async function getMaterializationPaths(jobId) {
+    async function getMaterializationPaths(jobId, ext = 'mp4') {
         if (!isSafeAssetId(jobId)) {
             throw comfyError('COMFY_JOB_ID_INVALID', 'Job ID is invalid');
+        }
+        if (!OUTPUT_EXTENSIONS.includes(ext)) {
+            throw comfyError('COMFY_OUTPUT_MARKER_INVALID', 'Output extension is not allowlisted');
         }
         const finalRoot = await resolveSafeRoot(inlayDir, 'COMFY_OUTPUT_UNSAFE');
         const stagingRoot = await resolveSafeRoot(stagingDir, 'COMFY_OUTPUT_UNSAFE');
@@ -359,7 +384,7 @@ function createComfyAssetStore(options) {
             stagedSidecar: path.join(realJobDir, 'sidecar.part'),
             readyPath: path.join(realJobDir, 'ready.json'),
             readyTmpPath: path.join(realJobDir, 'ready.tmp'),
-            finalPayload: path.join(finalRoot, `${assetId}.mp4`),
+            finalPayload: path.join(finalRoot, `${assetId}.${ext}`),
             finalSidecar: path.join(finalRoot, `${assetId}.meta.json`),
         };
     }
@@ -380,12 +405,19 @@ function createComfyAssetStore(options) {
         }
     }
 
-    async function publishReadyOutput(paths, marker, target) {
+    async function publishReadyOutput(paths, marker, target, expectedMediaType = null) {
+        const legacyMp4 = marker.version === 1;
+        const mediaType = legacyMp4 ? 'video/mp4' : marker.mediaType;
+        const media = OUTPUT_MEDIA_TYPES[mediaType];
         if (
-            marker.version !== 1
+            ![1, 2].includes(marker.version)
             || marker.jobId !== path.basename(paths.jobDir)
             || marker.assetId !== paths.assetId
-            || marker.ext !== 'mp4'
+            || !media
+            || !media.extensions.has(marker.ext)
+            || (legacyMp4 && marker.ext !== 'mp4')
+            || (!legacyMp4 && marker.assetType !== media.assetType)
+            || (expectedMediaType != null && mediaType !== expectedMediaType)
             || marker.payloadFile !== 'payload.part'
             || marker.sidecarFile !== 'sidecar.part'
             || marker.markerHash !== markerHash(marker)
@@ -419,9 +451,9 @@ function createComfyAssetStore(options) {
         }
 
         const expectedSidecar = JSON.stringify({
-            ext: 'mp4',
+            ext: marker.ext,
             name: marker.name,
-            type: 'video',
+            type: media.assetType,
         });
         const finalSidecarStat = await pathStat(paths.finalSidecar);
         if (finalSidecarStat?.isSymbolicLink()) {
@@ -465,14 +497,20 @@ function createComfyAssetStore(options) {
         kvSet(`inlay_meta/${paths.assetId}`, Buffer.from(JSON.stringify(metadata)));
         return {
             resultAssetId: paths.assetId,
-            mimeType: 'video/mp4',
+            mimeType: mediaType,
             hash: marker.hash,
             size: marker.size,
         };
     }
 
     async function recoverMaterialization(jobId, requestOptions = {}) {
-        const paths = await getMaterializationPaths(jobId);
+        const expectedMediaType = requestOptions.mediaType ?? 'video/mp4';
+        const expectedMedia = OUTPUT_MEDIA_TYPES[expectedMediaType];
+        if (!expectedMedia) throw comfyError('COMFY_OUTPUT_DESCRIPTOR_INVALID', 'Comfy output media type is unsupported');
+        const expectedDescriptor = requestOptions.output
+            ? validateOutputDescriptor(requestOptions.output, expectedMediaType)
+            : null;
+        let paths = await getMaterializationPaths(jobId, expectedDescriptor?.ext ?? expectedMedia.defaultExt);
         const readyStat = await pathStat(paths.readyPath);
         if (!readyStat) {
             const [payload, sidecar] = await Promise.all([
@@ -491,8 +529,18 @@ function createComfyAssetStore(options) {
         } catch (cause) {
             throw comfyError('COMFY_OUTPUT_MARKER_INVALID', 'Output recovery marker is invalid JSON', { cause });
         }
+        if (!OUTPUT_EXTENSIONS.includes(marker?.ext)) {
+            throw comfyError('COMFY_OUTPUT_MARKER_INVALID', 'Output recovery marker extension is invalid');
+        }
+        if (
+            expectedDescriptor
+            && (marker.name !== expectedDescriptor.filename || marker.ext !== expectedDescriptor.ext)
+        ) {
+            throw comfyError('COMFY_OUTPUT_MARKER_INVALID', 'Output recovery marker does not match the selected history output');
+        }
+        paths = await getMaterializationPaths(jobId, marker.ext);
         try {
-            return await publishReadyOutput(paths, marker, requestOptions.target);
+            return await publishReadyOutput(paths, marker, requestOptions.target, expectedMediaType);
         } catch (cause) {
             if (isComfyError(cause)) throw cause;
             throw comfyError(
@@ -504,9 +552,10 @@ function createComfyAssetStore(options) {
     }
 
     async function materializeOutput(endpointUrl, jobId, output, requestOptions = {}) {
-        const descriptor = validateOutputDescriptor(output);
-        const paths = await getMaterializationPaths(jobId);
-        const recovered = await recoverMaterialization(jobId, requestOptions);
+        const mediaType = requestOptions.mediaType ?? 'video/mp4';
+        const descriptor = validateOutputDescriptor(output, mediaType);
+        const paths = await getMaterializationPaths(jobId, descriptor.ext);
+        const recovered = await recoverMaterialization(jobId, { ...requestOptions, mediaType, output });
         if (recovered) return recovered;
 
         for (const pathname of [
@@ -544,9 +593,9 @@ function createComfyAssetStore(options) {
             );
         }
         const contentType = String(response.headers.get('content-type') ?? '').split(';', 1)[0].trim().toLowerCase();
-        if (contentType !== 'video/mp4') {
+        if (contentType !== mediaType) {
             abortScope.cleanup();
-            throw comfyError('COMFY_OUTPUT_MIME_INVALID', 'Comfy output response is not video/mp4');
+            throw comfyError('COMFY_OUTPUT_MIME_INVALID', 'Comfy output response media type does not match its descriptor');
         }
         const declared = Number(response.headers.get('content-length'));
         if (Number.isFinite(declared) && declared > maxOutputBytes) {
@@ -612,29 +661,37 @@ function createComfyAssetStore(options) {
         }
 
         const header = Buffer.concat(head, headSize);
-        if (size < 12 || header.toString('ascii', 4, 8) !== 'ftyp') {
+        if (!hasOutputMagic(mediaType, header)) {
             await fs.promises.unlink(paths.stagedPayload).catch(() => {});
-            throw comfyError('COMFY_OUTPUT_MAGIC_INVALID', 'Comfy output is not a valid MP4');
+            throw comfyError('COMFY_OUTPUT_MAGIC_INVALID', 'Comfy output magic bytes do not match its descriptor');
         }
         const outputHash = hash.digest('hex').toUpperCase();
-        const sidecar = JSON.stringify({ ext: 'mp4', name: descriptor.filename, type: 'video' });
+        const sidecar = JSON.stringify({
+            ext: descriptor.ext,
+            name: descriptor.filename,
+            type: descriptor.assetType,
+        });
         await writeSyncedFile(paths.stagedSidecar, sidecar);
         const marker = {
-            version: 1,
+            version: mediaType === 'video/mp4' ? 1 : 2,
             jobId,
             assetId: paths.assetId,
-            ext: 'mp4',
+            ext: descriptor.ext,
             name: descriptor.filename,
             hash: outputHash,
             size,
             payloadFile: 'payload.part',
             sidecarFile: 'sidecar.part',
         };
+        if (marker.version === 2) {
+            marker.mediaType = mediaType;
+            marker.assetType = descriptor.assetType;
+        }
         marker.markerHash = markerHash(marker);
         await writeSyncedFile(paths.readyTmpPath, JSON.stringify(marker));
         await rename(paths.readyTmpPath, paths.readyPath);
         try {
-            return await publishReadyOutput(paths, marker, requestOptions.target);
+            return await publishReadyOutput(paths, marker, requestOptions.target, mediaType);
         } catch (cause) {
             if (isComfyError(cause)) throw cause;
             throw comfyError(
@@ -648,7 +705,9 @@ function createComfyAssetStore(options) {
     async function removeMaterializedAsset(assetId) {
         if (!isSafeAssetId(assetId) || !assetId.startsWith('comfy-')) return;
         const root = await resolveSafeRoot(inlayDir, 'COMFY_OUTPUT_UNSAFE');
-        await fs.promises.unlink(path.join(root, `${assetId}.mp4`)).catch(() => {});
+        for (const ext of OUTPUT_EXTENSIONS) {
+            await fs.promises.unlink(path.join(root, `${assetId}.${ext}`)).catch(() => {});
+        }
         await fs.promises.unlink(path.join(root, `${assetId}.meta.json`)).catch(() => {});
         kvDel(`inlay_meta/${assetId}`);
     }
