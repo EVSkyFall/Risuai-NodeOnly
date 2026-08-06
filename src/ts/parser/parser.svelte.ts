@@ -717,7 +717,7 @@ export function parseInlayAssets(data:string){
                     data = data.replace(inlay, `${prefix}<img src="${url}"/>${postfix}`)
                     break
                 case 'video':
-                    data = data.replace(inlay, `${prefix}<video controls autoplay muted loop playsinline><source src="${url}" type="video/mp4"></video>${postfix}`)
+                    data = data.replace(inlay, `${prefix}<video controls autoplay muted loop playsinline><source src="${url}"></video>${postfix}`)
                     break
                 case 'audio':
                     data = data.replace(inlay, `${prefix}<audio controls><source src="${url}" type="audio/mpeg"></audio>${postfix}`)
@@ -824,7 +824,6 @@ async function processInlayQueue() {
                         video.playsInline = true
                         const source = document.createElement('source')
                         source.src = url
-                        source.type = 'video/mp4'
                         video.appendChild(source)
                         el.replaceWith(video)
                         break
