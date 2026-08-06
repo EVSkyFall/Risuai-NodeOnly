@@ -22,6 +22,7 @@ const MODES_BY_KIND = Object.freeze({
     image: new Set(['t2i', 'i2i']),
 });
 const IMAGE_ROLE_PATTERN = /^(?:input_image|keyframe|start_image|end_image|reference_[1-9][0-9]*)$/;
+const EMBEDDED_IMAGE_LITERAL_PATTERN = /\.(?:png|jpe?g|webp)$/i;
 const CUSTOM_SLOT_TOKEN_PATTERN = /\{\{([a-z_][a-z0-9_]*)\}\}/g;
 const FIXED_CUSTOM_SLOT_NAMES = Object.freeze([
     'positive', 'negative', 'seed', 'input_image', 'keyframe', 'start_image', 'end_image',
@@ -156,22 +157,119 @@ function findReferenceSlotSuggestion(name) {
     return null;
 }
 
-function findSuspiciousCustomSlotTokens(value) {
-    const suspicious = [];
+function findCustomSlotSuggestion(name) {
+    const referenceSuggestion = findReferenceSlotSuggestion(name);
+    const candidates = referenceSuggestion
+        ? [...FIXED_CUSTOM_SLOT_NAMES, referenceSuggestion]
+        : FIXED_CUSTOM_SLOT_NAMES;
+    return candidates.find(candidate => isSingleDamerauEdit(name, candidate)) ?? null;
+}
+
+function findUnrecognizedCustomSlotTokens(value) {
+    const unrecognized = [];
     const seen = new Set();
     for (const match of value.matchAll(CUSTOM_SLOT_TOKEN_PATTERN)) {
         const name = match[1];
         if (isKnownCustomSlotName(name) || seen.has(name)) continue;
-        const referenceSuggestion = findReferenceSlotSuggestion(name);
-        const candidates = referenceSuggestion
-            ? [...FIXED_CUSTOM_SLOT_NAMES, referenceSuggestion]
-            : FIXED_CUSTOM_SLOT_NAMES;
-        const suggestion = candidates.find(candidate => isSingleDamerauEdit(name, candidate));
-        if (!suggestion) continue;
         seen.add(name);
-        suspicious.push({ token: match[0], suggestion: `{{${suggestion}}}` });
+        const suggestion = findCustomSlotSuggestion(name);
+        unrecognized.push({
+            token: match[0],
+            ...(suggestion ? { suggestion: `{{${suggestion}}}` } : {}),
+        });
     }
-    return suspicious;
+    return unrecognized;
+}
+
+function appendJsonPointer(pathHint, segment) {
+    return `${pathHint}/${String(segment).replace(/~/g, '~0').replace(/\//g, '~1')}`;
+}
+
+function visitJsonStringValues(value, visitor, pathHint = '') {
+    if (typeof value === 'string') {
+        visitor(value, pathHint || '/');
+        return;
+    }
+    if (Array.isArray(value)) {
+        value.forEach((child, index) => visitJsonStringValues(child, visitor, appendJsonPointer(pathHint, index)));
+        return;
+    }
+    if (isPlainObject(value)) {
+        for (const [key, child] of Object.entries(value)) {
+            visitJsonStringValues(child, visitor, appendJsonPointer(pathHint, key));
+        }
+    }
+}
+
+function visitJsonObjectKeys(value, visitor) {
+    if (Array.isArray(value)) {
+        value.forEach(child => visitJsonObjectKeys(child, visitor));
+        return;
+    }
+    if (!isPlainObject(value)) return;
+    for (const [key, child] of Object.entries(value)) {
+        visitor(key);
+        visitJsonObjectKeys(child, visitor);
+    }
+}
+
+function inspectEmbeddedJsonInput(value) {
+    let parsed;
+    try {
+        parsed = JSON.parse(value);
+    } catch {
+        return null;
+    }
+    const slotsByToken = new Map();
+    const imagesByLiteral = new Map();
+    const unrecognizedByToken = new Map();
+    let knownTokenInKey = false;
+    visitJsonStringValues(parsed, (leaf, pathHint) => {
+        for (const match of leaf.matchAll(CUSTOM_SLOT_TOKEN_PATTERN)) {
+            const token = match[0];
+            const name = match[1];
+            if (isKnownCustomSlotName(name)) {
+                const current = slotsByToken.get(token);
+                if (current) current.occurrences += 1;
+                else slotsByToken.set(token, { token, occurrences: 1 });
+                continue;
+            }
+            if (!unrecognizedByToken.has(token)) {
+                const suggestion = findCustomSlotSuggestion(name);
+                unrecognizedByToken.set(token, {
+                    token,
+                    ...(suggestion ? { suggestion: `{{${suggestion}}}` } : {}),
+                });
+            }
+        }
+        if (!EMBEDDED_IMAGE_LITERAL_PATTERN.test(leaf)) return;
+        const current = imagesByLiteral.get(leaf);
+        if (current) current.occurrences += 1;
+        else imagesByLiteral.set(leaf, { literal: leaf, pathHint, occurrences: 1 });
+    });
+    visitJsonObjectKeys(parsed, key => {
+        for (const match of key.matchAll(CUSTOM_SLOT_TOKEN_PATTERN)) {
+            const token = match[0];
+            const name = match[1];
+            if (isKnownCustomSlotName(name)) {
+                knownTokenInKey = true;
+                continue;
+            }
+            if (!unrecognizedByToken.has(token)) {
+                const suggestion = findCustomSlotSuggestion(name);
+                unrecognizedByToken.set(token, {
+                    token,
+                    ...(suggestion ? { suggestion: `{{${suggestion}}}` } : {}),
+                });
+            }
+        }
+    });
+    return {
+        slots: [...slotsByToken.values()],
+        imageLiterals: [...imagesByLiteral.values()],
+        unrecognized: [...unrecognizedByToken.values()],
+        knownTokenInKey,
+    };
 }
 
 function parseGraphInput(graphJson, maxBytes) {
@@ -290,6 +388,8 @@ function inspectGraph(graphJson, maxBytes) {
     const loadImages = [];
     const seeds = [];
     const outputCandidates = [];
+    const embeddedSlots = [];
+    const embeddedImageLiterals = [];
     let linkCount = 0;
     for (const [nodeId, node] of Object.entries(document)) {
         const loadImage = node.class_type === 'LoadImage' ? { nodeId, inputName: 'image' } : null;
@@ -306,6 +406,13 @@ function inspectGraph(graphJson, maxBytes) {
             if (typeof value !== 'string') continue;
             const ref = { nodeId, inputName };
             const exactSlotName = getExactCustomSlotName(value);
+            const embeddedJson = inspectEmbeddedJsonInput(value);
+            if (embeddedJson) {
+                embeddedSlots.push(...embeddedJson.slots.map(candidate => ({ nodeId, inputName, ...candidate })));
+                embeddedImageLiterals.push(...embeddedJson.imageLiterals.map(candidate => ({
+                    nodeId, inputName, ...candidate,
+                })));
+            }
             if (!isImageInput && !isSeedInput) textInputs.push(ref);
             if (exactSlotName === 'positive' || exactSlotName === 'negative') {
                 if (isImageInput || isSeedInput) {
@@ -337,18 +444,27 @@ function inspectGraph(graphJson, maxBytes) {
                 }
                 continue;
             }
-            if (findKnownCustomSlotToken(value)) {
+            if (
+                embeddedJson?.knownTokenInKey
+                || (findKnownCustomSlotToken(value) && (!embeddedJson || embeddedJson.slots.length === 0))
+            ) {
                 errors.push(errorEntry(comfyError(
                     'COMFY_TEMPLATE_PLACEHOLDER_INVALID',
                     `Template placeholder is not an exact input value at ${nodeId}.inputs.${inputName}`,
                 )));
                 continue;
             }
-            for (const suspicious of findSuspiciousCustomSlotTokens(value)) {
-                warnings.push(errorEntry(comfyError(
-                    'COMFY_TEMPLATE_PLACEHOLDER_SUSPICIOUS',
-                    `Possible template placeholder typo at ${nodeId}.inputs.${inputName}: ${suspicious.token}; did you mean ${suspicious.suggestion}?`,
-                )));
+            const unrecognized = embeddedJson?.unrecognized ?? findUnrecognizedCustomSlotTokens(value);
+            for (const candidate of unrecognized) {
+                warnings.push(errorEntry(candidate.suggestion
+                    ? comfyError(
+                        'COMFY_TEMPLATE_PLACEHOLDER_SUSPICIOUS',
+                        `Possible template placeholder typo at ${nodeId}.inputs.${inputName}: ${candidate.token}; did you mean ${candidate.suggestion}?`,
+                    )
+                    : comfyError(
+                        'COMFY_TEMPLATE_PLACEHOLDER_UNKNOWN',
+                        `Unknown template placeholder at ${nodeId}.inputs.${inputName}: ${candidate.token}; value will be preserved`,
+                    )));
             }
         }
     }
@@ -389,6 +505,8 @@ function inspectGraph(graphJson, maxBytes) {
             inputImages,
             seeds,
         },
+        ...(embeddedSlots.length > 0 ? { embeddedSlots } : {}),
+        ...(embeddedImageLiterals.length > 0 ? { embeddedImageLiterals } : {}),
         output: outputCandidates.length === 1
             ? outputCandidates[0]
             : (outputCandidates.length > 1 ? outputCandidates : null),
@@ -402,7 +520,17 @@ function inspectGraph(graphJson, maxBytes) {
             outputCandidateCount: outputCandidates.length,
         },
     };
-    return { ...parsed, analysis, textInputs, positiveRefs, negativeRefs, loadImages, outputCandidates };
+    return {
+        ...parsed,
+        analysis,
+        textInputs,
+        positiveRefs,
+        negativeRefs,
+        loadImages,
+        outputCandidates,
+        embeddedSlots,
+        embeddedImageLiterals,
+    };
 }
 
 function scanLegacyPlaceholders(value, currentPath = [], slots = []) {
@@ -525,13 +653,192 @@ function setInput(document, ref, value) {
     document[ref.nodeId].inputs[ref.inputName] = value;
 }
 
+function embeddedRefKey(ref) {
+    return JSON.stringify([ref.nodeId, ref.inputName]);
+}
+
+function assertEmbeddedSnapshotBindings(document, templateSlots) {
+    const embedded = templateSlots.embedded;
+    const representatives = [
+        templateSlots.positive,
+        templateSlots.negative,
+        ...(templateSlots.inputImages ?? []),
+        ...(templateSlots.seeds ?? []),
+    ].filter(ref => ref?.embedded === true);
+    if (embedded == null) {
+        if (representatives.length > 0) {
+            throw comfyError('COMFY_TEMPLATE_SNAPSHOT_INVALID', 'Stored embedded slot representative has no binding');
+        }
+        return;
+    }
+    if (!isPlainObject(embedded) || !Array.isArray(embedded.slots) || !Array.isArray(embedded.inputImages)) {
+        throw comfyError('COMFY_TEMPLATE_SNAPSHOT_INVALID', 'Stored embedded slot bindings are malformed');
+    }
+    const seen = new Set();
+    for (const [type, bindings] of [['slot', embedded.slots], ['image', embedded.inputImages]]) {
+        for (const binding of bindings) {
+            const source = type === 'slot' ? binding?.token : binding?.literal;
+            const key = embeddedCandidateKey(binding?.nodeId, binding?.inputName, source);
+            if (
+                !isPlainObject(binding)
+                || typeof binding.nodeId !== 'string'
+                || typeof binding.inputName !== 'string'
+                || typeof source !== 'string'
+                || typeof binding.name !== 'string'
+                || !Number.isSafeInteger(binding.occurrences)
+                || binding.occurrences < 1
+                || seen.has(key)
+                || !Object.prototype.hasOwnProperty.call(document, binding.nodeId)
+                || typeof document[binding.nodeId]?.inputs?.[binding.inputName] !== 'string'
+            ) {
+                throw comfyError('COMFY_TEMPLATE_SNAPSHOT_INVALID', 'Stored embedded slot binding is invalid');
+            }
+            if (
+                (type === 'slot' && (getExactCustomSlotName(binding.token) !== binding.name))
+                || (type === 'image' && (
+                    !IMAGE_ROLE_PATTERN.test(binding.name)
+                    || !EMBEDDED_IMAGE_LITERAL_PATTERN.test(binding.literal)
+                    || typeof binding.pathHint !== 'string'
+                ))
+            ) {
+                throw comfyError('COMFY_TEMPLATE_SNAPSHOT_INVALID', 'Stored embedded slot binding contradicts its source');
+            }
+            seen.add(key);
+        }
+    }
+    for (const image of embedded.inputImages) {
+        if (embedded.slots.some(slot => (
+            slot.nodeId === image.nodeId
+            && slot.inputName === image.inputName
+            && image.literal.includes(slot.token)
+        ))) {
+            throw comfyError('COMFY_TEMPLATE_SNAPSHOT_INVALID', 'Stored embedded bindings overlap');
+        }
+    }
+
+    const embeddedInputKeys = new Set([...embedded.slots, ...embedded.inputImages].map(embeddedRefKey));
+    const directRefs = [
+        templateSlots.positive,
+        templateSlots.negative,
+        ...(templateSlots.inputImages ?? []),
+        ...(templateSlots.seeds ?? []),
+    ].filter(ref => ref && ref.embedded !== true);
+    if (directRefs.some(ref => embeddedInputKeys.has(embeddedRefKey(ref)))) {
+        throw comfyError('COMFY_TEMPLATE_SNAPSHOT_INVALID', 'Stored direct slot overlaps an embedded input');
+    }
+
+    const representativeMatches = (ref, name, candidates) => candidates.some(candidate => (
+        candidate.name === name
+        && candidate.nodeId === ref.nodeId
+        && candidate.inputName === ref.inputName
+    ));
+    if (
+        (templateSlots.positive?.embedded === true
+            && !representativeMatches(templateSlots.positive, 'positive', embedded.slots))
+        || (templateSlots.negative?.embedded === true
+            && !representativeMatches(templateSlots.negative, 'negative', embedded.slots))
+        || (templateSlots.seeds ?? []).some(ref => (
+            ref.embedded === true && !representativeMatches(ref, 'seed', embedded.slots)
+        ))
+        || (templateSlots.inputImages ?? []).some(ref => (
+            ref.embedded === true
+            && !representativeMatches(ref, ref.name, [...embedded.slots, ...embedded.inputImages])
+        ))
+    ) {
+        throw comfyError('COMFY_TEMPLATE_SNAPSHOT_INVALID', 'Stored embedded slot representative is inconsistent');
+    }
+    for (const binding of embedded.slots) {
+        const declared = binding.name === 'positive'
+            ? Boolean(templateSlots.positive)
+            : binding.name === 'negative'
+                ? Boolean(templateSlots.negative)
+                : binding.name === 'seed'
+                    ? (templateSlots.seeds ?? []).length > 0
+                    : (templateSlots.inputImages ?? []).some(image => image.name === binding.name);
+        if (!declared) {
+            throw comfyError('COMFY_TEMPLATE_SNAPSHOT_INVALID', 'Stored embedded slot has no logical runtime slot');
+        }
+    }
+    for (const binding of embedded.inputImages) {
+        if (!(templateSlots.inputImages ?? []).some(image => image.name === binding.name)) {
+            throw comfyError('COMFY_TEMPLATE_SNAPSHOT_INVALID', 'Stored embedded image has no logical runtime slot');
+        }
+    }
+}
+
+function escapeRegExp(value) {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function transformEmbeddedJsonValue(value, tokenBindings, imageBindings, slots, counts) {
+    if (typeof value === 'string') {
+        const image = imageBindings.find(binding => binding.literal === value);
+        if (image) {
+            counts.set(image, (counts.get(image) ?? 0) + 1);
+            return String(slots[image.name]);
+        }
+        if (tokenBindings.length === 0) return value;
+        const byToken = new Map(tokenBindings.map(binding => [binding.token, binding]));
+        const pattern = new RegExp([...byToken.keys()].map(escapeRegExp).join('|'), 'g');
+        return value.replace(pattern, token => {
+            const binding = byToken.get(token);
+            counts.set(binding, (counts.get(binding) ?? 0) + 1);
+            return String(slots[binding.name]);
+        });
+    }
+    if (Array.isArray(value)) {
+        return value.map(child => transformEmbeddedJsonValue(child, tokenBindings, imageBindings, slots, counts));
+    }
+    if (isPlainObject(value)) {
+        return Object.fromEntries(Object.entries(value).map(([key, child]) => [
+            key,
+            transformEmbeddedJsonValue(child, tokenBindings, imageBindings, slots, counts),
+        ]));
+    }
+    return value;
+}
+
+function applyEmbeddedInputs(document, templateSlots, slots) {
+    const embedded = templateSlots.embedded;
+    if (!embedded) return;
+    const groups = new Map();
+    for (const binding of [...embedded.slots, ...embedded.inputImages]) {
+        const key = embeddedRefKey(binding);
+        if (!groups.has(key)) groups.set(key, { ref: binding, tokens: [], images: [] });
+        groups.get(key)[Object.prototype.hasOwnProperty.call(binding, 'token') ? 'tokens' : 'images'].push(binding);
+    }
+    for (const { ref, tokens, images } of groups.values()) {
+        const source = document[ref.nodeId].inputs[ref.inputName];
+        let parsed;
+        try {
+            parsed = JSON.parse(source);
+        } catch (cause) {
+            throw comfyError('COMFY_TEMPLATE_SNAPSHOT_INVALID', 'Stored embedded input is not valid JSON', { cause });
+        }
+        const counts = new Map();
+        const transformed = transformEmbeddedJsonValue(parsed, tokens, images, slots, counts);
+        for (const binding of [...tokens, ...images]) {
+            if ((counts.get(binding) ?? 0) !== binding.occurrences) {
+                throw comfyError('COMFY_TEMPLATE_SNAPSHOT_INVALID', 'Stored embedded occurrence count does not match');
+            }
+        }
+        document[ref.nodeId].inputs[ref.inputName] = JSON.stringify(transformed);
+    }
+}
+
 function instantiateDocument(document, templateSlots, slots, outputDescriptor) {
+    assertEmbeddedSnapshotBindings(document, templateSlots);
     validateRuntimeSlots(templateSlots, slots);
     const prompt = structuredClone(document);
-    if (templateSlots.positive) setInput(prompt, templateSlots.positive, slots.positive);
-    if (templateSlots.negative) setInput(prompt, templateSlots.negative, slots.negative);
-    for (const image of templateSlots.inputImages ?? []) setInput(prompt, image, slots[image.name]);
-    for (const seed of templateSlots.seeds ?? []) setInput(prompt, seed, slots.seed);
+    if (templateSlots.positive && !templateSlots.positive.embedded) setInput(prompt, templateSlots.positive, slots.positive);
+    if (templateSlots.negative && !templateSlots.negative.embedded) setInput(prompt, templateSlots.negative, slots.negative);
+    for (const image of templateSlots.inputImages ?? []) {
+        if (!image.embedded) setInput(prompt, image, slots[image.name]);
+    }
+    for (const seed of templateSlots.seeds ?? []) {
+        if (!seed.embedded) setInput(prompt, seed, slots.seed);
+    }
+    applyEmbeddedInputs(prompt, templateSlots, slots);
     return {
         prompt,
         outputDescriptor,
@@ -549,18 +856,110 @@ function selectNodeRef(value, candidates, code) {
     return { nodeId: match.nodeId, inputName: match.inputName };
 }
 
+function embeddedCandidateKey(nodeId, inputName, source) {
+    return JSON.stringify([nodeId, inputName, source]);
+}
+
+function resolveEmbeddedCandidates(candidates, supplied, type) {
+    const sourceName = type === 'slot' ? 'token' : 'literal';
+    const expected = new Map(candidates.map(candidate => [
+        embeddedCandidateKey(candidate.nodeId, candidate.inputName, candidate[sourceName]),
+        candidate,
+    ]));
+    if (expected.size === 0) {
+        if (supplied != null && (!Array.isArray(supplied) || supplied.length > 0)) {
+            throw comfyError('COMFY_TEMPLATE_SLOT_RESOLUTION_INVALID', 'Embedded resolution contains an unanalyzed candidate');
+        }
+        return [];
+    }
+    if (!Array.isArray(supplied)) {
+        throw comfyError('COMFY_TEMPLATE_RESOLUTION_REQUIRED', 'Every embedded template candidate requires approval');
+    }
+    const resolved = [];
+    const seen = new Set();
+    for (const item of supplied) {
+        if (
+            !isPlainObject(item)
+            || typeof item.nodeId !== 'string'
+            || typeof item.inputName !== 'string'
+            || typeof item[sourceName] !== 'string'
+        ) {
+            throw comfyError('COMFY_TEMPLATE_SLOT_RESOLUTION_INVALID', 'Embedded resolution is malformed');
+        }
+        if (type === 'image' && (typeof item.name !== 'string' || !IMAGE_ROLE_PATTERN.test(item.name))) {
+            throw comfyError('COMFY_TEMPLATE_SLOT_RESOLUTION_INVALID', 'Embedded image role is invalid');
+        }
+        const key = embeddedCandidateKey(item.nodeId, item.inputName, item[sourceName]);
+        if (seen.has(key) || !expected.has(key)) {
+            throw comfyError('COMFY_TEMPLATE_SLOT_RESOLUTION_INVALID', 'Embedded resolution is duplicated or was not analyzed');
+        }
+        seen.add(key);
+        const candidate = expected.get(key);
+        resolved.push({
+            ...candidate,
+            name: type === 'slot' ? candidate.token.slice(2, -2) : item.name,
+        });
+    }
+    if (seen.size !== expected.size) {
+        throw comfyError('COMFY_TEMPLATE_RESOLUTION_REQUIRED', 'Every embedded template candidate requires approval');
+    }
+    return resolved;
+}
+
+function resolveEmbeddedBindings(inspected, value) {
+    if (value != null && !isPlainObject(value)) {
+        throw comfyError('COMFY_TEMPLATE_SLOT_RESOLUTION_INVALID', 'slotResolution.embedded must be an object');
+    }
+    const resolution = value ?? {};
+    const slots = resolveEmbeddedCandidates(inspected.embeddedSlots, resolution.slots, 'slot');
+    const inputImages = resolveEmbeddedCandidates(
+        inspected.embeddedImageLiterals,
+        resolution.inputImages,
+        'image',
+    );
+    for (const image of inputImages) {
+        if (slots.some(slot => (
+            slot.nodeId === image.nodeId
+            && slot.inputName === image.inputName
+            && image.literal.includes(slot.token)
+        ))) {
+            throw comfyError(
+                'COMFY_TEMPLATE_SLOT_RESOLUTION_INVALID',
+                'Embedded token and image approvals overlap in the same JSON value',
+            );
+        }
+    }
+    return { slots, inputImages };
+}
+
+function isEmbeddedInputRef(embedded, ref) {
+    return [...embedded.slots, ...embedded.inputImages].some(candidate => (
+        candidate.nodeId === ref.nodeId && candidate.inputName === ref.inputName
+    ));
+}
+
 function resolveTemplateSlots(inspected, slotResolution) {
     const resolution = slotResolution ?? {};
     if (!isPlainObject(resolution)) {
         throw comfyError('COMFY_TEMPLATE_SLOT_RESOLUTION_INVALID', 'slotResolution must be an object');
     }
+    const embedded = resolveEmbeddedBindings(inspected, resolution.embedded);
+    const embeddedPositive = embedded.slots.find(slot => slot.name === 'positive');
     const positive = inspected.positiveRefs.length === 1
         ? inspected.positiveRefs[0]
-        : selectNodeRef(
-            resolution.positive,
-            inspected.textInputs,
-            'COMFY_TEMPLATE_RESOLUTION_REQUIRED',
-        );
+        : resolution.positive != null
+            ? selectNodeRef(
+                resolution.positive,
+                inspected.textInputs,
+                'COMFY_TEMPLATE_RESOLUTION_REQUIRED',
+            )
+            : embeddedPositive
+                ? { nodeId: embeddedPositive.nodeId, inputName: embeddedPositive.inputName, embedded: true }
+                : selectNodeRef(
+                    resolution.positive,
+                    inspected.textInputs,
+                    'COMFY_TEMPLATE_RESOLUTION_REQUIRED',
+                );
     let negative;
     if (inspected.negativeRefs.length === 1) negative = inspected.negativeRefs[0];
     else if (resolution.negative != null) {
@@ -569,8 +968,18 @@ function resolveTemplateSlots(inspected, slotResolution) {
             inspected.textInputs,
             'COMFY_TEMPLATE_SLOT_RESOLUTION_INVALID',
         );
+    } else {
+        const embeddedNegative = embedded.slots.find(slot => slot.name === 'negative');
+        if (embeddedNegative) {
+            negative = { nodeId: embeddedNegative.nodeId, inputName: embeddedNegative.inputName, embedded: true };
+        }
     }
-    if (negative && negative.nodeId === positive.nodeId && negative.inputName === positive.inputName) {
+    if (
+        negative
+        && negative.nodeId === positive.nodeId
+        && negative.inputName === positive.inputName
+        && (!positive.embedded || !negative.embedded)
+    ) {
         throw comfyError('COMFY_TEMPLATE_SLOT_RESOLUTION_INVALID', 'positive and negative cannot use the same input');
     }
 
@@ -614,7 +1023,41 @@ function resolveTemplateSlots(inspected, slotResolution) {
             throw comfyError('COMFY_TEMPLATE_SLOT_RESOLUTION_INVALID', 'Image slot mappings must cover every LoadImage once');
         }
     }
-    return { positive, ...(negative ? { negative } : {}), inputImages, seeds: inspected.analysis.slots.seeds };
+    const embeddedImageRefs = [
+        ...embedded.slots.filter(slot => IMAGE_ROLE_PATTERN.test(slot.name)),
+        ...embedded.inputImages,
+    ];
+    for (const candidate of embeddedImageRefs) {
+        if (inputImages.some(image => image.name === candidate.name)) continue;
+        inputImages.push({
+            nodeId: candidate.nodeId,
+            inputName: candidate.inputName,
+            name: candidate.name,
+            embedded: true,
+        });
+    }
+    const seeds = [...inspected.analysis.slots.seeds];
+    if (seeds.length === 0) {
+        const embeddedSeed = embedded.slots.find(slot => slot.name === 'seed');
+        if (embeddedSeed) {
+            seeds.push({ nodeId: embeddedSeed.nodeId, inputName: embeddedSeed.inputName, embedded: true });
+        }
+    }
+    for (const ref of [positive, negative, ...inputImages, ...seeds].filter(Boolean)) {
+        if (!ref.embedded && isEmbeddedInputRef(embedded, ref)) {
+            throw comfyError(
+                'COMFY_TEMPLATE_SLOT_RESOLUTION_INVALID',
+                'A direct slot cannot overwrite an embedded JSON input',
+            );
+        }
+    }
+    return {
+        positive,
+        ...(negative ? { negative } : {}),
+        inputImages,
+        seeds,
+        ...((embedded.slots.length > 0 || embedded.inputImages.length > 0) ? { embedded } : {}),
+    };
 }
 
 function validateOutputDescriptor(document, descriptor) {
@@ -656,7 +1099,12 @@ function assertRegistrationShape(input, templateSlots, outputDescriptor) {
     if (mediaKind !== input.kind) {
         throw comfyError('COMFY_TEMPLATE_KIND_OUTPUT_MISMATCH', 'Template kind does not match its output media type');
     }
-    const imageCount = templateSlots.inputImages.length;
+    const directImageCount = templateSlots.inputImages.filter(image => !image.embedded).length;
+    const embeddedImageCount = [
+        ...(templateSlots.embedded?.slots ?? []).filter(slot => IMAGE_ROLE_PATTERN.test(slot.name)),
+        ...(templateSlots.embedded?.inputImages ?? []),
+    ].reduce((total, binding) => total + binding.occurrences, 0);
+    const imageCount = directImageCount + embeddedImageCount;
     const validCardinality = input.mode === 't2v' || input.mode === 't2i'
         ? imageCount === 0
         : input.mode === 'i2v' || input.mode === 'i2i'

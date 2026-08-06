@@ -1454,6 +1454,18 @@ type ComfyOutputMediaType = 'video/mp4' | 'video/webm' | 'image/png' | 'image/jp
 interface ComfyTemplateNodeRef {
     nodeId: string;
     inputName: string;
+    embedded?: true;
+}
+
+interface ComfyTemplateEmbeddedSlot extends ComfyTemplateNodeRef {
+    token: string;
+    occurrences: number;
+}
+
+interface ComfyTemplateEmbeddedImageLiteral extends ComfyTemplateNodeRef {
+    literal: string;
+    pathHint: string;
+    occurrences: number;
 }
 
 interface ComfyTemplateOutputDescriptor {
@@ -1473,6 +1485,8 @@ interface ComfyTemplateAnalysis {
         inputImages: Array<ComfyTemplateNodeRef & { name?: string }>;
         seeds: ComfyTemplateNodeRef[];
     };
+    embeddedSlots?: ComfyTemplateEmbeddedSlot[];
+    embeddedImageLiterals?: ComfyTemplateEmbeddedImageLiteral[];
     output: ComfyTemplateOutputDescriptor | ComfyTemplateOutputDescriptor[] | null;
     stats: {
         bytes?: number;
@@ -1494,6 +1508,10 @@ interface ComfyTemplateRegistrationInput {
         positive?: ComfyTemplateNodeRef;
         negative?: ComfyTemplateNodeRef;
         inputImages?: Array<{ nodeId: string; name: string }>;
+        embedded?: {
+            slots?: Array<ComfyTemplateNodeRef & { token: string }>;
+            inputImages?: Array<ComfyTemplateNodeRef & { literal: string; name: string }>;
+        };
     };
     outputDescriptor?: ComfyTemplateOutputDescriptor;
     promptProfile?: ComfyPromptProfile;
@@ -1512,6 +1530,10 @@ interface ComfyTemplateSlotBindings {
     negative?: ComfyTemplateNodeRef;
     inputImages: Array<ComfyTemplateNodeRef & { name: string }>;
     seeds: ComfyTemplateNodeRef[];
+    embedded?: {
+        slots: Array<ComfyTemplateEmbeddedSlot & { name: string }>;
+        inputImages: Array<ComfyTemplateEmbeddedImageLiteral & { name: string }>;
+    };
 }
 
 interface ComfyBuiltinTemplateSummary {

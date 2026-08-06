@@ -52,29 +52,89 @@ function graph(options: {
 }
 
 describe('Comfy custom template analysis and registration', () => {
-  it('registers the FL2VA fixture without mistaking serialized widget state for placeholders', async () => {
+  it('analyzes embedded slots, image literals, and unknown tokens in the real FL2VA state strings', async () => {
     const { registry } = createRegistry()
     const graphJson = await readFile(fl2vaFixturePath, 'utf8')
-    const source = JSON.parse(graphJson)
 
     const analyzed = registry.analyzeTemplate(graphJson)
     expect(analyzed).toMatchObject({
       ok: true,
       errors: [],
-      warnings: [],
+      warnings: [
+        { code: 'COMFY_TEMPLATE_PLACEHOLDER_UNKNOWN', message: expect.stringContaining('timeline_data') },
+        { code: 'COMFY_TEMPLATE_PLACEHOLDER_UNKNOWN', message: expect.stringContaining('builder_state') },
+      ],
       slots: {
         positive: expect.arrayContaining([{ nodeId: '2693', inputName: 'prompt' }]),
         inputImages: [],
+        seeds: [{ nodeId: '1512:2600', inputName: 'noise_seed' }],
       },
       output: null,
+      embeddedSlots: expect.arrayContaining([
+        { nodeId: '2693', inputName: 'timeline_data', token: '{{positive}}', occurrences: 1 },
+        { nodeId: '2693', inputName: 'builder_state', token: '{{positive}}', occurrences: 1 },
+      ]),
+      embeddedImageLiterals: [
+        {
+          nodeId: '2693',
+          inputName: 'timeline_data',
+          literal: 'img-204fe3a6-34ab-48a3-89d3-643ddf1543ac_00002_.png',
+          pathHint: '/items/0/value',
+          occurrences: 1,
+        },
+        {
+          nodeId: '2693',
+          inputName: 'timeline_data',
+          literal: 'img-efa3e877-b3a1-42d8-9540-7a21240cc067_00014_.png',
+          pathHint: '/items/1/value',
+          occurrences: 1,
+        },
+      ],
+    })
+  })
+
+  it('keeps non-JSON partial known tokens fatal while accepting JSON scalar string slots', () => {
+    const { registry } = createRegistry()
+    const partial = graph({ positive: 'prefix {{positive}} suffix' })
+    expect(registry.analyzeTemplate(partial)).toMatchObject({
+      ok: false,
+      errors: [{ code: 'COMFY_TEMPLATE_PLACEHOLDER_INVALID' }],
+    })
+    const jsonKey = graph({
+      positive: JSON.stringify({ '{{positive}}': 'key data', prompt: '{{negative}}' }),
+    })
+    expect(registry.analyzeTemplate(jsonKey)).toMatchObject({
+      ok: false,
+      errors: [{ code: 'COMFY_TEMPLATE_PLACEHOLDER_INVALID' }],
+    })
+    const unknownJsonKeys = graph({
+      positive: JSON.stringify({ '{{soundscape}}': 'kept', '{{positve}}': 'also kept' }),
+    })
+    expect(registry.analyzeTemplate(unknownJsonKeys)).toMatchObject({
+      ok: true,
+      errors: [],
+      warnings: expect.arrayContaining([
+        { code: 'COMFY_TEMPLATE_PLACEHOLDER_UNKNOWN', message: expect.stringContaining('{{soundscape}}') },
+        { code: 'COMFY_TEMPLATE_PLACEHOLDER_SUSPICIOUS', message: expect.stringContaining('{{positve}}') },
+      ]),
     })
 
-    const registered = await registry.registerTemplate({
-      name: 'Dasiwa cMMH3 V11 FL2VA',
+    const scalar = graph({ positive: JSON.stringify('prefix {{positive}} suffix') })
+    expect(registry.analyzeTemplate(scalar)).toMatchObject({
+      ok: true,
+      errors: [],
+      embeddedSlots: [{ nodeId: 'text', inputName: 'text', token: '{{positive}}', occurrences: 1 }],
+    })
+  })
+
+  it('registers every real FL2VA embedded binding with one shared image role and a three-slot manifest', async () => {
+    const { registry } = createRegistry()
+    const graphJson = await readFile(fl2vaFixturePath, 'utf8')
+    const metadata = {
+      name: 'Dasiwa cMMH3 V11 FL2VA embedded',
       kind: 'video',
       mode: 'flf2v',
       graphJson,
-      slotResolution: { positive: { nodeId: '2693', inputName: 'prompt' } },
       outputDescriptor: {
         nodeId: '2568',
         classType: 'DaSiWa_EnhancedVideoCombine',
@@ -82,28 +142,225 @@ describe('Comfy custom template analysis and registration', () => {
         mediaType: 'video/webm',
       },
       promptProfile: 'h3-structured',
+    }
+    await expect(registry.registerTemplate({
+      ...metadata,
+      slotResolution: { positive: { nodeId: '2693', inputName: 'prompt' } },
+    })).rejects.toMatchObject({ code: 'COMFY_TEMPLATE_RESOLUTION_REQUIRED' })
+
+    const embeddedResolution = {
+      embedded: {
+        slots: [
+          { nodeId: '2693', inputName: 'timeline_data', token: '{{positive}}' },
+          { nodeId: '2693', inputName: 'builder_state', token: '{{positive}}' },
+        ],
+        inputImages: [
+          {
+            nodeId: '2693',
+            inputName: 'timeline_data',
+            literal: 'img-204fe3a6-34ab-48a3-89d3-643ddf1543ac_00002_.png',
+            name: 'input_image',
+          },
+          {
+            nodeId: '2693',
+            inputName: 'timeline_data',
+            literal: 'img-efa3e877-b3a1-42d8-9540-7a21240cc067_00014_.png',
+            name: 'input_image',
+          },
+        ],
+      },
+    }
+    await expect(registry.registerTemplate({
+      ...metadata,
+      mode: 'i2v',
+      slotResolution: embeddedResolution,
+    })).rejects.toMatchObject({ code: 'COMFY_TEMPLATE_IMAGE_CARDINALITY' })
+
+    const registered = await registry.registerTemplate({
+      ...metadata,
+      slotResolution: embeddedResolution,
     })
     expect(registered).toMatchObject({
       created: true,
       template: {
         mode: 'flf2v',
+        slots: [
+          { name: 'input_image', type: 'imageAsset', required: true },
+          { name: 'positive', type: 'string', required: true },
+          {
+            name: 'seed', type: 'integer', required: true,
+            minimum: 0, maximum: Number.MAX_SAFE_INTEGER,
+          },
+        ],
         slotBindings: {
-          positive: { nodeId: '2693', inputName: 'prompt' },
-          inputImages: [],
+          positive: { nodeId: '2693', inputName: 'timeline_data', embedded: true },
+          inputImages: [{
+            nodeId: '2693', inputName: 'timeline_data', name: 'input_image', embedded: true,
+          }],
+          seeds: [{ nodeId: '1512:2600', inputName: 'noise_seed' }],
+          embedded: {
+            slots: expect.arrayContaining([
+              {
+                nodeId: '2693', inputName: 'timeline_data', token: '{{positive}}',
+                occurrences: 1, name: 'positive',
+              },
+              {
+                nodeId: '2693', inputName: 'builder_state', token: '{{positive}}',
+                occurrences: 1, name: 'positive',
+              },
+            ]),
+            inputImages: expect.arrayContaining([
+              expect.objectContaining({
+                literal: 'img-204fe3a6-34ab-48a3-89d3-643ddf1543ac_00002_.png',
+                name: 'input_image',
+              }),
+              expect.objectContaining({
+                literal: 'img-efa3e877-b3a1-42d8-9540-7a21240cc067_00014_.png',
+                name: 'input_image',
+              }),
+            ]),
+          },
         },
-        outputDescriptor: {
-          nodeId: '2568',
-          classType: 'DaSiWa_EnhancedVideoCombine',
-          historyKey: 'gifs',
-          mediaType: 'video/webm',
-        },
+        outputDescriptor: metadata.outputDescriptor,
       },
     })
 
-    const instantiated = await registry.instantiate(registered.template.id, { positive: 'resolved FL2VA prompt' })
-    expect(instantiated.prompt['2693'].inputs.prompt).toBe('resolved FL2VA prompt')
-    expect(instantiated.prompt['2693'].inputs.timeline_data).toBe(source['2693'].inputs.timeline_data)
-    expect(instantiated.prompt['2693'].inputs.builder_state).toBe(source['2693'].inputs.builder_state)
+    const originalImageLiteral = 'img-204fe3a6-34ab-48a3-89d3-643ddf1543ac_00002_.png'
+    const positive = [
+      'Camera holds on "the quoted subject".',
+      'A backslash \\ crosses the frame.\u0001',
+      `Compile once: {{positive}} {{input_image}} ${originalImageLiteral}`,
+    ].join('\n')
+    const inputImage = 'risu-comfy/job/frame-"quoted".png'
+    const instantiated = await registry.instantiate(registered.template.id, {
+      positive,
+      input_image: inputImage,
+      seed: 123456,
+    })
+    const timeline = JSON.parse(instantiated.prompt['2693'].inputs.timeline_data)
+    const builderState = JSON.parse(instantiated.prompt['2693'].inputs.builder_state)
+    expect(timeline.builder_state.imd).toBe(positive)
+    expect(builderState.imd).toBe(positive)
+    expect(timeline.items.map((item: any) => item.value)).toEqual([inputImage, inputImage])
+    expect(timeline.builder_state.soundscape).toBe('{{soundscape}}')
+    expect(builderState.soundscape).toBe('{{soundscape}}')
+    expect(instantiated.prompt['2693'].inputs.prompt).toBe('')
+    expect(instantiated.prompt['1512:2600'].inputs.noise_seed).toBe(123456)
+  })
+
+  it('deduplicates semantic image literals across JSON escape spellings and rejects tampered occurrence metadata', async () => {
+    const { registry } = createRegistry()
+    const state = '{"prompt":"\\u007b\\u007bpositive}}","images":["folder\\/same.png","folder/same.png"]}'
+    const custom = {
+      director: { class_type: 'Director', inputs: { state } },
+      output: { class_type: 'SaveVideo', inputs: { images: ['director', 0] } },
+    }
+    expect(registry.analyzeTemplate(custom)).toMatchObject({
+      ok: true,
+      embeddedSlots: [
+        { nodeId: 'director', inputName: 'state', token: '{{positive}}', occurrences: 1 },
+      ],
+      embeddedImageLiterals: [
+        {
+          nodeId: 'director', inputName: 'state', literal: 'folder/same.png',
+          pathHint: '/images/0', occurrences: 2,
+        },
+      ],
+    })
+    const registered = await registry.registerTemplate({
+      name: 'Semantic escaped state',
+      kind: 'video',
+      mode: 'flf2v',
+      graphJson: custom,
+      slotResolution: {
+        embedded: {
+          slots: [{ nodeId: 'director', inputName: 'state', token: '{{positive}}' }],
+          inputImages: [{
+            nodeId: 'director', inputName: 'state', literal: 'folder/same.png', name: 'input_image',
+          }],
+        },
+      },
+      promptProfile: 'h3-structured',
+    })
+    const compiled = await registry.instantiate(registered.template.id, {
+      positive: 'semantic prompt', input_image: 'risu/new.png',
+    })
+    expect(JSON.parse(compiled.prompt.director.inputs.state)).toEqual({
+      prompt: 'semantic prompt', images: ['risu/new.png', 'risu/new.png'],
+    })
+
+    const loaded = await registry.loadTemplate(registered.template.id)
+    const tamperedSlots = structuredClone(loaded.templateSlots)
+    tamperedSlots.embedded.inputImages[0].occurrences = 3
+    expect(() => registry.instantiateSnapshot(
+      loaded.sourceText,
+      loaded.hash,
+      { positive: 'semantic prompt', input_image: 'risu/new.png' },
+      loaded.id,
+      { templateSlots: tamperedSlots, outputDescriptor: loaded.outputDescriptor },
+    )).toThrow(expect.objectContaining({ code: 'COMFY_TEMPLATE_SNAPSHOT_INVALID' }))
+  })
+
+  it('supports embedded prompt, seed, and image token families without direct bindings', async () => {
+    const { registry } = createRegistry()
+    const custom = {
+      director: {
+        class_type: 'Director',
+        inputs: {
+          state: JSON.stringify({
+            prompt: '{{positive}}',
+            negative: '{{negative}}',
+            seed: '{{seed}}',
+            image: '{{input_image}}',
+          }),
+        },
+      },
+      output: { class_type: 'SaveVideo', inputs: { images: ['director', 0] } },
+    }
+    const slots = ['positive', 'negative', 'seed', 'input_image'].map(name => ({
+      nodeId: 'director', inputName: 'state', token: `{{${name}}}`,
+    }))
+    const registered = await registry.registerTemplate({
+      name: 'Embedded token families',
+      kind: 'video',
+      mode: 'i2v',
+      graphJson: custom,
+      slotResolution: { embedded: { slots } },
+      promptProfile: 'h3-structured',
+    })
+    expect(registered.template.slots).toEqual([
+      { name: 'input_image', type: 'imageAsset', required: true },
+      { name: 'positive', type: 'string', required: true },
+      { name: 'negative', type: 'string', required: true },
+      {
+        name: 'seed', type: 'integer', required: true,
+        minimum: 0, maximum: Number.MAX_SAFE_INTEGER,
+      },
+    ])
+    const compiled = await registry.instantiate(registered.template.id, {
+      positive: 'p', negative: 'n', seed: 7, input_image: 'risu/token.png',
+    })
+    expect(JSON.parse(compiled.prompt.director.inputs.state)).toEqual({
+      prompt: 'p', negative: 'n', seed: '7', image: 'risu/token.png',
+    })
+
+    const overlapping = structuredClone(custom)
+    overlapping.director.inputs.state = JSON.stringify({ image: '{{positive}}.png' })
+    await expect(registry.registerTemplate({
+      name: 'Overlapping embedded sources',
+      kind: 'video',
+      mode: 'i2v',
+      graphJson: overlapping,
+      slotResolution: {
+        embedded: {
+          slots: [{ nodeId: 'director', inputName: 'state', token: '{{positive}}' }],
+          inputImages: [{
+            nodeId: 'director', inputName: 'state', literal: '{{positive}}.png', name: 'input_image',
+          }],
+        },
+      },
+      promptProfile: 'h3-structured',
+    })).rejects.toMatchObject({ code: 'COMFY_TEMPLATE_SLOT_RESOLUTION_INVALID' })
   })
 
   it('distinguishes UI format, rejects blank class_type and dangling links, and accepts colon node ids', () => {
@@ -195,7 +452,7 @@ describe('Comfy custom template analysis and registration', () => {
     expect(onePositive.b.inputs.noise_seed).toEqual(['a', 0])
   })
 
-  it('keeps raw brace data intact and reports only slot-like typos as nonblocking warnings', async () => {
+  it('keeps raw brace data intact and distinguishes unknown tokens from slot-like typos', async () => {
     const { registry } = createRegistry()
     const timelineData = JSON.stringify({
       version: 1,
@@ -222,6 +479,10 @@ describe('Comfy custom template analysis and registration', () => {
       errors: [],
       warnings: expect.arrayContaining([
         {
+          code: 'COMFY_TEMPLATE_PLACEHOLDER_UNKNOWN',
+          message: expect.stringMatching(/director\.inputs\.timeline_data.*\{\{unrelated_template_token\}\}/),
+        },
+        {
           code: 'COMFY_TEMPLATE_PLACEHOLDER_SUSPICIOUS',
           message: expect.stringMatching(/director\.inputs\.builder_state.*\{\{positve\}\}.*\{\{positive\}\}/),
         },
@@ -239,7 +500,7 @@ describe('Comfy custom template analysis and registration', () => {
         },
       ]),
     })
-    expect(analyzed.warnings).toHaveLength(4)
+    expect(analyzed.warnings).toHaveLength(5)
 
     const registered = await registry.registerTemplate({
       name: 'Raw widget state',
@@ -262,20 +523,12 @@ describe('Comfy custom template analysis and registration', () => {
     const embeddedKnownLiteral = structuredClone(custom)
     embeddedKnownLiteral.director.inputs.builder_state = JSON.stringify({ prompt: '{{positive}}' })
     expect(registry.analyzeTemplate(embeddedKnownLiteral)).toMatchObject({
-      ok: false,
-      errors: [{
-        code: 'COMFY_TEMPLATE_PLACEHOLDER_INVALID',
-        message: expect.stringContaining('director.inputs.builder_state'),
+      ok: true,
+      errors: [],
+      embeddedSlots: [{
+        nodeId: 'director', inputName: 'builder_state', token: '{{positive}}', occurrences: 1,
       }],
     })
-    await expect(registry.registerTemplate({
-      name: 'Embedded known literal',
-      kind: 'video',
-      mode: 't2v',
-      graphJson: embeddedKnownLiteral,
-      slotResolution: { positive: { nodeId: 'director', inputName: 'prompt' } },
-      promptProfile: 'h3-structured',
-    })).rejects.toMatchObject({ code: 'COMFY_TEMPLATE_PLACEHOLDER_INVALID' })
   })
 
   it('binds exact image-role literals and rejects an explicit mapping that contradicts them', async () => {
