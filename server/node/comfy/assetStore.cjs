@@ -21,11 +21,12 @@ const IMAGE_MIME_BY_EXT = Object.freeze({
 });
 const OUTPUT_MEDIA_TYPES = Object.freeze({
     'video/mp4': Object.freeze({ extensions: new Set(['mp4']), defaultExt: 'mp4', assetType: 'video' }),
+    'video/webm': Object.freeze({ extensions: new Set(['webm']), defaultExt: 'webm', assetType: 'video' }),
     'image/png': Object.freeze({ extensions: new Set(['png']), defaultExt: 'png', assetType: 'image' }),
     'image/jpeg': Object.freeze({ extensions: new Set(['jpg', 'jpeg']), defaultExt: 'jpg', assetType: 'image' }),
     'image/webp': Object.freeze({ extensions: new Set(['webp']), defaultExt: 'webp', assetType: 'image' }),
 });
-const OUTPUT_EXTENSIONS = Object.freeze(['mp4', 'png', 'jpg', 'jpeg', 'webp']);
+const OUTPUT_EXTENSIONS = Object.freeze(['mp4', 'webm', 'png', 'jpg', 'jpeg', 'webp']);
 
 function isSafeAssetId(id) {
     return typeof id === 'string'
@@ -115,6 +116,13 @@ function hasImageMagic(ext, bytes) {
 function hasOutputMagic(mediaType, bytes) {
     if (mediaType === 'video/mp4') {
         return bytes.length >= 12 && bytes.toString('ascii', 4, 8) === 'ftyp';
+    }
+    if (mediaType === 'video/webm') {
+        return bytes.length >= 4
+            && bytes[0] === 0x1A
+            && bytes[1] === 0x45
+            && bytes[2] === 0xDF
+            && bytes[3] === 0xA3;
     }
     const ext = OUTPUT_MEDIA_TYPES[mediaType]?.defaultExt;
     return Boolean(ext) && hasImageMagic(ext, bytes);

@@ -231,6 +231,72 @@ describe('Comfy input asset admission', () => {
     )).resolves.toEqual(result)
   })
 
+  it('rejects WebM output without the exact EBML magic bytes', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'comfy-webm-magic-'))
+    dirs.push(root)
+    const assets = createComfyAssetStore({
+      inlayDir: path.join(root, 'inlays'),
+      stagingDir: path.join(root, 'staging'),
+      fetchImpl: (async () => new Response(
+        Buffer.from('1A45DF0000000000', 'hex'),
+        { headers: { 'content-type': 'video/webm' } },
+      )) as typeof fetch,
+    })
+
+    await expect(assets.materializeOutput(
+      'http://127.0.0.1:8188',
+      'webm-invalid-magic',
+      { filename: 'result.webm', subfolder: '', type: 'output' },
+      { mediaType: 'video/webm' },
+    )).rejects.toMatchObject({ code: 'COMFY_OUTPUT_MAGIC_INVALID' })
+  })
+
+  it('crash-recovers WebM through the version 2 marker and video sidecar', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'comfy-webm-recovery-'))
+    dirs.push(root)
+    const inlayDir = path.join(root, 'inlays')
+    const stagingDir = path.join(root, 'staging')
+    const webm = Buffer.from('1A45DFA300000000', 'hex')
+    let failPayloadRename = true
+    const assets = createComfyAssetStore({
+      inlayDir,
+      stagingDir,
+      fetchImpl: (async () => new Response(webm, {
+        headers: { 'content-type': 'video/webm' },
+      })) as typeof fetch,
+      rename: async (from, to) => {
+        if (failPayloadRename && String(to).endsWith('.webm')) {
+          failPayloadRename = false
+          throw new Error('simulated WebM payload publish crash')
+        }
+        await rename(from, to)
+      },
+    })
+    const jobId = 'webm-recovery'
+    const output = { filename: 'result.webm', subfolder: 'video', type: 'output' }
+
+    await expect(assets.materializeOutput(
+      'http://127.0.0.1:8188',
+      jobId,
+      output,
+      { mediaType: 'video/webm' },
+    )).rejects.toMatchObject({ code: 'COMFY_OUTPUT_PUBLISH_RETRY', retryMaterialization: true })
+    expect(JSON.parse(await readFile(path.join(stagingDir, jobId, 'ready.json'), 'utf8'))).toMatchObject({
+      version: 2,
+      ext: 'webm',
+      mediaType: 'video/webm',
+      assetType: 'video',
+    })
+
+    const recovered = await assets.recoverMaterialization(jobId, { mediaType: 'video/webm', output })
+    expect(recovered).toMatchObject({ mimeType: 'video/webm', resultAssetId: `comfy-${jobId}` })
+    expect(await readFile(path.join(inlayDir, `${recovered.resultAssetId}.webm`))).toEqual(webm)
+    expect(JSON.parse(await readFile(
+      path.join(inlayDir, `${recovered.resultAssetId}.meta.json`),
+      'utf8',
+    ))).toEqual({ ext: 'webm', name: 'result.webm', type: 'video' })
+  })
+
   it.each([
     ['png', 'image/png', Buffer.from('89504E470D0A1A0A0000000D49484452', 'hex')],
     ['jpg', 'image/jpeg', Buffer.from('FFD8FFE000104A4649460001', 'hex')],

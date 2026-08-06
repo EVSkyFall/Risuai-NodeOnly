@@ -231,4 +231,110 @@ describe('Comfy custom template orchestration', () => {
     await orchestrator.runOnce()
     expect(await orchestrator.poll(job.jobId)).toMatchObject({ state: 'succeeded', mimeType: 'video/mp4' })
   })
+
+  it('ingests a Dasiwa WebM from the explicit gifs history key', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'comfy-dasiwa-webm-'))
+    dirs.push(root)
+    const inlayDir = path.join(root, 'inlays')
+    const webm = Buffer.from('1A45DFA300000000', 'hex')
+    const dasiwaOutput = {
+      filename: '204924_00001-audio.webm',
+      subfolder: 'video\\2026-08-06',
+      type: 'output',
+      format: 'video/webm',
+      codec: 'AV1',
+      container: 'WebM',
+      width: 896,
+      height: 608,
+      fps: 24,
+    }
+    const dasiwaHistory = {
+      gifs: [dasiwaOutput],
+      images: [dasiwaOutput],
+    }
+    let requestedView: [string, string][] = []
+    const fetchImpl = (async (urlValue: string | URL | Request) => {
+      const url = new URL(String(urlValue))
+      if (url.pathname === '/system_stats') return Response.json({ system: {} })
+      if (url.pathname === '/prompt') return Response.json({ prompt_id: 'dasiwa-webm-prompt' })
+      if (url.pathname === '/history/dasiwa-webm-prompt') {
+        return Response.json({
+          'dasiwa-webm-prompt': {
+            outputs: { '2568': dasiwaHistory },
+            status: { status_str: 'success', completed: true, messages: [] },
+          },
+        })
+      }
+      if (url.pathname === '/view') {
+        requestedView = [...url.searchParams.entries()]
+        return new Response(webm, { headers: { 'content-type': 'video/webm' } })
+      }
+      throw new Error(`Unexpected request ${url.pathname}`)
+    }) as typeof fetch
+
+    const db = new Database(':memory:')
+    dbs.push(db)
+    const store = createComfyStore(db, { defaultTemplateDir: templateDir })
+    const registry = createTemplateRegistry({ templateDir, store })
+    const outputDescriptor = {
+      nodeId: '2568',
+      classType: 'DaSiWa_EnhancedVideoCombine',
+      historyKey: 'gifs',
+      mediaType: 'video/webm',
+    }
+    const registered = await registry.registerTemplate({
+      name: 'Dasiwa cMMH3 V11 WebM',
+      kind: 'video',
+      mode: 't2v',
+      graphJson: {
+        text: { class_type: 'Text', inputs: { value: '{{positive}}' } },
+        sampler: { class_type: 'SamplerCustom', inputs: { seed: 1 } },
+        '2568': {
+          class_type: 'DaSiWa_EnhancedVideoCombine',
+          inputs: { images: ['sampler', 0] },
+        },
+      },
+      outputDescriptor,
+      promptProfile: 'h3-structured',
+    })
+    expect(registered.template.outputDescriptor).toEqual(outputDescriptor)
+
+    const orchestrator = createComfyOrchestrator({
+      store,
+      registry,
+      assets: createComfyAssetStore({ inlayDir, stagingDir: path.join(root, 'staging'), fetchImpl }),
+      fetchImpl,
+    })
+    await orchestrator.updateEndpoint('http://127.0.0.1:8188')
+    const submitted = await orchestrator.submit({
+      operationKey: 'dasiwa-webm-op',
+      template: registered.template.id,
+      slots: { positive: 'move', seed: 24 },
+    })
+    const raw = store.getJob(submitted.jobId)
+    store.updateJob(raw.jobId, raw.revision, 'queued', { state: 'submitting' })
+    await orchestrator.runOnce()
+    await orchestrator.runOnce()
+    await orchestrator.runOnce()
+
+    expect(await orchestrator.poll(submitted.jobId)).toMatchObject({
+      state: 'succeeded',
+      mimeType: 'video/webm',
+      resultAssetId: `comfy-${submitted.jobId}`,
+    })
+    expect(requestedView).toEqual([
+      ['filename', '204924_00001-audio.webm'],
+      ['subfolder', 'video/2026-08-06'],
+      ['type', 'output'],
+    ])
+    expect(await readFile(path.join(inlayDir, `comfy-${submitted.jobId}.webm`))).toEqual(webm)
+    expect(JSON.parse(await readFile(
+      path.join(inlayDir, `comfy-${submitted.jobId}.meta.json`),
+      'utf8',
+    ))).toEqual({
+      ext: 'webm',
+      name: '204924_00001-audio.webm',
+      type: 'video',
+    })
+  })
 })
