@@ -1445,6 +1445,111 @@ interface ComfyConfig {
     health?: ComfyHealth;
 }
 
+type ComfyTemplateGraph = string | Record<string, unknown>;
+type ComfyTemplateKind = 'video' | 'image';
+type ComfyTemplateMode = 't2v' | 'i2v' | 'flf2v' | 'ref2v' | 't2i' | 'i2i';
+type ComfyPromptProfile = 'wan-motion' | 'h3-structured' | 'image-tags';
+type ComfyOutputMediaType = 'video/mp4' | 'video/webm' | 'image/png' | 'image/jpeg' | 'image/webp';
+
+interface ComfyTemplateNodeRef {
+    nodeId: string;
+    inputName: string;
+}
+
+interface ComfyTemplateOutputDescriptor {
+    nodeId: string;
+    classType: string;
+    historyKey: string;
+    mediaType: ComfyOutputMediaType;
+}
+
+interface ComfyTemplateAnalysis {
+    ok: boolean;
+    errors: Array<{ code: string; message: string }>;
+    slots: {
+        positive: ComfyTemplateNodeRef | ComfyTemplateNodeRef[];
+        negative: ComfyTemplateNodeRef | ComfyTemplateNodeRef[];
+        inputImages: Array<ComfyTemplateNodeRef & { name?: string }>;
+        seeds: ComfyTemplateNodeRef[];
+    };
+    output: ComfyTemplateOutputDescriptor | ComfyTemplateOutputDescriptor[] | null;
+    stats: {
+        bytes?: number;
+        nodeCount?: number;
+        linkCount?: number;
+        stringInputCount?: number;
+        loadImageCount?: number;
+        seedInputCount?: number;
+        outputCandidateCount?: number;
+    };
+}
+
+interface ComfyTemplateRegistrationInput {
+    name: string;
+    kind: ComfyTemplateKind;
+    mode: ComfyTemplateMode;
+    graphJson: ComfyTemplateGraph;
+    slotResolution?: {
+        positive?: ComfyTemplateNodeRef;
+        negative?: ComfyTemplateNodeRef;
+        inputImages?: Array<{ nodeId: string; name: string }>;
+    };
+    outputDescriptor?: ComfyTemplateOutputDescriptor;
+    promptProfile?: ComfyPromptProfile;
+}
+
+interface ComfyTemplateManifestSlot {
+    name: string;
+    type: 'string' | 'imageAsset' | 'integer';
+    required: true;
+    minimum?: number;
+    maximum?: number;
+}
+
+interface ComfyTemplateSlotBindings {
+    positive: ComfyTemplateNodeRef;
+    negative?: ComfyTemplateNodeRef;
+    inputImages: Array<ComfyTemplateNodeRef & { name: string }>;
+    seeds: ComfyTemplateNodeRef[];
+}
+
+interface ComfyBuiltinTemplateSummary {
+    id: string;
+    hash: string;
+    source: 'builtin';
+    name: string;
+    kind: ComfyTemplateKind;
+    mode: ComfyTemplateMode;
+    slots: ComfyTemplateManifestSlot[];
+    outputDescriptor: ComfyTemplateOutputDescriptor;
+    promptProfile: ComfyPromptProfile;
+}
+
+interface ComfyCustomTemplateSummary {
+    id: string;
+    hash: string;
+    source: 'custom';
+    name: string;
+    kind: ComfyTemplateKind;
+    mode: ComfyTemplateMode;
+    slots: ComfyTemplateManifestSlot[];
+    slotBindings: ComfyTemplateSlotBindings;
+    outputDescriptor: ComfyTemplateOutputDescriptor;
+    promptProfile: ComfyPromptProfile;
+    createdAt: number;
+}
+
+interface ComfyBuiltinTemplateFailure {
+    id: string;
+    source: 'builtin';
+    error: { code: string; message: string };
+}
+
+type ComfyTemplateSummary =
+    | ComfyBuiltinTemplateSummary
+    | ComfyCustomTemplateSummary
+    | ComfyBuiltinTemplateFailure;
+
 interface ComfyOrchestratorAPI {
     submit(input: {
         operationKey: string;
@@ -1457,25 +1562,13 @@ interface ComfyOrchestratorAPI {
         operationKey: string;
     }): Promise<ComfyResult<{ job: ComfyJobSnapshot | null }>>;
     cancel(input: { jobId: string }): Promise<ComfyResult<{ job: ComfyJobSnapshot }>>;
-    listTemplates(): Promise<ComfyResult<{
-        templates: Array<
-            | {
-                id: string;
-                hash: string;
-                slots: Array<{
-                    name: string;
-                    type: 'string' | 'imageAsset' | 'integer';
-                    required: true;
-                    minimum?: number;
-                    maximum?: number;
-                }>;
-            }
-            | {
-                id: string;
-                error: { code: string; message: string };
-            }
-        >;
+    analyzeTemplate(graphJson: ComfyTemplateGraph): Promise<ComfyTemplateAnalysis | ComfyFailure>;
+    registerTemplate(input: ComfyTemplateRegistrationInput): Promise<ComfyResult<{
+        created: boolean;
+        template: ComfyCustomTemplateSummary;
     }>>;
+    removeTemplate(id: string): Promise<ComfyResult<{ id: string; removed: true }>>;
+    listTemplates(kind?: ComfyTemplateKind): Promise<ComfyResult<{ templates: ComfyTemplateSummary[] }>>;
     getConfig(): Promise<ComfyResult<{ config: ComfyConfig }>>;
     updateEndpoint(input: { url: string }): Promise<ComfyResult<{ config: ComfyConfig }>>;
     getHealth(): Promise<ComfyResult<{ health: ComfyHealth }>>;

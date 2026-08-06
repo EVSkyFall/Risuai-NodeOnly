@@ -53,6 +53,111 @@ export interface ComfyConfig {
     health?: ComfyHealth
 }
 
+export type ComfyTemplateGraph = string | Record<string, unknown>
+export type ComfyTemplateKind = 'video' | 'image'
+export type ComfyTemplateMode = 't2v' | 'i2v' | 'flf2v' | 'ref2v' | 't2i' | 'i2i'
+export type ComfyPromptProfile = 'wan-motion' | 'h3-structured' | 'image-tags'
+export type ComfyOutputMediaType = 'video/mp4' | 'video/webm' | 'image/png' | 'image/jpeg' | 'image/webp'
+
+export interface ComfyTemplateNodeRef {
+    nodeId: string
+    inputName: string
+}
+
+export interface ComfyTemplateOutputDescriptor {
+    nodeId: string
+    classType: string
+    historyKey: string
+    mediaType: ComfyOutputMediaType
+}
+
+export interface ComfyTemplateAnalysis {
+    ok: boolean
+    errors: Array<{ code: string; message: string }>
+    slots: {
+        positive: ComfyTemplateNodeRef | ComfyTemplateNodeRef[]
+        negative: ComfyTemplateNodeRef | ComfyTemplateNodeRef[]
+        inputImages: Array<ComfyTemplateNodeRef & { name?: string }>
+        seeds: ComfyTemplateNodeRef[]
+    }
+    output: ComfyTemplateOutputDescriptor | ComfyTemplateOutputDescriptor[] | null
+    stats: {
+        bytes?: number
+        nodeCount?: number
+        linkCount?: number
+        stringInputCount?: number
+        loadImageCount?: number
+        seedInputCount?: number
+        outputCandidateCount?: number
+    }
+}
+
+export interface ComfyTemplateRegistrationInput {
+    name: string
+    kind: ComfyTemplateKind
+    mode: ComfyTemplateMode
+    graphJson: ComfyTemplateGraph
+    slotResolution?: {
+        positive?: ComfyTemplateNodeRef
+        negative?: ComfyTemplateNodeRef
+        inputImages?: Array<{ nodeId: string; name: string }>
+    }
+    outputDescriptor?: ComfyTemplateOutputDescriptor
+    promptProfile?: ComfyPromptProfile
+}
+
+export interface ComfyTemplateManifestSlot {
+    name: string
+    type: 'string' | 'imageAsset' | 'integer'
+    required: true
+    minimum?: number
+    maximum?: number
+}
+
+export interface ComfyTemplateSlotBindings {
+    positive: ComfyTemplateNodeRef
+    negative?: ComfyTemplateNodeRef
+    inputImages: Array<ComfyTemplateNodeRef & { name: string }>
+    seeds: ComfyTemplateNodeRef[]
+}
+
+export interface ComfyBuiltinTemplateSummary {
+    id: string
+    hash: string
+    source: 'builtin'
+    name: string
+    kind: ComfyTemplateKind
+    mode: ComfyTemplateMode
+    slots: ComfyTemplateManifestSlot[]
+    outputDescriptor: ComfyTemplateOutputDescriptor
+    promptProfile: ComfyPromptProfile
+}
+
+export interface ComfyCustomTemplateSummary {
+    id: string
+    hash: string
+    source: 'custom'
+    name: string
+    kind: ComfyTemplateKind
+    mode: ComfyTemplateMode
+    slots: ComfyTemplateManifestSlot[]
+    slotBindings: ComfyTemplateSlotBindings
+    outputDescriptor: ComfyTemplateOutputDescriptor
+    promptProfile: ComfyPromptProfile
+    createdAt: number
+}
+
+export interface ComfyBuiltinTemplateFailure {
+    id: string
+    source: 'builtin'
+    error: { code: string; message: string }
+}
+
+export type ComfyTemplateSummary =
+    | ComfyBuiltinTemplateSummary
+    | ComfyCustomTemplateSummary
+    | ComfyBuiltinTemplateFailure
+
 export interface ComfyHttpResponse {
     status: number
     json(): Promise<any>
@@ -81,6 +186,26 @@ export class ComfyRelayError extends Error {
         this.code = code
         this.uncertain = uncertain
     }
+}
+
+function isTemplateAnalysis(value: unknown): value is ComfyTemplateAnalysis {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
+    const analysis = value as Record<string, unknown>
+    const slots = analysis.slots
+    const stats = analysis.stats
+    return typeof analysis.ok === 'boolean'
+        && Array.isArray(analysis.errors)
+        && slots !== null
+        && typeof slots === 'object'
+        && !Array.isArray(slots)
+        && Object.prototype.hasOwnProperty.call(slots, 'positive')
+        && Object.prototype.hasOwnProperty.call(slots, 'negative')
+        && Array.isArray((slots as Record<string, unknown>).inputImages)
+        && Array.isArray((slots as Record<string, unknown>).seeds)
+        && Object.prototype.hasOwnProperty.call(analysis, 'output')
+        && stats !== null
+        && typeof stats === 'object'
+        && !Array.isArray(stats)
 }
 
 async function defaultTransport(body: unknown): Promise<ComfyHttpResponse> {
@@ -123,6 +248,7 @@ export class ComfyOrchestratorClient {
         op: string,
         input: Record<string, unknown> = {},
         uncertainIfResponseInvalid = false,
+        responseEnvelope: 'standard' | 'analysis' = 'standard',
     ): Promise<any> {
         const response = await this.transport({ protocolVersion: PROTOCOL_VERSION, op, ...input })
         let data: any
@@ -140,7 +266,10 @@ export class ComfyOrchestratorClient {
         const successStatus = response.status >= 200 && response.status < 300
         const submitCouldHaveCommitted = uncertainIfResponseInvalid
             && (successStatus || response.status >= 500)
-        if (successStatus && data?.ok === true) {
+        const validSuccess = responseEnvelope === 'analysis'
+            ? isTemplateAnalysis(data)
+            : data?.ok === true
+        if (successStatus && validSuccess) {
             if (!uncertainIfResponseInvalid || (typeof data.jobId === 'string' && data.jobId.length > 0)) {
                 return data
             }
@@ -179,6 +308,16 @@ export function createComfySandboxApi(options: { transport?: ComfyTransport } = 
         }
     }
 
+    const analyzeTemplate = async (
+        graphJson: ComfyTemplateGraph,
+    ): Promise<ComfyTemplateAnalysis | ComfySandboxFailure> => {
+        try {
+            return await client.send('analyzeTemplate', { graphJson }, false, 'analysis') as ComfyTemplateAnalysis
+        } catch (error) {
+            return relayFailure(error)
+        }
+    }
+
     return {
         submit: (input: ComfySubmitInput) => call<{ jobId: string }>('submit', input as unknown as Record<string, unknown>, true),
         poll: (input: { jobId: string }) => call<{ job: ComfyJobSnapshot }>('poll', input),
@@ -186,7 +325,17 @@ export function createComfySandboxApi(options: { transport?: ComfyTransport } = 
             call<{ job: ComfyJobSnapshot | null }>('findByOperationKey', input)
         ),
         cancel: (input: { jobId: string }) => call<{ job: ComfyJobSnapshot }>('cancel', input),
-        listTemplates: () => call<{ templates: any[] }>('listTemplates', {}),
+        analyzeTemplate,
+        registerTemplate: (input: ComfyTemplateRegistrationInput) => (
+            call<{ created: boolean; template: ComfyCustomTemplateSummary }>(
+                'registerTemplate',
+                input as unknown as Record<string, unknown>,
+            )
+        ),
+        removeTemplate: (id: string) => call<{ id: string; removed: true }>('removeTemplate', { id }),
+        listTemplates: (kind?: ComfyTemplateKind) => (
+            call<{ templates: ComfyTemplateSummary[] }>('listTemplates', kind === undefined ? {} : { kind })
+        ),
         getConfig: () => call<{ config: ComfyConfig }>('getConfig', {}),
         updateEndpoint: (input: { url: string }) => call<{ config: ComfyConfig }>('updateEndpoint', input),
         getHealth: () => call<{ health: ComfyHealth }>('getHealth', {}),
