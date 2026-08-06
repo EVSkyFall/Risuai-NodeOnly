@@ -135,6 +135,207 @@ describe('Comfy custom template orchestration', () => {
     })).rejects.toMatchObject({ code: 'COMFY_OPERATION_KEY_CONFLICT' })
   })
 
+  it('resolves an omitted duration before storing and submits the numeric default', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'comfy-duration-default-'))
+    dirs.push(root)
+    let submittedPrompt: any
+    const fetchImpl = (async (urlValue: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(urlValue))
+      if (url.pathname === '/system_stats') return Response.json({ system: {} })
+      if (url.pathname === '/prompt') {
+        submittedPrompt = JSON.parse(String(init?.body)).prompt
+        return Response.json({ prompt_id: 'duration-default-prompt' })
+      }
+      throw new Error(`Unexpected request ${url.pathname}`)
+    }) as typeof fetch
+
+    const db = new Database(':memory:')
+    dbs.push(db)
+    const store = createComfyStore(db, { defaultTemplateDir: templateDir })
+    const registry = createTemplateRegistry({ templateDir, store })
+    const registered = await registry.registerTemplate({
+      name: 'Duration default video',
+      kind: 'video',
+      mode: 't2v',
+      graphJson: {
+        text: { class_type: 'Text', inputs: { value: '{{positive}}' } },
+        director: { class_type: 'DasiwaDirector', inputs: { duration: 5 } },
+        sampler: { class_type: 'SamplerCustom', inputs: { seed: 1 } },
+        output: { class_type: 'SaveVideo', inputs: { images: ['sampler', 0] } },
+      },
+      slotResolution: { duration: { nodeId: 'director', inputName: 'duration' } },
+      promptProfile: 'h3-structured',
+    })
+    const orchestrator = createComfyOrchestrator({
+      store,
+      registry,
+      assets: createComfyAssetStore({
+        inlayDir: path.join(root, 'inlays'),
+        stagingDir: path.join(root, 'staging'),
+        fetchImpl,
+      }),
+      fetchImpl,
+    })
+    await orchestrator.updateEndpoint('http://127.0.0.1:8188')
+
+    const submitted = await orchestrator.submit({
+      operationKey: 'duration-default-op',
+      template: registered.template.id,
+      slots: { positive: 'move', seed: 12 },
+    })
+    expect(store.getJob(submitted.jobId).slots).toEqual({ positive: 'move', seed: 12, duration: 5 })
+
+    await orchestrator.runOnce()
+    expect(submittedPrompt.director.inputs.duration).toBe(5)
+    expect(typeof submittedPrompt.director.inputs.duration).toBe('number')
+  })
+
+  it('rejects duration on a template that does not declare the slot', async () => {
+    const db = new Database(':memory:')
+    dbs.push(db)
+    const store = createComfyStore(db, { defaultTemplateDir: templateDir })
+    const registry = createTemplateRegistry({ templateDir, store })
+    const orchestrator = createComfyOrchestrator({ store, registry, assets: {} })
+
+    await expect(orchestrator.submit({
+      operationKey: 'undeclared-duration-op',
+      template: 'wan-i2v',
+      slots: { positive: 'move', input_image: 'missing', seed: 12, duration: 5 },
+    })).rejects.toMatchObject({ code: 'COMFY_SLOT_UNKNOWN' })
+  })
+
+  it('accepts only positive finite duration values at submit', async () => {
+    const db = new Database(':memory:')
+    dbs.push(db)
+    const store = createComfyStore(db, { defaultTemplateDir: templateDir })
+    const registry = createTemplateRegistry({ templateDir, store })
+    const registered = await registry.registerTemplate({
+      name: 'Validated submit duration',
+      kind: 'video',
+      mode: 't2v',
+      graphJson: {
+        text: { class_type: 'Text', inputs: { value: '{{positive}}' } },
+        director: { class_type: 'DasiwaDirector', inputs: { duration: 5 } },
+        sampler: { class_type: 'SamplerCustom', inputs: { seed: 1 } },
+        output: { class_type: 'SaveVideo', inputs: { images: ['sampler', 0] } },
+      },
+      slotResolution: { duration: { nodeId: 'director', inputName: 'duration' } },
+      promptProfile: 'h3-structured',
+    })
+    const orchestrator = createComfyOrchestrator({ store, registry, assets: {} })
+
+    for (const [index, duration] of [0, -1, '5', Number.NaN, Number.POSITIVE_INFINITY, undefined].entries()) {
+      await expect(orchestrator.submit({
+        operationKey: `invalid-submit-duration-${index}`,
+        template: registered.template.id,
+        slots: { positive: 'move', seed: 12, duration },
+      })).rejects.toMatchObject({ code: 'COMFY_SLOT_INVALID' })
+    }
+  })
+
+  it('includes resolved duration in binding hashes and replay identity', async () => {
+    const fetchImpl = (async (urlValue: string | URL | Request) => {
+      const url = new URL(String(urlValue))
+      if (url.pathname === '/system_stats') return Response.json({ system: {} })
+      throw new Error(`Unexpected request ${url.pathname}`)
+    }) as typeof fetch
+    const db = new Database(':memory:')
+    dbs.push(db)
+    const store = createComfyStore(db, { defaultTemplateDir: templateDir })
+    const registry = createTemplateRegistry({ templateDir, store })
+    const registered = await registry.registerTemplate({
+      name: 'Duration binding video',
+      kind: 'video',
+      mode: 't2v',
+      graphJson: {
+        text: { class_type: 'Text', inputs: { value: '{{positive}}' } },
+        director: { class_type: 'DasiwaDirector', inputs: { duration: 5 } },
+        sampler: { class_type: 'SamplerCustom', inputs: { seed: 1 } },
+        output: { class_type: 'SaveVideo', inputs: { images: ['sampler', 0] } },
+      },
+      slotResolution: { duration: { nodeId: 'director', inputName: 'duration' } },
+      promptProfile: 'h3-structured',
+    })
+    const orchestrator = createComfyOrchestrator({ store, registry, assets: {}, fetchImpl })
+    await orchestrator.updateEndpoint('http://127.0.0.1:8188')
+
+    const first = await orchestrator.submit({
+      operationKey: 'duration-binding-7',
+      template: registered.template.id,
+      slots: { positive: 'move', seed: 12, duration: 7 },
+    })
+    await expect(orchestrator.submit({
+      operationKey: 'duration-binding-7',
+      template: registered.template.id,
+      slots: { positive: 'move', seed: 12, duration: 7 },
+    })).resolves.toMatchObject({ jobId: first.jobId })
+    await expect(orchestrator.submit({
+      operationKey: 'duration-binding-7',
+      template: registered.template.id,
+      slots: { positive: 'move', seed: 12, duration: 8 },
+    })).rejects.toMatchObject({ code: 'COMFY_OPERATION_KEY_CONFLICT' })
+
+    const second = await orchestrator.submit({
+      operationKey: 'duration-binding-8',
+      template: registered.template.id,
+      slots: { positive: 'move', seed: 12, duration: 8 },
+    })
+    expect(second.jobId).not.toBe(first.jobId)
+    expect(store.getJob(second.jobId).bindingHash).not.toBe(store.getJob(first.jobId).bindingHash)
+
+    const defaulted = await orchestrator.submit({
+      operationKey: 'duration-binding-default',
+      template: registered.template.id,
+      slots: { positive: 'move', seed: 12 },
+    })
+    await expect(orchestrator.submit({
+      operationKey: 'duration-binding-default',
+      template: registered.template.id,
+      slots: { positive: 'move', seed: 12, duration: 5 },
+    })).resolves.toMatchObject({ jobId: defaulted.jobId })
+
+    await registry.removeTemplate(registered.template.id)
+    await expect(orchestrator.submit({
+      operationKey: 'duration-binding-default',
+      template: registered.template.id,
+      slots: { positive: 'move', seed: 12 },
+    })).resolves.toMatchObject({ jobId: defaulted.jobId })
+  })
+
+  it('preserves raw-slot replay compatibility for legacy jobs without a template-slot snapshot', async () => {
+    const fetchImpl = (async (urlValue: string | URL | Request) => {
+      const url = new URL(String(urlValue))
+      if (url.pathname === '/system_stats') return Response.json({ system: {} })
+      throw new Error(`Unexpected request ${url.pathname}`)
+    }) as typeof fetch
+    const db = new Database(':memory:')
+    dbs.push(db)
+    const store = createComfyStore(db, { defaultTemplateDir: templateDir })
+    const registry = createTemplateRegistry({ templateDir, store })
+    const registered = await registry.registerTemplate({
+      name: 'Legacy replay video',
+      kind: 'video',
+      mode: 't2v',
+      graphJson: {
+        text: { class_type: 'Text', inputs: { value: '{{positive}}' } },
+        sampler: { class_type: 'SamplerCustom', inputs: { seed: 1 } },
+        output: { class_type: 'SaveVideo', inputs: { images: ['sampler', 0] } },
+      },
+      promptProfile: 'h3-structured',
+    })
+    const orchestrator = createComfyOrchestrator({ store, registry, assets: {}, fetchImpl })
+    await orchestrator.updateEndpoint('http://127.0.0.1:8188')
+    const input = {
+      operationKey: 'legacy-null-template-slots',
+      template: registered.template.id,
+      slots: { positive: 'move', seed: 12 },
+    }
+    const submitted = await orchestrator.submit(input)
+    db.prepare('UPDATE comfy_jobs SET template_slots_json = NULL WHERE job_id = ?').run(submitted.jobId)
+
+    await expect(orchestrator.submit(input)).resolves.toMatchObject({ jobId: submitted.jobId })
+  })
+
   it('uses an explicit custom history key and persists multi-input upload progress before prompt submission', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'comfy-custom-video-'))
     dirs.push(root)

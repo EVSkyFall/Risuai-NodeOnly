@@ -290,7 +290,10 @@ function createComfyOrchestrator(options) {
         const target = normalizeTarget(input.target);
         const prior = store.findByOperationKey(input.operationKey);
         if (prior) {
-            const requested = store.computeBindingHash({ templateId: input.template, slots: input.slots, target });
+            const requestedSlots = prior.templateSlots == null
+                ? input.slots
+                : registry.resolveRuntimeSlots(prior.templateSlots, input.slots);
+            const requested = store.computeBindingHash({ templateId: input.template, slots: requestedSlots, target });
             const stored = store.computeBindingHash({ templateId: prior.templateId, slots: prior.slots, target: prior.target });
             if (requested !== stored || !sameTarget(target, prior.target)) {
                 throw comfyError(
@@ -302,16 +305,17 @@ function createComfyOrchestrator(options) {
             return toPublicJob(prior);
         }
         const template = await registry.loadTemplate(input.template);
+        const resolvedSlots = registry.resolveRuntimeSlots(template.templateSlots, input.slots);
         registry.instantiateSnapshot(
             template.sourceText,
             template.hash,
-            input.slots,
+            resolvedSlots,
             template.id,
             { templateSlots: template.templateSlots, outputDescriptor: template.outputDescriptor },
         );
         const inputAssets = {};
         for (const imageSlot of template.templateSlots.inputImages ?? []) {
-            const assetId = input.slots[imageSlot.name];
+            const assetId = resolvedSlots[imageSlot.name];
             const inputAsset = await assets.readInputAsset(assetId);
             inputAssets[imageSlot.name] = { assetId, hash: inputAsset.hash };
         }
@@ -320,7 +324,7 @@ function createComfyOrchestrator(options) {
         const binding = {
             templateId: input.template,
             templateHash: template.hash,
-            slots: input.slots,
+            slots: resolvedSlots,
             inputAssets,
             endpointGeneration,
             target,
@@ -341,7 +345,7 @@ function createComfyOrchestrator(options) {
                 templateKind: template.kind,
                 templateSlots: template.templateSlots,
                 outputDescriptor: template.outputDescriptor,
-                slots: input.slots,
+                slots: resolvedSlots,
                 inputAssets,
                 endpointUrl,
                 endpointGeneration,

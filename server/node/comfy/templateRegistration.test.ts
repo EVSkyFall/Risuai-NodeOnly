@@ -709,6 +709,116 @@ describe('Comfy custom template analysis and registration', () => {
     })
   })
 
+  it('registers a numeric duration binding and exposes its captured default in template metadata', async () => {
+    const { registry } = createRegistry()
+    const custom = graph({ images: [] })
+    custom.director = { class_type: 'DasiwaDirector', inputs: { duration: 5 } }
+
+    const registered = await registry.registerTemplate({
+      name: 'Duration video',
+      kind: 'video',
+      mode: 't2v',
+      graphJson: custom,
+      slotResolution: { duration: { nodeId: 'director', inputName: 'duration' } },
+      promptProfile: 'h3-structured',
+    })
+
+    expect(registered.template).toMatchObject({
+      slots: expect.arrayContaining([{
+        name: 'duration',
+        type: 'number',
+        required: false,
+        exclusiveMinimum: 0,
+        defaultValue: 5,
+      }]),
+      slotBindings: {
+        duration: { nodeId: 'director', inputName: 'duration', defaultValue: 5 },
+      },
+    })
+    expect(await registry.listTemplates('video')).toContainEqual(expect.objectContaining({
+      id: registered.template.id,
+      slotBindings: expect.objectContaining({
+        duration: { nodeId: 'director', inputName: 'duration', defaultValue: 5 },
+      }),
+    }))
+  })
+
+  it('compiles an explicit duration as a number and injects the registered default when omitted', async () => {
+    const { registry } = createRegistry()
+    const custom = graph({ images: [] })
+    custom.director = { class_type: 'DasiwaDirector', inputs: { duration: 5 } }
+    const registered = await registry.registerTemplate({
+      name: 'Duration compile video',
+      kind: 'video',
+      mode: 't2v',
+      graphJson: custom,
+      slotResolution: { duration: { nodeId: 'director', inputName: 'duration' } },
+      promptProfile: 'h3-structured',
+    })
+
+    const explicit = await registry.instantiate(registered.template.id, {
+      positive: 'move', seed: 9, duration: 7.5,
+    })
+    expect(explicit.prompt.director.inputs.duration).toBe(7.5)
+    expect(typeof explicit.prompt.director.inputs.duration).toBe('number')
+
+    const defaulted = await registry.instantiate(registered.template.id, {
+      positive: 'move', seed: 9,
+    })
+    expect(defaulted.prompt.director.inputs.duration).toBe(5)
+    expect(typeof defaulted.prompt.director.inputs.duration).toBe('number')
+  })
+
+  it('rejects non-positive, non-finite, non-numeric, and explicitly undefined duration values', async () => {
+    const { registry } = createRegistry()
+    const custom = graph({ images: [] })
+    custom.director = { class_type: 'DasiwaDirector', inputs: { duration: 5 } }
+    const registered = await registry.registerTemplate({
+      name: 'Validated duration video',
+      kind: 'video',
+      mode: 't2v',
+      graphJson: custom,
+      slotResolution: { duration: { nodeId: 'director', inputName: 'duration' } },
+      promptProfile: 'h3-structured',
+    })
+
+    for (const duration of [0, -1, '5', Number.NaN, Number.POSITIVE_INFINITY, undefined]) {
+      await expect(registry.instantiate(registered.template.id, {
+        positive: 'move', seed: 9, duration,
+      })).rejects.toMatchObject({ code: 'COMFY_SLOT_INVALID' })
+    }
+  })
+
+  it('rejects duration resolutions that do not target a positive numeric graph input', async () => {
+    const { registry } = createRegistry()
+    for (const defaultValue of ['5', 0, -1]) {
+      const custom = graph({ images: [] })
+      custom.director = { class_type: 'DasiwaDirector', inputs: { duration: defaultValue } }
+
+      await expect(registry.registerTemplate({
+        name: 'Invalid duration video',
+        kind: 'video',
+        mode: 't2v',
+        graphJson: custom,
+        slotResolution: { duration: { nodeId: 'director', inputName: 'duration' } },
+        promptProfile: 'h3-structured',
+      })).rejects.toMatchObject({ code: 'COMFY_TEMPLATE_SLOT_RESOLUTION_INVALID' })
+    }
+  })
+
+  it('rejects a duration binding that overlaps an existing structural slot', async () => {
+    const { registry } = createRegistry()
+
+    await expect(registry.registerTemplate({
+      name: 'Overlapping duration video',
+      kind: 'video',
+      mode: 't2v',
+      graphJson: graph({ images: [] }),
+      slotResolution: { duration: { nodeId: 'sampler', inputName: 'seed' } },
+      promptProfile: 'h3-structured',
+    })).rejects.toMatchObject({ code: 'COMFY_TEMPLATE_SLOT_RESOLUTION_INVALID' })
+  })
+
   it('enforces kind, mode, output family, image cardinality, and image role namespace together', async () => {
     const { registry } = createRegistry()
     await expect(registry.registerTemplate({

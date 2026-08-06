@@ -7,6 +7,7 @@ export interface ComfySlots {
     positive: string
     input_image: string
     seed: number
+    duration?: number
 }
 
 export interface ComfySubmitInput {
@@ -115,6 +116,7 @@ export interface ComfyTemplateRegistrationInput {
     slotResolution?: {
         positive?: ComfyTemplateNodeRef
         negative?: ComfyTemplateNodeRef
+        duration?: ComfyTemplateNodeRef
         inputImages?: Array<{ nodeId: string; name: string }>
         embedded?: {
             slots?: Array<ComfyTemplateNodeRef & { token: string }>
@@ -125,7 +127,7 @@ export interface ComfyTemplateRegistrationInput {
     promptProfile?: ComfyPromptProfile
 }
 
-export interface ComfyTemplateManifestSlot {
+export interface ComfyTemplateRequiredManifestSlot {
     name: string
     type: 'string' | 'imageAsset' | 'integer'
     required: true
@@ -133,11 +135,24 @@ export interface ComfyTemplateManifestSlot {
     maximum?: number
 }
 
+export interface ComfyTemplateDurationManifestSlot {
+    name: 'duration'
+    type: 'number'
+    required: false
+    exclusiveMinimum: 0
+    defaultValue: number
+}
+
+export type ComfyTemplateManifestSlot =
+    | ComfyTemplateRequiredManifestSlot
+    | ComfyTemplateDurationManifestSlot
+
 export interface ComfyTemplateSlotBindings {
     positive: ComfyTemplateNodeRef
     negative?: ComfyTemplateNodeRef
     inputImages: Array<ComfyTemplateNodeRef & { name: string }>
     seeds: ComfyTemplateNodeRef[]
+    duration?: ComfyTemplateNodeRef & { defaultValue: number }
     embedded?: {
         slots: Array<ComfyTemplateEmbeddedSlot & { name: string }>
         inputImages: Array<ComfyTemplateEmbeddedImageLiteral & { name: string }>

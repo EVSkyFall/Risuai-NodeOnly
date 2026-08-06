@@ -607,6 +607,7 @@ function expectedRuntimeSlots(templateSlots) {
     if (templateSlots.positive) expected.push(['positive', 'string']);
     if (templateSlots.negative) expected.push(['negative', 'string']);
     if ((templateSlots.seeds ?? []).length > 0) expected.push(['seed', 'integer']);
+    if (templateSlots.duration) expected.push(['duration', 'positiveNumber', false]);
     return expected;
 }
 
@@ -614,7 +615,8 @@ function validateRuntimeSlots(templateSlots, slots) {
     if (!isPlainObject(slots)) throw comfyError('COMFY_SLOTS_INVALID', 'Template slots must be an object');
     const expected = expectedRuntimeSlots(templateSlots);
     const names = new Set(expected.map(([name]) => name));
-    for (const [name] of expected) {
+    for (const [name, , required = true] of expected) {
+        if (!required) continue;
         if (!Object.prototype.hasOwnProperty.call(slots, name)) {
             throw comfyError('COMFY_SLOT_MISSING', `Required template slot is missing: ${name}`);
         }
@@ -630,6 +632,9 @@ function validateRuntimeSlots(templateSlots, slots) {
         if (type === 'integer' && (!Number.isSafeInteger(value) || value < 0)) {
             throw comfyError('COMFY_SLOT_INVALID', `${name} must be a non-negative safe integer`);
         }
+        if (type === 'positiveNumber' && (typeof value !== 'number' || !Number.isFinite(value) || value <= 0)) {
+            throw comfyError('COMFY_SLOT_INVALID', `${name} must be a positive finite number`);
+        }
         if (
             type === 'imageAsset'
             && (
@@ -644,6 +649,16 @@ function validateRuntimeSlots(templateSlots, slots) {
             throw comfyError('COMFY_SLOT_INVALID', `${name} must be a safe Comfy input path or asset id`);
         }
     }
+}
+
+function resolveRuntimeSlots(templateSlots, slots) {
+    if (!isPlainObject(slots)) throw comfyError('COMFY_SLOTS_INVALID', 'Template slots must be an object');
+    const resolved = { ...slots };
+    if (templateSlots.duration && !Object.prototype.hasOwnProperty.call(resolved, 'duration')) {
+        resolved.duration = templateSlots.duration.defaultValue;
+    }
+    validateRuntimeSlots(templateSlots, resolved);
+    return resolved;
 }
 
 function setInput(document, ref, value) {
@@ -828,17 +843,18 @@ function applyEmbeddedInputs(document, templateSlots, slots) {
 
 function instantiateDocument(document, templateSlots, slots, outputDescriptor) {
     assertEmbeddedSnapshotBindings(document, templateSlots);
-    validateRuntimeSlots(templateSlots, slots);
+    const resolvedSlots = resolveRuntimeSlots(templateSlots, slots);
     const prompt = structuredClone(document);
-    if (templateSlots.positive && !templateSlots.positive.embedded) setInput(prompt, templateSlots.positive, slots.positive);
-    if (templateSlots.negative && !templateSlots.negative.embedded) setInput(prompt, templateSlots.negative, slots.negative);
+    if (templateSlots.positive && !templateSlots.positive.embedded) setInput(prompt, templateSlots.positive, resolvedSlots.positive);
+    if (templateSlots.negative && !templateSlots.negative.embedded) setInput(prompt, templateSlots.negative, resolvedSlots.negative);
     for (const image of templateSlots.inputImages ?? []) {
-        if (!image.embedded) setInput(prompt, image, slots[image.name]);
+        if (!image.embedded) setInput(prompt, image, resolvedSlots[image.name]);
     }
     for (const seed of templateSlots.seeds ?? []) {
-        if (!seed.embedded) setInput(prompt, seed, slots.seed);
+        if (!seed.embedded) setInput(prompt, seed, resolvedSlots.seed);
     }
-    applyEmbeddedInputs(prompt, templateSlots, slots);
+    if (templateSlots.duration) setInput(prompt, templateSlots.duration, resolvedSlots.duration);
+    applyEmbeddedInputs(prompt, templateSlots, resolvedSlots);
     return {
         prompt,
         outputDescriptor,
@@ -854,6 +870,29 @@ function selectNodeRef(value, candidates, code) {
     const match = candidates.find(candidate => candidate.nodeId === value.nodeId && candidate.inputName === value.inputName);
     if (!match) throw comfyError(code, 'Slot resolution does not match an analyzed candidate');
     return { nodeId: match.nodeId, inputName: match.inputName };
+}
+
+function resolveDurationSlot(document, value) {
+    if (value == null) return undefined;
+    if (!isPlainObject(value) || typeof value.nodeId !== 'string' || typeof value.inputName !== 'string') {
+        throw comfyError(
+            'COMFY_TEMPLATE_SLOT_RESOLUTION_INVALID',
+            'Duration resolution must identify nodeId and inputName',
+        );
+    }
+    const node = Object.prototype.hasOwnProperty.call(document, value.nodeId)
+        ? document[value.nodeId]
+        : null;
+    const defaultValue = node && Object.prototype.hasOwnProperty.call(node.inputs, value.inputName)
+        ? node.inputs[value.inputName]
+        : undefined;
+    if (typeof defaultValue !== 'number' || !Number.isFinite(defaultValue) || defaultValue <= 0) {
+        throw comfyError(
+            'COMFY_TEMPLATE_SLOT_RESOLUTION_INVALID',
+            'Duration resolution must target a positive finite numeric input',
+        );
+    }
+    return { nodeId: value.nodeId, inputName: value.inputName, defaultValue };
 }
 
 function embeddedCandidateKey(nodeId, inputName, source) {
@@ -1043,7 +1082,18 @@ function resolveTemplateSlots(inspected, slotResolution) {
             seeds.push({ nodeId: embeddedSeed.nodeId, inputName: embeddedSeed.inputName, embedded: true });
         }
     }
-    for (const ref of [positive, negative, ...inputImages, ...seeds].filter(Boolean)) {
+    const duration = resolveDurationSlot(inspected.document, resolution.duration);
+    const structuralRefs = [positive, negative, ...inputImages, ...seeds].filter(Boolean);
+    if (duration && (
+        structuralRefs.some(ref => ref.nodeId === duration.nodeId && ref.inputName === duration.inputName)
+        || isEmbeddedInputRef(embedded, duration)
+    )) {
+        throw comfyError(
+            'COMFY_TEMPLATE_SLOT_RESOLUTION_INVALID',
+            'Duration cannot overwrite another template slot',
+        );
+    }
+    for (const ref of structuralRefs) {
         if (!ref.embedded && isEmbeddedInputRef(embedded, ref)) {
             throw comfyError(
                 'COMFY_TEMPLATE_SLOT_RESOLUTION_INVALID',
@@ -1056,6 +1106,7 @@ function resolveTemplateSlots(inspected, slotResolution) {
         ...(negative ? { negative } : {}),
         inputImages,
         seeds,
+        ...(duration ? { duration } : {}),
         ...((embedded.slots.length > 0 || embedded.inputImages.length > 0) ? { embedded } : {}),
     };
 }
@@ -1126,6 +1177,12 @@ function buildManifest(templateSlots) {
         manifest.push({
             name: 'seed', type: 'integer', required: true,
             minimum: 0, maximum: Number.MAX_SAFE_INTEGER,
+        });
+    }
+    if (templateSlots.duration) {
+        manifest.push({
+            name: 'duration', type: 'number', required: false,
+            exclusiveMinimum: 0, defaultValue: templateSlots.duration.defaultValue,
         });
     }
     return manifest;
@@ -1387,6 +1444,7 @@ function createTemplateRegistry(options = {}) {
         analyzeTemplate,
         registerTemplate,
         removeTemplate,
+        resolveRuntimeSlots,
         instantiate,
         instantiateSnapshot,
         loadTemplate,

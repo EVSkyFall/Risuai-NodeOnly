@@ -1507,6 +1507,7 @@ interface ComfyTemplateRegistrationInput {
     slotResolution?: {
         positive?: ComfyTemplateNodeRef;
         negative?: ComfyTemplateNodeRef;
+        duration?: ComfyTemplateNodeRef;
         inputImages?: Array<{ nodeId: string; name: string }>;
         embedded?: {
             slots?: Array<ComfyTemplateNodeRef & { token: string }>;
@@ -1517,7 +1518,7 @@ interface ComfyTemplateRegistrationInput {
     promptProfile?: ComfyPromptProfile;
 }
 
-interface ComfyTemplateManifestSlot {
+interface ComfyTemplateRequiredManifestSlot {
     name: string;
     type: 'string' | 'imageAsset' | 'integer';
     required: true;
@@ -1525,11 +1526,24 @@ interface ComfyTemplateManifestSlot {
     maximum?: number;
 }
 
+interface ComfyTemplateDurationManifestSlot {
+    name: 'duration';
+    type: 'number';
+    required: false;
+    exclusiveMinimum: 0;
+    defaultValue: number;
+}
+
+type ComfyTemplateManifestSlot =
+    | ComfyTemplateRequiredManifestSlot
+    | ComfyTemplateDurationManifestSlot;
+
 interface ComfyTemplateSlotBindings {
     positive: ComfyTemplateNodeRef;
     negative?: ComfyTemplateNodeRef;
     inputImages: Array<ComfyTemplateNodeRef & { name: string }>;
     seeds: ComfyTemplateNodeRef[];
+    duration?: ComfyTemplateNodeRef & { defaultValue: number };
     embedded?: {
         slots: Array<ComfyTemplateEmbeddedSlot & { name: string }>;
         inputImages: Array<ComfyTemplateEmbeddedImageLiteral & { name: string }>;
@@ -1577,7 +1591,7 @@ interface ComfyOrchestratorAPI {
     submit(input: {
         operationKey: string;
         template: string;
-        slots: { positive: string; input_image: string; seed: number };
+        slots: { positive: string; input_image: string; seed: number; duration?: number };
         target?: { charId?: string; chatId?: string };
     }): Promise<ComfyResult<{ jobId: string }>>;
     poll(input: { jobId: string }): Promise<ComfyResult<{ job: ComfyJobSnapshot }>>;
