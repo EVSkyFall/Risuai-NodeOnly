@@ -1,6 +1,7 @@
 // @vitest-environment node
 
 import Database from 'better-sqlite3'
+import { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 import registryPkg from './templateRegistry.cjs'
@@ -9,6 +10,7 @@ import storePkg from './store.cjs'
 const { createTemplateRegistry } = registryPkg as any
 const { createComfyStore } = storePkg as any
 const templateDir = fileURLToPath(new URL('./templates/', import.meta.url))
+const fl2vaFixturePath = fileURLToPath(new URL('./fixtures/DasiwaMinimaxH3WorkflowsT2VA_cMMH3V11_FL2VA.min.json', import.meta.url))
 const dbs: any[] = []
 
 afterEach(() => {
@@ -50,18 +52,74 @@ function graph(options: {
 }
 
 describe('Comfy custom template analysis and registration', () => {
+  it('registers the FL2VA fixture without mistaking serialized widget state for placeholders', async () => {
+    const { registry } = createRegistry()
+    const graphJson = await readFile(fl2vaFixturePath, 'utf8')
+    const source = JSON.parse(graphJson)
+
+    const analyzed = registry.analyzeTemplate(graphJson)
+    expect(analyzed).toMatchObject({
+      ok: true,
+      errors: [],
+      warnings: [],
+      slots: {
+        positive: expect.arrayContaining([{ nodeId: '2693', inputName: 'prompt' }]),
+        inputImages: [],
+      },
+      output: null,
+    })
+
+    const registered = await registry.registerTemplate({
+      name: 'Dasiwa cMMH3 V11 FL2VA',
+      kind: 'video',
+      mode: 'flf2v',
+      graphJson,
+      slotResolution: { positive: { nodeId: '2693', inputName: 'prompt' } },
+      outputDescriptor: {
+        nodeId: '2568',
+        classType: 'DaSiWa_EnhancedVideoCombine',
+        historyKey: 'gifs',
+        mediaType: 'video/webm',
+      },
+      promptProfile: 'h3-structured',
+    })
+    expect(registered).toMatchObject({
+      created: true,
+      template: {
+        mode: 'flf2v',
+        slotBindings: {
+          positive: { nodeId: '2693', inputName: 'prompt' },
+          inputImages: [],
+        },
+        outputDescriptor: {
+          nodeId: '2568',
+          classType: 'DaSiWa_EnhancedVideoCombine',
+          historyKey: 'gifs',
+          mediaType: 'video/webm',
+        },
+      },
+    })
+
+    const instantiated = await registry.instantiate(registered.template.id, { positive: 'resolved FL2VA prompt' })
+    expect(instantiated.prompt['2693'].inputs.prompt).toBe('resolved FL2VA prompt')
+    expect(instantiated.prompt['2693'].inputs.timeline_data).toBe(source['2693'].inputs.timeline_data)
+    expect(instantiated.prompt['2693'].inputs.builder_state).toBe(source['2693'].inputs.builder_state)
+  })
+
   it('distinguishes UI format, rejects blank class_type and dangling links, and accepts colon node ids', () => {
     const { registry } = createRegistry()
 
     expect(registry.analyzeTemplate({ nodes: [], links: [] })).toMatchObject({
       ok: false,
       errors: [{ code: 'COMFY_TEMPLATE_UI_FORMAT', message: expect.stringContaining('API Format') }],
+      warnings: [],
     })
     expect(registry.analyzeTemplate({
       '2693': { class_type: '', inputs: {} },
     })).toMatchObject({
       ok: false,
       errors: [{ code: 'COMFY_TEMPLATE_CLASS_TYPE_MISSING' }],
+      warnings: [],
     })
     expect(registry.analyzeTemplate({
       ...graph(),
@@ -83,6 +141,11 @@ describe('Comfy custom template analysis and registration', () => {
         historyKey: 'images',
         mediaType: 'video/mp4',
       },
+    })
+    expect(registry.analyzeTemplate('{')).toMatchObject({
+      ok: false,
+      errors: [{ code: 'COMFY_TEMPLATE_INVALID_JSON' }],
+      warnings: [],
     })
   })
 
@@ -130,6 +193,160 @@ describe('Comfy custom template analysis and registration', () => {
       },
     })
     expect(onePositive.b.inputs.noise_seed).toEqual(['a', 0])
+  })
+
+  it('keeps raw brace data intact and reports only slot-like typos as nonblocking warnings', async () => {
+    const { registry } = createRegistry()
+    const timelineData = JSON.stringify({
+      version: 1,
+      builder_state: { template: '{{unrelated_template_token}}', items: [] },
+    })
+    const custom = {
+      director: {
+        class_type: 'MiniMaxH3Director',
+        inputs: {
+          prompt: 'ordinary prompt',
+          timeline_data: timelineData,
+          builder_state: '{{positve}}',
+          reference_zero: '{{reference_0}}',
+          reference_missing: '{{reference_}}',
+          reference_trailing: '{{reference_1x}}',
+        },
+      },
+      output: { class_type: 'SaveVideo', inputs: { images: ['director', 0] } },
+    }
+
+    const analyzed = registry.analyzeTemplate(custom)
+    expect(analyzed).toMatchObject({
+      ok: true,
+      errors: [],
+      warnings: expect.arrayContaining([
+        {
+          code: 'COMFY_TEMPLATE_PLACEHOLDER_SUSPICIOUS',
+          message: expect.stringMatching(/director\.inputs\.builder_state.*\{\{positve\}\}.*\{\{positive\}\}/),
+        },
+        {
+          code: 'COMFY_TEMPLATE_PLACEHOLDER_SUSPICIOUS',
+          message: expect.stringMatching(/director\.inputs\.reference_zero.*\{\{reference_0\}\}.*\{\{reference_1\}\}/),
+        },
+        {
+          code: 'COMFY_TEMPLATE_PLACEHOLDER_SUSPICIOUS',
+          message: expect.stringMatching(/director\.inputs\.reference_missing.*\{\{reference_\}\}.*\{\{reference_1\}\}/),
+        },
+        {
+          code: 'COMFY_TEMPLATE_PLACEHOLDER_SUSPICIOUS',
+          message: expect.stringMatching(/director\.inputs\.reference_trailing.*\{\{reference_1x\}\}.*\{\{reference_1\}\}/),
+        },
+      ]),
+    })
+    expect(analyzed.warnings).toHaveLength(4)
+
+    const registered = await registry.registerTemplate({
+      name: 'Raw widget state',
+      kind: 'video',
+      mode: 't2v',
+      graphJson: custom,
+      slotResolution: { positive: { nodeId: 'director', inputName: 'prompt' } },
+      promptProfile: 'h3-structured',
+    })
+    const instantiated = await registry.instantiate(registered.template.id, { positive: 'resolved prompt' })
+    expect(instantiated.prompt.director.inputs).toMatchObject({
+      prompt: 'resolved prompt',
+      timeline_data: timelineData,
+      builder_state: '{{positve}}',
+      reference_zero: '{{reference_0}}',
+      reference_missing: '{{reference_}}',
+      reference_trailing: '{{reference_1x}}',
+    })
+
+    const embeddedKnownLiteral = structuredClone(custom)
+    embeddedKnownLiteral.director.inputs.builder_state = JSON.stringify({ prompt: '{{positive}}' })
+    expect(registry.analyzeTemplate(embeddedKnownLiteral)).toMatchObject({
+      ok: false,
+      errors: [{
+        code: 'COMFY_TEMPLATE_PLACEHOLDER_INVALID',
+        message: expect.stringContaining('director.inputs.builder_state'),
+      }],
+    })
+    await expect(registry.registerTemplate({
+      name: 'Embedded known literal',
+      kind: 'video',
+      mode: 't2v',
+      graphJson: embeddedKnownLiteral,
+      slotResolution: { positive: { nodeId: 'director', inputName: 'prompt' } },
+      promptProfile: 'h3-structured',
+    })).rejects.toMatchObject({ code: 'COMFY_TEMPLATE_PLACEHOLDER_INVALID' })
+  })
+
+  it('binds exact image-role literals and rejects an explicit mapping that contradicts them', async () => {
+    const { registry } = createRegistry()
+    const single = {
+      text: { class_type: 'Text', inputs: { value: '{{positive}}' } },
+      image: { class_type: 'LoadImage', inputs: { image: '{{start_image}}' } },
+      output: { class_type: 'SaveVideo', inputs: { images: ['image', 0] } },
+    }
+    expect(registry.analyzeTemplate(single)).toMatchObject({
+      ok: true,
+      slots: { inputImages: [{ nodeId: 'image', inputName: 'image', name: 'start_image' }] },
+    })
+
+    const registered = await registry.registerTemplate({
+      name: 'Single exact image role',
+      kind: 'video',
+      mode: 'i2v',
+      graphJson: single,
+      promptProfile: 'wan-motion',
+    })
+    const instantiated = await registry.instantiate(registered.template.id, {
+      positive: 'move', start_image: 'risu/start.png',
+    })
+    expect(instantiated.prompt.image.inputs.image).toBe('risu/start.png')
+
+    const multiple = {
+      ...single,
+      last: { class_type: 'LoadImage', inputs: { image: '{{end_image}}' } },
+    }
+    await expect(registry.registerTemplate({
+      name: 'Contradictory exact roles',
+      kind: 'video',
+      mode: 'flf2v',
+      graphJson: multiple,
+      slotResolution: {
+        inputImages: [
+          { nodeId: 'image', name: 'end_image' },
+          { nodeId: 'last', name: 'start_image' },
+        ],
+      },
+      promptProfile: 'wan-motion',
+    })).rejects.toMatchObject({ code: 'COMFY_TEMPLATE_SLOT_RESOLUTION_INVALID' })
+
+    const exactMultiple = await registry.registerTemplate({
+      name: 'Matching exact roles',
+      kind: 'video',
+      mode: 'flf2v',
+      graphJson: multiple,
+      slotResolution: {
+        inputImages: [
+          { nodeId: 'image', name: 'start_image' },
+          { nodeId: 'last', name: 'end_image' },
+        ],
+      },
+      promptProfile: 'wan-motion',
+    })
+    const exactMultipleInstance = await registry.instantiate(exactMultiple.template.id, {
+      positive: 'move between frames',
+      start_image: 'risu/start.png',
+      end_image: 'risu/end.png',
+    })
+    expect(exactMultipleInstance.prompt.image.inputs.image).toBe('risu/start.png')
+    expect(exactMultipleInstance.prompt.last.inputs.image).toBe('risu/end.png')
+
+    const duplicateRole = structuredClone(multiple)
+    duplicateRole.last.inputs.image = '{{start_image}}'
+    expect(registry.analyzeTemplate(duplicateRole)).toMatchObject({
+      ok: false,
+      errors: [{ code: 'COMFY_TEMPLATE_IMAGE_ROLE_AMBIGUOUS' }],
+    })
   })
 
   it('round-trips analyze, explicit ambiguity resolution, registration, load, and hard removal', async () => {
@@ -255,6 +472,13 @@ describe('Comfy custom template analysis and registration', () => {
       graphJson: graph({ images: ['input'] }),
       promptProfile: 'wan-motion',
     })).rejects.toMatchObject({ code: 'COMFY_TEMPLATE_IMAGE_CARDINALITY' })
+    await expect(registry.registerTemplate({
+      name: 'Reference video without references',
+      kind: 'video',
+      mode: 'ref2v',
+      graphJson: graph({ images: [] }),
+      promptProfile: 'wan-motion',
+    })).rejects.toMatchObject({ code: 'COMFY_TEMPLATE_IMAGE_CARDINALITY' })
 
     const ambiguous = graph({ images: ['first', 'second'] })
     for (const inputImages of [
@@ -311,6 +535,11 @@ describe('Comfy custom template analysis and registration', () => {
       },
       {
         text: { class_type: 'Text', inputs: { value: '{{seed}}' } },
+        sampler: { class_type: 'SamplerCustom', inputs: { seed: 1 } },
+        output: { class_type: 'SaveVideo', inputs: { images: ['sampler', 0] } },
+      },
+      {
+        text: { class_type: 'Text', inputs: { value: '{{start_image}}' } },
         sampler: { class_type: 'SamplerCustom', inputs: { seed: 1 } },
         output: { class_type: 'SaveVideo', inputs: { images: ['sampler', 0] } },
       },

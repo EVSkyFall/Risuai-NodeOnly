@@ -201,6 +201,10 @@ describe('plugin Comfy orchestrator relay', () => {
     const analysis = {
       ok: true,
       errors: [],
+      warnings: [{
+        code: 'COMFY_TEMPLATE_PLACEHOLDER_SUSPICIOUS',
+        message: 'Possible template placeholder typo',
+      }],
       slots: {
         positive: { nodeId: 'text', inputName: 'text' },
         negative: [{ nodeId: 'text', inputName: 'text' }],

@@ -74,6 +74,7 @@ export interface ComfyTemplateOutputDescriptor {
 export interface ComfyTemplateAnalysis {
     ok: boolean
     errors: Array<{ code: string; message: string }>
+    warnings?: Array<{ code: string; message: string }>
     slots: {
         positive: ComfyTemplateNodeRef | ComfyTemplateNodeRef[]
         negative: ComfyTemplateNodeRef | ComfyTemplateNodeRef[]

@@ -22,6 +22,10 @@ const MODES_BY_KIND = Object.freeze({
     image: new Set(['t2i', 'i2i']),
 });
 const IMAGE_ROLE_PATTERN = /^(?:input_image|keyframe|start_image|end_image|reference_[1-9][0-9]*)$/;
+const CUSTOM_SLOT_TOKEN_PATTERN = /\{\{([a-z_][a-z0-9_]*)\}\}/g;
+const FIXED_CUSTOM_SLOT_NAMES = Object.freeze([
+    'positive', 'negative', 'seed', 'input_image', 'keyframe', 'start_image', 'end_image',
+]);
 const SAFE_HISTORY_KEY_PATTERN = /^[A-Za-z0-9_:-]{1,128}$/;
 const DANGEROUS_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
 const BUILTIN_META = Object.freeze({
@@ -68,6 +72,106 @@ function errorEntry(error) {
         code: typeof error?.code === 'string' ? error.code : 'COMFY_TEMPLATE_INVALID',
         message: String(error?.message ?? error),
     };
+}
+
+function isKnownCustomSlotName(name) {
+    return name === 'positive' || name === 'negative' || name === 'seed' || IMAGE_ROLE_PATTERN.test(name);
+}
+
+function getExactCustomSlotName(value) {
+    const match = value.match(/^\{\{([a-z_][a-z0-9_]*)\}\}$/);
+    return match && isKnownCustomSlotName(match[1]) ? match[1] : null;
+}
+
+function findKnownCustomSlotToken(value) {
+    for (const match of value.matchAll(CUSTOM_SLOT_TOKEN_PATTERN)) {
+        if (isKnownCustomSlotName(match[1])) return match[0];
+    }
+    return null;
+}
+
+function isSingleDamerauEdit(left, right) {
+    if (left === right || Math.abs(left.length - right.length) > 1) return false;
+    if (left.length === right.length) {
+        const differences = [];
+        for (let index = 0; index < left.length; index += 1) {
+            if (left[index] !== right[index]) differences.push(index);
+            if (differences.length > 2) return false;
+        }
+        if (differences.length === 1) return true;
+        return differences.length === 2
+            && differences[1] === differences[0] + 1
+            && left[differences[0]] === right[differences[1]]
+            && left[differences[1]] === right[differences[0]];
+    }
+    const shorter = left.length < right.length ? left : right;
+    const longer = left.length < right.length ? right : left;
+    let shortIndex = 0;
+    let longIndex = 0;
+    let skipped = false;
+    while (shortIndex < shorter.length && longIndex < longer.length) {
+        if (shorter[shortIndex] === longer[longIndex]) {
+            shortIndex += 1;
+            longIndex += 1;
+        } else if (skipped) {
+            return false;
+        } else {
+            skipped = true;
+            longIndex += 1;
+        }
+    }
+    return true;
+}
+
+function findReferenceSlotSuggestion(name) {
+    const trailingDigits = name.match(/([1-9][0-9]*)$/)?.[1];
+    if (trailingDigits) {
+        const candidate = `reference_${trailingDigits}`;
+        if (isSingleDamerauEdit(name, candidate)) return candidate;
+    }
+    if (!name.startsWith('reference_')) return null;
+    const suffix = name.slice('reference_'.length);
+    if (suffix === '') return 'reference_1';
+
+    let invalidIndex = -1;
+    for (let index = 0; index < suffix.length; index += 1) {
+        const validDigit = index === 0
+            ? suffix[index] >= '1' && suffix[index] <= '9'
+            : suffix[index] >= '0' && suffix[index] <= '9';
+        if (validDigit) continue;
+        if (invalidIndex !== -1) return null;
+        invalidIndex = index;
+    }
+    if (invalidIndex === -1) return null;
+
+    const candidateSuffixes = [
+        `${suffix.slice(0, invalidIndex)}${suffix.slice(invalidIndex + 1)}`,
+        `${suffix.slice(0, invalidIndex)}${invalidIndex === 0 ? '1' : '0'}${suffix.slice(invalidIndex + 1)}`,
+    ];
+    for (const candidateSuffix of candidateSuffixes) {
+        if (!/^[1-9][0-9]*$/.test(candidateSuffix)) continue;
+        const candidate = `reference_${candidateSuffix}`;
+        if (isSingleDamerauEdit(name, candidate)) return candidate;
+    }
+    return null;
+}
+
+function findSuspiciousCustomSlotTokens(value) {
+    const suspicious = [];
+    const seen = new Set();
+    for (const match of value.matchAll(CUSTOM_SLOT_TOKEN_PATTERN)) {
+        const name = match[1];
+        if (isKnownCustomSlotName(name) || seen.has(name)) continue;
+        const referenceSuggestion = findReferenceSlotSuggestion(name);
+        const candidates = referenceSuggestion
+            ? [...FIXED_CUSTOM_SLOT_NAMES, referenceSuggestion]
+            : FIXED_CUSTOM_SLOT_NAMES;
+        const suggestion = candidates.find(candidate => isSingleDamerauEdit(name, candidate));
+        if (!suggestion) continue;
+        seen.add(name);
+        suspicious.push({ token: match[0], suggestion: `{{${suggestion}}}` });
+    }
+    return suspicious;
 }
 
 function parseGraphInput(graphJson, maxBytes) {
@@ -133,6 +237,7 @@ function inspectGraph(graphJson, maxBytes) {
     }
 
     const errors = [];
+    const warnings = [];
     for (const [nodeId, node] of Object.entries(document)) {
         if (!nodeId || nodeId.includes('\0') || DANGEROUS_KEYS.has(nodeId)) {
             errors.push(errorEntry(comfyError('COMFY_TEMPLATE_NODE_ID_INVALID', `Node id is unsafe: ${nodeId}`)));
@@ -163,6 +268,7 @@ function inspectGraph(graphJson, maxBytes) {
             analysis: {
                 ok: false,
                 errors,
+                warnings,
                 slots: { positive: [], negative: [], inputImages: [], seeds: [] },
                 output: null,
                 stats: { bytes: parsed.inputBytes, nodeCount: Object.keys(document).length },
@@ -186,7 +292,8 @@ function inspectGraph(graphJson, maxBytes) {
     const outputCandidates = [];
     let linkCount = 0;
     for (const [nodeId, node] of Object.entries(document)) {
-        if (node.class_type === 'LoadImage') loadImages.push({ nodeId, inputName: 'image' });
+        const loadImage = node.class_type === 'LoadImage' ? { nodeId, inputName: 'image' } : null;
+        if (loadImage) loadImages.push(loadImage);
         const automatic = OUTPUT_BY_CLASS[node.class_type];
         if (automatic) outputCandidates.push({ nodeId, classType: node.class_type, ...automatic });
         for (const [inputName, value] of Object.entries(node.inputs)) {
@@ -198,27 +305,30 @@ function inspectGraph(graphJson, maxBytes) {
             if (isSeedInput) seeds.push({ nodeId, inputName });
             if (typeof value !== 'string') continue;
             const ref = { nodeId, inputName };
+            const exactSlotName = getExactCustomSlotName(value);
             if (!isImageInput && !isSeedInput) textInputs.push(ref);
-            if (value === '{{positive}}' || value === '{{negative}}') {
+            if (exactSlotName === 'positive' || exactSlotName === 'negative') {
                 if (isImageInput || isSeedInput) {
                     errors.push(errorEntry(comfyError(
                         'COMFY_TEMPLATE_SLOT_OVERLAP',
                         `Prompt slot overlaps a structural slot at ${nodeId}.inputs.${inputName}`,
                     )));
-                } else if (value === '{{positive}}') positiveRefs.push(ref);
+                } else if (exactSlotName === 'positive') positiveRefs.push(ref);
                 else negativeRefs.push(ref);
                 continue;
             }
-            if (value === '{{input_image}}') {
+            if (exactSlotName && IMAGE_ROLE_PATTERN.test(exactSlotName)) {
                 if (!isImageInput) {
                     errors.push(errorEntry(comfyError(
                         'COMFY_TEMPLATE_PLACEHOLDER_INVALID',
-                        `{{input_image}} is misplaced at ${nodeId}.inputs.${inputName}`,
+                        `{{${exactSlotName}}} is misplaced at ${nodeId}.inputs.${inputName}`,
                     )));
+                } else {
+                    loadImage.name = exactSlotName;
                 }
                 continue;
             }
-            if (value === '{{seed}}') {
+            if (exactSlotName === 'seed') {
                 if (!isSeedInput) {
                     errors.push(errorEntry(comfyError(
                         'COMFY_TEMPLATE_PLACEHOLDER_INVALID',
@@ -227,10 +337,17 @@ function inspectGraph(graphJson, maxBytes) {
                 }
                 continue;
             }
-            if (value.includes('{{') || value.includes('}}')) {
+            if (findKnownCustomSlotToken(value)) {
                 errors.push(errorEntry(comfyError(
                     'COMFY_TEMPLATE_PLACEHOLDER_INVALID',
-                    `Invalid template placeholder at ${nodeId}.inputs.${inputName}`,
+                    `Template placeholder is not an exact input value at ${nodeId}.inputs.${inputName}`,
+                )));
+                continue;
+            }
+            for (const suspicious of findSuspiciousCustomSlotTokens(value)) {
+                warnings.push(errorEntry(comfyError(
+                    'COMFY_TEMPLATE_PLACEHOLDER_SUSPICIOUS',
+                    `Possible template placeholder typo at ${nodeId}.inputs.${inputName}: ${suspicious.token}; did you mean ${suspicious.suggestion}?`,
                 )));
             }
         }
@@ -247,13 +364,25 @@ function inspectGraph(graphJson, maxBytes) {
             'Template contains more than one {{negative}} literal',
         )));
     }
+    const declaredImageNames = new Set();
+    for (const image of loadImages) {
+        if (!image.name) continue;
+        if (declaredImageNames.has(image.name)) {
+            errors.push(errorEntry(comfyError(
+                'COMFY_TEMPLATE_IMAGE_ROLE_AMBIGUOUS',
+                `Template contains more than one {{${image.name}}} literal`,
+            )));
+        }
+        declaredImageNames.add(image.name);
+    }
 
     const inputImages = loadImages.length === 1
-        ? [{ ...loadImages[0], name: 'input_image' }]
+        ? [{ ...loadImages[0], name: loadImages[0].name ?? 'input_image' }]
         : loadImages;
     const analysis = {
         ok: errors.length === 0,
         errors,
+        warnings,
         slots: {
             positive: positiveRefs.length === 1 ? positiveRefs[0] : textInputs,
             negative: negativeRefs.length === 1 ? negativeRefs[0] : textInputs,
@@ -455,7 +584,10 @@ function resolveTemplateSlots(inspected, slotResolution) {
         if (Array.isArray(resolution.inputImages) && resolution.inputImages.length > 0) {
             throw comfyError('COMFY_TEMPLATE_SLOT_RESOLUTION_INVALID', 'A single LoadImage is bound automatically');
         }
-        inputImages = [{ ...inspected.loadImages[0], name: 'input_image' }];
+        inputImages = [{
+            ...inspected.loadImages[0],
+            name: inspected.loadImages[0].name ?? 'input_image',
+        }];
     } else {
         if (!Array.isArray(resolution.inputImages) || resolution.inputImages.length !== inspected.loadImages.length) {
             throw comfyError('COMFY_TEMPLATE_RESOLUTION_REQUIRED', 'Every LoadImage node requires a role mapping');
@@ -471,6 +603,9 @@ function resolveTemplateSlots(inspected, slotResolution) {
             }
             const candidate = inspected.loadImages.find(entry => entry.nodeId === item.nodeId);
             if (!candidate) throw comfyError('COMFY_TEMPLATE_SLOT_RESOLUTION_INVALID', 'Image slot node was not detected');
+            if (candidate.name && candidate.name !== item.name) {
+                throw comfyError('COMFY_TEMPLATE_SLOT_RESOLUTION_INVALID', 'Image slot mapping contradicts an exact template literal');
+            }
             names.add(item.name);
             nodeIds.add(item.nodeId);
             return { ...candidate, name: item.name };
@@ -526,7 +661,7 @@ function assertRegistrationShape(input, templateSlots, outputDescriptor) {
         ? imageCount === 0
         : input.mode === 'i2v' || input.mode === 'i2i'
             ? imageCount === 1
-            : imageCount >= 1;
+            : input.mode === 'flf2v' || imageCount >= 1;
     if (!validCardinality) {
         throw comfyError('COMFY_TEMPLATE_IMAGE_CARDINALITY', 'Template mode does not match its LoadImage cardinality');
     }
@@ -711,6 +846,7 @@ function createTemplateRegistry(options = {}) {
             return {
                 ok: false,
                 errors: [errorEntry(error)],
+                warnings: [],
                 slots: { positive: [], negative: [], inputImages: [], seeds: [] },
                 output: null,
                 stats: {},
