@@ -921,6 +921,60 @@ describe('Comfy orchestrator', () => {
     expect(promptCalls).toBe(1)
   })
 
+  it('surfaces the failing node from a prompt rejection body', async () => {
+    const db = new Database(':memory:')
+    dbs.push(db)
+    const store = createComfyStore(db, {
+      randomUUID: () => 'abcdabcd-abcd-4bcd-8bcd-abcdabcdabcd',
+      defaultTemplateDir: templateDir,
+    })
+    const fetchImpl = (async (urlValue: string | URL | Request) => {
+      const url = new URL(String(urlValue))
+      if (url.pathname === '/system_stats') return Response.json({ system: {} })
+      if (url.pathname === '/prompt') {
+        return Response.json({
+          error: { type: 'prompt_outputs_failed_validation', message: 'Prompt outputs failed validation', details: '', extra_info: {} },
+          node_errors: {
+            '1512:2719': {
+              errors: [{ type: 'required_input_missing', message: 'Required input is missing', details: 'model', extra_info: { input_name: 'model' } }],
+              dependent_outputs: ['2568'],
+              class_type: 'MiniMaxH3Cache',
+            },
+          },
+        }, { status: 400 })
+      }
+      throw new Error(`Unexpected request: ${url.pathname}`)
+    }) as typeof fetch
+    const assets = {
+      readInputAsset: async () => ({
+        assetId: 'source',
+        ext: 'png',
+        mimeType: 'image/png',
+        hash: 'INPUT',
+        bytes: Buffer.from('image'),
+      }),
+      uploadInput: async () => 'risu-comfy/source.png',
+    }
+    const orchestrator = createComfyOrchestrator({
+      store,
+      registry: createTemplateRegistry({ templateDir }),
+      assets,
+      fetchImpl,
+    })
+
+    await orchestrator.updateEndpoint('http://127.0.0.1:8188')
+    const submitted = await orchestrator.submit({
+      operationKey: 'prompt-400-node-errors',
+      template: 'wan-i2v',
+      slots: { positive: 'rejected', input_image: 'source', seed: 1 },
+    })
+    await orchestrator.runOnce()
+    const failed = await orchestrator.poll(submitted.jobId)
+    expect(failed).toMatchObject({ state: 'failed', error: { code: 'COMFY_HTTP_ERROR' } })
+    expect(failed.error?.message).toContain('Prompt outputs failed validation')
+    expect(failed.error?.message).toContain('MiniMaxH3Cache#1512:2719: Required input is missing (model)')
+  })
+
   it('lets a materialized completion win a concurrent nonterminal state change', async () => {
     const db = new Database(':memory:')
     dbs.push(db)

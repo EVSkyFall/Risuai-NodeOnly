@@ -184,6 +184,48 @@ function createComfyOrchestrator(options) {
         }
     }
 
+    // Comfy's non-2xx bodies name the exact failing node ("node_errors"); dropping
+    // them left only "Comfy returned HTTP 400" in job records, which is
+    // undiagnosable without replaying the prompt by hand. Best-effort: an
+    // unreadable body still produces the bare status message.
+    async function readErrorDetail(response) {
+        let text = '';
+        try {
+            text = await response.text();
+        } catch {
+            return '';
+        }
+        if (!text) return '';
+        try {
+            const parsed = JSON.parse(text);
+            const parts = [];
+            const top = parsed?.error?.message ?? parsed?.error;
+            if (typeof top === 'string' && top) parts.push(top);
+            for (const [nodeId, entry] of Object.entries(parsed?.node_errors ?? {})) {
+                for (const nodeError of entry?.errors ?? []) {
+                    const detail = typeof nodeError?.details === 'string' && nodeError.details
+                        ? ` (${nodeError.details})`
+                        : '';
+                    parts.push(`${entry?.class_type ?? '?'}#${nodeId}: ${nodeError?.message ?? nodeError?.type ?? 'error'}${detail}`);
+                }
+            }
+            if (parts.length > 0) text = parts.join(' · ');
+        } catch { /* not JSON — keep the raw body */ }
+        return text.replace(/\s+/g, ' ').trim().slice(0, 600);
+    }
+
+    async function httpStatusError(response) {
+        const detail = await readErrorDetail(response);
+        return comfyError(
+            'COMFY_HTTP_ERROR',
+            `Comfy returned HTTP ${response.status}${detail ? ` — ${detail}` : ''}`,
+            {
+                httpStatus: response.status >= 500 ? 502 : 400,
+                uncertain: response.status >= 500,
+            },
+        );
+    }
+
     async function requestJson(endpointUrl, route, init = {}) {
         const abortScope = createRequestAbortScope(init.signal, requestTimeoutMs);
         try {
@@ -192,10 +234,7 @@ function createComfyOrchestrator(options) {
                 signal: abortScope.signal,
             });
             if (!response.ok) {
-                throw comfyError('COMFY_HTTP_ERROR', `Comfy returned HTTP ${response.status}`, {
-                    httpStatus: response.status >= 500 ? 502 : 400,
-                    uncertain: response.status >= 500,
-                });
+                throw await httpStatusError(response);
             }
             return await readJsonResponse(response);
         } catch (cause) {
@@ -214,10 +253,7 @@ function createComfyOrchestrator(options) {
                 signal: abortScope.signal,
             });
             if (!response.ok) {
-                throw comfyError('COMFY_HTTP_ERROR', `Comfy returned HTTP ${response.status}`, {
-                    httpStatus: response.status >= 500 ? 502 : 400,
-                    uncertain: response.status >= 500,
-                });
+                throw await httpStatusError(response);
             }
         } catch (cause) {
             if (isComfyError(cause)) throw cause;
