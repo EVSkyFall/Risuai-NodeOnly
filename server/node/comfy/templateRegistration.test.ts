@@ -170,12 +170,6 @@ describe('Comfy custom template analysis and registration', () => {
         ],
       },
     }
-    await expect(registry.registerTemplate({
-      ...metadata,
-      mode: 'i2v',
-      slotResolution: embeddedResolution,
-    })).rejects.toMatchObject({ code: 'COMFY_TEMPLATE_IMAGE_CARDINALITY' })
-
     const registered = await registry.registerTemplate({
       ...metadata,
       slotResolution: embeddedResolution,
@@ -361,6 +355,69 @@ describe('Comfy custom template analysis and registration', () => {
       },
       promptProfile: 'h3-structured',
     })).rejects.toMatchObject({ code: 'COMFY_TEMPLATE_SLOT_RESOLUTION_INVALID' })
+  })
+
+  it('registers i2v when a direct LoadImage and an embedded literal share one image role', async () => {
+    const { registry } = createRegistry()
+    const custom = {
+      loader: { class_type: 'LoadImage', inputs: { image: 'start.png' } },
+      director: {
+        class_type: 'Director',
+        inputs: {
+          state: JSON.stringify({ prompt: '{{positive}}', seed: '{{seed}}', items: [{ value: 'keyframe.png' }] }),
+          image: ['loader', 0],
+        },
+      },
+      output: { class_type: 'SaveVideo', inputs: { images: ['director', 0] } },
+    }
+    // Two DISTINCT roles still exceed i2v — cardinality counts roles, not bindings.
+    await expect(registry.registerTemplate({
+      name: 'Two roles under i2v',
+      kind: 'video',
+      mode: 'i2v',
+      graphJson: custom,
+      slotResolution: {
+        embedded: {
+          slots: ['positive', 'seed'].map(name => ({
+            nodeId: 'director', inputName: 'state', token: `{{${name}}}`,
+          })),
+          inputImages: [{
+            nodeId: 'director', inputName: 'state', literal: 'keyframe.png', name: 'end_image',
+          }],
+        },
+      },
+      promptProfile: 'h3-structured',
+    })).rejects.toMatchObject({ code: 'COMFY_TEMPLATE_IMAGE_CARDINALITY' })
+
+    const registered = await registry.registerTemplate({
+      name: 'Dasiwa I2VA shared image role',
+      kind: 'video',
+      mode: 'i2v',
+      graphJson: custom,
+      slotResolution: {
+        embedded: {
+          slots: ['positive', 'seed'].map(name => ({
+            nodeId: 'director', inputName: 'state', token: `{{${name}}}`,
+          })),
+          inputImages: [{
+            nodeId: 'director', inputName: 'state', literal: 'keyframe.png', name: 'input_image',
+          }],
+        },
+      },
+      promptProfile: 'h3-structured',
+    })
+    expect(registered.template.mode).toBe('i2v')
+    expect(registered.template.slots.filter((slot: { type: string }) => slot.type === 'imageAsset')).toEqual([
+      { name: 'input_image', type: 'imageAsset', required: true },
+    ])
+
+    const compiled = await registry.instantiate(registered.template.id, {
+      positive: 'p', seed: 3, input_image: 'risu-comfy/up.png',
+    })
+    expect(compiled.prompt.loader.inputs.image).toBe('risu-comfy/up.png')
+    expect(JSON.parse(compiled.prompt.director.inputs.state)).toMatchObject({
+      items: [{ value: 'risu-comfy/up.png' }],
+    })
   })
 
   it('distinguishes UI format, rejects blank class_type and dangling links, and accepts colon node ids', () => {

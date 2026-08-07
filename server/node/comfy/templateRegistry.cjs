@@ -1150,12 +1150,17 @@ function assertRegistrationShape(input, templateSlots, outputDescriptor) {
     if (mediaKind !== input.kind) {
         throw comfyError('COMFY_TEMPLATE_KIND_OUTPUT_MISMATCH', 'Template kind does not match its output media type');
     }
-    const directImageCount = templateSlots.inputImages.filter(image => !image.embedded).length;
-    const embeddedImageCount = [
-        ...(templateSlots.embedded?.slots ?? []).filter(slot => IMAGE_ROLE_PATTERN.test(slot.name)),
-        ...(templateSlots.embedded?.inputImages ?? []),
-    ].reduce((total, binding) => total + binding.occurrences, 0);
-    const imageCount = directImageCount + embeddedImageCount;
+    // Cardinality counts DISTINCT image roles, not bindings: execution uploads
+    // one image per role name and substitutes it into every binding that
+    // carries it, so a direct LoadImage plus an embedded literal sharing
+    // input_image (Dasiwa I2VA) — or several literals on one role (the loop
+    // recipe) — is still a one-image template.
+    const imageRoles = new Set(templateSlots.inputImages.map(image => image.name));
+    for (const slot of templateSlots.embedded?.slots ?? []) {
+        if (IMAGE_ROLE_PATTERN.test(slot.name)) imageRoles.add(slot.name);
+    }
+    for (const binding of templateSlots.embedded?.inputImages ?? []) imageRoles.add(binding.name);
+    const imageCount = imageRoles.size;
     const validCardinality = input.mode === 't2v' || input.mode === 't2i'
         ? imageCount === 0
         : input.mode === 'i2v' || input.mode === 'i2i'
