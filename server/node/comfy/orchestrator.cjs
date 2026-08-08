@@ -966,13 +966,11 @@ function createComfyOrchestrator(options) {
                 errorMessage: null,
             }) ?? store.getJob(job.jobId);
         }
-        if (job.state !== 'queued' && now() >= job.deadlineAt && !job.terminalIntent) {
-            job = store.updateJob(job.jobId, job.revision, job.state, {
-                state: 'cancel_requested',
-                terminalIntent: 'timeout',
-                cancelRequestedAt: now(),
-            }) ?? store.getJob(job.jobId);
-        }
+        // No generation deadline: a high-quality render legitimately runs for
+        // hours (user directive 2026-08-08 — connection timeouts only, never a
+        // generation timeout). deadlineAt stays as dispatch metadata; a job
+        // whose REMOTE vanished is still reaped by absence reconciliation, and
+        // cancel remains available at any time.
         if (!job || store.isTerminalState(job.state)) return job;
         if (job.state === 'queued') return dispatchQueued(job, generation, signal);
         return reconcileJob(job, generation, signal);

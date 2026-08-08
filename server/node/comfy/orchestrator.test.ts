@@ -573,7 +573,7 @@ describe('Comfy orchestrator', () => {
     expect((await orchestrator.poll(job.jobId)).state).toBe('cancelled')
   })
 
-  it('turns an expired running job into a targeted interrupt and only then a timeout failure', async () => {
+  it('never times out a running generation — hours past the deadline it keeps running', async () => {
     let clock = 50_000
     const db = new Database(':memory:')
     dbs.push(db)
@@ -587,23 +587,19 @@ describe('Comfy orchestrator', () => {
       promptId: 'timeout-prompt',
       state: 'running',
     })
-    clock = job.deadlineAt + 1
-    let interrupted = false
+    clock = job.deadlineAt + 5 * 3_600_000
     let interruptCalls = 0
     const fetchImpl = (async (urlValue: string | URL | Request) => {
       const url = new URL(String(urlValue))
       if (url.pathname === '/history/timeout-prompt') return Response.json({})
       if (url.pathname === '/queue') {
         return Response.json({
-          queue_running: interrupted
-            ? []
-            : [[1, 'timeout-prompt', {}, { client_id: job.jobId }, []]],
+          queue_running: [[1, 'timeout-prompt', {}, { client_id: job.jobId }, []]],
           queue_pending: [],
         })
       }
       if (url.pathname === '/interrupt') {
         interruptCalls += 1
-        interrupted = true
         return new Response(null, { status: 200 })
       }
       throw new Error(`Unexpected request: ${url.pathname}`)
@@ -617,15 +613,13 @@ describe('Comfy orchestrator', () => {
     })
 
     await orchestrator.runOnce()
-    expect(interruptCalls).toBe(1)
-    expect(await orchestrator.poll(job.jobId)).toMatchObject({ state: 'cancel_requested' })
+    expect(interruptCalls).toBe(0)
+    expect((await orchestrator.poll(job.jobId)).state).toBe('running')
 
-    clock += 1_000
+    clock += 3_600_000
     await orchestrator.runOnce()
-    expect(await orchestrator.poll(job.jobId)).toMatchObject({
-      state: 'failed',
-      error: { code: 'COMFY_TIMEOUT' },
-    })
+    expect(interruptCalls).toBe(0)
+    expect((await orchestrator.poll(job.jobId)).state).toBe('running')
   })
 
   it('reconciles persisted jobs on boot, resuming completion before confirming an orphan', async () => {
