@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, test, vi } from 'vitest'
 const harness = vi.hoisted(() => ({
     db: {} as any,
     globalFetch: vi.fn(),
-    processZip: vi.fn(),
+    processZipWithMetadata: vi.fn(),
 }))
 
 vi.mock('svelte/store', () => ({
@@ -34,7 +34,7 @@ vi.mock('src/ts/stores.svelte', () => ({
 }))
 
 vi.mock('src/ts/process/processzip', () => ({
-    processZip: harness.processZip,
+    processZipWithMetadata: harness.processZipWithMetadata,
 }))
 
 vi.mock('lodash/random', () => ({
@@ -71,14 +71,17 @@ beforeEach(() => {
         },
     }
     harness.globalFetch.mockReset()
-    harness.processZip.mockReset()
+    harness.processZipWithMetadata.mockReset()
     harness.globalFetch.mockResolvedValue({
         ok: true,
         data: new Uint8Array([1, 2, 3]),
         headers: { 'risu-image-result': 'provider-response' },
         status: 200,
     })
-    harness.processZip.mockResolvedValue('data:image/png;base64,generated')
+    harness.processZipWithMetadata.mockResolvedValue({
+        dataUrl: 'data:image/png;base64,generated',
+        seedUsed: null,
+    })
 })
 
 describe('illustration prompt ownership', () => {

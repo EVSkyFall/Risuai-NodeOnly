@@ -4,9 +4,12 @@ const mocks = vi.hoisted(() => ({
     db: {} as any,
     charEmotions: {} as Record<string, [string, string, number][]>,
     globalFetch: vi.fn(),
+    fetchNative: vi.fn(),
     processZip: vi.fn(),
+    processZipWithMetadata: vi.fn(),
     notifyError: vi.fn(),
     charEmotionSet: vi.fn(),
+    random: vi.fn(),
 }))
 
 vi.mock('svelte/store', () => ({
@@ -27,7 +30,7 @@ vi.mock('../alert', () => ({
 }))
 
 vi.mock('../globalApi.svelte', () => ({
-    fetchNative: vi.fn(),
+    fetchNative: mocks.fetchNative,
     globalFetch: mocks.globalFetch,
     readImage: vi.fn(),
 }))
@@ -38,13 +41,14 @@ vi.mock('../stores.svelte', () => ({
 
 vi.mock('./processzip', () => ({
     processZip: mocks.processZip,
+    processZipWithMetadata: mocks.processZipWithMetadata,
 }))
 
 vi.mock('lodash/random', () => ({
-    default: () => 12345,
+    default: mocks.random,
 }))
 
-const { generateAIImage } = await import('./stableDiff')
+const { generateAIImage, generateAIImageTyped } = await import('./stableDiff')
 
 const currentChar = {
     chaId: 'test-character',
@@ -88,13 +92,67 @@ beforeEach(() => {
     mocks.db = makeDatabase()
     mocks.charEmotions = {}
     mocks.globalFetch.mockReset()
+    mocks.fetchNative.mockReset()
     mocks.processZip.mockReset()
+    mocks.processZipWithMetadata.mockReset()
     mocks.notifyError.mockReset()
     mocks.charEmotionSet.mockReset()
+    mocks.random.mockReset()
+    mocks.random.mockReturnValue(12345)
     mocks.processZip.mockResolvedValue('data:image/png;base64,generated')
+    mocks.processZipWithMetadata.mockResolvedValue({
+        dataUrl: 'data:image/png;base64,generated',
+        seedUsed: null,
+    })
 })
 
 describe('generateAIImage NAI compatibility wrapper', () => {
+    it('uses a supplied uint32 seed for both NAI seed fields and reports it', async () => {
+        mocks.globalFetch.mockResolvedValue(fetchResult({}))
+
+        const attempt = await generateAIImageTyped(
+            'prompt', currentChar, 'negative', 'inlay', 'interactive', { seed: 0 },
+        )
+        const [, request] = mocks.globalFetch.mock.calls[0] as [string, { body: any }]
+
+        expect(request.body.parameters.seed).toBe(0)
+        expect(request.body.parameters.extra_noise_seed).toBe(0)
+        expect(attempt.seedSupported).toBe(true)
+        expect(attempt.seedUsed).toBe(0)
+    })
+
+    it('prefers the seed returned in NAI PNG metadata over the request echo', async () => {
+        mocks.globalFetch.mockResolvedValue(fetchResult({}))
+        mocks.processZipWithMetadata.mockResolvedValue({
+            dataUrl: 'data:image/png;base64,generated',
+            seedUsed: 987654321,
+        })
+
+        const attempt = await generateAIImageTyped(
+            'prompt', currentChar, 'negative', 'inlay', 'interactive', { seed: 123 },
+        )
+
+        expect(attempt.seedSupported).toBe(true)
+        expect(attempt.seedUsed).toBe(987654321)
+    })
+
+    it('keeps the two existing NAI random seed draws when no seed is supplied', async () => {
+        mocks.globalFetch.mockResolvedValue(fetchResult({}))
+        mocks.random.mockReset()
+        mocks.random.mockReturnValueOnce(111).mockReturnValueOnce(222)
+
+        const attempt = await generateAIImageTyped(
+            'prompt', currentChar, 'negative', 'inlay', 'interactive', {},
+        )
+        const [, request] = mocks.globalFetch.mock.calls[0] as [string, { body: any }]
+
+        expect(request.body.parameters.seed).toBe(111)
+        expect(request.body.parameters.extra_noise_seed).toBe(222)
+        expect(mocks.random.mock.calls).toEqual([[0, 2**32 - 1], [0, 2**32 - 1]])
+        expect(attempt.seedSupported).toBe(true)
+        expect(attempt.seedUsed).toBe(111)
+    })
+
     it('keeps inlay provider rejection as an empty string and marks the proxy request safe', async () => {
         mocks.globalFetch.mockResolvedValue(fetchResult({
             ok: false,
@@ -130,7 +188,7 @@ describe('generateAIImage NAI compatibility wrapper', () => {
     it('keeps a thrown ZIP decode failure in inlay mode as false', async () => {
         const zipError = new Error('invalid zip')
         mocks.globalFetch.mockResolvedValue(fetchResult({}))
-        mocks.processZip.mockRejectedValue(zipError)
+        mocks.processZipWithMetadata.mockRejectedValue(zipError)
 
         await expect(generateAIImage('prompt', currentChar, 'negative', 'inlay')).resolves.toBe(false)
         expect(mocks.notifyError).toHaveBeenCalledWith(zipError)
@@ -159,6 +217,186 @@ describe('generateAIImage NAI compatibility wrapper', () => {
                 proxyRequestHeaders: { 'risu-image-class': 'background' },
             }),
         )
+    })
+})
+
+describe('generateAIImage Comfy seed threading', () => {
+    it('applies a supplied seed to the Comfy workflow and reports it', async () => {
+        mocks.db = {
+            sdProvider: 'comfyui',
+            comfyUiUrl: 'http://127.0.0.1:8188/',
+            comfyConfig: {
+                workflow: JSON.stringify({
+                    sampler: { class_type: 'KSampler', inputs: { seed: 17, steps: 28 } },
+                    sampler2: { class_type: 'KSampler', inputs: { seed: 18, steps: 20 } },
+                    positive: { class_type: 'CLIPTextEncode', inputs: { text: '{{risu_prompt}}' } },
+                }),
+                timeout: 30,
+            },
+        }
+        mocks.globalFetch.mockResolvedValue({ ok: true, data: { prompt_id: 'job-1' } })
+        mocks.fetchNative
+            .mockResolvedValueOnce({
+                json: async () => ({
+                    'job-1': {
+                        outputs: { save: { images: [{ filename: 'out.png', subfolder: '', type: 'output' }] } },
+                        status: { messages: [] },
+                    },
+                }),
+            })
+            .mockResolvedValueOnce({ arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer })
+
+        const attempt = await generateAIImageTyped(
+            'prompt', currentChar, 'negative', 'inlay', 'interactive', { seed: 4294967295 },
+        )
+        const promptRequest = mocks.globalFetch.mock.calls[0][1] as { body: { prompt: any } }
+
+        expect(promptRequest.body.prompt.sampler.inputs.seed).toBe(4294967295)
+        expect(promptRequest.body.prompt.sampler2.inputs.seed).toBe(4294967295)
+        expect(attempt.seedSupported).toBe(true)
+        expect(attempt.seedUsed).toBe(4294967295)
+    })
+
+    it('preserves and reports the workflow seed in legacy Comfy mode when none is supplied', async () => {
+        mocks.db = {
+            sdProvider: 'comfy',
+            comfyUiUrl: 'http://127.0.0.1:8188/',
+            comfyConfig: {
+                workflow: JSON.stringify({
+                    sampler: { class_type: 'KSampler', inputs: { seed: 17, steps: 28 } },
+                    positive: { class_type: 'CLIPTextEncode', inputs: { text: 'old positive' } },
+                    negative: { class_type: 'CLIPTextEncode', inputs: { text: 'old negative' } },
+                }),
+                posNodeID: 'positive',
+                posInputName: 'text',
+                negNodeID: 'negative',
+                negInputName: 'text',
+                timeout: 30,
+            },
+        }
+        mocks.globalFetch.mockResolvedValue({ ok: true, data: { prompt_id: 'job-1' } })
+        mocks.fetchNative
+            .mockResolvedValueOnce({
+                json: async () => ({
+                    'job-1': {
+                        outputs: { save: { images: [{ filename: 'out.png', subfolder: '', type: 'output' }] } },
+                        status: { messages: [] },
+                    },
+                }),
+            })
+            .mockResolvedValueOnce({ arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer })
+
+        const attempt = await generateAIImageTyped(
+            'prompt', currentChar, 'negative', 'inlay', 'interactive', {},
+        )
+        const promptRequest = mocks.globalFetch.mock.calls[0][1] as { body: { prompt: any } }
+
+        expect(promptRequest.body.prompt.sampler.inputs.seed).toBe(17)
+        expect(attempt.seedSupported).toBe(true)
+        expect(attempt.seedUsed).toBe(17)
+    })
+
+    it('keeps the existing Comfy randomization when no seed is supplied', async () => {
+        mocks.db = {
+            sdProvider: 'comfyui',
+            comfyUiUrl: 'http://127.0.0.1:8188/',
+            comfyConfig: {
+                workflow: JSON.stringify({
+                    sampler: { class_type: 'KSampler', inputs: { seed: 17, steps: 28 } },
+                    positive: { class_type: 'CLIPTextEncode', inputs: { text: '{{risu_prompt}}' } },
+                }),
+                timeout: 30,
+            },
+        }
+        mocks.globalFetch.mockResolvedValue({ ok: true, data: { prompt_id: 'job-1' } })
+        mocks.fetchNative
+            .mockResolvedValueOnce({
+                json: async () => ({
+                    'job-1': {
+                        outputs: { save: { images: [{ filename: 'out.png', subfolder: '', type: 'output' }] } },
+                        status: { messages: [] },
+                    },
+                }),
+            })
+            .mockResolvedValueOnce({ arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer })
+        const random = vi.spyOn(Math, 'random').mockReturnValue(0.25)
+
+        try {
+            const attempt = await generateAIImageTyped(
+                'prompt', currentChar, 'negative', 'inlay', 'interactive', {},
+            )
+            const promptRequest = mocks.globalFetch.mock.calls[0][1] as { body: { prompt: any } }
+            expect(promptRequest.body.prompt.sampler.inputs.seed).toBe(250000000)
+            expect(attempt.seedSupported).toBe(true)
+            expect(attempt.seedUsed).toBe(250000000)
+            expect(random).toHaveBeenCalledTimes(1)
+        } finally {
+            random.mockRestore()
+        }
+    })
+})
+
+describe('generateAIImage WebUI seed threading', () => {
+    it('applies a supplied seed and prefers the seed reported by WebUI', async () => {
+        mocks.db = {
+            sdProvider: 'webui',
+            webUiUrl: 'http://127.0.0.1:7860/',
+            sdConfig: {
+                width: 1024,
+                height: 1024,
+                sampler_name: 'Euler',
+                enable_hr: false,
+                denoising_strength: 0.7,
+                hr_scale: 2,
+                hr_upscaler: 'Latent',
+            },
+            sdSteps: 28,
+            sdCFG: 7,
+        }
+        mocks.globalFetch.mockResolvedValue({
+            ok: true,
+            data: { images: ['AAAA'], info: JSON.stringify({ seed: 987654321 }) },
+        })
+
+        const attempt = await generateAIImageTyped(
+            'prompt', currentChar, 'negative', 'inlay', 'interactive', { seed: 123 },
+        )
+        const [, request] = mocks.globalFetch.mock.calls[0] as [string, { body: any }]
+
+        expect(request.body.seed).toBe(123)
+        expect(attempt.seedSupported).toBe(true)
+        expect(attempt.seedUsed).toBe(987654321)
+    })
+
+    it('preserves the WebUI -1 random sentinel when no seed is supplied', async () => {
+        mocks.db = {
+            sdProvider: 'webui',
+            webUiUrl: 'http://127.0.0.1:7860/',
+            sdConfig: {
+                width: 1024,
+                height: 1024,
+                sampler_name: 'Euler',
+                enable_hr: false,
+                denoising_strength: 0.7,
+                hr_scale: 2,
+                hr_upscaler: 'Latent',
+            },
+            sdSteps: 28,
+            sdCFG: 7,
+        }
+        mocks.globalFetch.mockResolvedValue({
+            ok: true,
+            data: { images: ['AAAA'], info: JSON.stringify({ seed: 456 }) },
+        })
+
+        const attempt = await generateAIImageTyped(
+            'prompt', currentChar, 'negative', 'inlay', 'interactive', {},
+        )
+        const [, request] = mocks.globalFetch.mock.calls[0] as [string, { body: any }]
+
+        expect(request.body.seed).toBe(-1)
+        expect(attempt.seedSupported).toBe(true)
+        expect(attempt.seedUsed).toBe(456)
     })
 })
 

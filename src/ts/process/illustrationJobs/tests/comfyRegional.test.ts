@@ -25,7 +25,10 @@ vi.mock('src/ts/globalApi.svelte', () => ({
     readImage: vi.fn(),
 }))
 vi.mock('src/ts/stores.svelte', () => ({ CharEmotion: { set: vi.fn() } }))
-vi.mock('src/ts/process/processzip', () => ({ processZip: vi.fn() }))
+vi.mock('src/ts/process/processzip', () => ({
+    processZip: vi.fn(),
+    processZipWithMetadata: vi.fn(),
+}))
 vi.mock('lodash/random', () => ({ default: () => 12345 }))
 
 const { generateAIImageTyped } = await import('../../stableDiff')

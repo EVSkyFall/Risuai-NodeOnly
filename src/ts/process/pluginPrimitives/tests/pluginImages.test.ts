@@ -63,11 +63,13 @@ function makeDeps(overrides: Partial<PluginImagesDependencies> = {}): PluginImag
         removed,
         getDatabase: () => ({ ...NAI_SETTINGS }),
         getCurrentCharacter: () => ({ chaId: 'char-1' }) as any,
-        async generateImage(positive: string, _char: any, negative: string, prompt: any) {
-            generated.push({ positive, negative, prompt })
+        async generateImage(positive: string, _char: any, negative: string, prompt: any, seed?: number) {
+            generated.push({ positive, negative, prompt, seed })
             return {
                 result: { ok: true, bytesOrDataUrl: 'data:image/png;base64,AAAA', providerStatus: 200 },
                 compatibilityValue: 'data:image/png;base64,AAAA',
+                seedSupported: seed !== undefined,
+                seedUsed: seed ?? null,
             }
         },
         async measure() {
@@ -185,6 +187,51 @@ describe('measurePrompt', () => {
 })
 
 describe('generateToInlay', () => {
+    it('rejects any supplied seed that is not a uint32 integer before dispatch', async () => {
+        const deps = makeDeps()
+        const api = createPluginImagesApi(deps)
+        const invalidSeeds = [-1, 4294967296, 1.5, Number.NaN, Number.POSITIVE_INFINITY, '1', null]
+
+        for (const seed of invalidSeeds) {
+            const response = await api.generateToInlay(generateInput({ seed }))
+            expect(response.status).toBe('definite_failure')
+            if (response.status === 'succeeded') throw new Error('unreachable')
+            expect(response.code).toBe('image_seed_invalid')
+        }
+        expect(deps.generated).toHaveLength(0)
+    })
+
+    it('accepts both uint32 boundaries and returns the applied provider seed', async () => {
+        for (const seed of [0, 4294967295]) {
+            const deps = makeDeps()
+            const api = createPluginImagesApi(deps)
+            const response = await api.generateToInlay(generateInput({ seed }))
+
+            expect(response.status).toBe('succeeded')
+            if (response.status !== 'succeeded') throw new Error('unreachable')
+            expect(deps.generated[0].seed).toBe(seed)
+            expect(response.result.seedSupported).toBe(true)
+            expect(response.result.seedUsed).toBe(seed)
+        }
+    })
+
+    it('succeeds honestly when the configured provider ignores an explicit seed', async () => {
+        const deps = makeDeps({
+            getDatabase: () => ({ sdProvider: 'dalle' }),
+            generateImage: async () => ({
+                result: { ok: true, bytesOrDataUrl: 'data:image/png;base64,AAAA', providerStatus: 200 },
+                compatibilityValue: 'data:image/png;base64,AAAA',
+            }),
+        })
+        const api = createPluginImagesApi(deps)
+        const response = await api.generateToInlay(generateInput({ seed: 7 }))
+
+        expect(response.status).toBe('succeeded')
+        if (response.status !== 'succeeded') throw new Error('unreachable')
+        expect(response.result.seedSupported).toBe(false)
+        expect(response.result.seedUsed).toBeNull()
+    })
+
     it('runs the configured provider and lands the result on the caller-supplied asset id', async () => {
         const deps = makeDeps()
         const api = createPluginImagesApi(deps)
@@ -195,6 +242,8 @@ describe('generateToInlay', () => {
         expect(response.result.assetId).toBe('ri-asset-1')
         expect(response.result.inlayToken).toBe('{{inlay::ri-asset-1}}')
         expect(response.result.provider).toBe('novelai')
+        expect(response.result.seedSupported).toBe(false)
+        expect(response.result.seedUsed).toBeNull()
         expect(deps.written).toEqual([{ dataUrl: 'data:image/png;base64,AAAA', assetId: 'ri-asset-1' }])
         expect(deps.generated[0].positive).toBe(FLAT_PROMPT.positive)
         expect(deps.generated[0].negative).toBe(FLAT_PROMPT.negative)

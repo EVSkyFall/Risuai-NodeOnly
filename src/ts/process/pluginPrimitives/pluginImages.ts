@@ -79,6 +79,7 @@ export interface PluginImageGenerateInput {
     operationKey: string
     prompt: PluginImagePromptInput
     expectedConfigRevision?: string
+    seed?: number
     output: {
         kind: 'inlay'
         assetId: string
@@ -95,6 +96,8 @@ export type PluginImageGenerateResult =
             provider: string
             model: string
             configRevision: string
+            seedSupported: boolean
+            seedUsed: number | null
         }
     }
     | { status: 'precondition_failed'; error: string; code: string }
@@ -229,6 +232,7 @@ export interface PluginImagesDependencies {
         currentChar: character,
         negative: string,
         prompt: IllustrationPromptV1,
+        seed?: number,
     ): Promise<ImageGenerationAttempt>
     /**
      * Exact token measurement, or a throw when the configured provider has no
@@ -345,6 +349,10 @@ export function createPluginImagesApi(deps: PluginImagesDependencies): PluginIma
                 if (typeof input.operationKey !== 'string' || !input.operationKey) {
                     throw new PluginImageError('image_operation_key_invalid', 'operationKey must be a non-empty string')
                 }
+                if (input.seed !== undefined
+                    && (!Number.isInteger(input.seed) || input.seed < 0 || input.seed > 0xFFFFFFFF)) {
+                    throw new PluginImageError('image_seed_invalid', 'seed must be a uint32 integer')
+                }
                 prompt = toIllustrationPrompt(input.prompt)
             } catch (error) {
                 // Nothing was dispatched, so this is unambiguously terminal.
@@ -375,6 +383,7 @@ export function createPluginImagesApi(deps: PluginImagesDependencies): PluginIma
                     deps.getCurrentCharacter(),
                     prompt.baseNegative,
                     prompt,
+                    input.seed,
                 )
             } catch (error) {
                 // A throw out of the dispatch path gives no evidence about
@@ -418,6 +427,14 @@ export function createPluginImagesApi(deps: PluginImagesDependencies): PluginIma
                         provider,
                         model,
                         configRevision,
+                        seedSupported: attempt.seedSupported === true,
+                        seedUsed: attempt.seedSupported === true
+                            ? (Number.isInteger(attempt.seedUsed)
+                                && Number(attempt.seedUsed) >= 0
+                                && Number(attempt.seedUsed) <= 0xFFFFFFFF
+                                ? Number(attempt.seedUsed)
+                                : input.seed ?? null)
+                            : null,
                     },
                 }
             } catch (error) {
@@ -502,7 +519,7 @@ export function createPluginImagesApi(deps: PluginImagesDependencies): PluginIma
 export const defaultPluginImagesDependencies: PluginImagesDependencies = {
     getDatabase: () => getDatabase() as unknown as Record<string, any>,
     getCurrentCharacter: () => getCurrentCharacter({ snapshot: true }) as character,
-    generateImage: (positive, currentChar, negative, prompt) => generateAIImageTyped(
+    generateImage: (positive, currentChar, negative, prompt, seed) => generateAIImageTyped(
         positive,
         currentChar,
         negative,
@@ -511,7 +528,7 @@ export const defaultPluginImagesDependencies: PluginImagesDependencies = {
         // The prompt is already final: the plugin owns its dialect, and
         // rewriting a user's parentheses or wrapper syntax here would change
         // what they asked for.
-        { preservePromptText: true, illustrationPrompt: prompt },
+        { preservePromptText: true, illustrationPrompt: prompt, ...(seed === undefined ? {} : { seed }) },
     ),
     // measureImagePrompt fences on the NAI settings fingerprint, which is a
     // different digest from the generic configRevision this module reports.

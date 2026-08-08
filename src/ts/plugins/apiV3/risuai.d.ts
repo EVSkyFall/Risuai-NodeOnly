@@ -1378,6 +1378,75 @@ type PluginInlayMediaReadResult =
     }
     | { status: 'definite_failure'; error: string; code: string };
 
+interface PluginImagePromptCharacter {
+    positive: string;
+    negative?: string;
+    center?: { x: number; y: number };
+}
+
+interface PluginImagePromptInput {
+    layout: 'flat' | 'nai-v4-characters';
+    positive: string;
+    negative?: string;
+    dialect?: string;
+    characters?: PluginImagePromptCharacter[];
+}
+
+interface PluginImageMeasurement {
+    exact: boolean;
+    units: number | null;
+    limit: number | null;
+    withinLimits: boolean;
+    accepted: boolean;
+    configRevision: string;
+    provider: string;
+    model: string;
+    supportsRegional: boolean;
+    tokenizer: string | null;
+    detail: {
+        positiveTokens: number | null;
+        negativeTokens: number | null;
+        maxPositiveTokens: number | null;
+        maxNegativeTokens: number | null;
+    };
+    reason?: string;
+}
+
+interface PluginImageGenerateInput {
+    operationKey: string;
+    prompt: PluginImagePromptInput;
+    expectedConfigRevision?: string;
+    /** Optional deterministic image seed. Must be an integer in the uint32 range. */
+    seed?: number;
+    output: {
+        kind: 'inlay';
+        assetId: string;
+        metadata?: Record<string, unknown>;
+    };
+}
+
+type PluginImageGenerateResult =
+    | {
+        status: 'succeeded';
+        result: {
+            assetId: string;
+            inlayToken: string;
+            provider: string;
+            model: string;
+            configRevision: string;
+            seedSupported: boolean;
+            seedUsed: number | null;
+        };
+    }
+    | { status: 'precondition_failed'; error: string; code: string }
+    | { status: 'definite_failure'; error: string; code: string }
+    | { status: 'ambiguous'; error: string; code: string };
+
+interface PluginImagesAPI {
+    measurePrompt(input: { prompt: PluginImagePromptInput }): Promise<PluginImageMeasurement>;
+    generateToInlay(input: PluginImageGenerateInput): Promise<PluginImageGenerateResult>;
+}
+
 interface PluginInlaysAPI {
     remove(input: { operationKey: string; assetId: string }): Promise<any>;
     read(input: { assetId: string }): Promise<any>;
@@ -1800,6 +1869,9 @@ interface RisuaiPluginAPI {
      * concurrently, or anything that must survive a lost response.
      */
     pluginAtomic: PluginAtomicStorage;
+
+    /** Image generation through the user's configured provider. */
+    pluginImages: PluginImagesAPI;
 
     /** Existing inlay operations plus the optional video-capable media reader. */
     pluginInlays: PluginInlaysAPI;

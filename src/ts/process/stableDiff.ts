@@ -5,7 +5,7 @@ import { alertError, notifyError } from "../alert"
 import { fetchNative, globalFetch, readImage } from "../globalApi.svelte"
 import { CharEmotion } from "../stores.svelte"
 import type { OpenAIChat } from "./index.svelte"
-import { processZip } from "./processzip"
+import { processZipWithMetadata } from "./processzip"
 import random from "lodash/random"
 import type { IllustrationPromptV1 } from "./illustrationJobs/types"
 
@@ -19,6 +19,8 @@ export type ImageGenerationPriority = 'interactive' | 'background'
 export type ImageGenerationAttempt = {
     result: ImageGenerationResult
     compatibilityValue: string | false
+    seedSupported?: boolean
+    seedUsed?: number | null
     shouldNotify?: boolean
     notifyErrorValue?: unknown
 }
@@ -26,6 +28,19 @@ export type ImageGenerationAttempt = {
 export type ImageGenerationOptions = {
     preservePromptText?: boolean
     illustrationPrompt?: IllustrationPromptV1
+    seed?: number
+}
+
+function readWebUiSeed(info: unknown): number | null {
+    try {
+        const parsed = typeof info === 'string' ? JSON.parse(info) : info
+        const seed = parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>).seed : null
+        return Number.isInteger(seed) && Number(seed) >= 0 && Number(seed) <= 0xFFFFFFFF
+            ? Number(seed)
+            : null
+    } catch {
+        return null
+    }
 }
 
 export async function stableDiff(currentChar:character,prompt:string){
@@ -149,7 +164,7 @@ async function generateAIImageInternal(
                 body: {
                     "width": db.sdConfig.width,
                     "height": db.sdConfig.height,
-                    "seed": -1,
+                    "seed": options.seed ?? -1,
                     "steps": db.sdSteps,
                     "cfg_scale": db.sdCFG,
                     "prompt": genPrompt,
@@ -167,7 +182,13 @@ async function generateAIImageInternal(
 
             if(returnSdData === 'inlay'){
                 if(da.ok){
-                    return `data:image/png;base64,${da.data.images[0]}`
+                    const dataUrl = `data:image/png;base64,${da.data.images[0]}`
+                    return {
+                        result: { ok: true, bytesOrDataUrl: dataUrl, providerStatus: da.status ?? 200 },
+                        compatibilityValue: dataUrl,
+                        seedSupported: true,
+                        seedUsed: readWebUiSeed(da.data.info) ?? options.seed ?? null,
+                    }
                 }
                 else{
                     notifyError(JSON.stringify(da.data))
@@ -187,7 +208,12 @@ async function generateAIImageInternal(
                 return false   
             }
 
-            return returnSdData
+            return {
+                result: { ok: true, bytesOrDataUrl: `data:image/png;base64,${da.data.images[0]}`, providerStatus: da.status ?? 200 },
+                compatibilityValue: returnSdData,
+                seedSupported: true,
+                seedUsed: readWebUiSeed(da.data.info) ?? options.seed ?? null,
+            }
 
 
         } catch (error) {
@@ -235,6 +261,8 @@ async function generateAIImageInternal(
         const characterNegatives = options.illustrationPrompt?.layout === 'nai-v4-characters'
             ? options.illustrationPrompt.characterNegatives.map(toCaption)
             : []
+        const naiSeed = options.seed ?? random(0, 2**32-1)
+        const naiExtraNoiseSeed = options.seed ?? random(0, 2**32-1)
 
         const commonReq = {
             body: {
@@ -292,8 +320,8 @@ async function generateAIImageInternal(
                     "strength": undefined,
                     "noise": undefined,
                     //add additional parameters
-                    "seed": random(0, 2**32-1),
-                    "extra_noise_seed": random(0, 2**32-1),
+                    "seed": naiSeed,
+                    "extra_noise_seed": naiExtraNoiseSeed,
                     "prefer_brownian": true,
                     "deliberate_euler_ancestral_bug": false,
                     "skip_cfg_above_sigma": null,
@@ -492,11 +520,15 @@ async function generateAIImageInternal(
                 }
             }
 
-            const img = await processZip(da.data);
+            const processed = await processZipWithMetadata(da.data);
+            const img = processed.dataUrl
+            const seedUsed = processed.seedUsed ?? naiSeed
             if(returnSdData === 'inlay'){
                 return {
                     result: { ok: true, bytesOrDataUrl: img, providerStatus: da.status },
                     compatibilityValue: img,
+                    seedSupported: true,
+                    seedUsed,
                 }
             }
 
@@ -507,6 +539,8 @@ async function generateAIImageInternal(
             return {
                 result: { ok: true, bytesOrDataUrl: img, providerStatus: da.status },
                 compatibilityValue: returnSdData,
+                seedSupported: true,
+                seedUsed,
             }
 
         } catch (error) {
@@ -636,9 +670,22 @@ async function generateAIImageInternal(
 
         try {
             const prompt = JSON.parse(workflow)
+            let comfySeedSupported = false
+            let comfySeedUsed: number | null = null
             if(legacy){
                 prompt[posNodeID].inputs[posInputName] = genPrompt
                 prompt[negNodeID].inputs[negInputName] = neg
+                for (const node of Object.values(prompt) as any[]) {
+                    for (const inputName of Object.keys(node.inputs)) {
+                        if (inputName === 'seed' && typeof node.inputs[inputName] === 'number') {
+                            if (options.seed !== undefined) {
+                                node.inputs[inputName] = options.seed
+                            }
+                            comfySeedSupported = true
+                            comfySeedUsed ??= node.inputs[inputName]
+                        }
+                    }
+                }
             }
             else{
                 // Regional prompting lives in the user's own workflow: Comfy
@@ -794,7 +841,9 @@ async function generateAIImageInternal(
                         }
 
                         if(inputKeys[j] === 'seed' && typeof input === 'number'){
-                            input = Math.floor(Math.random() * 1000000000)
+                            input = options.seed ?? Math.floor(Math.random() * 1000000000)
+                            comfySeedSupported = true
+                            comfySeedUsed ??= input
                         }
 
                         node.inputs[inputKeys[j]] = input
@@ -870,7 +919,13 @@ async function generateAIImageInternal(
             const img64 = Buffer.from(await imgResponse.arrayBuffer()).toString('base64')
 
             if(returnSdData === 'inlay'){
-                return `data:image/png;base64,${img64}`
+                const dataUrl = `data:image/png;base64,${img64}`
+                return {
+                    result: { ok: true, bytesOrDataUrl: dataUrl, providerStatus: 200 },
+                    compatibilityValue: dataUrl,
+                    seedSupported: comfySeedSupported,
+                    seedUsed: comfySeedSupported ? comfySeedUsed : null,
+                }
             }
             else {
                 let charemotions = get(CharEmotion)
@@ -880,7 +935,12 @@ async function generateAIImageInternal(
                 CharEmotion.set(charemotions)
             }
 
-            return returnSdData
+            return {
+                result: { ok: true, bytesOrDataUrl: `data:image/png;base64,${img64}`, providerStatus: 200 },
+                compatibilityValue: returnSdData,
+                seedSupported: comfySeedSupported,
+                seedUsed: comfySeedSupported ? comfySeedUsed : null,
+            }
         } catch (error) {
             notifyError(error)
             return false

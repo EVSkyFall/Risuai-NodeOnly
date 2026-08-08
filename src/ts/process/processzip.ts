@@ -4,6 +4,7 @@ import { asBuffer, Semaphore, sleep } from "../util";
 import { alertStore } from "../alert";
 import { hasher } from "../parser/parser.svelte";
 import { hubURL } from "../characterCards";
+import { PngChunk } from "../pngChunk";
 
 // File size and chunk size constants
 const MAX_ASSET_SIZE_BYTES = 50 * 1024 * 1024; // 50MB
@@ -16,7 +17,7 @@ const MAX_CONCURRENT_ASSET_SAVES = 10;
 const HTTP_STATUS_OK_MIN = 200;
 const HTTP_STATUS_OK_MAX = 300;
 
-export async function processZip(dataArray: Uint8Array): Promise<string> {
+async function unzipImage(dataArray: Uint8Array): Promise<Uint8Array> {
     const unzipped = await new Promise<fflate.Unzipped>((resolve, reject) => {
         fflate.unzip(dataArray, (err, data) => {
             if (err) reject(err);
@@ -26,21 +27,46 @@ export async function processZip(dataArray: Uint8Array): Promise<string> {
 
     const imageFile = Object.keys(unzipped).find(fileName => /\.(jpg|jpeg|png)$/i.test(fileName));
     if (imageFile) {
-        const imageData = unzipped[imageFile];
-        const blob = new Blob([asBuffer(imageData)], { type: 'image/png' });
-        const base64 = await new Promise<string>((resolve, reject) => {
-            const reader = new FileReader();
-            reader.onload = () => {
-                const result = reader.result as string;
-                resolve(result);
-            };
-            reader.onerror = reject;
-            reader.readAsDataURL(blob);
-        });
-        return base64;
+        return unzipped[imageFile];
     } else {
         throw new Error("No image found in ZIP file");
     }
+}
+
+async function imageDataUrl(imageData: Uint8Array): Promise<string> {
+    const blob = new Blob([asBuffer(imageData)], { type: 'image/png' });
+    return await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result as string);
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+    });
+}
+
+function readNovelAiSeed(imageData: Uint8Array): number | null {
+    try {
+        const comment = PngChunk.read(imageData, ['Comment']).Comment
+        if (!comment) return null
+        const seed = JSON.parse(comment)?.seed
+        return Number.isInteger(seed) && seed >= 0 && seed <= 0xFFFFFFFF ? seed : null
+    } catch {
+        return null
+    }
+}
+
+export async function processZipWithMetadata(dataArray: Uint8Array): Promise<{
+    dataUrl: string
+    seedUsed: number | null
+}> {
+    const imageData = await unzipImage(dataArray)
+    return {
+        dataUrl: await imageDataUrl(imageData),
+        seedUsed: readNovelAiSeed(imageData),
+    }
+}
+
+export async function processZip(dataArray: Uint8Array): Promise<string> {
+    return await imageDataUrl(await unzipImage(dataArray))
 }
 
 export class CharXWriter{
