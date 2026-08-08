@@ -1631,6 +1631,39 @@ export const languageEnglish = {
     resetPluginPermission: "Reset permission responses",
     resetPluginPermissionConfirm: "Clear all saved permission responses (granted / denied history) for plugin \"{}\"?\n\nThe plugin will be asked again the next time it requests permission.",
     resetPluginPermissionDone: "Permission responses for \"{}\" have been reset",
+    pluginPermissionSettings: "Permission presets",
+    pluginPermissionSettingsDesc: "Decide up front how this plugin's permission requests are handled. With \"Ask\", a dialog appears when the plugin actually uses the feature.",
+    pluginPermissionAllow: "Allow",
+    pluginPermissionAsk: "Ask (default)",
+    pluginPermissionDeny: "Block",
+    pluginPermissionLoadFailed: "Could not load the permission settings",
+    pluginPermissionSaveFailed: "Could not save the permission setting",
+    pluginPermissionLabels: {
+        provider: {
+            name: "Custom model provider",
+            desc: "Acts as a model provider and handles requests, so it can make API calls on its own.",
+        },
+        replacer: {
+            name: "Request / response processing",
+            desc: "Reads and rewrites prompts and AI replies before they are used.",
+        },
+        db: {
+            name: "Full database access",
+            desc: "Reads and modifies the entire database, including chats, characters and settings.",
+        },
+        mainDom: {
+            name: "Main screen (DOM) access",
+            desc: "Reads and manipulates the main screen directly.",
+        },
+        fetchLogs: {
+            name: "Request log access",
+            desc: "Reads request logs, which may contain API keys and chat content.",
+        },
+        sendChat: {
+            name: "Sending chat messages",
+            desc: "Sends chat messages on your behalf, which triggers AI responses.",
+        },
+    },
     pluginV2Warning: "Plugin V2 and V2.1 is considered unsafe and will stop working in future versions. **Please do not use these versions of plugins.**. If you are the developer of this plugin, please update to V3 as soon as possible.",
     createFolderOnBranch: "Create Folder on Branch",
     hamburgerButtonBottom: "Move Menu Button to Bottom of Sidebar",

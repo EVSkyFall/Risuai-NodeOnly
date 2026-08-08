@@ -1773,6 +1773,40 @@ export const languageKorean = {
   resetPluginPermissionConfirm:
     '플러그인 "{}"의 저장된 권한 응답(허용/거부 이력)을 모두 삭제하시겠습니까?\n\n다음에 플러그인이 권한을 요청할 때 다시 묻게 됩니다.',
   resetPluginPermissionDone: '"{}"의 권한 응답을 초기화했습니다',
+  pluginPermissionSettings: "권한 사전 설정",
+  pluginPermissionSettingsDesc:
+    '이 플러그인의 권한 요청을 미리 정해둘 수 있습니다. "물어보기"로 두면 플러그인이 실제로 해당 기능을 쓸 때 창을 띄워 물어봅니다.',
+  pluginPermissionAllow: "허용",
+  pluginPermissionAsk: "물어보기(기본)",
+  pluginPermissionDeny: "차단",
+  pluginPermissionLoadFailed: "권한 설정을 불러오지 못했습니다",
+  pluginPermissionSaveFailed: "권한 설정을 저장하지 못했습니다",
+  pluginPermissionLabels: {
+    provider: {
+      name: "커스텀 모델 제공",
+      desc: "모델 제공자로서 요청을 처리합니다. 플러그인이 직접 API를 호출할 수 있습니다.",
+    },
+    replacer: {
+      name: "요청/응답 가공",
+      desc: "프롬프트와 AI 응답이 사용되기 전에 읽고 바꿀 수 있습니다.",
+    },
+    db: {
+      name: "전체 데이터베이스 접근",
+      desc: "채팅·캐릭터·설정을 포함한 데이터베이스 전체를 읽고 수정할 수 있습니다.",
+    },
+    mainDom: {
+      name: "메인 화면(DOM) 접근",
+      desc: "메인 화면을 직접 읽고 조작할 수 있습니다.",
+    },
+    fetchLogs: {
+      name: "요청 로그 열람",
+      desc: "API 키나 대화 내용이 담겨 있을 수 있는 요청 로그를 읽습니다.",
+    },
+    sendChat: {
+      name: "채팅 전송",
+      desc: "사용자 대신 채팅 메시지를 보냅니다. AI 응답이 트리거됩니다.",
+    },
+  },
   pluginV2Warning:
     "플러그인 V2 및 V2.1은 안전하지 않다고 간주되며, 향후 버전에서는 동작이 중단됩니다. **이 버전의 플러그인을 사용하지 마세요.** 이 플러그인의 개발자라면 가능한 한 빨리 V3로 업데이트해주세요.",
   partialBackupFirstConfirm:

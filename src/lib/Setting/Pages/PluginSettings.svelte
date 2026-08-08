@@ -2,13 +2,21 @@
     import { PlusIcon, TrashIcon, LinkIcon, CodeXmlIcon, PowerIcon, PowerOffIcon, ShieldIcon } from "@lucide/svelte";
     import { language } from "src/lang";
     import SettingPage from "src/lib/UI/GUI/SettingPage.svelte";
-    import { alertConfirm, alertMd, alertSelect, notifySuccess } from "src/ts/alert";
+    import { alertConfirm, alertMd, alertSelect, notifyError, notifySuccess } from "src/ts/alert";
     import { TriangleAlert } from '@lucide/svelte';
 
     import { DBState, hotReloading } from "src/ts/stores.svelte";
     import { checkPluginUpdate, createBlankPlugin, importPlugin, loadPlugins, updatePlugin } from "src/ts/plugins/plugins.svelte";
     import { requestImmediateSave } from "src/ts/globalApi.svelte";
-    import { resetPluginPermission } from "src/ts/plugins/apiV3/v3.svelte";
+    import {
+        listPluginPermissionStates,
+        pluginPermissionDescList,
+        resetPluginPermission,
+        setPluginPermissionPreset,
+        type PluginPermissionDesc,
+        type PluginPermissionPresetState,
+    } from "src/ts/plugins/apiV3/v3.svelte";
+    import SegmentedControl from "src/lib/UI/GUI/SegmentedControl.svelte";
     import TextInput from "src/lib/UI/GUI/TextInput.svelte";
     import NumberInput from "src/lib/UI/GUI/NumberInput.svelte";
     import SelectInput from "src/lib/UI/GUI/SelectInput.svelte";
@@ -21,6 +29,63 @@
     let hotReloadRunning = $state(isHotReloadActive())
     let hasSavedHandle = $state(false)
     hasPersistedHandle().then(v => { hasSavedHandle = v })
+
+    // Only one permission panel is open at a time, so the loaded states can be a
+    // single record instead of a per-plugin map.
+    let openPermissionPlugin = $state<string | null>(null)
+    let permissionStates = $state<Record<PluginPermissionDesc, PluginPermissionPresetState> | null>(null)
+    let permissionLoadFailed = $state(false)
+
+    const permissionStateOptions = () => [
+        { value: 'granted', label: language.pluginPermissionAllow },
+        { value: 'unset', label: language.pluginPermissionAsk },
+        { value: 'denied', label: language.pluginPermissionDeny },
+    ]
+
+    async function loadPermissionStates(pluginName: string) {
+        try {
+            const states = await listPluginPermissionStates(pluginName)
+            if (openPermissionPlugin !== pluginName) return
+            permissionStates = states
+            permissionLoadFailed = false
+        } catch (error) {
+            if (openPermissionPlugin !== pluginName) return
+            permissionStates = null
+            permissionLoadFailed = true
+            notifyError(language.pluginPermissionLoadFailed)
+        }
+    }
+
+    async function togglePermissionPanel(pluginName: string) {
+        if (openPermissionPlugin === pluginName) {
+            openPermissionPlugin = null
+            permissionStates = null
+            permissionLoadFailed = false
+            return
+        }
+        openPermissionPlugin = pluginName
+        permissionStates = null
+        permissionLoadFailed = false
+        await loadPermissionStates(pluginName)
+    }
+
+    async function changePermissionState(
+        pluginName: string,
+        desc: PluginPermissionDesc,
+        next: PluginPermissionPresetState,
+    ) {
+        const states = permissionStates
+        if (!states) return
+        const previous = states[desc]
+        if (previous === next) return
+        states[desc] = next
+        try {
+            await setPluginPermissionPreset(pluginName, desc, next)
+        } catch (error) {
+            if (permissionStates === states) states[desc] = previous
+            notifyError(language.pluginPermissionSaveFailed)
+        }
+    }
 </script>
 
 <SettingPage title={language.plugin}>
@@ -179,16 +244,11 @@
 
             <button
                 class="textcolor2 hover:text-primary cursor-pointer"
-                title={language.resetPluginPermission}
-                onclick={async (e) => {
+                class:text-primary={openPermissionPlugin === plugin.name}
+                title={language.pluginPermissionSettings}
+                onclick={(e) => {
                     e.stopPropagation()
-                    const v = await alertConfirm(
-                        language.resetPluginPermissionConfirm.replace("{}", plugin.displayName ?? plugin.name)
-                    )
-                    if (v) {
-                        await resetPluginPermission(plugin.name)
-                        notifySuccess(language.resetPluginPermissionDone.replace("{}", plugin.displayName ?? plugin.name))
-                    }
+                    void togglePermissionPanel(plugin.name)
                 }}
             >
                 <ShieldIcon />
@@ -326,6 +386,54 @@
                         {/if}
                     {/if}
                 {/each}
+            </div>
+        {/if}
+        {#if openPermissionPlugin === plugin.name}
+            <div class="flex flex-col mt-2 bg-dark-900/50 p-3">
+                <span class="font-bold text-sm">{language.pluginPermissionSettings}</span>
+                <span class="mt-1 text-xs text-textcolor2">{language.pluginPermissionSettingsDesc}</span>
+                {#if permissionLoadFailed}
+                    <span class="mt-3 text-xs text-draculared">{language.pluginPermissionLoadFailed}</span>
+                {:else if !permissionStates}
+                    <span class="mt-3 text-xs text-textcolor2">{language.loading}</span>
+                {:else}
+                    {#each pluginPermissionDescList as desc}
+                        <div class="flex flex-wrap items-center justify-between gap-2 mt-4">
+                            <div class="flex flex-col min-w-40 flex-1">
+                                <span class="text-sm">{language.pluginPermissionLabels[desc].name}</span>
+                                <span class="text-xs text-textcolor2">{language.pluginPermissionLabels[desc].desc}</span>
+                            </div>
+                            <SegmentedControl
+                                size="sm"
+                                className="shrink-0 mb-0!"
+                                options={permissionStateOptions()}
+                                bind:value={
+                                    () => permissionStates[desc],
+                                    (v) => {
+                                        void changePermissionState(plugin.name, desc, String(v) as PluginPermissionPresetState)
+                                    }
+                                }
+                            />
+                        </div>
+                    {/each}
+                {/if}
+                <button
+                    class="mt-4 self-end text-xs text-textcolor2 hover:text-textcolor cursor-pointer"
+                    onclick={async () => {
+                        const v = await alertConfirm(
+                            language.resetPluginPermissionConfirm.replace("{}", plugin.displayName ?? plugin.name)
+                        )
+                        if (v) {
+                            await resetPluginPermission(plugin.name)
+                            notifySuccess(language.resetPluginPermissionDone.replace("{}", plugin.displayName ?? plugin.name))
+                            if (openPermissionPlugin === plugin.name) {
+                                await loadPermissionStates(plugin.name)
+                            }
+                        }
+                    }}
+                >
+                    {language.resetPluginPermission}
+                </button>
             </div>
         {/if}
     {/each}
