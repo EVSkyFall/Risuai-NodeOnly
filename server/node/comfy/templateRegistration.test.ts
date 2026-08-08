@@ -418,6 +418,38 @@ describe('Comfy custom template analysis and registration', () => {
     expect(JSON.parse(compiled.prompt.director.inputs.state)).toMatchObject({
       items: [{ value: 'risu-comfy/up.png' }],
     })
+
+    // l2v mirrors i2v cardinality: exactly one image role, anchored at the end.
+    const l2vGraph = structuredClone(custom)
+    l2vGraph.director.inputs.state = JSON.stringify({
+      prompt: '{{positive}}', seed: '{{seed}}', items: [{ value: 'endframe.png' }],
+    })
+    const l2v = await registry.registerTemplate({
+      name: 'Dasiwa L2VA last-frame anchor',
+      kind: 'video',
+      mode: 'l2v',
+      graphJson: l2vGraph,
+      slotResolution: {
+        embedded: {
+          slots: ['positive', 'seed'].map(name => ({
+            nodeId: 'director', inputName: 'state', token: `{{${name}}}`,
+          })),
+          inputImages: [{
+            nodeId: 'director', inputName: 'state', literal: 'endframe.png', name: 'input_image',
+          }],
+        },
+      },
+      promptProfile: 'h3-structured',
+    })
+    expect(l2v.template.mode).toBe('l2v')
+
+    await expect(registry.registerTemplate({
+      name: 'L2VA needs exactly one image',
+      kind: 'video',
+      mode: 'l2v',
+      graphJson: graph({ images: [] }),
+      promptProfile: 'h3-structured',
+    })).rejects.toMatchObject({ code: 'COMFY_TEMPLATE_IMAGE_CARDINALITY' })
   })
 
   it('distinguishes UI format, rejects blank class_type and dangling links, and accepts colon node ids', () => {
