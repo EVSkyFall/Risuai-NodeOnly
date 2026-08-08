@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
     fetchNative: vi.fn(),
     processZip: vi.fn(),
     processZipWithMetadata: vi.fn(),
+    alertError: vi.fn(),
     notifyError: vi.fn(),
     charEmotionSet: vi.fn(),
     random: vi.fn(),
@@ -25,7 +26,7 @@ vi.mock('./request/request', () => ({
 }))
 
 vi.mock('../alert', () => ({
-    alertError: vi.fn(),
+    alertError: mocks.alertError,
     notifyError: mocks.notifyError,
 }))
 
@@ -78,6 +79,51 @@ function makeDatabase() {
     }
 }
 
+function makeWebUiDatabase() {
+    return {
+        sdProvider: 'webui',
+        webUiUrl: 'http://127.0.0.1:7860/',
+        sdConfig: {
+            width: 1024,
+            height: 1024,
+            sampler_name: 'Euler',
+            enable_hr: false,
+            denoising_strength: 0.7,
+            hr_scale: 2,
+            hr_upscaler: 'Latent',
+        },
+        sdSteps: 28,
+        sdCFG: 7,
+    }
+}
+
+function makeComfyUiDatabase(timeout = 30) {
+    return {
+        sdProvider: 'comfyui',
+        comfyUiUrl: 'http://127.0.0.1:8188/',
+        comfyConfig: {
+            workflow: JSON.stringify({
+                sampler: { class_type: 'KSampler', inputs: { seed: 17, steps: 28 } },
+                positive: { class_type: 'CLIPTextEncode', inputs: { text: '{{risu_prompt}}' } },
+            }),
+            timeout,
+        },
+    }
+}
+
+function jsonResponse(data: unknown) {
+    return { json: async () => data }
+}
+
+function completedComfyHistory(promptId: string) {
+    return {
+        [promptId]: {
+            outputs: { save: { images: [{ filename: 'out.png', subfolder: '', type: 'output' }] } },
+            status: { messages: [] },
+        },
+    }
+}
+
 function fetchResult(overrides: Record<string, unknown>) {
     return {
         ok: true,
@@ -95,6 +141,7 @@ beforeEach(() => {
     mocks.fetchNative.mockReset()
     mocks.processZip.mockReset()
     mocks.processZipWithMetadata.mockReset()
+    mocks.alertError.mockReset()
     mocks.notifyError.mockReset()
     mocks.charEmotionSet.mockReset()
     mocks.random.mockReset()
@@ -107,18 +154,20 @@ beforeEach(() => {
 })
 
 describe('generateAIImage NAI compatibility wrapper', () => {
-    it('uses a supplied uint32 seed for both NAI seed fields and reports it', async () => {
+    it.each([0, 4294967295])(
+        'uses supplied uint32 seed %s for both NAI seed fields and reports it',
+        async (seed) => {
         mocks.globalFetch.mockResolvedValue(fetchResult({}))
 
         const attempt = await generateAIImageTyped(
-            'prompt', currentChar, 'negative', 'inlay', 'interactive', { seed: 0 },
+            'prompt', currentChar, 'negative', 'inlay', 'interactive', { seed },
         )
         const [, request] = mocks.globalFetch.mock.calls[0] as [string, { body: any }]
 
-        expect(request.body.parameters.seed).toBe(0)
-        expect(request.body.parameters.extra_noise_seed).toBe(0)
+        expect(request.body.parameters.seed).toBe(seed)
+        expect(request.body.parameters.extra_noise_seed).toBe(seed)
         expect(attempt.seedSupported).toBe(true)
-        expect(attempt.seedUsed).toBe(0)
+        expect(attempt.seedUsed).toBe(seed)
     })
 
     it('prefers the seed returned in NAI PNG metadata over the request echo', async () => {
@@ -134,6 +183,24 @@ describe('generateAIImage NAI compatibility wrapper', () => {
 
         expect(attempt.seedSupported).toBe(true)
         expect(attempt.seedUsed).toBe(987654321)
+    })
+
+    it('rejects a seed above the NAI uint32 limit before dispatch', async () => {
+        const attempt = await generateAIImageTyped(
+            'prompt', currentChar, 'negative', 'inlay', 'interactive', { seed: 4294967296 },
+        )
+
+        expect(attempt.result.ok).toBe(false)
+        const failure = attempt.result as Extract<
+            import('./stableDiff').ImageGenerationResult,
+            { ok: false; certainty: 'definite' }
+        >
+        expect(failure.certainty).toBe('definite')
+        expect(failure.code).toBe('image_seed_invalid')
+        expect(failure.reason).toMatch(/NAI.*4294967295/)
+        expect(attempt.compatibilityValue).toBe('')
+        expect(mocks.globalFetch).not.toHaveBeenCalled()
+        expect(mocks.random).not.toHaveBeenCalled()
     })
 
     it('keeps the two existing NAI random seed draws when no seed is supplied', async () => {
@@ -221,7 +288,9 @@ describe('generateAIImage NAI compatibility wrapper', () => {
 })
 
 describe('generateAIImage Comfy seed threading', () => {
-    it('applies a supplied seed to the Comfy workflow and reports it', async () => {
+    it.each([4294967295, 4294967296, 9007199254740991])(
+        'applies safe-integer seed %s to the Comfy workflow and reports it exactly',
+        async (seed) => {
         mocks.db = {
             sdProvider: 'comfyui',
             comfyUiUrl: 'http://127.0.0.1:8188/',
@@ -247,14 +316,14 @@ describe('generateAIImage Comfy seed threading', () => {
             .mockResolvedValueOnce({ arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer })
 
         const attempt = await generateAIImageTyped(
-            'prompt', currentChar, 'negative', 'inlay', 'interactive', { seed: 4294967295 },
+            'prompt', currentChar, 'negative', 'inlay', 'interactive', { seed },
         )
         const promptRequest = mocks.globalFetch.mock.calls[0][1] as { body: { prompt: any } }
 
-        expect(promptRequest.body.prompt.sampler.inputs.seed).toBe(4294967295)
-        expect(promptRequest.body.prompt.sampler2.inputs.seed).toBe(4294967295)
+        expect(promptRequest.body.prompt.sampler.inputs.seed).toBe(seed)
+        expect(promptRequest.body.prompt.sampler2.inputs.seed).toBe(seed)
         expect(attempt.seedSupported).toBe(true)
-        expect(attempt.seedUsed).toBe(4294967295)
+        expect(attempt.seedUsed).toBe(seed)
     })
 
     it('preserves and reports the workflow seed in legacy Comfy mode when none is supplied', async () => {
@@ -336,54 +405,166 @@ describe('generateAIImage Comfy seed threading', () => {
     })
 })
 
-describe('generateAIImage WebUI seed threading', () => {
-    it('applies a supplied seed and prefers the seed reported by WebUI', async () => {
-        mocks.db = {
-            sdProvider: 'webui',
-            webUiUrl: 'http://127.0.0.1:7860/',
-            sdConfig: {
-                width: 1024,
-                height: 1024,
-                sampler_name: 'Euler',
-                enable_hr: false,
-                denoising_strength: 0.7,
-                hr_scale: 2,
-                hr_upscaler: 'Latent',
-            },
-            sdSteps: 28,
-            sdCFG: 7,
+describe('generateAIImage Comfy polling', () => {
+    it.each(['queue_pending', 'queue_running'] as const)(
+        'waits past the configured deadline while the job remains in %s and collects completion',
+        async (queueLane) => {
+            vi.useFakeTimers()
+            try {
+                const promptId = 'job/1?x'
+                const queue: Record<'queue_pending' | 'queue_running', unknown[]> = {
+                    queue_pending: [],
+                    queue_running: [],
+                }
+                queue[queueLane] = [[0, promptId]]
+                mocks.db = makeComfyUiDatabase(0.5)
+                mocks.globalFetch.mockResolvedValue({ ok: true, data: { prompt_id: promptId } })
+                mocks.fetchNative
+                    .mockResolvedValueOnce(jsonResponse({}))
+                    .mockResolvedValueOnce(jsonResponse(queue))
+                    .mockResolvedValueOnce(jsonResponse({}))
+                    .mockResolvedValueOnce(jsonResponse(queue))
+                    .mockResolvedValueOnce(jsonResponse(completedComfyHistory(promptId)))
+                    .mockResolvedValueOnce({ arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer })
+
+                const resultPromise = generateAIImageTyped(
+                    'prompt', currentChar, 'negative', 'inlay', 'interactive',
+                    { seed: 9007199254740991 },
+                )
+                await vi.advanceTimersByTimeAsync(2000)
+                const attempt = await resultPromise
+
+                expect(attempt.result.ok).toBe(true)
+                expect(attempt.seedSupported).toBe(true)
+                expect(attempt.seedUsed).toBe(9007199254740991)
+                const urls = mocks.fetchNative.mock.calls.map(([url]) => url)
+                expect(urls.filter((url) => url === 'http://127.0.0.1:8188/history/job%2F1%3Fx')).toHaveLength(3)
+                expect(urls.filter((url) => url === 'http://127.0.0.1:8188/queue')).toHaveLength(2)
+            } finally {
+                vi.useRealTimers()
+            }
+        },
+    )
+
+    it('fails after two consecutive observations absent from both queue and history', async () => {
+        vi.useFakeTimers()
+        try {
+            const promptId = 'lost-job'
+            const emptyQueue = { queue_pending: [], queue_running: [] }
+            mocks.db = makeComfyUiDatabase(0.001)
+            mocks.globalFetch.mockResolvedValue({ ok: true, data: { prompt_id: promptId } })
+            mocks.fetchNative
+                .mockResolvedValueOnce(jsonResponse({}))
+                .mockResolvedValueOnce(jsonResponse(emptyQueue))
+                .mockResolvedValueOnce(jsonResponse({}))
+                .mockResolvedValueOnce(jsonResponse(emptyQueue))
+
+            const resultPromise = generateAIImageTyped(
+                'prompt', currentChar, 'negative', 'inlay', 'interactive', {},
+            )
+            await vi.advanceTimersByTimeAsync(1000)
+            const attempt = await resultPromise
+
+            expect(attempt.result.ok).toBe(false)
+            expect(mocks.alertError).toHaveBeenCalledOnce()
+            expect(mocks.alertError).toHaveBeenCalledWith(
+                'Error: ComfyUI job disappeared from both queue and history.',
+            )
+            expect(mocks.alertError.mock.calls[0][0]).not.toMatch(/time/i)
+            const urls = mocks.fetchNative.mock.calls.map(([url]) => url)
+            expect(urls.filter((url) => url.endsWith('/history/lost-job'))).toHaveLength(2)
+            expect(urls.filter((url) => url.endsWith('/queue'))).toHaveLength(2)
+        } finally {
+            vi.useRealTimers()
         }
+    })
+
+    it('resets an absence after rediscovering the job and tolerates a later queue-to-history gap', async () => {
+        vi.useFakeTimers()
+        try {
+            const promptId = 'transition-job'
+            const emptyQueue = { queue_pending: [], queue_running: [] }
+            const queued = { queue_pending: [[0, promptId]], queue_running: [] }
+            mocks.db = makeComfyUiDatabase(0.001)
+            mocks.globalFetch.mockResolvedValue({ ok: true, data: { prompt_id: promptId } })
+            mocks.fetchNative
+                .mockResolvedValueOnce(jsonResponse({}))
+                .mockResolvedValueOnce(jsonResponse(emptyQueue))
+                .mockResolvedValueOnce(jsonResponse({}))
+                .mockResolvedValueOnce(jsonResponse(queued))
+                .mockResolvedValueOnce(jsonResponse({}))
+                .mockResolvedValueOnce(jsonResponse(emptyQueue))
+                .mockResolvedValueOnce(jsonResponse(completedComfyHistory(promptId)))
+                .mockResolvedValueOnce({ arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer })
+
+            const resultPromise = generateAIImageTyped(
+                'prompt', currentChar, 'negative', 'inlay', 'interactive', { seed: 4294967296 },
+            )
+            await vi.advanceTimersByTimeAsync(3000)
+            const attempt = await resultPromise
+
+            expect(attempt.result.ok).toBe(true)
+            expect(attempt.seedUsed).toBe(4294967296)
+            expect(mocks.alertError).not.toHaveBeenCalled()
+        } finally {
+            vi.useRealTimers()
+        }
+    })
+})
+
+describe('generateAIImage WebUI seed threading', () => {
+    it('applies a supplied uint32 seed and exactly reports a safe-integer seed returned by WebUI', async () => {
+        mocks.db = makeWebUiDatabase()
         mocks.globalFetch.mockResolvedValue({
             ok: true,
-            data: { images: ['AAAA'], info: JSON.stringify({ seed: 987654321 }) },
+            data: { images: ['AAAA'], info: JSON.stringify({ seed: 9007199254740991 }) },
+        })
+
+        const attempt = await generateAIImageTyped(
+            'prompt', currentChar, 'negative', 'inlay', 'interactive', { seed: 4294967295 },
+        )
+        const [, request] = mocks.globalFetch.mock.calls[0] as [string, { body: any }]
+
+        expect(request.body.seed).toBe(4294967295)
+        expect(attempt.seedSupported).toBe(true)
+        expect(attempt.seedUsed).toBe(9007199254740991)
+    })
+
+    it('ignores an unsafe integer returned in WebUI info and falls back to the requested seed', async () => {
+        mocks.db = makeWebUiDatabase()
+        mocks.globalFetch.mockResolvedValue({
+            ok: true,
+            data: { images: ['AAAA'], info: JSON.stringify({ seed: 9007199254740992 }) },
         })
 
         const attempt = await generateAIImageTyped(
             'prompt', currentChar, 'negative', 'inlay', 'interactive', { seed: 123 },
         )
-        const [, request] = mocks.globalFetch.mock.calls[0] as [string, { body: any }]
 
-        expect(request.body.seed).toBe(123)
-        expect(attempt.seedSupported).toBe(true)
-        expect(attempt.seedUsed).toBe(987654321)
+        expect(attempt.seedUsed).toBe(123)
+    })
+
+    it('rejects a seed above the WebUI uint32 limit before dispatch', async () => {
+        mocks.db = makeWebUiDatabase()
+
+        const attempt = await generateAIImageTyped(
+            'prompt', currentChar, 'negative', 'inlay', 'interactive', { seed: 4294967296 },
+        )
+
+        expect(attempt.result.ok).toBe(false)
+        const failure = attempt.result as Extract<
+            import('./stableDiff').ImageGenerationResult,
+            { ok: false; certainty: 'definite' }
+        >
+        expect(failure.certainty).toBe('definite')
+        expect(failure.code).toBe('image_seed_invalid')
+        expect(failure.reason).toMatch(/WebUI.*4294967295/)
+        expect(attempt.compatibilityValue).toBe('')
+        expect(mocks.globalFetch).not.toHaveBeenCalled()
     })
 
     it('preserves the WebUI -1 random sentinel when no seed is supplied', async () => {
-        mocks.db = {
-            sdProvider: 'webui',
-            webUiUrl: 'http://127.0.0.1:7860/',
-            sdConfig: {
-                width: 1024,
-                height: 1024,
-                sampler_name: 'Euler',
-                enable_hr: false,
-                denoising_strength: 0.7,
-                hr_scale: 2,
-                hr_upscaler: 'Latent',
-            },
-            sdSteps: 28,
-            sdCFG: 7,
-        }
+        mocks.db = makeWebUiDatabase()
         mocks.globalFetch.mockResolvedValue({
             ok: true,
             data: { images: ['AAAA'], info: JSON.stringify({ seed: 456 }) },

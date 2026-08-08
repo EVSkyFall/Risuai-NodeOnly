@@ -48,7 +48,7 @@ function readNovelAiSeed(imageData: Uint8Array): number | null {
         const comment = PngChunk.read(imageData, ['Comment']).Comment
         if (!comment) return null
         const seed = JSON.parse(comment)?.seed
-        return Number.isInteger(seed) && seed >= 0 && seed <= 0xFFFFFFFF ? seed : null
+        return Number.isSafeInteger(seed) && seed >= 0 ? seed : null
     } catch {
         return null
     }

@@ -187,10 +187,10 @@ describe('measurePrompt', () => {
 })
 
 describe('generateToInlay', () => {
-    it('rejects any supplied seed that is not a uint32 integer before dispatch', async () => {
+    it('rejects any supplied seed that is not a non-negative safe integer before dispatch', async () => {
         const deps = makeDeps()
         const api = createPluginImagesApi(deps)
-        const invalidSeeds = [-1, 4294967296, 1.5, Number.NaN, Number.POSITIVE_INFINITY, '1', null]
+        const invalidSeeds = [-1, 9007199254740992, 1.5, Number.NaN, Number.POSITIVE_INFINITY, '1', null]
 
         for (const seed of invalidSeeds) {
             const response = await api.generateToInlay(generateInput({ seed }))
@@ -201,9 +201,11 @@ describe('generateToInlay', () => {
         expect(deps.generated).toHaveLength(0)
     })
 
-    it('accepts both uint32 boundaries and returns the applied provider seed', async () => {
-        for (const seed of [0, 4294967295]) {
-            const deps = makeDeps()
+    it('accepts the full safe-integer seed range and returns the applied provider seed', async () => {
+        for (const seed of [0, 4294967295, 4294967296, 9007199254740991]) {
+            const deps = makeDeps({
+                getDatabase: () => ({ sdProvider: 'comfyui' }),
+            })
             const api = createPluginImagesApi(deps)
             const response = await api.generateToInlay(generateInput({ seed }))
 
@@ -230,6 +232,27 @@ describe('generateToInlay', () => {
         if (response.status !== 'succeeded') throw new Error('unreachable')
         expect(response.result.seedSupported).toBe(false)
         expect(response.result.seedUsed).toBeNull()
+    })
+
+    it('preserves a provider-specific seed rejection code and limit message', async () => {
+        const api = createPluginImagesApi(makeDeps({
+            generateImage: async () => ({
+                result: {
+                    ok: false,
+                    certainty: 'definite',
+                    reason: 'NAI seed must be at most 4294967295',
+                    code: 'image_seed_invalid',
+                },
+                compatibilityValue: '',
+            }),
+        }))
+
+        const response = await api.generateToInlay(generateInput({ seed: 4294967296 }))
+
+        expect(response.status).toBe('definite_failure')
+        if (response.status === 'succeeded') throw new Error('unreachable')
+        expect(response.code).toBe('image_seed_invalid')
+        expect(response.error).toMatch(/NAI.*4294967295/)
     })
 
     it('runs the configured provider and lands the result on the caller-supplied asset id', async () => {

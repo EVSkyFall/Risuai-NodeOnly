@@ -24,9 +24,9 @@ const ONE_PIXEL_PNG = Buffer.from(
 )
 
 describe('processZipWithMetadata', () => {
-    it('recovers the uint32 seed from NovelAI PNG Comment metadata', async () => {
+    it('recovers a MAX_SAFE_INTEGER seed from NovelAI PNG Comment metadata', async () => {
         const png = await PngChunk.write(ONE_PIXEL_PNG, {
-            Comment: JSON.stringify({ seed: 4294967295, steps: 28 }),
+            Comment: JSON.stringify({ seed: 9007199254740991, steps: 28 }),
         })
         if (!(png instanceof Uint8Array)) throw new Error('expected PNG bytes')
         const zipped = zipSync({ 'image.png': png })
@@ -34,6 +34,18 @@ describe('processZipWithMetadata', () => {
         const result = await processZipWithMetadata(zipped)
 
         expect(result.dataUrl).toMatch(/^data:image\/png;base64,/)
-        expect(result.seedUsed).toBe(4294967295)
+        expect(result.seedUsed).toBe(9007199254740991)
+    })
+
+    it('rejects an unsafe integer from NovelAI PNG Comment metadata', async () => {
+        const png = await PngChunk.write(ONE_PIXEL_PNG, {
+            Comment: JSON.stringify({ seed: 9007199254740992, steps: 28 }),
+        })
+        if (!(png instanceof Uint8Array)) throw new Error('expected PNG bytes')
+        const zipped = zipSync({ 'image.png': png })
+
+        const result = await processZipWithMetadata(zipped)
+
+        expect(result.seedUsed).toBeNull()
     })
 })

@@ -350,8 +350,11 @@ export function createPluginImagesApi(deps: PluginImagesDependencies): PluginIma
                     throw new PluginImageError('image_operation_key_invalid', 'operationKey must be a non-empty string')
                 }
                 if (input.seed !== undefined
-                    && (!Number.isInteger(input.seed) || input.seed < 0 || input.seed > 0xFFFFFFFF)) {
-                    throw new PluginImageError('image_seed_invalid', 'seed must be a uint32 integer')
+                    && (!Number.isInteger(input.seed) || input.seed < 0 || input.seed > Number.MAX_SAFE_INTEGER)) {
+                    throw new PluginImageError(
+                        'image_seed_invalid',
+                        `seed must be an integer between 0 and ${Number.MAX_SAFE_INTEGER}`,
+                    )
                 }
                 prompt = toIllustrationPrompt(input.prompt)
             } catch (error) {
@@ -404,7 +407,7 @@ export function createPluginImagesApi(deps: PluginImagesDependencies): PluginIma
                 return {
                     status: uncertain ? 'ambiguous' : 'definite_failure',
                     error: failure.reason || 'image generation failed',
-                    code: uncertain ? 'image_dispatch_uncertain' : 'image_generation_failed',
+                    code: uncertain ? 'image_dispatch_uncertain' : failure.code ?? 'image_generation_failed',
                 }
             }
 
@@ -431,7 +434,7 @@ export function createPluginImagesApi(deps: PluginImagesDependencies): PluginIma
                         seedUsed: attempt.seedSupported === true
                             ? (Number.isInteger(attempt.seedUsed)
                                 && Number(attempt.seedUsed) >= 0
-                                && Number(attempt.seedUsed) <= 0xFFFFFFFF
+                                && Number(attempt.seedUsed) <= Number.MAX_SAFE_INTEGER
                                 ? Number(attempt.seedUsed)
                                 : input.seed ?? null)
                             : null,

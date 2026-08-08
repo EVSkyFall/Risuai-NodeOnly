@@ -11,7 +11,7 @@ import type { IllustrationPromptV1 } from "./illustrationJobs/types"
 
 export type ImageGenerationResult =
     | { ok: true; bytesOrDataUrl: string; providerStatus: number }
-    | { ok: false; certainty: 'definite'; reason: string; providerStatus?: number }
+    | { ok: false; certainty: 'definite'; reason: string; providerStatus?: number; code?: string }
     | { ok: false; certainty: 'uncertain'; reason: string }
 
 export type ImageGenerationPriority = 'interactive' | 'background'
@@ -35,7 +35,7 @@ function readWebUiSeed(info: unknown): number | null {
     try {
         const parsed = typeof info === 'string' ? JSON.parse(info) : info
         const seed = parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>).seed : null
-        return Number.isInteger(seed) && Number(seed) >= 0 && Number(seed) <= 0xFFFFFFFF
+        return Number.isSafeInteger(seed) && Number(seed) >= 0
             ? Number(seed)
             : null
     } catch {
@@ -155,6 +155,17 @@ async function generateAIImageInternal(
     }
     console.log(db.sdProvider)
     if(db.sdProvider === 'webui'){
+        if (options.seed !== undefined && options.seed > 0xFFFFFFFF) {
+            return {
+                result: {
+                    ok: false,
+                    certainty: 'definite',
+                    reason: 'WebUI seed must be at most 4294967295',
+                    code: 'image_seed_invalid',
+                },
+                compatibilityValue: returnSdData === 'inlay' ? '' : false,
+            }
+        }
 
 
         const uri = new URL(db.webUiUrl)
@@ -222,6 +233,17 @@ async function generateAIImageInternal(
         }
     }
     if(db.sdProvider === 'novelai'){
+        if (options.seed !== undefined && options.seed > 0xFFFFFFFF) {
+            return {
+                result: {
+                    ok: false,
+                    certainty: 'definite',
+                    reason: 'NAI seed must be at most 4294967295',
+                    code: 'image_seed_invalid',
+                },
+                compatibilityValue: returnSdData === 'inlay' ? '' : false,
+            }
+        }
         if(options.preservePromptText !== true){
             genPrompt = genPrompt
                 .replaceAll('\\(', "♧")
@@ -878,18 +900,35 @@ async function generateAIImageInternal(
             console.log(`prompt id: ${id}`)
 
             let item
+            let consecutiveAbsences = 0
+            while (!item) {
+                const history = await (await fetchNative(createUrl(`/history/${encodeURIComponent(id)}`), {
+                    headers: { 'Content-Type': 'application/json' },
+                    method: 'GET'
+                })).json()
+                item = history[id]
+                if (item) break
 
-            const startTime = Date.now()
-            const timeout = db.comfyConfig.timeout * 1000
-            while (!(item = (await (await fetchNative(createUrl('/history'), {
-                headers: { 'Content-Type': 'application/json' },
-                method: 'GET'
-            })).json())[id])) {
-                console.log("Checking /history...")
-                if (Date.now() - startTime >= timeout) {
-                    alertError("Error: Image generation took longer than expected.");
-                    return false
+                const queue = await (await fetchNative(createUrl('/queue'), {
+                    headers: { 'Content-Type': 'application/json' },
+                    method: 'GET'
+                })).json()
+                if (!Array.isArray(queue?.queue_running) || !Array.isArray(queue?.queue_pending)) {
+                    throw new Error('ComfyUI returned an invalid queue response')
                 }
+                const queued = [...queue.queue_running, ...queue.queue_pending]
+                    .some((entry: unknown) => Array.isArray(entry) && entry[1] === id)
+                if (queued) {
+                    consecutiveAbsences = 0
+                } else {
+                    consecutiveAbsences += 1
+                    // One empty observation can be the queue-to-history handoff.
+                    if (consecutiveAbsences >= 2) {
+                        alertError('Error: ComfyUI job disappeared from both queue and history.')
+                        return false
+                    }
+                }
+                console.log("Checking /history...")
                 await new Promise(r => setTimeout(r, 1000))
             } // Check history until the generation is complete.
             // A history entry also appears when the workflow failed, but then it carries
