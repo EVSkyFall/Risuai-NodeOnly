@@ -91,6 +91,9 @@ describe('Comfy durable submission receipts', () => {
     expect(replay.replayed).toBe(true)
     expect(replay.job.jobId).toBe(created.job.jobId)
     expect(store.findByOperationKey(request.operationKey).jobId).toBe(created.job.jobId)
+    expect(store.updateJob(created.job.jobId, created.job.revision, 'queued', {
+      attemptSequenceHorizon: 42.5,
+    })).toMatchObject({ attemptSequenceHorizon: 42.5 })
 
     expect(() => store.createOrReplayJob({
       ...request,
@@ -312,8 +315,10 @@ describe('Comfy durable submission receipts', () => {
       inputAssets: { input_image: { assetId: 'source', hash: 'INPUT' } },
       remoteInputs: {},
       promptAttemptedAt: null,
+      attemptSequenceHorizon: null,
       materializeAttempts: 0,
       materializeRetryAt: null,
+      dispatchRetryAt: null,
     })
     expect(db.prepare('PRAGMA table_info(comfy_jobs)').all().map((column: any) => column.name))
       .toEqual(expect.arrayContaining([
@@ -321,12 +326,14 @@ describe('Comfy durable submission receipts', () => {
         'target_json',
         'materialize_attempts',
         'materialize_retry_at',
+        'dispatch_retry_at',
         'template_kind',
         'template_slots_json',
         'output_descriptor_json',
         'input_assets_json',
         'remote_inputs_json',
         'prompt_attempted_at',
+        'attempt_sequence_horizon',
       ]))
   })
 

@@ -2,6 +2,7 @@
 
 import { createHash } from 'node:crypto'
 import { access, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises'
+import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -13,6 +14,9 @@ const { createComfyAssetStore, validateOutputDescriptor } = pkg as {
     stagingDir: string
     maxInputBytes?: number
     maxOutputBytes?: number
+    transferTimeoutMs?: number
+    uploadIdleTimeoutMs?: number
+    multipartBoundaryFactory?: () => string
     fetchImpl?: typeof fetch
     kvSet?: (key: string, value: Buffer) => void
     kvDel?: (key: string) => void
@@ -20,7 +24,7 @@ const { createComfyAssetStore, validateOutputDescriptor } = pkg as {
     now?: () => number
   }) => {
     readInputAsset: (assetId: string) => Promise<any>
-    uploadInput: (endpointUrl: string, jobId: string, input: any) => Promise<string>
+    uploadInput: (endpointUrl: string, jobId: string, input: any, options?: any) => Promise<string>
     materializeOutput: (endpointUrl: string, jobId: string, output: any, options?: any) => Promise<any>
     recoverMaterialization: (jobId: string, options?: any) => Promise<any>
     removeMaterializedAsset: (assetId: string) => Promise<void>
@@ -86,12 +90,22 @@ describe('Comfy input asset admission', () => {
     dirs.push(root)
     let capturedUrl = ''
     let capturedBody: FormData | null = null
+    let capturedContentLength: string | null = null
+    let capturedWireBytes = 0
     const assets = createComfyAssetStore({
       inlayDir: path.join(root, 'inlays'),
       stagingDir: path.join(root, 'staging'),
       fetchImpl: (async (url: string | URL | Request, init?: RequestInit) => {
         capturedUrl = String(url)
-        capturedBody = init?.body as FormData
+        const request = new Request(url, {
+          method: init?.method,
+          headers: init?.headers,
+          body: init?.body,
+          duplex: 'half',
+        } as RequestInit)
+        capturedContentLength = request.headers.get('content-length')
+        capturedWireBytes = (await request.clone().arrayBuffer()).byteLength
+        capturedBody = await request.formData()
         return new Response(JSON.stringify({
           name: 'server-selected.png',
           subfolder: 'risu-comfy',
@@ -118,7 +132,8 @@ describe('Comfy input asset admission', () => {
     expect(capturedUrl).toBe('http://127.0.0.1:8188/upload/image')
     expect(capturedBody?.get('type')).toBe('input')
     expect(capturedBody?.get('subfolder')).toBe('risu-comfy')
-    expect(capturedBody?.get('overwrite')).toBe('false')
+    expect(capturedBody?.get('overwrite')).toBe('true')
+    expect(capturedContentLength).toBe(String(capturedWireBytes))
     const uploaded = capturedBody?.get('image') as File
     expect(uploaded.name).toBe(
       'risu-11111111-1111-4111-8111-111111111111-0123456789ABCDEFFEDCBA9876543210.png',
@@ -128,6 +143,278 @@ describe('Comfy input asset admission', () => {
       input.bytes.byteOffset + input.bytes.byteLength,
     ))
     expect(remotePath).toBe('risu-comfy/server-selected.png')
+  })
+
+  it('sends the exact multipart Content-Length on the wire', async () => {
+    let declaredLength: string | undefined
+    let receivedLength = 0
+    const server = createServer((request, response) => {
+      declaredLength = request.headers['content-length']
+      request.on('data', chunk => { receivedLength += chunk.length })
+      request.on('end', () => {
+        response.writeHead(200, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({ name: 'wire.png', subfolder: 'risu-comfy', type: 'input' }))
+      })
+    })
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject)
+      server.listen(0, '127.0.0.1', resolve)
+    })
+    try {
+      const address = server.address() as { port: number }
+      const assets = createComfyAssetStore({
+        inlayDir: path.join(tmpdir(), 'unused-inlays'),
+        stagingDir: path.join(tmpdir(), 'unused-staging'),
+      })
+      await expect(assets.uploadInput(
+        `http://127.0.0.1:${address.port}`,
+        '12121212-1212-4212-8212-121212121212',
+        {
+          ext: 'png',
+          mimeType: 'image/png',
+          hash: 'WIRE',
+          bytes: Buffer.alloc(128 * 1024, 7),
+        },
+      )).resolves.toBe('risu-comfy/wire.png')
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()))
+    }
+
+    expect(declaredLength).toBe(String(receivedLength))
+    expect(receivedLength).toBeGreaterThan(128 * 1024)
+  })
+
+  it('streams bounded multipart segments and regenerates a boundary that collides with payload data', async () => {
+    const collidingBoundary = '----risu-comfy-collision'
+    const safeBoundary = '----risu-comfy-safe'
+    const candidates = [collidingBoundary, safeBoundary]
+    let boundaryCalls = 0
+    let maximumChunkBytes = 0
+    let capturedContentType = ''
+    let capturedBody = Buffer.alloc(0)
+    const assets = createComfyAssetStore({
+      inlayDir: path.join(tmpdir(), 'unused-inlays'),
+      stagingDir: path.join(tmpdir(), 'unused-staging'),
+      multipartBoundaryFactory: () => {
+        boundaryCalls += 1
+        return candidates.shift()!
+      },
+      fetchImpl: (async (url: string | URL | Request, init?: RequestInit) => {
+        capturedContentType = new Headers(init?.headers).get('content-type') ?? ''
+        const chunks: Buffer[] = []
+        let total = 0
+        const reader = (init?.body as ReadableStream<Uint8Array>).getReader()
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          const chunk = Buffer.from(value)
+          maximumChunkBytes = Math.max(maximumChunkBytes, chunk.length)
+          total += chunk.length
+          chunks.push(chunk)
+        }
+        capturedBody = Buffer.concat(chunks, total)
+        expect(new Headers(init?.headers).get('content-length')).toBe(String(total))
+        const parsed = await new Request(url, {
+          method: 'POST',
+          headers: init?.headers,
+          body: capturedBody,
+        }).formData()
+        expect(parsed.get('type')).toBe('input')
+        expect(parsed.get('subfolder')).toBe('risu-comfy')
+        expect(parsed.get('overwrite')).toBe('true')
+        expect(Buffer.from(await (parsed.get('image') as File).arrayBuffer())).toEqual(input.bytes)
+        return Response.json({ name: 'streamed.png', subfolder: 'risu-comfy', type: 'input' })
+      }) as typeof fetch,
+    })
+    const input = {
+      ext: 'png',
+      mimeType: 'image/png',
+      hash: `HASH"\\\r\n${collidingBoundary}`,
+      bytes: Buffer.concat([
+        Buffer.from(`payload-${collidingBoundary}-`),
+        Buffer.alloc(140 * 1024, 5),
+      ]),
+    }
+
+    await expect(assets.uploadInput(
+      'http://127.0.0.1:8188',
+      '14141414-1414-4414-8414-141414141414',
+      input,
+    )).resolves.toBe('risu-comfy/streamed.png')
+
+    expect(boundaryCalls).toBe(2)
+    expect(capturedContentType).toBe(`multipart/form-data; boundary=${safeBoundary}`)
+    expect(maximumChunkBytes).toBeLessThanOrEqual(64 * 1024)
+    expect(capturedBody.includes(Buffer.from(`--${safeBoundary}\r\n`))).toBe(true)
+    expect(capturedBody.includes(Buffer.from('HASH"\r\n'))).toBe(false)
+    expect(capturedBody.includes(Buffer.from('HASH%22\\%0D%0A'))).toBe(true)
+  })
+
+  it('does not start the network transfer when the parent was aborted during local encoding', async () => {
+    const parent = new AbortController()
+    const abortReason = Object.assign(new Error('endpoint changed'), {
+      code: 'COMFY_WORKER_PREEMPTED',
+      uncertain: true,
+    })
+    parent.abort(abortReason)
+    let fetchCalls = 0
+    const assets = createComfyAssetStore({
+      inlayDir: path.join(tmpdir(), 'unused-inlays'),
+      stagingDir: path.join(tmpdir(), 'unused-staging'),
+      fetchImpl: (async () => {
+        fetchCalls += 1
+        return Response.json({ name: 'must-not-upload.png', subfolder: 'risu-comfy', type: 'input' })
+      }) as typeof fetch,
+    })
+
+    await expect(assets.uploadInput(
+      'http://127.0.0.1:8188',
+      '13131313-1313-4313-8313-131313131313',
+      {
+        ext: 'png',
+        mimeType: 'image/png',
+        hash: 'ABORTED',
+        bytes: Buffer.alloc(128 * 1024, 3),
+      },
+      { signal: parent.signal },
+    )).rejects.toBe(abortReason)
+    expect(fetchCalls).toBe(0)
+  })
+
+  it('does not abort an input upload because its body transfer outlives the flat transfer timeout', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'comfy-slow-upload-'))
+    dirs.push(root)
+    const assets = createComfyAssetStore({
+      inlayDir: path.join(root, 'inlays'),
+      stagingDir: path.join(root, 'staging'),
+      transferTimeoutMs: 5,
+      fetchImpl: (async (_url: string | URL | Request, init?: RequestInit) => {
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(resolve, 30)
+          init?.signal?.addEventListener('abort', () => {
+            clearTimeout(timer)
+            reject(init.signal?.reason)
+          }, { once: true })
+        })
+        return Response.json({ name: 'slow.png', subfolder: 'risu-comfy', type: 'input' })
+      }) as typeof fetch,
+    })
+
+    await expect(assets.uploadInput(
+      'http://127.0.0.1:8188',
+      '45454545-4545-4545-8545-454545454545',
+      {
+        ext: 'png',
+        mimeType: 'image/png',
+        hash: 'SLOW',
+        bytes: Buffer.from('89504E470D0A1A0A', 'hex'),
+      },
+    )).resolves.toBe('risu-comfy/slow.png')
+  })
+
+  it('aborts a half-open upload after byte progress stays idle', async () => {
+    const assets = createComfyAssetStore({
+      inlayDir: path.join(tmpdir(), 'unused-inlays'),
+      stagingDir: path.join(tmpdir(), 'unused-staging'),
+      uploadIdleTimeoutMs: 20,
+      fetchImpl: (async (_url: string | URL | Request, init?: RequestInit) => (
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true })
+        })
+      )) as typeof fetch,
+    })
+
+    await expect(assets.uploadInput(
+      'http://127.0.0.1:8188',
+      '46464646-4646-4646-8646-464646464646',
+      {
+        ext: 'png',
+        mimeType: 'image/png',
+        hash: 'IDLE',
+        bytes: Buffer.from('89504E470D0A1A0A', 'hex'),
+      },
+    )).rejects.toMatchObject({
+      code: 'COMFY_UPLOAD_FAILED',
+      uncertain: true,
+      message: expect.stringContaining('no byte progress'),
+    })
+  })
+
+  it('allows an upload to outlive the idle interval while body and response bytes keep moving', async () => {
+    const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+    let bodyChunks = 0
+    let responseChunks = 0
+    const responseParts = [
+      Buffer.from('{"name":"progress.png","subfolder":"risu-comfy",'),
+      Buffer.from('"type":"input"}'),
+    ]
+    const assets = createComfyAssetStore({
+      inlayDir: path.join(tmpdir(), 'unused-inlays'),
+      stagingDir: path.join(tmpdir(), 'unused-staging'),
+      uploadIdleTimeoutMs: 500,
+      fetchImpl: (async (_url: string | URL | Request, init?: RequestInit) => {
+        for await (const _chunk of init?.body as any) {
+          bodyChunks += 1
+          await delay(100)
+        }
+        let index = 0
+        return new Response(new ReadableStream<Uint8Array>({
+          async pull(controller) {
+            await delay(100)
+            if (index >= responseParts.length) {
+              controller.close()
+              return
+            }
+            responseChunks += 1
+            controller.enqueue(responseParts[index++])
+          },
+        }))
+      }) as typeof fetch,
+    })
+
+    const startedAt = Date.now()
+    await expect(assets.uploadInput(
+      'http://127.0.0.1:8188',
+      '47474747-4747-4747-8747-474747474747',
+      {
+        ext: 'png',
+        mimeType: 'image/png',
+        hash: 'PROGRESS',
+        bytes: Buffer.alloc(256 * 1024, 1),
+      },
+    )).resolves.toBe('risu-comfy/progress.png')
+
+    expect(Date.now() - startedAt).toBeGreaterThan(500)
+    expect(bodyChunks).toBeGreaterThan(1)
+    expect(responseChunks).toBe(2)
+  })
+
+  it('marks upload transport and HTTP 5xx failures uncertain while keeping HTTP 4xx definitive', async () => {
+    const input = {
+      ext: 'png',
+      mimeType: 'image/png',
+      hash: 'FAILURE',
+      bytes: Buffer.from('89504E470D0A1A0A', 'hex'),
+    }
+    for (const [fetchImpl, uncertain] of [
+      [(async () => { throw new TypeError('connect failed') }) as typeof fetch, true],
+      [(async () => new Response('upstream down', { status: 503 })) as typeof fetch, true],
+      [(async () => new Response('bad input', { status: 413 })) as typeof fetch, false],
+    ] as const) {
+      const assets = createComfyAssetStore({
+        inlayDir: path.join(tmpdir(), 'unused-inlays'),
+        stagingDir: path.join(tmpdir(), 'unused-staging'),
+        fetchImpl,
+      })
+      await expect(assets.uploadInput(
+        'http://127.0.0.1:8188',
+        '56565656-5656-4656-8656-565656565656',
+        input,
+      )).rejects.toMatchObject({
+        code: 'COMFY_UPLOAD_FAILED',
+        uncertain,
+      })
+    }
   })
 
   it('preserves the typed lifecycle abort while reading an upload response body', async () => {

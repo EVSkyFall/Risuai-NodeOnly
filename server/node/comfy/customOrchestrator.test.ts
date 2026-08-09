@@ -53,6 +53,8 @@ describe('Comfy custom template orchestration', () => {
         uploadCalls += 1
         throw new Error('t2i must not upload an input')
       }
+      if (url.pathname === '/queue') return Response.json({ queue_running: [], queue_pending: [] })
+      if (url.pathname === '/history') return Response.json({})
       if (url.pathname === '/prompt') {
         promptCalls += 1
         submittedPrompt = JSON.parse(String(init?.body)).prompt
@@ -142,6 +144,8 @@ describe('Comfy custom template orchestration', () => {
     const fetchImpl = (async (urlValue: string | URL | Request, init?: RequestInit) => {
       const url = new URL(String(urlValue))
       if (url.pathname === '/system_stats') return Response.json({ system: {} })
+      if (url.pathname === '/queue') return Response.json({ queue_running: [], queue_pending: [] })
+      if (url.pathname === '/history') return Response.json({})
       if (url.pathname === '/prompt') {
         submittedPrompt = JSON.parse(String(init?.body)).prompt
         return Response.json({ prompt_id: 'duration-default-prompt' })
@@ -352,6 +356,8 @@ describe('Comfy custom template orchestration', () => {
         uploads.push('upload')
         return Response.json({ name: `uploaded-${uploads.length}.png`, subfolder: 'risu-comfy', type: 'input' })
       }
+      if (url.pathname === '/queue') return Response.json({ queue_running: [], queue_pending: [] })
+      if (url.pathname === '/history') return Response.json({})
       if (url.pathname === '/prompt') {
         submittedPrompt = JSON.parse(String(init?.body)).prompt
         return Response.json({ prompt_id: 'custom-video-prompt' })
@@ -457,6 +463,8 @@ describe('Comfy custom template orchestration', () => {
     const fetchImpl = (async (urlValue: string | URL | Request) => {
       const url = new URL(String(urlValue))
       if (url.pathname === '/system_stats') return Response.json({ system: {} })
+      if (url.pathname === '/queue') return Response.json({ queue_running: [], queue_pending: [] })
+      if (url.pathname === '/history') return Response.json({})
       if (url.pathname === '/prompt') return Response.json({ prompt_id: 'dasiwa-webm-prompt' })
       if (url.pathname === '/history/dasiwa-webm-prompt') {
         return Response.json({

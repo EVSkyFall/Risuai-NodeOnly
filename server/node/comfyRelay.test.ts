@@ -40,13 +40,14 @@ async function listenMockComfy() {
       expect(multipart).toContain('name="type"')
       expect(multipart).toContain('input')
       expect(multipart).toContain('name="overwrite"')
-      expect(multipart).toContain('false')
+      expect(multipart).toContain('true')
       return res.end(JSON.stringify({ name: 'renamed by comfy.png', subfolder: 'risu-comfy', type: 'input' }))
     }
     if (url.pathname === '/prompt') {
       submitted = JSON.parse(body.toString('utf8'))
       return res.end(JSON.stringify({ prompt_id: 'integration-prompt' }))
     }
+    if (url.pathname === '/history') return res.end(JSON.stringify({}))
     if (url.pathname === '/history/integration-prompt') {
       return res.end(JSON.stringify({
         'integration-prompt': {
@@ -170,7 +171,7 @@ describe('Comfy relay over the real NodeOnly server', { timeout: 30_000 }, () =>
     expect(submitted.body).toMatchObject({ ok: true, jobId: expect.any(String) })
 
     let job: any = null
-    for (let attempt = 0; attempt < 30; attempt += 1) {
+    for (let attempt = 0; attempt < 60; attempt += 1) {
       const polled = await relay(client, { op: 'poll', jobId: submitted.body.jobId })
       job = polled.body.job
       if (job?.state === 'succeeded') break

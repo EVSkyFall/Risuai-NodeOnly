@@ -10,6 +10,7 @@ const DEFAULT_MAX_OUTPUT_BYTES = 256 * 1024 * 1024;
 const MAX_SIDECAR_BYTES = 64 * 1024;
 const MAX_JSON_BYTES = 16 * 1024 * 1024;
 const DEFAULT_TRANSFER_TIMEOUT_MS = 10 * 60 * 1000;
+const DEFAULT_UPLOAD_IDLE_TIMEOUT_MS = 60 * 1000;
 const IMAGE_MIME_BY_EXT = Object.freeze({
     png: 'image/png',
     jpg: 'image/jpeg',
@@ -128,7 +129,7 @@ function hasOutputMagic(mediaType, bytes) {
     return Boolean(ext) && hasImageMagic(ext, bytes);
 }
 
-async function readCappedBytes(response, maxBytes, tooLargeCode) {
+async function readCappedBytes(response, maxBytes, tooLargeCode, onProgress = null) {
     const declared = Number(response.headers.get('content-length'));
     if (Number.isFinite(declared) && declared > maxBytes) {
         throw comfyError(tooLargeCode, 'Remote response exceeds the configured size limit');
@@ -138,6 +139,7 @@ async function readCappedBytes(response, maxBytes, tooLargeCode) {
     let total = 0;
     for await (const chunk of response.body) {
         const bytes = Buffer.from(chunk);
+        onProgress?.();
         total += bytes.length;
         if (total > maxBytes) {
             throw comfyError(tooLargeCode, 'Remote response exceeds the configured size limit');
@@ -147,8 +149,13 @@ async function readCappedBytes(response, maxBytes, tooLargeCode) {
     return Buffer.concat(chunks, total);
 }
 
-async function readCappedJson(response) {
-    const bytes = await readCappedBytes(response, MAX_JSON_BYTES, 'COMFY_RESPONSE_TOO_LARGE');
+async function readCappedJson(response, onProgress = null) {
+    const bytes = await readCappedBytes(
+        response,
+        MAX_JSON_BYTES,
+        'COMFY_RESPONSE_TOO_LARGE',
+        onProgress,
+    );
     try {
         return JSON.parse(bytes.toString('utf8'));
     } catch (cause) {
@@ -198,6 +205,102 @@ function createAbortScope(parentSignal, timeoutMs) {
             parentSignal?.removeEventListener('abort', abort);
         },
     };
+}
+
+function createIdleAbortScope(parentSignal, idleTimeoutMs) {
+    const controller = new AbortController();
+    const abortFromParent = () => controller.abort(parentSignal?.reason);
+    if (parentSignal?.aborted) abortFromParent();
+    else parentSignal?.addEventListener('abort', abortFromParent, { once: true });
+    let timer = null;
+    const arm = () => {
+        if (timer) clearTimeout(timer);
+        if (controller.signal.aborted) return;
+        timer = setTimeout(() => controller.abort(comfyError(
+            'COMFY_UPLOAD_FAILED',
+            'Comfy input upload made no byte progress before the idle watchdog expired',
+            { uncertain: true },
+        )), idleTimeoutMs);
+    };
+    arm();
+    return {
+        signal: controller.signal,
+        progress: arm,
+        cleanup() {
+            if (timer) clearTimeout(timer);
+            parentSignal?.removeEventListener('abort', abortFromParent);
+        },
+    };
+}
+
+function escapeMultipartQuoted(value) {
+    return String(value)
+        .replace(/\r/g, '%0D')
+        .replace(/\n/g, '%0A')
+        .replace(/"/g, '%22');
+}
+
+function encodeMultipart(input, filename, boundaryFactory) {
+    const rawValues = [filename, input.mimeType, 'input', 'risu-comfy', 'true'];
+    let boundary;
+    while (!boundary) {
+        const candidate = boundaryFactory();
+        if (
+            typeof candidate !== 'string'
+            || candidate.length === 0
+            || candidate.length > 70
+            || !/^[0-9A-Za-z'()+_,\-./:=?]+$/.test(candidate)
+        ) continue;
+        const needle = Buffer.from(candidate);
+        if (input.bytes.includes(needle) || rawValues.some(value => String(value).includes(candidate))) continue;
+        boundary = candidate;
+    }
+
+    const escapedFilename = escapeMultipartQuoted(filename);
+    const head = Buffer.from(
+        `--${boundary}\r\n`
+        + `Content-Disposition: form-data; name="image"; filename="${escapedFilename}"\r\n`
+        + `Content-Type: ${input.mimeType}\r\n\r\n`,
+    );
+    const tail = Buffer.from(
+        `\r\n--${boundary}\r\n`
+        + 'Content-Disposition: form-data; name="type"\r\n\r\n'
+        + 'input\r\n'
+        + `--${boundary}\r\n`
+        + 'Content-Disposition: form-data; name="subfolder"\r\n\r\n'
+        + 'risu-comfy\r\n'
+        + `--${boundary}\r\n`
+        + 'Content-Disposition: form-data; name="overwrite"\r\n\r\n'
+        + 'true\r\n'
+        + `--${boundary}--\r\n`,
+    );
+    return {
+        segments: [head, input.bytes, tail],
+        contentType: `multipart/form-data; boundary=${boundary}`,
+        contentLength: head.length + input.bytes.length + tail.length,
+    };
+}
+
+function createProgressBody(segments, onProgress) {
+    let segmentIndex = 0;
+    let offset = 0;
+    return new ReadableStream({
+        pull(controller) {
+            while (segmentIndex < segments.length && offset >= segments[segmentIndex].length) {
+                segmentIndex += 1;
+                offset = 0;
+            }
+            if (segmentIndex >= segments.length) {
+                controller.close();
+                return;
+            }
+            const segment = segments[segmentIndex];
+            const end = Math.min(segment.length, offset + 64 * 1024);
+            controller.enqueue(segment.subarray(offset, end));
+            offset = end;
+            onProgress();
+        },
+    });
 }
 
 async function pathStat(pathname) {
@@ -256,7 +359,10 @@ function createComfyAssetStore(options) {
     const maxInputBytes = options.maxInputBytes ?? DEFAULT_MAX_INPUT_BYTES;
     const maxOutputBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
     const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+    const multipartBoundaryFactory = options.multipartBoundaryFactory
+        ?? (() => `----risu-comfy-${crypto.randomBytes(24).toString('hex')}`);
     const transferTimeoutMs = options.transferTimeoutMs ?? DEFAULT_TRANSFER_TIMEOUT_MS;
+    const uploadIdleTimeoutMs = options.uploadIdleTimeoutMs ?? DEFAULT_UPLOAD_IDLE_TIMEOUT_MS;
     const kvSet = options.kvSet ?? (() => {});
     const kvDel = options.kvDel ?? (() => {});
     const now = options.now ?? Date.now;
@@ -314,41 +420,72 @@ function createComfyAssetStore(options) {
             throw comfyError('COMFY_UPLOAD_INVALID', 'Upload input is invalid');
         }
         const filename = `risu-${jobId}-${input.hash}.${input.ext}`;
-        const form = new FormData();
-        form.append('image', new Blob([input.bytes], { type: input.mimeType }), filename);
-        form.append('type', 'input');
-        form.append('subfolder', 'risu-comfy');
-        form.append('overwrite', 'false');
+        if (/\r|\n/.test(String(input.mimeType))) {
+            throw comfyError('COMFY_UPLOAD_INVALID', 'Upload input media type is invalid');
+        }
 
-        const abortScope = createAbortScope(requestOptions.signal, transferTimeoutMs);
+        let multipart;
+        try {
+            multipart = encodeMultipart(input, filename, multipartBoundaryFactory);
+        } catch (error) {
+            if (isComfyError(error)) throw error;
+            throw comfyError('COMFY_UPLOAD_FAILED', 'Could not encode the Comfy input upload', { cause: error });
+        }
+        const idleScope = createIdleAbortScope(requestOptions.signal, uploadIdleTimeoutMs);
+        if (idleScope.signal.aborted) {
+            idleScope.cleanup();
+            throw idleScope.signal.reason ?? comfyError(
+                'COMFY_UPLOAD_FAILED',
+                'Comfy input upload was aborted before transfer',
+                { uncertain: true },
+            );
+        }
+        const body = createProgressBody(multipart.segments, idleScope.progress);
+
         let response;
         try {
             response = await fetchImpl(`${endpointUrl.replace(/\/+$/, '')}/upload/image`, {
                 method: 'POST',
-                body: form,
-                signal: abortScope.signal,
+                headers: {
+                    'content-type': multipart.contentType,
+                    'content-length': String(multipart.contentLength),
+                },
+                body,
+                duplex: 'half',
+                signal: idleScope.signal,
             });
+            if (idleScope.signal.aborted) throw idleScope.signal.reason;
         } catch (cause) {
-            abortScope.cleanup();
-            if (requestOptions.signal?.aborted && isComfyError(requestOptions.signal.reason)) {
-                throw requestOptions.signal.reason;
+            if (idleScope.signal.aborted && isComfyError(idleScope.signal.reason)) {
+                idleScope.cleanup();
+                throw idleScope.signal.reason;
             }
-            throw comfyError('COMFY_UPLOAD_FAILED', 'Could not upload the input image to Comfy', { cause });
+            idleScope.cleanup();
+            throw comfyError(
+                'COMFY_UPLOAD_FAILED',
+                'Could not upload the input image to Comfy',
+                { cause, uncertain: true },
+            );
         }
         if (!response.ok) {
-            abortScope.cleanup();
-            throw comfyError('COMFY_UPLOAD_FAILED', `Comfy input upload failed with HTTP ${response.status}`);
+            idleScope.cleanup();
+            throw comfyError(
+                'COMFY_UPLOAD_FAILED',
+                `Comfy input upload failed with HTTP ${response.status}`,
+                { uncertain: response.status >= 500 },
+            );
         }
         let result;
         try {
-            result = await readCappedJson(response);
+            result = await readCappedJson(response, idleScope.progress);
+            if (idleScope.signal.aborted) throw idleScope.signal.reason;
         } catch (cause) {
-            if (requestOptions.signal?.aborted && isComfyError(requestOptions.signal.reason)) {
-                throw requestOptions.signal.reason;
+            if (idleScope.signal.aborted && isComfyError(idleScope.signal.reason)) {
+                throw idleScope.signal.reason;
             }
             throw cause;
         } finally {
-            abortScope.cleanup();
+            idleScope.cleanup();
         }
         if (!isSafeRemoteSegment(result?.name) || result?.type !== 'input') {
             throw comfyError('COMFY_UPLOAD_RESPONSE_INVALID', 'Comfy returned an invalid upload path');
@@ -779,4 +916,5 @@ module.exports = {
     validateOutputDescriptor,
     DEFAULT_MAX_INPUT_BYTES,
     DEFAULT_MAX_OUTPUT_BYTES,
+    DEFAULT_UPLOAD_IDLE_TIMEOUT_MS,
 };

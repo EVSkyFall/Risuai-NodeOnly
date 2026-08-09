@@ -5,9 +5,16 @@ const { comfyError, isComfyError } = require('./errors.cjs');
 const MAX_JSON_BYTES = 16 * 1024 * 1024;
 const DEFAULT_POLL_INTERVAL_MS = 1_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const DEFAULT_PROMPT_SETTLEMENT_WINDOW_MS = 120_000;
+const DEFAULT_SETTLEMENT_SCAN_INTERVAL_MS = 5_000;
+const DEFAULT_SUBMISSION_PROOF_RETRY_DELAY_MS = 30_000;
 const GLOBAL_HISTORY_PAGE_LIMIT = 200;
 const MAX_MATERIALIZE_ATTEMPTS = 5;
 const MATERIALIZE_RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000];
+const DISPATCH_WAIT_MESSAGE = 'ComfyUI 연결 대기 — 터널 혼잡/끊김, 자동 재시도 중';
+const WORKER_PREEMPTED_MESSAGE = 'ComfyUI 작업 전환 대기 — 자동으로 다시 확인 중';
+const SUBMISSION_PROOF_WAIT_MESSAGE = 'ComfyUI 원격 접수 여부를 증명할 수 없어요 — 대기 중이며 취소할 수 있어요';
+const CANCEL_PENDING_MESSAGE = 'ComfyUI 취소 진행 중 — 원격 작업을 확인하고 있어요';
 
 function normalizeEndpoint(value) {
     let parsed;
@@ -130,18 +137,35 @@ function createComfyOrchestrator(options) {
     const fetchImpl = options.fetchImpl ?? globalThis.fetch;
     const now = options.now ?? Date.now;
     const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+    const dispatchRetryDelayMs = options.dispatchRetryDelayMs ?? (2 * pollIntervalMs);
     const requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    const promptSettlementWindowMs = Math.max(
+        requestTimeoutMs,
+        options.promptSettlementWindowMs ?? DEFAULT_PROMPT_SETTLEMENT_WINDOW_MS,
+    );
+    const settlementScanIntervalMs = options.settlementScanIntervalMs
+        ?? DEFAULT_SETTLEMENT_SCAN_INTERVAL_MS;
+    const submissionProofRetryDelayMs = options.submissionProofRetryDelayMs
+        ?? DEFAULT_SUBMISSION_PROOF_RETRY_DELAY_MS;
     const stopDrainTimeoutMs = options.stopDrainTimeoutMs ?? 5_000;
     const logger = options.logger ?? console;
     const setTimer = options.setTimer ?? setTimeout;
     const clearTimer = options.clearTimer ?? clearTimeout;
     let activeRun = null;
     let activeRunController = null;
+    let activeRunJobId = null;
     let timer = null;
     let started = false;
     let disabledCause = null;
     let worldReplacementPauseDepth = 0;
     let localGeneration = store.getConfig().restoreEpoch;
+    const lastServedJobId = {
+        cancel: null,
+        reconcile: null,
+        dispatch: null,
+    };
+    let lastRegularLane = null;
+    let lastTopLevelLane = null;
 
     function unavailableError() {
         return comfyError(
@@ -155,9 +179,9 @@ function createComfyOrchestrator(options) {
         if (disabledCause) throw unavailableError();
     }
 
-    function workerAbortError(reason) {
+    function workerAbortError(reason, code = 'COMFY_WORKER_ABORTED') {
         return comfyError(
-            'COMFY_WORKER_ABORTED',
+            code,
             `Comfy worker was aborted for ${reason}`,
             { uncertain: true },
         );
@@ -165,11 +189,14 @@ function createComfyOrchestrator(options) {
 
     async function drainActiveRun(timeoutMs = null) {
         const run = activeRun;
-        if (!run) return;
-        const observed = run.catch(() => undefined);
+        if (!run) return true;
+        let settled = false;
+        const observed = run.catch(() => undefined).then(() => {
+            settled = true;
+        });
         if (timeoutMs == null) {
             await observed;
-            return;
+            return true;
         }
         let timeout;
         try {
@@ -182,6 +209,7 @@ function createComfyOrchestrator(options) {
         } finally {
             if (timeout) clearTimer(timeout);
         }
+        return settled;
     }
 
     // Comfy's non-2xx bodies name the exact failing node ("node_errors"); dropping
@@ -216,7 +244,7 @@ function createComfyOrchestrator(options) {
 
     async function httpStatusError(response) {
         const detail = await readErrorDetail(response);
-        return comfyError(
+        const error = comfyError(
             'COMFY_HTTP_ERROR',
             `Comfy returned HTTP ${response.status}${detail ? ` — ${detail}` : ''}`,
             {
@@ -224,6 +252,8 @@ function createComfyOrchestrator(options) {
                 uncertain: response.status >= 500,
             },
         );
+        error.remoteStatus = response.status;
+        return error;
     }
 
     async function requestJson(endpointUrl, route, init = {}) {
@@ -275,6 +305,7 @@ function createComfyOrchestrator(options) {
                 error: {
                     code: isComfyError(error) ? error.code : 'COMFY_UNREACHABLE',
                     message: String(error?.message ?? error),
+                    uncertain: error?.uncertain === true,
                 },
             };
         }
@@ -368,7 +399,7 @@ function createComfyOrchestrator(options) {
 
         const endpointUrl = requireConfiguredEndpoint(config);
         const health = await probe(endpointUrl);
-        if (!health.reachable) {
+        if (!health.reachable && !health.error.uncertain) {
             throw comfyError('COMFY_UNREACHABLE', health.error.message, { httpStatus: 503 });
         }
         const created = store.createOrReplayJob({
@@ -389,8 +420,19 @@ function createComfyOrchestrator(options) {
                 target,
             },
         });
+        if (created.replayed) {
+            schedule(0);
+            return toPublicJob(created.job);
+        }
+        const queued = health.reachable
+            ? created.job
+            : queueDispatchRetry(created.job, comfyError(
+                health.error.code,
+                health.error.message,
+                { uncertain: true },
+            ));
         schedule(0);
-        return toPublicJob(created.job);
+        return toPublicJob(queued ?? store.getJob(created.job.jobId));
     }
 
     async function poll(jobId) {
@@ -415,41 +457,229 @@ function createComfyOrchestrator(options) {
     }
 
     function markUnknown(job, error) {
+        const errorMessage = error?.code === 'COMFY_WORKER_ABORTED'
+            || error?.code === 'COMFY_WORKER_PREEMPTED'
+            ? WORKER_PREEMPTED_MESSAGE
+            : String(error?.message ?? error);
         return store.updateJob(job.jobId, job.revision, job.state, {
             state: 'unknown',
             errorCode: isComfyError(error) ? error.code : 'COMFY_REMOTE_UNKNOWN',
-            errorMessage: String(error?.message ?? error),
+            errorMessage,
+            absenceCount: 0,
+            absenceConfirmedAt: null,
+        });
+    }
+
+    function isRetryableDispatchConnectionError(error) {
+        if (error?.code === 'COMFY_WORKER_ABORTED' || error?.code === 'COMFY_WORKER_PREEMPTED') return false;
+        return error?.code === 'COMFY_UNREACHABLE'
+            || (error?.code === 'COMFY_UPLOAD_FAILED' && error?.uncertain === true)
+            || (error?.code === 'COMFY_HTTP_ERROR' && error?.uncertain === true);
+    }
+
+    function isRetryablePromptSubmissionError(error) {
+        return isRetryableDispatchConnectionError(error)
+            || error?.code === 'COMFY_RESPONSE_INVALID'
+            || error?.code === 'COMFY_RESPONSE_TOO_LARGE'
+            || error?.code === 'COMFY_PROMPT_ACK_INVALID';
+    }
+
+    function isRetryableUploadError(error) {
+        return isRetryableDispatchConnectionError(error)
+            || error?.code === 'COMFY_RESPONSE_INVALID'
+            || error?.code === 'COMFY_RESPONSE_TOO_LARGE'
+            || error?.code === 'COMFY_UPLOAD_RESPONSE_INVALID';
+    }
+
+    function dispatchWaitMessage(error) {
+        if (error?.code === 'COMFY_WORKER_ABORTED' || error?.code === 'COMFY_WORKER_PREEMPTED') {
+            return WORKER_PREEMPTED_MESSAGE;
+        }
+        let detail = String(error?.message ?? '').trim();
+        if (detail.startsWith(DISPATCH_WAIT_MESSAGE)) {
+            detail = detail.slice(DISPATCH_WAIT_MESSAGE.length).replace(/^\s*—\s*/, '').trim();
+        }
+        return detail ? `${DISPATCH_WAIT_MESSAGE} — ${detail}` : DISPATCH_WAIT_MESSAGE;
+    }
+
+    function queueDispatchRetry(job, error, absence = null, retryDelayMs = dispatchRetryDelayMs) {
+        return store.updateJob(job.jobId, job.revision, job.state, {
+            state: 'queued',
+            startedAt: null,
+            dispatchRetryAt: now() + retryDelayMs,
+            errorCode: isComfyError(error) || typeof error?.code === 'string'
+                ? error.code
+                : 'COMFY_UNREACHABLE',
+            errorMessage: dispatchWaitMessage(error),
+            absenceCount: absence?.count ?? 0,
+            absenceConfirmedAt: absence?.confirmedAt ?? null,
+        });
+    }
+
+    function queueSubmissionProofWait(job) {
+        return store.updateJob(job.jobId, job.revision, job.state, {
+            state: 'queued',
+            startedAt: null,
+            dispatchRetryAt: now() + submissionProofRetryDelayMs,
+            errorCode: 'COMFY_SUBMISSION_PROOF_UNAVAILABLE',
+            errorMessage: SUBMISSION_PROOF_WAIT_MESSAGE,
+            absenceCount: 0,
+            absenceConfirmedAt: null,
+        });
+    }
+
+    function markerScanRetryDelay(error) {
+        return typeof error?.code === 'string' && error.code.startsWith('COMFY_DUPLICATE_')
+            ? dispatchRetryDelayMs
+            : settlementScanIntervalMs;
+    }
+
+    function handleDispatchInterruption(job, error) {
+        if (error?.code !== 'COMFY_WORKER_ABORTED' && error?.code !== 'COMFY_WORKER_PREEMPTED') {
+            return null;
+        }
+        if (job.terminalIntent === 'user_cancel') {
+            if (job.promptAttemptedAt == null) {
+                return store.updateJob(job.jobId, job.revision, job.state, {
+                    state: 'cancelled',
+                    dispatchRetryAt: null,
+                    errorCode: null,
+                    errorMessage: null,
+                    finishedAt: now(),
+                });
+            }
+            return store.updateJob(job.jobId, job.revision, job.state, {
+                state: 'cancel_requested',
+                startedAt: null,
+                dispatchRetryAt: now() + dispatchRetryDelayMs,
+                errorCode: error.code,
+                errorMessage: WORKER_PREEMPTED_MESSAGE,
+                absenceCount: 0,
+                absenceConfirmedAt: null,
+            });
+        }
+        if (job.promptAttemptedAt != null) return queueDispatchRetry(job, error);
+        return store.updateJob(job.jobId, job.revision, job.state, {
+            state: 'queued',
+            startedAt: null,
+            dispatchRetryAt: null,
+            errorCode: null,
+            errorMessage: null,
             absenceCount: 0,
             absenceConfirmedAt: null,
         });
     }
 
     async function dispatchQueued(job, generation, signal) {
+        if (job.promptId != null || job.remoteOutput != null) {
+            return reconcileJob(job, generation, signal);
+        }
         const dispatchNow = now();
         let current = store.updateJob(job.jobId, job.revision, 'queued', {
             state: 'submitting',
             startedAt: dispatchNow,
             deadlineAt: dispatchNow + job.timeoutMs,
+            dispatchRetryAt: null,
             errorCode: null,
             errorMessage: null,
         });
         if (!current || generation !== localGeneration) return;
 
         try {
+            if (current.promptAttemptedAt != null) {
+                let markerScan;
+                try {
+                    markerScan = await scanSubmissionMarker(current, signal, generation);
+                } catch (error) {
+                    if (generation !== localGeneration) return;
+                    return queueDispatchRetry(current, error, null, markerScanRetryDelay(error));
+                }
+                if (generation !== localGeneration) return;
+                const marker = markerScan?.marker;
+                if (marker) {
+                    if (marker.terminalSettled) {
+                        return store.updateJob(current.jobId, current.revision, 'submitting', {
+                            state: 'cancelled',
+                            dispatchRetryAt: null,
+                            errorCode: null,
+                            errorMessage: null,
+                            finishedAt: now(),
+                        });
+                    }
+                    const recovered = store.updateJob(current.jobId, current.revision, 'submitting', {
+                        state: 'remote_queued',
+                        promptId: marker.promptId,
+                        dispatchRetryAt: null,
+                        absenceCount: 0,
+                        absenceConfirmedAt: null,
+                        errorCode: null,
+                        errorMessage: null,
+                    });
+                    if (!recovered || generation !== localGeneration) return recovered;
+                    if (marker.historyEntry) {
+                        return finishFromHistory(recovered, marker.historyEntry, generation, signal);
+                    }
+                    return recovered;
+                }
+                if (now() - current.promptAttemptedAt < promptSettlementWindowMs) {
+                    return queueDispatchRetry(current, comfyError(
+                        'COMFY_SUBMISSION_SETTLING',
+                        'Comfy submission is still inside its acknowledgement settlement window',
+                        { uncertain: true },
+                    ), null, settlementScanIntervalMs);
+                }
+                if (!current.terminalIntent && !markerAbsenceIsProvable(current, markerScan)) {
+                    return queueSubmissionProofWait(current);
+                }
+                if (current.absenceCount < 1 || !current.absenceConfirmedAt) {
+                    return queueDispatchRetry(
+                        current,
+                        comfyError(
+                            'COMFY_SUBMISSION_UNCONFIRMED',
+                            'Comfy has not exposed the attempted submission yet',
+                            { uncertain: true },
+                        ),
+                        { count: 1, confirmedAt: now() },
+                    );
+                }
+                if (now() - current.absenceConfirmedAt < dispatchRetryDelayMs) {
+                    return queueDispatchRetry(
+                        current,
+                        comfyError(
+                            'COMFY_SUBMISSION_UNCONFIRMED',
+                            'Comfy submission absence is awaiting confirmation',
+                            { uncertain: true },
+                        ),
+                        { count: current.absenceCount, confirmedAt: current.absenceConfirmedAt },
+                    );
+                }
+                if (current.terminalIntent) {
+                    return finishConfirmedAbsent(current, dispatchRetryDelayMs);
+                }
+            }
+
             const remoteInputs = { ...(current.remoteInputs ?? {}) };
             for (const [slotName, snapshot] of Object.entries(current.inputAssets ?? {})) {
                 if (remoteInputs[slotName]) continue;
                 const input = await assets.readInputAsset(snapshot.assetId);
+                if (generation !== localGeneration) return;
                 if (input.hash !== snapshot.hash) {
                     return failJob(current, 'COMFY_INPUT_CHANGED', 'Input asset changed after submission');
                 }
                 if (generation !== localGeneration || !store.getJob(current.jobId)) return;
-                remoteInputs[slotName] = await assets.uploadInput(
-                    current.endpointUrl,
-                    current.jobId,
-                    input,
-                    { signal },
-                );
+                try {
+                    remoteInputs[slotName] = await assets.uploadInput(
+                        current.endpointUrl,
+                        current.jobId,
+                        input,
+                        { signal },
+                    );
+                } catch (error) {
+                    if (generation !== localGeneration) return;
+                    if (isRetryableUploadError(error)) return queueDispatchRetry(current, error);
+                    throw error;
+                }
+                if (generation !== localGeneration) return;
                 current = store.updateJob(current.jobId, current.revision, 'submitting', {
                     remoteInputs,
                     remoteInputName: Object.values(remoteInputs)[0] ?? null,
@@ -466,8 +696,33 @@ function createComfyOrchestrator(options) {
                 current.templateId,
                 { templateSlots: current.templateSlots, outputDescriptor: current.outputDescriptor },
             );
+            let attemptSequenceHorizon;
+            try {
+                attemptSequenceHorizon = await snapshotSubmissionSequenceHorizon(
+                    current,
+                    signal,
+                    generation,
+                );
+            } catch (error) {
+                if (generation !== localGeneration) return;
+                const latest = store.getJob(current.jobId);
+                if (!latest || store.isTerminalState(latest.state)) return latest;
+                if (handleDispatchInterruption(latest, error)) return;
+                return queueDispatchRetry(latest, error);
+            }
+            if (generation !== localGeneration) return;
+            if (!Number.isFinite(attemptSequenceHorizon)) {
+                return queueDispatchRetry(current, comfyError(
+                    'COMFY_SUBMISSION_HORIZON_UNAVAILABLE',
+                    'Comfy did not expose a finite submission sequence horizon',
+                    { uncertain: true },
+                ));
+            }
             current = store.updateJob(current.jobId, current.revision, 'submitting', {
                 promptAttemptedAt: now(),
+                attemptSequenceHorizon,
+                absenceCount: 0,
+                absenceConfirmedAt: null,
             });
             if (!current || generation !== localGeneration) return;
             let response;
@@ -475,21 +730,26 @@ function createComfyOrchestrator(options) {
                 response = await requestJson(current.endpointUrl, '/prompt', {
                     method: 'POST',
                     headers: { 'content-type': 'application/json' },
-                    body: JSON.stringify({ prompt: compiled.prompt, client_id: current.jobId }),
+                    body: JSON.stringify({
+                        prompt: compiled.prompt,
+                        client_id: current.jobId,
+                        extra_data: { risu_job_id: current.jobId },
+                    }),
                     signal,
                 });
             } catch (error) {
-                if (
-                    error?.uncertain
-                    || error?.code === 'COMFY_RESPONSE_INVALID'
-                    || error?.code === 'COMFY_RESPONSE_TOO_LARGE'
-                ) {
-                    return markUnknown(current, error);
+                if (generation !== localGeneration) return;
+                if (error?.code === 'COMFY_WORKER_ABORTED' || error?.code === 'COMFY_WORKER_PREEMPTED') {
+                    const latest = store.getJob(current.jobId);
+                    if (!latest || store.isTerminalState(latest.state)) return latest;
+                    return handleDispatchInterruption(latest, error);
                 }
+                if (isRetryablePromptSubmissionError(error)) return queueDispatchRetry(current, error);
                 return failJob(current, error?.code ?? 'COMFY_PROMPT_REJECTED', String(error?.message ?? error));
             }
+            if (generation !== localGeneration) return;
             if (typeof response?.prompt_id !== 'string' || !response.prompt_id) {
-                return markUnknown(current, comfyError(
+                return queueDispatchRetry(current, comfyError(
                     'COMFY_PROMPT_ACK_INVALID',
                     'Comfy prompt response did not contain a recoverable prompt ID',
                     { uncertain: true },
@@ -504,9 +764,12 @@ function createComfyOrchestrator(options) {
                 errorMessage: null,
             });
         } catch (error) {
+            if (generation !== localGeneration) return;
             const latest = store.getJob(job.jobId);
             if (!latest || store.isTerminalState(latest.state)) return;
-            if (error?.uncertain) markUnknown(latest, error);
+            if (handleDispatchInterruption(latest, error)) return;
+            if (isRetryableDispatchConnectionError(error)) queueDispatchRetry(latest, error);
+            else if (error?.uncertain) markUnknown(latest, error);
             else failJob(latest, error?.code ?? 'COMFY_SUBMIT_FAILED', String(error?.message ?? error));
         }
     }
@@ -543,6 +806,7 @@ function createComfyOrchestrator(options) {
     }
 
     async function finishFromHistory(job, entry, generation, signal) {
+        if (generation !== localGeneration) return null;
         if (historyHasExecutionError(entry)) {
             if (job.terminalIntent && job.cancelAction) {
                 if (job.terminalIntent === 'user_cancel') {
@@ -608,6 +872,7 @@ function createComfyOrchestrator(options) {
                 );
             }
         } catch (error) {
+            if (generation !== localGeneration) return;
             const latest = store.getJob(job.jobId);
             if (!latest || store.isTerminalState(latest.state)) return;
             if (error?.retryMaterialization) {
@@ -710,6 +975,32 @@ function createComfyOrchestrator(options) {
         };
     }
 
+    async function snapshotSubmissionSequenceHorizon(job, signal, generation) {
+        const queue = queueEntries(await requestJson(job.endpointUrl, '/queue', { signal }));
+        if (generation !== localGeneration) return null;
+        const history = await requestJson(job.endpointUrl, '/history?max_items=1', { signal });
+        if (generation !== localGeneration) return null;
+        if (!isObject(history)) throw comfyError(
+            'COMFY_HISTORY_RESPONSE_INVALID',
+            'Comfy history response is not a prompt-keyed object',
+            { uncertain: true },
+        );
+        const sequences = [];
+        for (const entry of [...queue.running, ...queue.pending]) {
+            if (!Array.isArray(entry) || !Number.isFinite(Number(entry[0]))) {
+                throw comfyError('COMFY_QUEUE_RESPONSE_INVALID', 'Comfy queue sequence is invalid', { uncertain: true });
+            }
+            sequences.push(Number(entry[0]));
+        }
+        for (const entry of Object.values(history)) {
+            if (!isObject(entry) || !Array.isArray(entry.prompt) || !Number.isFinite(Number(entry.prompt[0]))) {
+                throw comfyError('COMFY_HISTORY_RESPONSE_INVALID', 'Comfy history sequence is invalid', { uncertain: true });
+            }
+            sequences.push(Number(entry.prompt[0]));
+        }
+        return sequences.length > 0 ? Math.max(...sequences) : 0;
+    }
+
     async function reconcileKnownPrompt(job, generation, signal, allowCancelAction = true) {
         let history;
         try {
@@ -719,14 +1010,20 @@ function createComfyOrchestrator(options) {
                 { signal },
             );
         } catch (error) {
+            if (generation !== localGeneration) return;
+            if (job.terminalIntent === 'user_cancel') return queueDispatchRetry(job, error);
             return markUnknown(job, error);
         }
+        if (generation !== localGeneration) return;
         if (!isObject(history)) {
-            return markUnknown(job, comfyError(
+            const error = comfyError(
                 'COMFY_HISTORY_RESPONSE_INVALID',
                 'Comfy history response is not a prompt-keyed object',
                 { uncertain: true },
-            ));
+            );
+            return job.terminalIntent === 'user_cancel'
+                ? queueDispatchRetry(job, error)
+                : markUnknown(job, error);
         }
         const entry = history[job.promptId];
         if (entry) return finishFromHistory(job, entry, generation, signal);
@@ -735,8 +1032,11 @@ function createComfyOrchestrator(options) {
         try {
             queue = queueEntries(await requestJson(job.endpointUrl, '/queue', { signal }));
         } catch (error) {
+            if (generation !== localGeneration) return;
+            if (job.terminalIntent === 'user_cancel') return queueDispatchRetry(job, error);
             return markUnknown(job, error);
         }
+        if (generation !== localGeneration) return;
         const running = queue.running.find(item => Array.isArray(item) && item[1] === job.promptId);
         const pending = queue.pending.find(item => Array.isArray(item) && item[1] === job.promptId);
         if (job.terminalIntent && allowCancelAction && (running || pending)) {
@@ -773,9 +1073,9 @@ function createComfyOrchestrator(options) {
                         cancelAction: null,
                     });
                     if (!cleared) return store.getJob(latest.jobId);
-                    return markUnknown(cleared, error);
+                    return queueDispatchRetry(cleared, error);
                 }
-                return markUnknown(latest, error);
+                return queueDispatchRetry(latest, error);
             }
             const latest = store.getJob(job.jobId);
             if (!latest || store.isTerminalState(latest.state) || generation !== localGeneration) return latest;
@@ -795,50 +1095,246 @@ function createComfyOrchestrator(options) {
     }
 
     function inspectGlobalHistory(history, jobId) {
-        if (!isObject(history)) return { capable: false, matches: [] };
+        if (!isObject(history)) return {
+            capable: false,
+            matches: [],
+            full: false,
+            minSequence: null,
+        };
         const entries = Object.entries(history);
         const matches = [];
+        const sequences = [];
+        let sequencesComplete = true;
         for (const [key, entry] of entries) {
             if (!isObject(entry) || !Array.isArray(entry.prompt) || !isObject(entry.prompt[3])) {
-                return { capable: false, matches: [] };
+                return { capable: false, matches: [], full: false, minSequence: null };
             }
             const promptId = typeof entry.prompt[1] === 'string' ? entry.prompt[1] : key;
-            if (typeof promptId !== 'string' || !promptId) return { capable: false, matches: [] };
-            if (entry.prompt[3].client_id === jobId) matches.push({ promptId, entry });
+            if (typeof promptId !== 'string' || !promptId) {
+                return { capable: false, matches: [], full: false, minSequence: null };
+            }
+            const sequence = Number(entry.prompt[0]);
+            if (Number.isFinite(sequence)) sequences.push(sequence);
+            else sequencesComplete = false;
+            if (submissionMarkerMatches(entry.prompt[3], jobId)) {
+                matches.push({
+                    promptId,
+                    priority: sequence,
+                    historyEntry: entry,
+                    queueLocation: null,
+                });
+            }
         }
         return {
             capable: true,
             matches,
-            saturated: entries.length >= GLOBAL_HISTORY_PAGE_LIMIT,
+            full: entries.length >= GLOBAL_HISTORY_PAGE_LIMIT,
+            minSequence: sequencesComplete && sequences.length > 0 ? Math.min(...sequences) : null,
         };
     }
 
     function inspectGlobalQueue(queue, jobId) {
-        let entries;
+        let parsed;
         try {
-            const parsed = queueEntries(queue);
-            entries = [...parsed.running, ...parsed.pending];
+            parsed = queueEntries(queue);
         } catch {
             return { capable: false, matches: [] };
         }
         const matches = [];
-        for (const entry of entries) {
-            if (!Array.isArray(entry) || typeof entry[1] !== 'string' || !isObject(entry[3])) {
-                return { capable: false, matches: [] };
+        for (const [queueLocation, locationEntries] of [
+            ['running', parsed.running],
+            ['pending', parsed.pending],
+        ]) {
+            for (const entry of locationEntries) {
+                if (!Array.isArray(entry) || typeof entry[1] !== 'string' || !isObject(entry[3])) {
+                    return { capable: false, matches: [] };
+                }
+                if (submissionMarkerMatches(entry[3], jobId)) {
+                    matches.push({
+                        promptId: entry[1],
+                        priority: Number(entry[0]),
+                        historyEntry: null,
+                        queueLocation,
+                    });
+                }
             }
-            if (entry[3].client_id === jobId) matches.push({ promptId: entry[1], entry });
         }
         return { capable: true, matches };
     }
 
-    function finishConfirmedAbsent(job) {
+    function submissionMarkerMatches(extraData, jobId) {
+        if (Object.prototype.hasOwnProperty.call(extraData, 'risu_job_id')) {
+            return extraData.risu_job_id === jobId;
+        }
+        return extraData.client_id === jobId;
+    }
+
+    function mergeSubmissionMatches(queueMatches, historyMatches) {
+        const merged = new Map();
+        for (const match of [...queueMatches, ...historyMatches]) {
+            const prior = merged.get(match.promptId);
+            if (!prior) {
+                merged.set(match.promptId, { ...match });
+                continue;
+            }
+            if (Number.isFinite(match.priority)) prior.priority = match.priority;
+            if (match.historyEntry) prior.historyEntry = match.historyEntry;
+            if (match.queueLocation) prior.queueLocation = match.queueLocation;
+        }
+        return [...merged.values()].sort((left, right) => {
+            const leftPriority = Number.isFinite(left.priority) ? left.priority : Number.POSITIVE_INFINITY;
+            const rightPriority = Number.isFinite(right.priority) ? right.priority : Number.POSITIVE_INFINITY;
+            return leftPriority - rightPriority || left.promptId.localeCompare(right.promptId);
+        });
+    }
+
+    async function cancelRunningDuplicate(job, match, keeperPromptId, signal, generation) {
+        if (generation !== localGeneration) return false;
+        try {
+            await requestAck(
+                job.endpointUrl,
+                `/api/jobs/${encodeURIComponent(match.promptId)}/cancel`,
+                { method: 'POST', signal },
+            );
+            return generation === localGeneration;
+        } catch (error) {
+            if (generation !== localGeneration) return false;
+            if (!(error?.remoteStatus >= 400 && error.remoteStatus < 500)) throw error;
+        }
+
+        if (generation !== localGeneration) return false;
+        const freshQueue = queueEntries(await requestJson(job.endpointUrl, '/queue', { signal }));
+        if (generation !== localGeneration) return false;
+        const soleRunning = freshQueue.running.length === 1 ? freshQueue.running[0] : null;
+        if (
+            !Array.isArray(soleRunning)
+            || soleRunning[1] !== match.promptId
+            || soleRunning[1] === keeperPromptId
+        ) {
+            throw comfyError(
+                'COMFY_DUPLICATE_CLEANUP_UNSAFE',
+                'Legacy Comfy cannot safely interrupt this duplicate while other prompts are running',
+                { uncertain: true },
+            );
+        }
+        if (generation !== localGeneration) return false;
+        await requestAck(job.endpointUrl, '/interrupt', { method: 'POST', signal });
+        return generation === localGeneration;
+    }
+
+    async function settleSubmissionMatches(job, matches, signal, generation) {
+        if (generation !== localGeneration) return null;
+        if (matches.length === 0) return null;
+        const keeper = matches[0];
+        const terminal = Boolean(job.terminalIntent);
+        const activeTargets = matches.filter(match => (
+            match.queueLocation
+            && (terminal || match.promptId !== keeper.promptId)
+        ));
+        const pendingIds = activeTargets
+            .filter(match => match.queueLocation === 'pending')
+            .map(match => match.promptId);
+        try {
+            if (pendingIds.length > 0) {
+                if (generation !== localGeneration) return null;
+                await requestAck(job.endpointUrl, '/queue', {
+                    method: 'POST',
+                    headers: { 'content-type': 'application/json' },
+                    body: JSON.stringify({ delete: pendingIds }),
+                    signal,
+                });
+                if (generation !== localGeneration) return null;
+            }
+            for (const match of activeTargets.filter(candidate => candidate.queueLocation === 'running')) {
+                if (generation !== localGeneration) return null;
+                const cancelled = await cancelRunningDuplicate(
+                    job,
+                    match,
+                    terminal ? null : keeper.promptId,
+                    signal,
+                    generation,
+                );
+                if (!cancelled || generation !== localGeneration) return null;
+            }
+        } catch (cause) {
+            if (generation !== localGeneration) return null;
+            throw comfyError(
+                'COMFY_DUPLICATE_CLEANUP_FAILED',
+                `Could not safely cancel duplicate Comfy submissions: ${String(cause?.message ?? cause)}`,
+                { cause, uncertain: true },
+            );
+        }
+        if (generation !== localGeneration) return null;
+        if (activeTargets.length > 0) {
+            throw comfyError(
+                'COMFY_DUPLICATE_CLEANUP_PENDING',
+                'Duplicate Comfy submissions were cancelled and are awaiting queue reconciliation',
+                { uncertain: true },
+            );
+        }
+        if (terminal) return { terminalSettled: true };
+        if (matches.length > 1) {
+            logger.warn?.(
+                `[Comfy] Job ${job.jobId} has completed duplicate submissions; adopting the oldest ${keeper.promptId}`,
+            );
+        }
+        return {
+            promptId: keeper.promptId,
+            historyEntry: keeper.historyEntry,
+        };
+    }
+
+    async function scanSubmissionMarker(job, signal, generation) {
+        if (generation !== localGeneration) return null;
+        const queue = await requestJson(job.endpointUrl, '/queue', { signal });
+        if (generation !== localGeneration) return null;
+        const queueScan = inspectGlobalQueue(queue, job.jobId);
+        const history = await requestJson(
+            job.endpointUrl,
+            `/history?max_items=${GLOBAL_HISTORY_PAGE_LIMIT}`,
+            { signal },
+        );
+        if (generation !== localGeneration) return null;
+        const historyScan = inspectGlobalHistory(history, job.jobId);
+        if (!queueScan.capable || !historyScan.capable) {
+            throw comfyError(
+                'COMFY_MARKER_UNAVAILABLE',
+                'Comfy responses do not expose a recoverable client marker',
+                { uncertain: true },
+            );
+        }
+        const marker = await settleSubmissionMatches(
+            job,
+            mergeSubmissionMatches(queueScan.matches, historyScan.matches),
+            signal,
+            generation,
+        );
+        return {
+            marker,
+            historyFull: historyScan.full,
+            minHistorySequence: historyScan.minSequence,
+        };
+    }
+
+    function markerAbsenceIsProvable(job, scan) {
+        // This horizon rule follows the dedicated-backend contract: Risu submits
+        // with Comfy's default monotonic number and the retained tail brackets it.
+        // The unfilled-page shortcut also assumes stock Comfy retains every
+        // history entry until its configured history storage is explicitly pruned.
+        if (!scan.historyFull) return true;
+        return Number.isFinite(job.attemptSequenceHorizon)
+            && Number.isFinite(scan.minHistorySequence)
+            && scan.minHistorySequence <= job.attemptSequenceHorizon;
+    }
+
+    function finishConfirmedAbsent(job, confirmationDelayMs = pollIntervalMs) {
         if (job.absenceCount < 1 || !job.absenceConfirmedAt) {
             return store.updateJob(job.jobId, job.revision, job.state, {
                 absenceCount: 1,
                 absenceConfirmedAt: now(),
             });
         }
-        if (now() - job.absenceConfirmedAt < pollIntervalMs) return job;
+        if (now() - job.absenceConfirmedAt < confirmationDelayMs) return job;
         if (job.terminalIntent === 'user_cancel') {
             return store.updateJob(job.jobId, job.revision, job.state, {
                 state: 'cancelled',
@@ -862,63 +1358,115 @@ function createComfyOrchestrator(options) {
     }
 
     async function reconcilePromptless(job, generation, signal) {
-        let history;
-        let queue;
+        let markerScan;
         try {
-            [history, queue] = await Promise.all([
-                requestJson(
-                    job.endpointUrl,
-                    `/history?max_items=${GLOBAL_HISTORY_PAGE_LIMIT}`,
-                    { signal },
-                ),
-                requestJson(job.endpointUrl, '/queue', { signal }),
-            ]);
+            markerScan = await scanSubmissionMarker(job, signal, generation);
         } catch (error) {
+            if (generation !== localGeneration) return;
+            if (job.promptAttemptedAt != null) {
+                return queueDispatchRetry(job, error, null, markerScanRetryDelay(error));
+            }
             return markUnknown(job, error);
         }
-        const historyScan = inspectGlobalHistory(history, job.jobId);
-        const queueScan = inspectGlobalQueue(queue, job.jobId);
-        if (!historyScan.capable || !queueScan.capable) {
-            return markUnknown(job, comfyError(
-                'COMFY_MARKER_UNAVAILABLE',
-                'Comfy responses do not expose a recoverable client marker',
-                { uncertain: true },
-            ));
+        if (generation !== localGeneration) return;
+        const marker = markerScan?.marker;
+        if (!marker) {
+            if (job.promptAttemptedAt == null) return finishConfirmedAbsent(job);
+            if (
+                now() - job.promptAttemptedAt < promptSettlementWindowMs
+            ) {
+                return queueDispatchRetry(job, comfyError(
+                    'COMFY_SUBMISSION_SETTLING',
+                    'Comfy submission is still inside its acknowledgement settlement window',
+                    { uncertain: true },
+                ), null, settlementScanIntervalMs);
+            }
+            if (!job.terminalIntent && !markerAbsenceIsProvable(job, markerScan)) {
+                return queueSubmissionProofWait(job);
+            }
+            if (job.absenceCount < 1 || !job.absenceConfirmedAt) {
+                return queueDispatchRetry(
+                    job,
+                    comfyError(
+                        'COMFY_SUBMISSION_UNCONFIRMED',
+                        'Comfy has not exposed the attempted submission yet',
+                        { uncertain: true },
+                    ),
+                    { count: 1, confirmedAt: now() },
+                );
+            }
+            if (now() - job.absenceConfirmedAt < dispatchRetryDelayMs) {
+                return queueDispatchRetry(
+                    job,
+                    comfyError(
+                        'COMFY_SUBMISSION_UNCONFIRMED',
+                        'Comfy submission absence is awaiting confirmation',
+                        { uncertain: true },
+                    ),
+                    { count: job.absenceCount, confirmedAt: job.absenceConfirmedAt },
+                );
+            }
+            if (job.terminalIntent) return finishConfirmedAbsent(job, dispatchRetryDelayMs);
+            return store.updateJob(job.jobId, job.revision, job.state, {
+                state: 'queued',
+                startedAt: null,
+                promptAttemptedAt: null,
+                attemptSequenceHorizon: null,
+                dispatchRetryAt: now() + dispatchRetryDelayMs,
+                absenceCount: 0,
+                absenceConfirmedAt: null,
+                errorCode: 'COMFY_SUBMISSION_RETRY_READY',
+                errorMessage: DISPATCH_WAIT_MESSAGE,
+            });
         }
-        if (historyScan.matches.length === 0 && historyScan.saturated && queueScan.matches.length === 0) {
-            return markUnknown(job, comfyError(
-                'COMFY_HISTORY_TRUNCATED',
-                'Bounded Comfy history is saturated, so remote absence cannot be proven',
-                { uncertain: true },
-            ));
+        if (marker.terminalSettled) {
+            return store.updateJob(job.jobId, job.revision, job.state, {
+                state: 'cancelled',
+                dispatchRetryAt: null,
+                errorCode: null,
+                errorMessage: null,
+                finishedAt: now(),
+            });
         }
-
-        const promptIds = new Set([
-            ...historyScan.matches.map(match => match.promptId),
-            ...queueScan.matches.map(match => match.promptId),
-        ]);
-        if (promptIds.size > 1) {
-            return markUnknown(job, comfyError(
-                'COMFY_MARKER_AMBIGUOUS',
-                'Multiple Comfy prompts carry this job marker',
-                { uncertain: true },
-            ));
-        }
-        if (promptIds.size === 0) return finishConfirmedAbsent(job);
-
-        const promptId = [...promptIds][0];
         const recovered = store.updateJob(job.jobId, job.revision, job.state, {
             state: 'unknown',
-            promptId,
+            promptId: marker.promptId,
             absenceCount: 0,
             absenceConfirmedAt: null,
             errorCode: null,
             errorMessage: null,
         });
         if (!recovered || generation !== localGeneration) return recovered;
-        const historyMatch = historyScan.matches.find(match => match.promptId === promptId);
-        if (historyMatch) return finishFromHistory(recovered, historyMatch.entry, generation, signal);
+        if (marker.historyEntry) return finishFromHistory(recovered, marker.historyEntry, generation, signal);
         return reconcileKnownPrompt(recovered, generation, signal);
+    }
+
+    async function cancelMaterialization(job, generation) {
+        if (generation !== localGeneration) return null;
+        const cancelled = store.updateJob(job.jobId, job.revision, job.state, {
+            state: 'cancelled',
+            materializeRetryAt: null,
+            dispatchRetryAt: null,
+            errorCode: null,
+            errorMessage: null,
+            finishedAt: now(),
+        });
+        if (!cancelled) return store.getJob(job.jobId);
+        for (const cleanup of [
+            () => assets.removeMaterializedAsset?.(`comfy-${job.jobId}`),
+            () => assets.finalizeMaterialization?.(job.jobId),
+        ]) {
+            try {
+                await cleanup();
+            } catch (error) {
+                try {
+                    logger.error?.('[Comfy] cancelled materialization cleanup failed:', error);
+                } catch {
+                    // Cleanup logging is best-effort after the terminal CAS.
+                }
+            }
+        }
+        return cancelled;
     }
 
     async function reconcileJob(job, generation, signal) {
@@ -935,6 +1483,9 @@ function createComfyOrchestrator(options) {
                 errorMessage: null,
             }) ?? store.getJob(job.jobId);
         }
+        if (job.terminalIntent === 'user_cancel' && job.remoteOutput) {
+            return cancelMaterialization(job, generation);
+        }
         if (job.remoteOutput) {
             if (job.state !== 'materializing') {
                 job = store.updateJob(job.jobId, job.revision, job.state, {
@@ -948,11 +1499,112 @@ function createComfyOrchestrator(options) {
         return reconcilePromptless(job, generation, signal);
     }
 
-    async function runNext(signal) {
-        const generation = localGeneration;
-        const jobs = store.listNonterminalJobs();
-        if (jobs.length === 0) return null;
-        let job = jobs[0];
+    function compareServiceOrder(left, right) {
+        return (left.updatedAt - right.updatedAt)
+            || (left.createdAt - right.createdAt)
+            || left.jobId.localeCompare(right.jobId);
+    }
+
+    function selectRotating(candidates, lane) {
+        if (candidates.length === 0) return null;
+        const ordered = [...candidates].sort(compareServiceOrder);
+        const priorIndex = ordered.findIndex(job => job.jobId === lastServedJobId[lane]);
+        const selected = ordered[priorIndex < 0 ? 0 : (priorIndex + 1) % ordered.length];
+        lastServedJobId[lane] = selected.jobId;
+        return selected;
+    }
+
+    function isDispatchRetryDue(job, timestamp) {
+        if (job.dispatchRetryAt != null && job.dispatchRetryAt > timestamp) return false;
+        return true;
+    }
+
+    function isServiceDue(job, timestamp) {
+        if (!isDispatchRetryDue(job, timestamp)) return false;
+        if (job.materializeRetryAt != null && job.materializeRetryAt > timestamp) return false;
+        return true;
+    }
+
+    function selectRegularJob(dueRegular) {
+        const reconcile = dueRegular.filter(job => (
+            job.state !== 'queued'
+            || job.promptId != null
+            || job.remoteOutput != null
+            || job.promptAttemptedAt != null
+        ));
+        const dispatch = dueRegular.filter(job => (
+            job.state === 'queued'
+            && job.promptId == null
+            && job.remoteOutput == null
+            && job.promptAttemptedAt == null
+        ));
+
+        const laneOrder = lastRegularLane === 'reconcile'
+            ? ['dispatch', 'reconcile']
+            : ['reconcile', 'dispatch'];
+        for (const lane of laneOrder) {
+            const selected = selectRotating(lane === 'reconcile' ? reconcile : dispatch, lane);
+            if (!selected) continue;
+            lastRegularLane = lane;
+            return selected;
+        }
+        return null;
+    }
+
+    function selectNextJob(jobs) {
+        const timestamp = now();
+        const dueCancels = jobs.filter(job => (
+            job.terminalIntent === 'user_cancel' && isDispatchRetryDue(job, timestamp)
+        ));
+        const dueRegular = jobs.filter(job => (
+            job.terminalIntent !== 'user_cancel' && isServiceDue(job, timestamp)
+        ));
+        const chooseCancel = dueCancels.length > 0
+            && (dueRegular.length === 0 || lastTopLevelLane !== 'cancel');
+        if (chooseCancel) {
+            const cancel = selectRotating(dueCancels, 'cancel');
+            if (cancel) {
+                lastTopLevelLane = 'cancel';
+                return cancel;
+            }
+        }
+        const regular = selectRegularJob(dueRegular);
+        if (regular) {
+            lastTopLevelLane = 'regular';
+            return regular;
+        }
+        const cancel = selectRotating(dueCancels, 'cancel');
+        if (cancel) lastTopLevelLane = 'cancel';
+        return cancel;
+    }
+
+    function paceCancellation(jobId, generation) {
+        if (generation !== localGeneration) return null;
+        const latest = store.getJob(jobId);
+        if (
+            !latest
+            || store.isTerminalState(latest.state)
+            || latest.terminalIntent !== 'user_cancel'
+        ) return latest;
+        const nextDue = now() + dispatchRetryDelayMs;
+        if (latest.dispatchRetryAt != null && latest.dispatchRetryAt >= nextDue) return latest;
+        return store.updateJob(latest.jobId, latest.revision, latest.state, {
+            dispatchRetryAt: nextDue,
+        }) ?? store.getJob(latest.jobId);
+    }
+
+    async function serviceSelectedJob(job, signal, generation) {
+        if (
+            job.state === 'submitting'
+            && job.promptId == null
+            && job.promptAttemptedAt != null
+        ) {
+            return queueDispatchRetry(job, comfyError(
+                'COMFY_SUBMISSION_RECOVERY',
+                'A prior Comfy submission attempt requires marker reconciliation',
+                { uncertain: true },
+            ), null, settlementScanIntervalMs);
+        }
         if (
             job.state === 'submitting'
             && job.promptId == null
@@ -972,8 +1624,25 @@ function createComfyOrchestrator(options) {
         // whose REMOTE vanished is still reaped by absence reconciliation, and
         // cancel remains available at any time.
         if (!job || store.isTerminalState(job.state)) return job;
-        if (job.state === 'queued') return dispatchQueued(job, generation, signal);
+        if (job.state === 'queued' && job.promptId == null && job.remoteOutput == null) {
+            return dispatchQueued(job, generation, signal);
+        }
         return reconcileJob(job, generation, signal);
+    }
+
+    async function runNext(signal, generation) {
+        if (generation !== localGeneration) return null;
+        const jobs = store.listNonterminalJobs();
+        if (jobs.length === 0) return null;
+        let job = selectNextJob(jobs);
+        if (!job) return null;
+        activeRunJobId = job.jobId;
+        const result = await serviceSelectedJob(job, signal, generation);
+        const latest = store.getJob(job.jobId);
+        if (job.terminalIntent === 'user_cancel' || latest?.terminalIntent === 'user_cancel') {
+            return paceCancellation(job.jobId, generation) ?? result;
+        }
+        return result;
     }
 
     function runOnce() {
@@ -981,14 +1650,20 @@ function createComfyOrchestrator(options) {
         if (disabledCause) return Promise.resolve(null);
         if (activeRun) return activeRun;
         const controller = new AbortController();
+        const generation = localGeneration;
         const run = Promise.resolve()
-            .then(() => runNext(controller.signal))
+            .then(() => runNext(controller.signal, generation))
             .finally(() => {
+                let ownedActiveSlot = false;
                 if (activeRun === run) {
+                    ownedActiveSlot = true;
                     activeRun = null;
                     activeRunController = null;
+                    activeRunJobId = null;
                 }
-                if (started && store.listNonterminalJobs().length > 0) schedule(pollIntervalMs);
+                if (ownedActiveSlot && started && store.listNonterminalJobs().length > 0) {
+                    schedule(pollIntervalMs);
+                }
             });
         activeRun = run;
         activeRunController = controller;
@@ -1008,7 +1683,7 @@ function createComfyOrchestrator(options) {
         if (started) return;
         if (disabledCause) throw unavailableError();
         started = true;
-        localGeneration = store.getConfig().restoreEpoch;
+        localGeneration += 1;
         try {
             await assets.cleanupOrphanStaging?.(new Set(store.listNonterminalJobs().map(job => job.jobId)));
         } catch (error) {
@@ -1046,7 +1721,7 @@ function createComfyOrchestrator(options) {
             return;
         }
         try {
-            localGeneration = store.getConfig().restoreEpoch;
+            localGeneration += 1;
             if (!disabledCause) {
                 await assets.cleanupOrphanStaging?.(
                     new Set(store.listNonterminalJobs().map(job => job.jobId)),
@@ -1081,19 +1756,40 @@ function createComfyOrchestrator(options) {
         let job = store.getJob(jobId);
         if (!job) throw comfyError('COMFY_JOB_NOT_FOUND', 'Comfy job was not found', { httpStatus: 404 });
         if (store.isTerminalState(job.state)) return toPublicJob(job);
-        if (job.state === 'queued') {
+        let needsRemoteCancellation = false;
+        if (
+            job.state === 'queued'
+            && job.promptAttemptedAt == null
+            && job.promptId == null
+            && job.remoteOutput == null
+        ) {
             job = resolveCancelCas(job.jobId, store.updateJob(job.jobId, job.revision, 'queued', {
                 state: 'cancelled',
                 terminalIntent: 'user_cancel',
                 cancelRequestedAt: now(),
                 finishedAt: now(),
             }));
-        } else if (!job.terminalIntent) {
+        } else {
             job = resolveCancelCas(job.jobId, store.updateJob(job.jobId, job.revision, job.state, {
                 state: 'cancel_requested',
                 terminalIntent: 'user_cancel',
-                cancelRequestedAt: now(),
+                cancelRequestedAt: job.cancelRequestedAt ?? now(),
+                dispatchRetryAt: null,
+                errorCode: 'COMFY_CANCEL_PENDING',
+                errorMessage: CANCEL_PENDING_MESSAGE,
             }));
+            needsRemoteCancellation = true;
+        }
+        if (
+            needsRemoteCancellation
+            && activeRunJobId === jobId
+            && activeRunController
+            && !activeRunController.signal.aborted
+        ) {
+            activeRunController.abort(workerAbortError(
+                `cancellation of ${jobId} while ${activeRunJobId ?? 'worker'} was active`,
+                'COMFY_WORKER_PREEMPTED',
+            ));
         }
         schedule(0);
         return toPublicJob(job);
@@ -1102,6 +1798,12 @@ function createComfyOrchestrator(options) {
     async function updateEndpoint(value) {
         assertAvailable();
         const endpointUrl = normalizeEndpoint(value);
+        const staleRun = activeRun;
+        localGeneration += 1;
+        activeRunController?.abort(workerAbortError(
+            'Comfy endpoint replacement',
+            'COMFY_WORKER_PREEMPTED',
+        ));
         const config = store.updateConfig({ endpointUrl });
         const jobs = store.listNonterminalJobs();
         for (const original of jobs) {
@@ -1109,13 +1811,34 @@ function createComfyOrchestrator(options) {
             const patch = {
                 endpointUrl,
                 endpointGeneration: config.endpointGeneration,
-                errorCode: null,
-                errorMessage: null,
                 absenceCount: 0,
                 absenceConfirmedAt: null,
             };
-            if (job.state !== 'queued') patch.state = job.state === 'cancel_requested' ? 'cancel_requested' : 'unknown';
+            // Endpoint replacement normally rotates the tunnel to the same Comfy
+            // backend, so the durable attempt horizon remains valid. A switch to
+            // another backend stays conservatively proof-parked and cancellable.
+            if (job.state === 'queued') {
+                patch.dispatchRetryAt = null;
+            } else if (job.state === 'submitting') {
+                patch.state = 'queued';
+                patch.startedAt = null;
+                patch.dispatchRetryAt = null;
+                patch.errorCode = null;
+                patch.errorMessage = null;
+            } else {
+                patch.state = job.state === 'cancel_requested' ? 'cancel_requested' : 'unknown';
+                patch.errorCode = null;
+                patch.errorMessage = null;
+            }
             store.updateJob(job.jobId, job.revision, job.state, patch);
+        }
+        if (staleRun) {
+            const drained = await drainActiveRun(stopDrainTimeoutMs);
+            if (!drained && activeRun === staleRun) {
+                activeRun = null;
+                activeRunController = null;
+                activeRunJobId = null;
+            }
         }
         schedule(0);
         return toPublicConfig(config, await probe(endpointUrl));
@@ -1190,4 +1913,5 @@ module.exports = {
     createComfyOrchestrator,
     normalizeEndpoint,
     toPublicJob,
+    DEFAULT_PROMPT_SETTLEMENT_WINDOW_MS,
 };

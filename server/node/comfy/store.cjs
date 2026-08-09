@@ -29,8 +29,10 @@ const COLUMN_BY_FIELD = Object.freeze({
     deadlineAt: 'deadline_at',
     materializeAttempts: 'materialize_attempts',
     materializeRetryAt: 'materialize_retry_at',
+    dispatchRetryAt: 'dispatch_retry_at',
     remoteInputs: 'remote_inputs_json',
     promptAttemptedAt: 'prompt_attempted_at',
+    attemptSequenceHorizon: 'attempt_sequence_horizon',
 });
 
 function canonicalJson(value) {
@@ -99,6 +101,7 @@ function rowToJob(row) {
         remoteInputName: row.remote_input_name,
         remoteInputs,
         promptAttemptedAt: row.prompt_attempted_at,
+        attemptSequenceHorizon: row.attempt_sequence_horizon,
         remoteOutput: parseJson(row.remote_output_json),
         resultAssetId: row.result_asset_id,
         resultMimeType: row.result_mime_type,
@@ -109,6 +112,7 @@ function rowToJob(row) {
         absenceConfirmedAt: row.absence_confirmed_at,
         materializeAttempts: row.materialize_attempts,
         materializeRetryAt: row.materialize_retry_at,
+        dispatchRetryAt: row.dispatch_retry_at,
         deadlineAt: row.deadline_at,
         errorCode: row.error_code,
         errorMessage: row.error_message,
@@ -175,6 +179,7 @@ function createComfyStore(db, options = {}) {
         remote_input_name    TEXT,
         remote_inputs_json   TEXT,
         prompt_attempted_at  INTEGER,
+        attempt_sequence_horizon REAL,
         remote_output_json   TEXT,
         result_asset_id      TEXT,
         result_mime_type     TEXT,
@@ -185,6 +190,7 @@ function createComfyStore(db, options = {}) {
         absence_confirmed_at INTEGER,
         materialize_attempts  INTEGER NOT NULL DEFAULT 0,
         materialize_retry_at  INTEGER,
+        dispatch_retry_at     INTEGER,
         deadline_at          INTEGER NOT NULL,
         error_code           TEXT,
         error_message        TEXT,
@@ -271,6 +277,9 @@ function createComfyStore(db, options = {}) {
         if (!jobColumns.has('materialize_retry_at')) {
             db.exec('ALTER TABLE comfy_jobs ADD COLUMN materialize_retry_at INTEGER');
         }
+        if (!jobColumns.has('dispatch_retry_at')) {
+            db.exec('ALTER TABLE comfy_jobs ADD COLUMN dispatch_retry_at INTEGER');
+        }
         if (!jobColumns.has('template_kind')) {
             db.exec('ALTER TABLE comfy_jobs ADD COLUMN template_kind TEXT');
         }
@@ -288,6 +297,9 @@ function createComfyStore(db, options = {}) {
         }
         if (!jobColumns.has('prompt_attempted_at')) {
             db.exec('ALTER TABLE comfy_jobs ADD COLUMN prompt_attempted_at INTEGER');
+        }
+        if (!jobColumns.has('attempt_sequence_horizon')) {
+            db.exec('ALTER TABLE comfy_jobs ADD COLUMN attempt_sequence_horizon REAL');
         }
     });
     migrateJobs();
