@@ -31,6 +31,389 @@ export type ImageGenerationOptions = {
     seed?: number
 }
 
+const COMFY_QUEUE_POLL_INTERVAL_MS = 1500
+const COMFY_RETRY_INITIAL_MS = 1000
+const COMFY_RETRY_MAX_MS = 15000
+const COMFY_REQUEST_TIMEOUT_MS = 30_000
+
+type ComfyCreateUrl = (pathname: string, params?: Record<string, string>) => string
+type ComfyQueueSnapshot =
+    | { sequence: number; valid: true; queuedIds: ReadonlySet<string> }
+    | { sequence: number; valid: false }
+
+type ComfyQueueSubscriber = {
+    token: symbol
+    id: string
+    createUrl: ComfyCreateUrl
+    minimumSequence: number
+    lastConsumedSequence: number
+    lastQueuedSequence: number
+    latestSnapshot: ComfyQueueSnapshot | null
+    waiter: ((snapshot: ComfyQueueSnapshot) => void) | null
+}
+
+type ComfyQueuePoller = {
+    key: string
+    queueUrl: string
+    subscribers: Map<symbol, ComfyQueueSubscriber>
+    nextSequence: number
+    timer: ReturnType<typeof setTimeout> | null
+    inFlight: boolean
+    retryDelayMs: number
+    transportFailed: boolean
+    requestController: AbortController | null
+    disposed: boolean
+}
+
+type ComfyQueueSubscription = {
+    next: () => Promise<ComfyQueueSnapshot>
+    getLastQueuedSequence: () => number
+    checkHistoryImmediately: boolean
+    unsubscribe: () => void
+}
+
+const comfyQueuePollers = new Map<string, ComfyQueuePoller>()
+
+const waitForComfyRetry = (delayMs: number) => new Promise<void>((resolve) => {
+    setTimeout(resolve, delayMs)
+})
+
+function isComfyRecord(value: unknown): value is Record<string, any> {
+    return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+class ComfyDefiniteHttpError extends Error {
+    readonly comfyDefinite = true
+
+    constructor(
+        readonly status: number,
+        readonly path: string,
+        requestName: string,
+    ) {
+        super(`ComfyUI ${requestName} request failed with status ${status} for ${path}`)
+        this.name = 'ComfyDefiniteHttpError'
+    }
+}
+
+function isComfyDefiniteHttpError(error: unknown): error is ComfyDefiniteHttpError {
+    return isComfyRecord(error) && error.comfyDefinite === true
+}
+
+function getComfyRequestPath(url: string): string {
+    try {
+        return new URL(url).pathname
+    } catch {
+        return url
+    }
+}
+
+function isRetryableComfyHttpStatus(status: number): boolean {
+    return status === 408 || status === 429 || status >= 500 && status <= 599
+}
+
+function throwForComfyJobHttpError(
+    response: { ok?: boolean; status?: number },
+    url: string,
+    requestName: string,
+) {
+    if (response.ok !== false) return
+    const status = response.status
+    const message = `ComfyUI ${requestName} request failed with status ${status} for ${getComfyRequestPath(url)}`
+    if (typeof status !== 'number' || isRetryableComfyHttpStatus(status)) {
+        throw new Error(message)
+    }
+    throw new ComfyDefiniteHttpError(status, getComfyRequestPath(url), requestName)
+}
+
+async function withComfyRequestTimeout<T>(
+    operation: (signal: AbortSignal) => Promise<T>,
+    setController?: (controller: AbortController | null) => void,
+): Promise<T> {
+    const controller = new AbortController()
+    let rejectOnAbort!: (reason: unknown) => void
+    const abortPromise = new Promise<never>((_resolve, reject) => {
+        rejectOnAbort = reject
+    })
+    const onAbort = () => rejectOnAbort(
+        controller.signal.reason ?? new DOMException('The operation was aborted.', 'AbortError'),
+    )
+    controller.signal.addEventListener('abort', onAbort, { once: true })
+    const timeoutId = setTimeout(() => controller.abort(), COMFY_REQUEST_TIMEOUT_MS)
+    setController?.(controller)
+    try {
+        return await Promise.race([operation(controller.signal), abortPromise])
+    } finally {
+        clearTimeout(timeoutId)
+        controller.signal.removeEventListener('abort', onAbort)
+        setController?.(null)
+    }
+}
+
+function takeComfyQueueSnapshot(subscriber: ComfyQueueSubscriber): ComfyQueueSnapshot | null {
+    const snapshot = subscriber.latestSnapshot
+    if (!snapshot
+        || snapshot.sequence < subscriber.minimumSequence
+        || snapshot.sequence <= subscriber.lastConsumedSequence) {
+        return null
+    }
+    subscriber.lastConsumedSequence = snapshot.sequence
+    return snapshot
+}
+
+function publishComfyQueueSnapshot(poller: ComfyQueuePoller, snapshot: ComfyQueueSnapshot) {
+    if (poller.disposed) return
+    for (const subscriber of poller.subscribers.values()) {
+        // A request that started before this job subscribed may contain a stale
+        // absence, even if its response arrives after the POST completed.
+        if (snapshot.sequence < subscriber.minimumSequence) continue
+        if (snapshot.valid && snapshot.queuedIds.has(subscriber.id)) {
+            subscriber.lastQueuedSequence = snapshot.sequence
+        }
+        subscriber.latestSnapshot = snapshot
+        if (subscriber.waiter) {
+            const waiter = subscriber.waiter
+            subscriber.waiter = null
+            subscriber.lastConsumedSequence = snapshot.sequence
+            waiter(snapshot)
+        }
+    }
+}
+
+function scheduleComfyQueuePoll(poller: ComfyQueuePoller, delayMs: number) {
+    if (poller.disposed
+        || poller.timer !== null
+        || poller.inFlight
+        || poller.subscribers.size === 0) return
+    poller.timer = setTimeout(() => {
+        poller.timer = null
+        void runComfyQueuePoll(poller)
+    }, delayMs)
+}
+
+async function runComfyQueuePoll(poller: ComfyQueuePoller) {
+    if (poller.disposed || poller.inFlight || poller.subscribers.size === 0) return
+    poller.inFlight = true
+    const sequence = poller.nextSequence++
+    let nextDelayMs = COMFY_QUEUE_POLL_INTERVAL_MS
+    try {
+        const queuedIds = await withComfyRequestTimeout(async (signal) => {
+            const response = await fetchNative(poller.queueUrl, {
+                headers: { 'Content-Type': 'application/json' },
+                method: 'GET',
+                signal,
+                requestTimeoutMs: COMFY_REQUEST_TIMEOUT_MS,
+            })
+            if (response.ok === false || typeof response.json !== 'function') {
+                throw new Error(`ComfyUI queue request failed with status ${response.status}`)
+            }
+            const queue = await response.json()
+            if (!isComfyRecord(queue)
+                || !Array.isArray(queue.queue_running)
+                || !Array.isArray(queue.queue_pending)) {
+                throw new Error('ComfyUI returned an invalid queue response')
+            }
+            const ids = new Set<string>()
+            for (const entry of [...queue.queue_running, ...queue.queue_pending]) {
+                if (!Array.isArray(entry) || typeof entry[1] !== 'string') continue
+                ids.add(entry[1])
+            }
+            return ids
+        }, (controller) => {
+            poller.requestController = controller
+        })
+        if (poller.disposed) return
+        if (poller.transportFailed) {
+            console.warn(`[ComfyUI] Queue polling recovered for ${poller.queueUrl}`)
+        }
+        poller.transportFailed = false
+        poller.retryDelayMs = COMFY_RETRY_INITIAL_MS
+        publishComfyQueueSnapshot(poller, { sequence, valid: true, queuedIds })
+    } catch (error) {
+        if (poller.disposed) return
+        publishComfyQueueSnapshot(poller, { sequence, valid: false })
+        if (!poller.transportFailed) {
+            console.warn(
+                `[ComfyUI] Queue polling failed for ${poller.queueUrl}; retrying indefinitely.`,
+                error,
+            )
+        }
+        poller.transportFailed = true
+        nextDelayMs = poller.retryDelayMs
+        poller.retryDelayMs = Math.min(poller.retryDelayMs * 2, COMFY_RETRY_MAX_MS)
+    } finally {
+        poller.inFlight = false
+        if (poller.disposed) {
+            return
+        } else if (poller.subscribers.size === 0) {
+            if (comfyQueuePollers.get(poller.key) === poller) {
+                comfyQueuePollers.delete(poller.key)
+            }
+        } else {
+            scheduleComfyQueuePoll(poller, nextDelayMs)
+        }
+    }
+}
+
+function subscribeComfyQueue(createUrl: ComfyCreateUrl, id: string): ComfyQueueSubscription {
+    const queueUrl = createUrl('/queue')
+    let poller = comfyQueuePollers.get(queueUrl)
+    if (poller?.disposed) {
+        comfyQueuePollers.delete(queueUrl)
+        poller = undefined
+    }
+    const checkHistoryImmediately = !poller
+    if (!poller) {
+        poller = {
+            key: queueUrl,
+            queueUrl,
+            subscribers: new Map(),
+            nextSequence: 1,
+            timer: null,
+            inFlight: false,
+            retryDelayMs: COMFY_RETRY_INITIAL_MS,
+            transportFailed: false,
+            requestController: null,
+            disposed: false,
+        }
+        comfyQueuePollers.set(queueUrl, poller)
+    }
+
+    const token = Symbol(id)
+    const subscriber: ComfyQueueSubscriber = {
+        token,
+        id,
+        createUrl,
+        minimumSequence: poller.nextSequence,
+        lastConsumedSequence: 0,
+        lastQueuedSequence: 0,
+        latestSnapshot: null,
+        waiter: null,
+    }
+    poller.subscribers.set(token, subscriber)
+    scheduleComfyQueuePoll(poller, 0)
+
+    let active = true
+    return {
+        next: () => {
+            const snapshot = takeComfyQueueSnapshot(subscriber)
+            if (snapshot) return Promise.resolve(snapshot)
+            return new Promise((resolve) => {
+                subscriber.waiter = resolve
+            })
+        },
+        getLastQueuedSequence: () => subscriber.lastQueuedSequence,
+        checkHistoryImmediately,
+        unsubscribe: () => {
+            if (!active) return
+            active = false
+            poller.subscribers.delete(token)
+            if (poller.subscribers.size !== 0) return
+            if (poller.timer !== null) {
+                clearTimeout(poller.timer)
+                poller.timer = null
+            }
+            // Keep an in-flight poller discoverable so a new subscriber cannot
+            // create a second request to the same queue before this one settles.
+            if (!poller.inFlight && comfyQueuePollers.get(poller.key) === poller) {
+                comfyQueuePollers.delete(poller.key)
+            }
+        },
+    }
+}
+
+export function __resetComfyPollersForTest() {
+    for (const poller of comfyQueuePollers.values()) {
+        poller.disposed = true
+        if (poller.timer !== null) {
+            clearTimeout(poller.timer)
+            poller.timer = null
+        }
+        poller.subscribers.clear()
+        poller.requestController?.abort()
+    }
+    comfyQueuePollers.clear()
+}
+
+async function retryComfyTransport<T>(label: string, operation: () => Promise<T>): Promise<T> {
+    let retryDelayMs = COMFY_RETRY_INITIAL_MS
+    let transportFailed = false
+    while (true) {
+        try {
+            const value = await operation()
+            if (transportFailed) console.warn(`[ComfyUI] ${label} recovered`)
+            return value
+        } catch (error) {
+            if (isComfyDefiniteHttpError(error)) throw error
+            if (!transportFailed) {
+                console.warn(`[ComfyUI] ${label} failed; retrying indefinitely.`, error)
+            }
+            transportFailed = true
+            await waitForComfyRetry(retryDelayMs)
+            retryDelayMs = Math.min(retryDelayMs * 2, COMFY_RETRY_MAX_MS)
+        }
+    }
+}
+
+async function readComfyHistory(
+    createUrl: ComfyCreateUrl,
+    id: string,
+): Promise<Record<string, any> | undefined> {
+    return retryComfyTransport(`History polling for ${id}`, async () => {
+        const url = createUrl(`/history/${encodeURIComponent(id)}`)
+        return withComfyRequestTimeout(async (signal) => {
+            const response = await fetchNative(url, {
+                headers: { 'Content-Type': 'application/json' },
+                method: 'GET',
+                signal,
+                requestTimeoutMs: COMFY_REQUEST_TIMEOUT_MS,
+            })
+            throwForComfyJobHttpError(response, url, 'history')
+            if (typeof response.json !== 'function') {
+                throw new Error('ComfyUI returned an invalid history response')
+            }
+            const history = await response.json()
+            if (!isComfyRecord(history)) {
+                throw new Error('ComfyUI returned an invalid history response')
+            }
+            if (!Object.prototype.hasOwnProperty.call(history, id)) return undefined
+
+            const item = history[id]
+            if (!isComfyRecord(item) || !isComfyRecord(item.outputs)) {
+                throw new Error('ComfyUI returned an invalid history item')
+            }
+            if (item.status !== undefined) {
+                if (!isComfyRecord(item.status)
+                    || (item.status.messages !== undefined && !Array.isArray(item.status.messages))) {
+                    throw new Error('ComfyUI returned an invalid history status')
+                }
+            }
+            return item
+        })
+    })
+}
+
+async function downloadComfyImage(url: string): Promise<ArrayBuffer> {
+    return retryComfyTransport('Image download', async () => {
+        return withComfyRequestTimeout(async (signal) => {
+            const response = await fetchNative(url, {
+                headers: { 'Content-Type': 'application/json' },
+                method: 'GET',
+                signal,
+                requestTimeoutMs: COMFY_REQUEST_TIMEOUT_MS,
+            })
+            throwForComfyJobHttpError(response, url, 'image')
+            if (typeof response.arrayBuffer !== 'function') {
+                throw new Error('ComfyUI returned an invalid image response')
+            }
+            const body = await response.arrayBuffer()
+            if (Object.prototype.toString.call(body) !== '[object ArrayBuffer]') {
+                throw new Error('ComfyUI returned an invalid image response')
+            }
+            return body
+        })
+    })
+}
+
 function readWebUiSeed(info: unknown): number | null {
     try {
         const parsed = typeof info === 'string' ? JSON.parse(info) : info
@@ -899,28 +1282,29 @@ async function generateAIImageInternal(
             })
             console.log(`prompt id: ${id}`)
 
-            let item
-            let consecutiveAbsences = 0
-            while (!item) {
-                const history = await (await fetchNative(createUrl(`/history/${encodeURIComponent(id)}`), {
-                    headers: { 'Content-Type': 'application/json' },
-                    method: 'GET'
-                })).json()
-                item = history[id]
-                if (item) break
+            const queueSubscription = subscribeComfyQueue(createUrl, id)
+            try {
+                let item = queueSubscription.checkHistoryImmediately
+                    ? await readComfyHistory(createUrl, id)
+                    : undefined
+                let consecutiveAbsences = 0
+                while (!item) {
+                    const queue = await queueSubscription.next()
+                    if (!queue.valid) continue
+                    if (queue.queuedIds.has(id)) {
+                        consecutiveAbsences = 0
+                        continue
+                    }
 
-                const queue = await (await fetchNative(createUrl('/queue'), {
-                    headers: { 'Content-Type': 'application/json' },
-                    method: 'GET'
-                })).json()
-                if (!Array.isArray(queue?.queue_running) || !Array.isArray(queue?.queue_pending)) {
-                    throw new Error('ComfyUI returned an invalid queue response')
-                }
-                const queued = [...queue.queue_running, ...queue.queue_pending]
-                    .some((entry: unknown) => Array.isArray(entry) && entry[1] === id)
-                if (queued) {
-                    consecutiveAbsences = 0
-                } else {
+                    const history = await readComfyHistory(createUrl, id)
+                    if (history) {
+                        item = history
+                        break
+                    }
+                    if (queueSubscription.getLastQueuedSequence() > queue.sequence) {
+                        consecutiveAbsences = 0
+                        continue
+                    }
                     consecutiveAbsences += 1
                     // One empty observation can be the queue-to-history handoff.
                     if (consecutiveAbsences >= 2) {
@@ -928,60 +1312,63 @@ async function generateAIImageInternal(
                         return false
                     }
                 }
-                console.log("Checking /history...")
-                await new Promise(r => setTimeout(r, 1000))
-            } // Check history until the generation is complete.
-            // A history entry also appears when the workflow failed, but then it carries
-            // no outputs — surface the reported cause instead of dying on undefined.
-            const failure = (item?.status?.messages ?? []).find((m: any) =>
-                Array.isArray(m) && (m[0] === 'execution_error' || m[0] === 'execution_interrupted'))
-            if(failure){
-                const info = failure[1] ?? {}
-                const detail = [info.node_type ?? info.node_id, info.exception_type, info.exception_message].filter(Boolean).join(': ')
-                alertError(`Error: ComfyUI ${failure[0]}${detail ? ` (${detail})` : ''}`)
-                return false
-            }
-            const genImgInfo = Object.values(item?.outputs ?? {}).flatMap((output: any) => Array.isArray(output?.images) ? output.images : [])[0];
-            if(!genImgInfo?.filename){
-                alertError("Error: ComfyUI returned no image. Check that the workflow has a SaveImage output node.")
-                return false
-            }
+                queueSubscription.unsubscribe()
 
-            const imgResponse = await fetchNative(createUrl('/view', {
-                filename: genImgInfo.filename,
-                subfolder: genImgInfo.subfolder,
-                type: genImgInfo.type
-            }), {
-                headers: { 'Content-Type': 'application/json' }, 
-                method: 'GET'
-            })
-            const img64 = Buffer.from(await imgResponse.arrayBuffer()).toString('base64')
+                // A history entry also appears when the workflow failed, but then it carries
+                // no outputs — surface the reported cause instead of dying on undefined.
+                const failure = (item.status?.messages ?? []).find((m: any) =>
+                    Array.isArray(m) && (m[0] === 'execution_error' || m[0] === 'execution_interrupted'))
+                if(failure){
+                    const info = failure[1] ?? {}
+                    const detail = [info.node_type ?? info.node_id, info.exception_type, info.exception_message].filter(Boolean).join(': ')
+                    alertError(`Error: ComfyUI ${failure[0]}${detail ? ` (${detail})` : ''}`)
+                    return false
+                }
+                const genImgInfo = Object.values(item.outputs).flatMap((output: any) => Array.isArray(output?.images) ? output.images : [])[0];
+                if(!genImgInfo?.filename){
+                    alertError("Error: ComfyUI returned no image. Check that the workflow has a SaveImage output node.")
+                    return false
+                }
 
-            if(returnSdData === 'inlay'){
-                const dataUrl = `data:image/png;base64,${img64}`
+                const imgBuffer = await downloadComfyImage(createUrl('/view', {
+                    filename: genImgInfo.filename,
+                    subfolder: genImgInfo.subfolder,
+                    type: genImgInfo.type
+                }))
+                const img64 = Buffer.from(imgBuffer).toString('base64')
+
+                if(returnSdData === 'inlay'){
+                    const dataUrl = `data:image/png;base64,${img64}`
+                    return {
+                        result: { ok: true, bytesOrDataUrl: dataUrl, providerStatus: 200 },
+                        compatibilityValue: dataUrl,
+                        seedSupported: comfySeedSupported,
+                        seedUsed: comfySeedSupported ? comfySeedUsed : null,
+                    }
+                }
+                else {
+                    let charemotions = get(CharEmotion)
+                    const img = `data:image/png;base64,${img64}`
+                    const emos:[string, string,number][] = [[img, img, Date.now()]]
+                    charemotions[currentChar.chaId] = emos
+                    CharEmotion.set(charemotions)
+                }
+
                 return {
-                    result: { ok: true, bytesOrDataUrl: dataUrl, providerStatus: 200 },
-                    compatibilityValue: dataUrl,
+                    result: { ok: true, bytesOrDataUrl: `data:image/png;base64,${img64}`, providerStatus: 200 },
+                    compatibilityValue: returnSdData,
                     seedSupported: comfySeedSupported,
                     seedUsed: comfySeedSupported ? comfySeedUsed : null,
                 }
-            }
-            else {
-                let charemotions = get(CharEmotion)
-                const img = `data:image/png;base64,${img64}`
-                const emos:[string, string,number][] = [[img, img, Date.now()]]
-                charemotions[currentChar.chaId] = emos
-                CharEmotion.set(charemotions)
-            }
-
-            return {
-                result: { ok: true, bytesOrDataUrl: `data:image/png;base64,${img64}`, providerStatus: 200 },
-                compatibilityValue: returnSdData,
-                seedSupported: comfySeedSupported,
-                seedUsed: comfySeedSupported ? comfySeedUsed : null,
+            } finally {
+                queueSubscription.unsubscribe()
             }
         } catch (error) {
-            notifyError(error)
+            if (isComfyDefiniteHttpError(error)) {
+                alertError(`Error: ${error.message}`)
+            } else {
+                notifyError(error)
+            }
             return false
         }
     }
