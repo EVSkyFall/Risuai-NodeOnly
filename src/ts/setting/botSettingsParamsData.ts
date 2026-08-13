@@ -178,7 +178,7 @@ export const modelSpecificParameterItems: SettingItem[] = [
         bindKey: 'geminiThinkingLevel',
         condition: (ctx) =>
             ctx.modelInfo.flags.includes(LLMFlags.geminiThinking) ||
-            (ctx.db.subModel === 'google-dynamic-vertex' && ctx.subModelInfo.flags.includes(LLMFlags.geminiThinking)),
+            (ctx.subModelInfo.id === 'google-dynamic-vertex' && ctx.subModelInfo.flags.includes(LLMFlags.geminiThinking)),
         options: {
             segmentOptions: [
                 { value: -1, label: 'Minimal' },

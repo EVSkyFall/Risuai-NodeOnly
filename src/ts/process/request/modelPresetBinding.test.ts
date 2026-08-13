@@ -10,6 +10,7 @@ vi.mock('src/ts/storage/database.svelte', () => ({
 
 import {
     resolveChatModelBinding,
+    resolveEffectiveChatModelIds,
     resolvePresetMaxOutputTokens,
     resolveChatMaxResponseTokens,
     applyPromptPresetParams,
@@ -75,6 +76,60 @@ describe('resolveChatModelBinding — regime gate', () => {
         mockDb.nodeOnlyModelModeLock = 'preset'
         const chat = { useModelPreset: false, modelBinding: undefined } as any
         expect(resolveChatModelBinding(chat, 'model')).toEqual({ kind: 'block', reason: 'main-unset' })
+    })
+})
+
+describe('resolveEffectiveChatModelIds', () => {
+    const VERTEX_MAIN = {
+        id: 'p-vertex-main',
+        profileSnapshot: { modelId: 'google-dynamic-vertex' },
+    } as any
+    const VERTEX_SUB = {
+        id: 'p-vertex-sub',
+        profileSnapshot: { modelId: 'google-dynamic-vertex' },
+    } as any
+    const OTHER = {
+        id: 'p-other',
+        profileSnapshot: { modelId: 'gpt-4o' },
+    } as any
+
+    beforeEach(() => {
+        mockDb.aiModel = 'legacy-main'
+        mockDb.subModel = 'legacy-sub'
+        mockDb.modelPresets = [VERTEX_MAIN, VERTEX_SUB, OTHER]
+    })
+
+    test('preset regime resolves the bound Vertex main model', () => {
+        const chat = {
+            useModelPreset: true,
+            modelBinding: { ...emptyModelBinding(), main: VERTEX_MAIN.id, sub: OTHER.id },
+        } as any
+
+        expect(resolveEffectiveChatModelIds(chat)).toEqual({
+            modelId: 'google-dynamic-vertex',
+            subModelId: 'gpt-4o',
+        })
+    })
+
+    test('preset regime resolves the bound Vertex submodel independently', () => {
+        const chat = {
+            useModelPreset: true,
+            modelBinding: { ...emptyModelBinding(), main: OTHER.id, sub: VERTEX_SUB.id },
+        } as any
+
+        expect(resolveEffectiveChatModelIds(chat)).toEqual({
+            modelId: 'gpt-4o',
+            subModelId: 'google-dynamic-vertex',
+        })
+    })
+
+    test('legacy regime falls back to db.aiModel and db.subModel', () => {
+        const chat = { useModelPreset: false, modelBinding: undefined } as any
+
+        expect(resolveEffectiveChatModelIds(chat)).toEqual({
+            modelId: 'legacy-main',
+            subModelId: 'legacy-sub',
+        })
     })
 })
 

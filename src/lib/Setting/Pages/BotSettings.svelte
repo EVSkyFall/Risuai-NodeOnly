@@ -6,7 +6,7 @@
     import { language } from "src/lang";
     import Help from "src/lib/Others/Help.svelte";
     
-    import { DBState, BotSubmenuIndex } from 'src/ts/stores.svelte';
+    import { DBState, BotSubmenuIndex, selectedCharID } from 'src/ts/stores.svelte';
     import { customProviderStore } from "src/ts/plugins/plugins.svelte";
     import { tokenizerList } from "src/ts/tokenizer";
     import ModelList from "src/lib/UI/ModelList.svelte";
@@ -40,6 +40,7 @@
     import SeparateParametersSection from "./SeparateParametersSection.svelte";
     import AuxModelSelectors from './Model/AuxModelSelectors.svelte'
     import CustomModelsSettings from './Model/CustomModelsSettings.svelte'
+    import { resolveEffectiveChatModelIds } from 'src/ts/process/request/modelPresetBinding'
     
     const openrouterPinnedItems: ModelGridPinnedItem[] = [
         { id: 'risu/free',       displayName: 'Free Auto',       providerName: 'Risu'       },
@@ -93,6 +94,12 @@
 
     let modelInfo = $derived(getModelInfo(DBState.db.aiModel))
     let subModelInfo = $derived(getModelInfo(DBState.db.subModel))
+    let currentChat = $derived(
+        DBState.db.characters[$selectedCharID]?.chats?.[DBState.db.characters[$selectedCharID]?.chatPage]
+    )
+    let effectiveModelIds = $derived(resolveEffectiveChatModelIds(currentChat))
+    let parameterModelInfo = $derived(getModelInfo(effectiveModelIds.modelId))
+    let parameterSubModelInfo = $derived(getModelInfo(effectiveModelIds.subModelId))
     let nanogptInputMode = $state<'list' | 'manual'>(DBState.db.nanogptRequestModel && !DBState.db.nanogptRequestModelName ? 'manual' : 'list')
     // svelte-ignore state_referenced_locally
     let prevNanogptInputMode = nanogptInputMode;
@@ -487,7 +494,11 @@
         {/snippet}
     </ShAlert>
     <!-- Data-driven basic parameters -->
-    <SettingRenderer items={allBasicParameterItems} {modelInfo} {subModelInfo} />
+    <SettingRenderer
+        items={allBasicParameterItems}
+        modelInfo={parameterModelInfo}
+        subModelInfo={parameterSubModelInfo}
+    />
     {#if DBState.db.aiModel === 'textgen_webui' || DBState.db.aiModel === 'mancer' || DBState.db.aiModel.startsWith('local_') || DBState.db.aiModel.startsWith('hf:::')}
         <span class="text-textcolor">Repetition Penalty</span>
         <SliderInput className="mt-2" min={1} max={1.5} step={0.01} fixed={2} marginBottom bind:value={DBState.db.ooba.repetition_penalty}/>
@@ -555,7 +566,7 @@
         </div>
         <Check bind:check={DBState.db.ooba.formating.useName} name={language.useNamePrefix}/>
     
-    {:else if modelInfo.format === LLMFormat.NovelAI}
+    {:else if parameterModelInfo.format === LLMFormat.NovelAI}
         <div class="text-textcolor2 text-xs mt-4 mb-2 p-2 rounded-md border border-darkborderc">
             These parameters follow NovelAI's own definitions. See the official NovelAI documentation for details.
         </div>
@@ -592,7 +603,7 @@
         <span class="text-textcolor">Cfg Scale</span>
         <SliderInput className="mt-2" min={1} max={3} step={0.01} marginBottom fixed={2} bind:value={DBState.db.NAIsettings.cfg_scale}/>
 
-    {:else if modelInfo.format === LLMFormat.NovelList}
+    {:else if parameterModelInfo.format === LLMFormat.NovelList}
         <div class="text-textcolor2 text-xs mt-4 mb-2 p-2 rounded-md border border-darkborderc">
             These parameters follow NovelList's own definitions. See the official NovelList documentation for details.
         </div>

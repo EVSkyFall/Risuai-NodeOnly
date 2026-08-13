@@ -109,6 +109,31 @@ export function resolveChatModelBinding(
         : { kind: 'block', reason: 'sub-unset' }
 }
 
+export interface EffectiveChatModelIds {
+    modelId: string | undefined
+    subModelId: string | undefined
+}
+
+/**
+ * Main/sub model ids that are effective for the active chat. This intentionally
+ * delegates regime and preset selection to the request-path chokepoint above so
+ * settings visibility cannot drift from the models a send would use.
+ */
+export function resolveEffectiveChatModelIds(chat: Chat | null | undefined): EffectiveChatModelIds {
+    const db = getDatabase()
+    const main = resolveChatModelBinding(chat, 'model')
+    const sub = resolveChatModelBinding(chat, 'submodel')
+
+    return {
+        modelId: main.kind === 'modelPreset'
+            ? main.preset.profileSnapshot.modelId
+            : main.kind === 'classic' ? db.aiModel : undefined,
+        subModelId: sub.kind === 'modelPreset'
+            ? sub.preset.profileSnapshot.modelId
+            : sub.kind === 'classic' ? db.subModel : undefined,
+    }
+}
+
 /**
  * Effective max OUTPUT-token cap declared by a ModelPreset, read from its own
  * schema/userValues/defaults — the field that maps to the provider's
