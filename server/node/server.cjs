@@ -764,6 +764,84 @@ app.use('/assets', express.static(path.join(process.cwd(), 'dist/assets'), {
 }));
 app.use(express.static(path.join(process.cwd(), 'dist'), {index: false, maxAge: 0}));
 app.use(express.json({ limit: '100mb' }));
+
+// PocketRisu -> Termux native Android notification
+app.post('/api/termux-notify', (req, res) => {
+    const addr = String(req.socket.remoteAddress || '');
+    const isLoopback =
+        addr === '127.0.0.1' ||
+        addr === '::1' ||
+        addr === '::ffff:127.0.0.1';
+
+    if (!isLoopback) {
+        return res.status(403).json({ error: 'localhost only' });
+    }
+
+    const prefix = process.env.PREFIX;
+
+    if (!prefix) {
+        return res.status(503).json({
+            error: 'Termux environment not available'
+        });
+    }
+
+    const bin = path.join(prefix, 'bin', 'termux-notification');
+
+    if (!existsSync(bin)) {
+        return res.status(503).json({
+            error: 'termux-notification not installed'
+        });
+    }
+
+    const elapsedMs = Number(req.body?.elapsedMs);
+
+    const elapsedText = Number.isFinite(elapsedMs)
+        ? `${(elapsedMs / 1000).toFixed(1)}s`
+        : 'time unavailable';
+
+    const character =
+        typeof req.body?.character === 'string'
+            ? req.body.character.trim().slice(0, 80)
+            : '';
+
+    const title = character
+        ? `PocketRisu · ${character}`
+        : 'PocketRisu';
+
+    // Reuse one notification slot so repeated responses do not stack.
+    const child = spawn(bin, [
+        '--id', '8472',
+        '--title', title,
+        '--content', `Response complete · ${elapsedText}`,
+        '--priority', 'high',
+        '--sound'
+    ], {
+        stdio: 'ignore'
+    });
+
+    let replied = false;
+
+    child.once('error', (error) => {
+        console.error('[TermuxNotify]', error);
+
+        if (!replied) {
+            replied = true;
+            res.status(500).json({
+                error: 'notification failed'
+            });
+        }
+    });
+
+    child.once('close', (code) => {
+        if (!replied) {
+            replied = true;
+            res.status(code === 0 ? 200 : 500).json({
+                ok: code === 0
+            });
+        }
+    });
+});
+
 app.use((req, res, next) => {
     // Skip express.raw() for backup import — it must stream, not buffer into memory
     if (req.path === '/api/backup/import') return next();
