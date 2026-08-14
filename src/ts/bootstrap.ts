@@ -17,7 +17,7 @@ import { updateColorScheme, updateTextThemeAndCSS } from "./gui/colorscheme";
 import { applyEarlyLanguage, changeLanguage, language } from "src/lang";
 import { startObserveDom } from "./observer.svelte";
 import { updateGuisize } from "./gui/guisize";
-import { updateLorebooks } from "./characters";
+import { changeChar, updateLorebooks } from "./characters";
 import { initMobileGesture } from "./hotkey";
 import { moduleUpdate } from "./process/modules";
 import {
@@ -170,7 +170,30 @@ export async function loadData() {
                 console.warn('[bootstrap] boot backup reminder failed:', err)
             }
             loadedStore.set(true)
+
             selectedCharID.set(-1)
+
+            // Keep PocketRisu's normal clean boot (-1), then restore through
+            // the canonical changeChar path so lazy chat hydration, toggles,
+            // and chat UI initialization still run normally.
+            try {
+                const lastChaId = localStorage.getItem('risu-last-active-character')
+                const restoreIndex = lastChaId
+                    ? DBState.db.characters.findIndex((char) => char?.chaId === lastChaId)
+                    : -1
+
+                if (restoreIndex >= 0) {
+                    setTimeout(() => {
+                        try {
+                            changeChar(restoreIndex)
+
+                        } catch (error) {
+                            console.warn('[MobileResume] restore failed:', error)
+                        }
+                    }, 100)
+                }
+            } catch { /* best effort only */ }
+
             startObserveDom()
             assignIds()
             registerModelDynamic()

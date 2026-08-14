@@ -9,6 +9,7 @@ import { doingChat, previewBody, sendChat } from "./process/index.svelte"
 import { endAllGenerations } from "./process/generationState"
 import { RISU_SIDEBAR_DRAG_TYPE } from "./dragTypes"
 import { openSettings, SettingsRoute, SystemTab } from "./routing"
+import { deselectCharacter } from "./characters"
 
 export function initHotkey(){
     document.addEventListener('keydown', async (ev) => {
@@ -75,7 +76,7 @@ export function initHotkey(){
                     break
                 }
                 case 'home':{
-                    selectedCharID.set(-1)
+                    deselectCharacter()
                     break
                 }
                 case 'presets':{
@@ -105,6 +106,12 @@ export function initHotkey(){
                         return
                     }
                     selectedCharID.set(sorted[currentIndex - 1].i)
+                    try {
+                        const char = database.characters[sorted[currentIndex - 1].i]
+                        if (char?.chaId) {
+                            localStorage.setItem('risu-last-active-character', char.chaId)
+                        }
+                    } catch {}
                     PlaygroundStore.set(0)
                     OpenRealmStore.set(false)
                     break
@@ -120,6 +127,12 @@ export function initHotkey(){
                     // currentIndex === -1 (nothing selected) intentionally falls through
                     // to sorted[0], matching the previous behaviour.
                     selectedCharID.set(sorted[currentIndex + 1].i)
+                    try {
+                        const char = database.characters[sorted[currentIndex + 1].i]
+                        if (char?.chaId) {
+                            localStorage.setItem('risu-last-active-character', char.chaId)
+                        }
+                    } catch {}
                     PlaygroundStore.set(0)
                     OpenRealmStore.set(false)
                     break
