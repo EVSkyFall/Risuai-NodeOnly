@@ -5294,7 +5294,10 @@ app.get('/api/db/stats', async (req, res, next) => {
             }
             trashed.available = true;
         }
-        if (stripped) {
+        // `characters` must be an array: a decode failure parks `{}` in dbCache,
+        // and walking that yields an empty reference set — which would report
+        // every stored asset as an orphan.
+        if (stripped && Array.isArray(stripped.characters)) {
             const uncleanable = buildUncleanableSet(stripped);
             for (const it of kvListWithSizes('assets/')) {
                 if (!uncleanable.has(statsBasename(it.key))) {
@@ -5481,6 +5484,52 @@ app.get('/api/db/stats/modules', async (req, res, next) => {
 
         modules.sort((a, b) => b.totalBytes - a.totalBytes);
         res.json({ modules, etag: dbEtag });
+    } catch (err) { next(err); }
+});
+
+// Delete every assets/* row no reference in the database points at. The count
+// shown by /api/db/stats comes from the in-memory stripped cache; this pass
+// recomputes from the persisted blob instead, so the deletion is decided by the
+// same bytes a backup would carry rather than by cache state.
+app.post('/api/db/assets/purge-orphans', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    if (!checkActiveSession(req, res)) return;
+    try {
+        const result = await queueStorageOperation(async () => {
+            // Land any debounced write first — otherwise the blob we walk is
+            // older than the assets the client just attached.
+            await flushPendingDb();
+            const raw = kvGet(DB_BLOB_KEY);
+            if (!raw) return { error: 'No database blob' };
+            const dbObj = await decodeRisuSave(raw);
+            if (!dbObj || !Array.isArray(dbObj.characters)) return { error: 'Database decode failed' };
+
+            const uncleanable = buildUncleanableSet(dbObj);
+            const assets = kvListWithSizes('assets/');
+            // A walker that returns nothing while assets exist means the decode
+            // produced a shape we do not understand — every asset would look
+            // orphaned. Refuse rather than delete the library.
+            if (uncleanable.size === 0 && assets.length > 0) {
+                return { error: 'Reference scan produced no references — refusing to purge' };
+            }
+
+            const victims = assets.filter((it) => !uncleanable.has(statsBasename(it.key)));
+            // One commit for the whole sweep: thousands of autocommitted deletes
+            // would each hit the WAL, and a crash mid-loop would leave the
+            // library half-swept.
+            sqliteDb.transaction(() => {
+                for (const it of victims) kvDel(it.key);
+            })();
+            const deleted = victims.length;
+            const bytes = victims.reduce((sum, it) => sum + it.size, 0);
+            if (deleted > 0) {
+                try { checkpointWal('TRUNCATE'); } catch (e) { logger.warn('[PurgeOrphans] checkpoint failed:', e?.message || e); }
+            }
+            return { ok: true, deleted, bytes, scanned: assets.length };
+        });
+        if (result.error) return res.status(400).json(result);
+        logger.info(`[PurgeOrphans] removed ${result.deleted}/${result.scanned} assets (${result.bytes} bytes)`);
+        res.json(result);
     } catch (err) { next(err); }
 });
 

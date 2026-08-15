@@ -510,6 +510,11 @@ async function checkNewFormat(): Promise<void> {
  */
 async function cleanChunks() {
     const db = getDatabase()
+    // Orphan assets/* are only swept when the user opted in — the walker below
+    // has no way to know about a reference field it was never taught, and the
+    // deletion is permanent. Opted out, the storage dashboard offers the same
+    // sweep on demand. remotes/* are regenerable caches and always swept.
+    const cleanAssets = db.nodeOnlyAutoCleanAssets === true
     const uncleanable = new Set(getUncleanables(db))
     const indexes = await forageStorage.keys()
     const allKeys = new Set(indexes)
@@ -521,6 +526,9 @@ async function cleanChunks() {
             continue
         }
         else if (asset.startsWith('assets/')) {
+            if(!cleanAssets) {
+                continue
+            }
             const n = getBasename(asset)
             if(!uncleanable.has(n)) {
                 await forageStorage.removeItem(asset)

@@ -2047,6 +2047,26 @@ export const languageEnglish = {
 
     storageCleanup: "Clean up SQLite overhead",
 
+    storageOrphan: "Orphan media",
+    storageOrphanHeader: (count: number, size: number) =>
+        `${count} files · ${(size / 1024 / 1024).toFixed(1)} MB`,
+    storageOrphanWhat:
+        "Image files no character, module or persona refers to. They are left behind when you delete a character or replace an asset.",
+    storageOrphanWhen:
+        "Deleted files cannot be recovered — make a backup first if anything here matters. After purging, run \"Clean up SQLite overhead\" above to actually shrink the file.",
+    storageOrphanUnavailable:
+        "Not scannable yet. Refresh once the database has been loaded into server memory.",
+    storageOrphanPurge: "Purge orphan media",
+    storageOrphanPurging: "Purging orphan media...",
+    storageOrphanConfirm: (count: number, size: number) =>
+        `Delete ${count} unreferenced media file(s) (${(size / 1024 / 1024).toFixed(1)} MB)? This cannot be undone.`,
+    storageOrphanDone: (count: number, size: number) =>
+        `Deleted ${count} file(s) (${(size / 1024 / 1024).toFixed(1)} MB).`,
+    storageOrphanFailed: "Orphan media purge failed",
+    storageOrphanAutoClean: "Auto-purge on boot",
+    storageOrphanAutoCleanDesc:
+        "Delete orphan media every time the app opens. Off by default — it can also delete references the scanner does not know about yet, so manual purging is safer.",
+
     storageWalCleanup: "Manual WAL cleanup",
     storageWalCleanupHeader: (walSize: number) => `Current WAL ${(walSize / 1024 / 1024).toFixed(1)} MB`,
     storageWalCleanupWhat: "SQLite's WAL file (risuai.db-wal) collects recent changes before merging them into the main database. A background checkpoint runs every 5 minutes, but bursts like backup import or large asset uploads can temporarily inflate it.",
