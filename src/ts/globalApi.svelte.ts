@@ -1170,6 +1170,7 @@ const knownHostes = ["localhost", "127.0.0.1", "0.0.0.0"];
  * @property {AbortSignal} [abortSignal] - The abort signal to cancel the request.
  * @property {boolean} [useRisuToken] - Whether to use the Risu token.
  * @property {string} [chatId] - The chat ID associated with the request.
+ * @property {boolean} [throwOnTransportError] - Whether failures before a response is acquired should reject.
  */
 interface GlobalFetchArgs {
     plainFetchForce?: boolean;
@@ -1185,6 +1186,7 @@ interface GlobalFetchArgs {
     chatId?: string;
     interceptor?: string;
     requestTimeoutMs?: number;
+    throwOnTransportError?: boolean;
     networkRoute?: 'auto' | 'local_network';
     /** Request-log classification. Defaults to the neutral 'other'/'other';
      *  LLM call sites pass 'llm' plus the issuing part of the app so the log's
@@ -1209,6 +1211,65 @@ interface GlobalFetchResult {
     status: number;
 }
 
+export class GlobalFetchTransportError extends Error {
+    readonly globalFetchTransportError = true
+
+    constructor(
+        readonly dispatched: boolean,
+        readonly transportCause: unknown,
+    ) {
+        super(
+            dispatched
+                ? `Global fetch did not acquire a response after dispatch: ${String(transportCause)}`
+                : `Global fetch failed before dispatch: ${String(transportCause)}`,
+        )
+        this.name = 'GlobalFetchTransportError'
+    }
+}
+
+function isGlobalFetchTransportError(error: unknown): error is GlobalFetchTransportError {
+    return error !== null
+        && typeof error === 'object'
+        && (error as { globalFetchTransportError?: unknown }).globalFetchTransportError === true
+        && typeof (error as { dispatched?: unknown }).dispatched === 'boolean'
+}
+
+function throwIfGlobalFetchAbortedBeforeDispatch(arg: GlobalFetchArgs): void {
+    if (!arg.abortSignal?.aborted) return
+    throw arg.abortSignal.reason ?? new DOMException('The operation was aborted.', 'AbortError')
+}
+
+function synthesizeGlobalFetchFailure(error: unknown): GlobalFetchResult {
+    return { ok: false, data: `${error}`, headers: {}, status: 400 }
+}
+
+function handleGlobalFetchTransportFailure(
+    error: unknown,
+    arg: GlobalFetchArgs,
+    dispatched: boolean,
+): GlobalFetchResult {
+    if (arg.throwOnTransportError) throw new GlobalFetchTransportError(dispatched, error)
+    return synthesizeGlobalFetchFailure(error)
+}
+
+function handleGlobalFetchBodyFailure(
+    error: unknown,
+    response: Response,
+    url: string,
+    arg: GlobalFetchArgs,
+    started: number,
+): GlobalFetchResult {
+    if (!arg.throwOnTransportError) return synthesizeGlobalFetchFailure(error)
+    const data = `${error}`
+    addFetchLogInGlobalFetch(data, false, url, arg, response.status, started)
+    return {
+        ok: false,
+        data,
+        headers: Object.fromEntries(response.headers),
+        status: response.status,
+    }
+}
+
 /**
  * Performs a global fetch request.
  * 
@@ -1220,7 +1281,15 @@ export async function globalFetch(url: string, arg: GlobalFetchArgs = {}): Promi
     try {
         const db = getDatabase();
 
-        if (arg.abortSignal?.aborted) { return { ok: false, data: 'aborted', headers: {}, status: 400 }; }
+        if (arg.abortSignal?.aborted) {
+            if (arg.throwOnTransportError) {
+                throw new GlobalFetchTransportError(
+                    false,
+                    arg.abortSignal.reason ?? new DOMException('The operation was aborted.', 'AbortError'),
+                )
+            }
+            return { ok: false, data: 'aborted', headers: {}, status: 400 }
+        }
 
         const urlHost = new URL(url).hostname
         const useLocalNetworkRoute = arg.networkRoute === 'local_network' && isLocalNetworkUrl(url)
@@ -1261,7 +1330,11 @@ export async function globalFetch(url: string, arg: GlobalFetchArgs = {}): Promi
 
     } catch (error) {
         console.error(error);
-        return { ok: false, data: `${error}`, headers: {}, status: 400 };
+        if (arg.throwOnTransportError) {
+            if (isGlobalFetchTransportError(error)) throw error
+            throw new GlobalFetchTransportError(false, error)
+        }
+        return synthesizeGlobalFetchFailure(error)
     }
 }
 
@@ -1321,16 +1394,26 @@ function addFetchLogInGlobalFetch(response: any, success: boolean, url: string, 
  * @returns {Promise<GlobalFetchResult>} - The result of the fetch request.
  */
 async function fetchWithPlainFetch(url: string, arg: GlobalFetchArgs): Promise<GlobalFetchResult> {
+    const started = Date.now();
+    let response: Response
+    let dispatched = false
     try {
-        const started = Date.now();
         const headers = { 'Content-Type': 'application/json', ...arg.headers };
-        const response = await fetch(new URL(url), { body: JSON.stringify(arg.body), headers, method: arg.method ?? "POST", signal: arg.abortSignal });
+        const requestUrl = new URL(url)
+        const body = JSON.stringify(arg.body)
+        throwIfGlobalFetchAbortedBeforeDispatch(arg)
+        dispatched = true
+        response = await fetch(requestUrl, { body, headers, method: arg.method ?? "POST", signal: arg.abortSignal });
+    } catch (error) {
+        return handleGlobalFetchTransportFailure(error, arg, dispatched)
+    }
+    try {
         const data = arg.rawResponse ? new Uint8Array(await response.arrayBuffer()) : await response.json();
         const ok = response.ok && response.status >= 200 && response.status < 300;
         addFetchLogInGlobalFetch(data, ok, url, arg, response.status, started);
         return { ok, data, headers: Object.fromEntries(response.headers), status: response.status };
     } catch (error) {
-        return { ok: false, data: `${error}`, headers: {}, status: 400 };
+        return handleGlobalFetchBodyFailure(error, response, url, arg, started)
     }
 }
 
@@ -1342,16 +1425,25 @@ async function fetchWithPlainFetch(url: string, arg: GlobalFetchArgs): Promise<G
  * @returns {Promise<GlobalFetchResult>} - The result of the fetch request.
  */
 async function fetchWithUSFetch(url: string, arg: GlobalFetchArgs): Promise<GlobalFetchResult> {
+    const started = Date.now();
+    let response: Response
+    let dispatched = false
     try {
-        const started = Date.now();
         const headers = { 'Content-Type': 'application/json', ...arg.headers };
-        const response = await userScriptFetch(url, { body: JSON.stringify(arg.body), headers, method: arg.method ?? "POST", signal: arg.abortSignal });
+        const body = JSON.stringify(arg.body)
+        throwIfGlobalFetchAbortedBeforeDispatch(arg)
+        dispatched = true
+        response = await userScriptFetch(url, { body, headers, method: arg.method ?? "POST", signal: arg.abortSignal });
+    } catch (error) {
+        return handleGlobalFetchTransportFailure(error, arg, dispatched)
+    }
+    try {
         const data = arg.rawResponse ? new Uint8Array(await response.arrayBuffer()) : await response.json();
         const ok = response.ok && response.status >= 200 && response.status < 300;
         addFetchLogInGlobalFetch(data, ok, url, arg, response.status, started);
         return { ok, data, headers: Object.fromEntries(response.headers), status: response.status };
     } catch (error) {
-        return { ok: false, data: `${error}`, headers: {}, status: 400 };
+        return handleGlobalFetchBodyFailure(error, response, url, arg, started)
     }
 }
 
@@ -1363,10 +1455,12 @@ async function fetchWithUSFetch(url: string, arg: GlobalFetchArgs): Promise<Glob
  * @returns {Promise<GlobalFetchResult>} - The result of the fetch request.
  */
 async function fetchWithProxy(url: string, arg: GlobalFetchArgs): Promise<GlobalFetchResult> {
+    const started = Date.now();
+    let response: Response
+    let dispatched = false
     try {
-        const started = Date.now();
         const furl = `/proxy2`;
-        arg.headers["Content-Type"] ??= arg.body instanceof URLSearchParams ? "application/x-www-form-urlencoded" : "application/json";
+        arg.headers!["Content-Type"] ??= arg.body instanceof URLSearchParams ? "application/x-www-form-urlencoded" : "application/json";
         const turnId = getEffectiveTurnId()
         const headers = {
             ...(arg.proxyRequestHeaders ?? {}),
@@ -1383,9 +1477,15 @@ async function fetchWithProxy(url: string, arg: GlobalFetchArgs): Promise<Global
 
         const body = arg.body instanceof URLSearchParams ? arg.body.toString() : JSON.stringify(arg.body);
 
-        const response = await fetch(furl, { body, headers, method: arg.method ?? "POST", signal: arg.abortSignal });
-        const isSuccess = response.ok && response.status >= 200 && response.status < 300;
+        throwIfGlobalFetchAbortedBeforeDispatch(arg)
+        dispatched = true
+        response = await fetch(furl, { body, headers, method: arg.method ?? "POST", signal: arg.abortSignal });
+    } catch (error) {
+        return handleGlobalFetchTransportFailure(error, arg, dispatched)
+    }
+    const isSuccess = response.ok && response.status >= 200 && response.status < 300;
 
+    try {
         if (arg.rawResponse) {
             const data = new Uint8Array(await response.arrayBuffer());
             addFetchLogInGlobalFetch("Uint8Array Response", isSuccess, url, arg, response.status, started);
@@ -1403,7 +1503,7 @@ async function fetchWithProxy(url: string, arg: GlobalFetchArgs): Promise<Global
             return { ok: false, data: errorMsg, headers: Object.fromEntries(response.headers), status: response.status };
         }
     } catch (error) {
-        return { ok: false, data: `${error}`, headers: {}, status: 400 };
+        return handleGlobalFetchBodyFailure(error, response, url, arg, started)
     }
 }
 
@@ -1958,6 +2058,8 @@ export interface FetchNativeArgs {
      *  logCategory, so a caller that logs at a higher level (the model-preset
      *  path) can record the true route instead of guessing. */
     onLogRoute?: (route: RequestLogRoute) => void
+    /** Reports whether the selected transport exposes response bytes incrementally. */
+    onResponseBodyMode?: (mode: 'streaming' | 'buffered') => void
 }
 
 export async function fetchNative(url: string, arg: FetchNativeArgs): Promise<Response> {
@@ -2057,6 +2159,7 @@ async function fetchNativeRaw(url: string, arg: FetchNativeArgs, hooks?: {
 
     try {
         if (window.userScriptFetch && !throughProxy) {
+            arg.onResponseBodyMode?.('buffered')
             hooks?.onRoute?.('direct')
             return await window.userScriptFetch(url, {
                 body: realBody as any,
@@ -2072,6 +2175,7 @@ async function fetchNativeRaw(url: string, arg: FetchNativeArgs, hooks?: {
             && arg.method === 'POST'
         if (useProxyJobWs) {
             try {
+                arg.onResponseBodyMode?.('streaming')
                 const res = await fetchViaProxyJobWs(url, {
                     method: arg.method,
                     headers,
@@ -2088,6 +2192,7 @@ async function fetchNativeRaw(url: string, arg: FetchNativeArgs, hooks?: {
 
         // Local network non-streaming or WS fallback: go through /proxy2 directly
         if (useLocalNetworkRoute) {
+            arg.onResponseBodyMode?.('streaming')
             hooks?.onRoute?.('proxy')
             return await fetchViaProxy2(url, headers, realBody, {
                 ...arg,
@@ -2097,6 +2202,7 @@ async function fetchNativeRaw(url: string, arg: FetchNativeArgs, hooks?: {
 
         // Copilot URLs: skip direct fetch (CORS will fail + wastes quota), go straight to proxy2
         if (url.includes('githubcopilot.com')) {
+            arg.onResponseBodyMode?.('streaming')
             hooks?.onRoute?.('proxy')
             return await fetchViaProxy2(url, headers, realBody, {
                 ...arg,
@@ -2106,6 +2212,7 @@ async function fetchNativeRaw(url: string, arg: FetchNativeArgs, hooks?: {
 
         // Try direct fetch first (upstream behavior), fall back to proxy on CORS/network error
         if (shouldSkipDirectFetch(url, Date.now())) {
+            arg.onResponseBodyMode?.('streaming')
             hooks?.onRoute?.('proxy')
             return await fetchViaProxy2(url, headers, realBody, {
                 ...arg,
@@ -2113,6 +2220,7 @@ async function fetchNativeRaw(url: string, arg: FetchNativeArgs, hooks?: {
             })
         }
         try {
+            arg.onResponseBodyMode?.('streaming')
             const response = await fetch(url, {
                 body: realBody as any,
                 headers: headers,
@@ -2123,8 +2231,14 @@ async function fetchNativeRaw(url: string, arg: FetchNativeArgs, hooks?: {
             hooks?.onRoute?.('direct')
             return response
         } catch (e) {
-            if (requestSignal?.aborted) throw e
+            if (requestSignal?.aborted) {
+                if (requestSignal.reason?.name === 'TimeoutError') {
+                    recordDirectFetchFailure(url, Date.now())
+                }
+                throw e
+            }
             recordDirectFetchFailure(url, Date.now())
+            arg.onResponseBodyMode?.('streaming')
             hooks?.onRoute?.('proxy')
             return await fetchViaProxy2(url, headers, realBody, {
                 ...arg,

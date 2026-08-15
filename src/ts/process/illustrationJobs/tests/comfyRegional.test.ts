@@ -69,7 +69,7 @@ beforeEach(() => {
                 json: async () => ({ p1: { outputs: { a: { images: [{ filename: 'f.png', subfolder: '', type: 'output' }] } } } }),
             } as any
         }
-        return { arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer } as any
+        return new Response(new Uint8Array([1, 2, 3]))
     })
 })
 

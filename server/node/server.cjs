@@ -3640,8 +3640,21 @@ const reverseProxyFunc_get = async (req, res, next) => {
     }
     const timeoutMs = getRequestTimeoutMs(req.headers['risu-timeout-ms']);
     const timeout = createTimeoutController(timeoutMs);
+    const downstreamController = new AbortController();
+    let downstreamDisconnected = false;
+    const onDownstreamClose = () => {
+        if (res.writableFinished) return;
+        downstreamDisconnected = true;
+        downstreamController.abort(new Error('Downstream client disconnected'));
+    };
+    res.once('close', onDownstreamClose);
+    if (res.destroyed && !res.writableFinished) onDownstreamClose();
+    const signals = [downstreamController.signal];
+    if (timeout.signal) signals.push(timeout.signal);
+    const signal = signals.length === 1 ? signals[0] : AbortSignal.any(signals);
     let originalResponse;
     try {
+    if (downstreamDisconnected) return;
     const header = req.headers['risu-header'] ? JSON.parse(decodeURIComponent(req.headers['risu-header'])) : req.headers;
     if (req.headers['x-risu-tk'] && !header['x-risu-tk']) {
         header['x-risu-tk'] = req.headers['x-risu-tk'];
@@ -3656,7 +3669,7 @@ const reverseProxyFunc_get = async (req, res, next) => {
         originalResponse = await fetch(urlParam, {
             method: 'GET',
             headers: header,
-            signal: timeout.signal
+            signal
         });
         // get response body as stream
         const originalBody = originalResponse.body;
@@ -3680,9 +3693,10 @@ const reverseProxyFunc_get = async (req, res, next) => {
         // send response status to client
         res.status(originalResponse.status);
         // send response body to client
-        await pipeline(originalResponse.body, res);
+        await pipeline(originalResponse.body, res, { signal });
     }
     catch (err) {
+        if (downstreamDisconnected || res.destroyed) return;
         if (err?.name === 'AbortError') {
             if (!res.headersSent) {
                 res.status(504).send({
@@ -3698,6 +3712,7 @@ const reverseProxyFunc_get = async (req, res, next) => {
         next(err);
         return;
     } finally {
+        res.removeListener('close', onDownstreamClose);
         timeout.cleanup();
     }
 }

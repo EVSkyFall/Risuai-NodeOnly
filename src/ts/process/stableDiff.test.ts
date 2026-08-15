@@ -120,10 +120,7 @@ function jsonResponse(data: unknown) {
 }
 
 function imageResponse(bytes = [1, 2, 3]) {
-    return {
-        ok: true,
-        arrayBuffer: async () => new Uint8Array(bytes).buffer,
-    }
+    return new Response(new Uint8Array(bytes), { status: 200 })
 }
 
 function httpErrorResponse(status: number) {
@@ -133,6 +130,33 @@ function httpErrorResponse(status: number) {
         json: async () => ({}),
         arrayBuffer: async () => new ArrayBuffer(0),
     }
+}
+
+function globalTransportError(dispatched: boolean, cause: unknown = new TypeError('Failed to fetch')) {
+    return {
+        name: 'GlobalFetchTransportError',
+        message: String(cause),
+        globalFetchTransportError: true,
+        dispatched,
+        transportCause: cause,
+    }
+}
+
+function globalFetchResponse(status: number, data: unknown = {}) {
+    return {
+        ok: status >= 200 && status < 300,
+        data,
+        headers: {},
+        status,
+    }
+}
+
+function typedImageResponse(byteLength: number, bodyMode: 'streaming' | 'buffered' = 'streaming') {
+    const response = new Response(new Uint8Array(byteLength), {
+        status: 200,
+        headers: { 'content-type': 'image/png; charset=binary' },
+    })
+    return { response, bodyMode }
 }
 
 function settleOnAbortOrDelay<T>(
@@ -1032,11 +1056,13 @@ describe('generateAIImage Comfy polling', () => {
         expect(mocks.fetchNative).toHaveBeenCalledOnce()
     })
 
-    it('keeps a rejected POST definite because no prompt id was submitted', async () => {
+    it('keeps a genuine HTTP 400 POST rejection definite', async () => {
         mocks.db = makeComfyUiDatabase()
         mocks.globalFetch.mockResolvedValue({
             ok: false,
             data: { error: 'prompt rejected' },
+            headers: {},
+            status: 400,
         })
 
         const attempt = await generateAIImageTyped(
@@ -1049,7 +1075,243 @@ describe('generateAIImage Comfy polling', () => {
             reason: 'Image generation failed',
         })
         expect(mocks.fetchNative).not.toHaveBeenCalled()
+        expect(mocks.globalFetch).toHaveBeenCalledOnce()
         expect(mocks.notifyError).toHaveBeenCalledOnce()
+    })
+
+    it.each([
+        null,
+        {},
+        { prompt_id: '' },
+    ])('reports malformed 2xx prompt acknowledgement %# as uncertain', async (data) => {
+        mocks.db = makeComfyUiDatabase()
+        mocks.globalFetch.mockResolvedValue({
+            ok: true,
+            data,
+            headers: {},
+            status: 200,
+        })
+
+        const attempt = await generateAIImageTyped(
+            'prompt', currentChar, 'negative', 'inlay', 'interactive', {},
+        )
+
+        expect(attempt.result).toMatchObject({
+            ok: false,
+            certainty: 'uncertain',
+        })
+        expect(mocks.fetchNative).not.toHaveBeenCalled()
+        expect(mocks.globalFetch).toHaveBeenCalledOnce()
+    })
+
+    it('keeps a decoded-failure HTTP 200 prompt acknowledgement uncertain without probing', async () => {
+        mocks.db = makeComfyUiDatabase()
+        mocks.globalFetch.mockResolvedValue({
+            ok: false,
+            data: 'SyntaxError: Unexpected token in JSON',
+            headers: {},
+            status: 200,
+        })
+
+        const attempt = await generateAIImageTyped(
+            'prompt', currentChar, 'negative', 'inlay', 'interactive', {},
+        )
+
+        expect(attempt.result).toMatchObject({
+            ok: false,
+            certainty: 'uncertain',
+        })
+        expect(mocks.globalFetch).toHaveBeenCalledOnce()
+        expect(mocks.globalFetch).toHaveBeenCalledWith(
+            'http://127.0.0.1:8188/prompt',
+            expect.objectContaining({ method: 'POST' }),
+        )
+        expect(mocks.fetchNative).not.toHaveBeenCalled()
+    })
+
+    it('keeps a proven pre-dispatch POST failure definite without probing', async () => {
+        mocks.db = makeComfyUiDatabase()
+        mocks.globalFetch.mockRejectedValue(globalTransportError(false))
+
+        const attempt = await generateAIImageTyped(
+            'prompt', currentChar, 'negative', 'inlay', 'interactive', {},
+        )
+
+        expect(attempt.result).toEqual({
+            ok: false,
+            certainty: 'definite',
+            reason: 'Image generation failed',
+        })
+        expect(mocks.globalFetch).toHaveBeenCalledOnce()
+        expect(mocks.fetchNative).not.toHaveBeenCalled()
+    })
+
+    it('downgrades a dispatched POST transport failure when its one-shot queue probe cannot connect', async () => {
+        mocks.db = makeComfyUiDatabase()
+        mocks.globalFetch
+            .mockRejectedValueOnce(globalTransportError(true))
+            .mockRejectedValueOnce(globalTransportError(true, new TypeError('queue connect failed')))
+
+        const attempt = await generateAIImageTyped(
+            'prompt', currentChar, 'negative', 'inlay', 'interactive', {},
+        )
+
+        expect(attempt.result).toEqual({
+            ok: false,
+            certainty: 'definite',
+            reason: 'Image generation failed',
+        })
+        expect(mocks.globalFetch).toHaveBeenCalledTimes(2)
+        expect(mocks.globalFetch.mock.calls.map(([url]) => url)).toEqual([
+            'http://127.0.0.1:8188/prompt',
+            'http://127.0.0.1:8188/queue',
+        ])
+        expect(mocks.fetchNative).not.toHaveBeenCalled()
+    })
+
+    it.each([200, 404])(
+        'keeps a dispatched POST transport failure uncertain when the queue probe receives HTTP %s',
+        async (probeStatus) => {
+            mocks.db = makeComfyUiDatabase()
+            mocks.globalFetch
+                .mockRejectedValueOnce(globalTransportError(true))
+                .mockResolvedValueOnce(globalFetchResponse(probeStatus, {
+                    queue_pending: [],
+                    queue_running: [],
+                }))
+
+            const attempt = await generateAIImageTyped(
+                'prompt', currentChar, 'negative', 'inlay', 'interactive', {},
+            )
+
+            expect(attempt.result).toMatchObject({
+                ok: false,
+                certainty: 'uncertain',
+            })
+            expect(mocks.globalFetch).toHaveBeenCalledTimes(2)
+            expect(mocks.globalFetch.mock.calls.map(([url]) => url)).toEqual([
+                'http://127.0.0.1:8188/prompt',
+                'http://127.0.0.1:8188/queue',
+            ])
+            expect(mocks.fetchNative).not.toHaveBeenCalled()
+        },
+    )
+
+    it('keeps a dispatched POST transport failure uncertain when the probe itself fails before dispatch', async () => {
+        mocks.db = makeComfyUiDatabase()
+        mocks.globalFetch
+            .mockRejectedValueOnce(globalTransportError(true))
+            .mockRejectedValueOnce(globalTransportError(false, new TypeError('auth refresh failed')))
+
+        const attempt = await generateAIImageTyped(
+            'prompt', currentChar, 'negative', 'inlay', 'interactive', {},
+        )
+
+        expect(attempt.result).toMatchObject({
+            ok: false,
+            certainty: 'uncertain',
+        })
+        expect(mocks.globalFetch).toHaveBeenCalledTimes(2)
+        expect(mocks.globalFetch.mock.calls.map(([url]) => url)).toEqual([
+            'http://127.0.0.1:8188/prompt',
+            'http://127.0.0.1:8188/queue',
+        ])
+        expect(mocks.fetchNative).not.toHaveBeenCalled()
+    })
+
+    it('opts the prompt into the 600 second request bound', async () => {
+        mocks.db = makeComfyUiDatabase()
+        mocks.globalFetch.mockRejectedValue(globalTransportError(false))
+
+        await generateAIImageTyped(
+            'prompt', currentChar, 'negative', 'inlay', 'interactive', {},
+        )
+
+        expect(mocks.globalFetch).toHaveBeenCalledWith(
+            'http://127.0.0.1:8188/prompt',
+            expect.objectContaining({
+                method: 'POST',
+                requestTimeoutMs: 600_000,
+                throwOnTransportError: true,
+            }),
+        )
+    })
+
+    it('allows a prompt response after 30 seconds under the 600 second request bound', async () => {
+        vi.useFakeTimers()
+        try {
+            const promptId = 'slow-prompt-ack'
+            mocks.db = makeComfyUiDatabase()
+            mocks.globalFetch.mockImplementationOnce((_url, options: { requestTimeoutMs?: number }) => (
+                new Promise(resolve => setTimeout(() => resolve({
+                    ok: true,
+                    data: { prompt_id: promptId },
+                    headers: {},
+                    status: 200,
+                }), 30_001))
+            ))
+            mocks.fetchNative.mockImplementation((url: string) => {
+                if (url.includes('/history/')) {
+                    return Promise.resolve(jsonResponse(completedComfyHistory(promptId)))
+                }
+                if (url.includes('/view?')) return Promise.resolve(imageResponse())
+                throw new Error(`Unexpected URL: ${url}`)
+            })
+
+            const resultPromise = generateAIImageTyped(
+                'prompt', currentChar, 'negative', 'inlay', 'interactive', {},
+            )
+            await vi.advanceTimersByTimeAsync(30_100)
+
+            expect((await resultPromise).result.ok).toBe(true)
+            expect(mocks.globalFetch).toHaveBeenCalledWith(
+                'http://127.0.0.1:8188/prompt',
+                expect.objectContaining({ requestTimeoutMs: 600_000 }),
+            )
+        } finally {
+            vi.useRealTimers()
+        }
+    })
+
+    it('keeps a gateway HTTP 502 POST response uncertain when its queue probe reaches Comfy', async () => {
+        mocks.db = makeComfyUiDatabase()
+        mocks.globalFetch
+            .mockResolvedValueOnce(globalFetchResponse(502, { error: 'upstream response lost' }))
+            .mockResolvedValueOnce(globalFetchResponse(200, { queue_pending: [], queue_running: [] }))
+
+        const attempt = await generateAIImageTyped(
+            'prompt', currentChar, 'negative', 'inlay', 'interactive', {},
+        )
+
+        expect(attempt.result).toMatchObject({
+            ok: false,
+            certainty: 'uncertain',
+        })
+        expect(mocks.globalFetch).toHaveBeenCalledTimes(2)
+        expect(mocks.fetchNative).not.toHaveBeenCalled()
+    })
+
+    it('downgrades a gateway HTTP 502 POST response when the queue probe also returns 502', async () => {
+        mocks.db = makeComfyUiDatabase()
+        mocks.globalFetch
+            .mockResolvedValueOnce(globalFetchResponse(502, { error: 'upstream response lost' }))
+            .mockResolvedValueOnce(globalFetchResponse(502, { error: 'queue upstream unavailable' }))
+
+        const attempt = await generateAIImageTyped(
+            'prompt', currentChar, 'negative', 'inlay', 'interactive', {},
+        )
+
+        expect(attempt.result).toEqual({
+            ok: false,
+            certainty: 'definite',
+            reason: 'Image generation failed',
+        })
+        expect(mocks.globalFetch).toHaveBeenCalledTimes(2)
+        expect(mocks.globalFetch.mock.calls.map(([url]) => url)).toEqual([
+            'http://127.0.0.1:8188/prompt',
+            'http://127.0.0.1:8188/queue',
+        ])
+        expect(mocks.fetchNative).not.toHaveBeenCalled()
     })
 
     it('retries the final image download after a transport rejection', async () => {
@@ -1199,11 +1461,10 @@ describe('generateAIImage Comfy polling', () => {
         }
     })
 
-    it('bounds a stalled image response body and retries after abort', async () => {
+    it('allows a progressing image stream to outlive the 30 second request interval', async () => {
         vi.useFakeTimers()
-        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
         try {
-            const promptId = 'view-body-stall'
+            const promptId = 'view-slow-progress'
             let viewAttempts = 0
 
             mocks.db = makeComfyUiDatabase()
@@ -1214,12 +1475,138 @@ describe('generateAIImage Comfy polling', () => {
                 }
                 if (url.includes('/view?')) {
                     viewAttempts += 1
-                    return Promise.resolve({
-                        ok: true,
-                        arrayBuffer: () => viewAttempts === 1
-                            ? new Promise(() => {})
-                            : Promise.resolve(new Uint8Array([1, 2, 3]).buffer),
-                    })
+                    if (viewAttempts > 1) return Promise.resolve(httpErrorResponse(400))
+                    return Promise.resolve(new Response(new ReadableStream<Uint8Array>({
+                        start(controller) {
+                            const timers = [20_000, 40_000, 60_000].map((delay, index) => setTimeout(() => {
+                                controller.enqueue(new Uint8Array([index + 1]))
+                                if (index === 2) controller.close()
+                            }, delay))
+                            options.signal?.addEventListener('abort', () => {
+                                timers.forEach(clearTimeout)
+                                controller.error(options.signal?.reason)
+                            }, { once: true })
+                        },
+                    })))
+                }
+                throw new Error(`Unexpected URL: ${url}`)
+            })
+
+            const resultPromise = generateAIImageTyped(
+                'prompt', currentChar, 'negative', 'inlay', 'interactive', {},
+            )
+            await vi.advanceTimersByTimeAsync(60_100)
+
+            expect((await resultPromise).result.ok).toBe(true)
+            expect(viewAttempts).toBe(1)
+        } finally {
+            vi.useRealTimers()
+        }
+    })
+
+    it('allows the buffered userscript image path to outlive 30 seconds within its request bound', async () => {
+        vi.useFakeTimers()
+        try {
+            const promptId = 'view-buffered-userscript'
+            let viewAttempts = 0
+
+            mocks.db = makeComfyUiDatabase()
+            mocks.globalFetch.mockResolvedValue({ ok: true, data: { prompt_id: promptId } })
+            mocks.fetchNative.mockImplementation((url: string, options: {
+                signal?: AbortSignal
+                onResponseBodyMode?: (mode: 'streaming' | 'buffered') => void
+            }) => {
+                if (url.includes('/history/')) {
+                    return Promise.resolve(jsonResponse(completedComfyHistory(promptId)))
+                }
+                if (url.includes('/view?')) {
+                    viewAttempts += 1
+                    options.onResponseBodyMode?.('buffered')
+                    return viewAttempts === 1
+                        ? settleOnAbortOrDelay(options.signal, imageResponse(), 30_001)
+                        : Promise.resolve(httpErrorResponse(400))
+                }
+                throw new Error(`Unexpected URL: ${url}`)
+            })
+
+            const resultPromise = generateAIImageTyped(
+                'prompt', currentChar, 'negative', 'inlay', 'interactive', {},
+            )
+            await vi.advanceTimersByTimeAsync(30_100)
+
+            expect((await resultPromise).result.ok).toBe(true)
+            expect(viewAttempts).toBe(1)
+        } finally {
+            vi.useRealTimers()
+        }
+    })
+
+    it('bounds a buffered userscript image request even when its transport ignores abort', async () => {
+        vi.useFakeTimers()
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+        try {
+            const promptId = 'view-buffered-userscript-timeout'
+            let viewAttempts = 0
+            const viewSignals: AbortSignal[] = []
+
+            mocks.db = makeComfyUiDatabase()
+            mocks.globalFetch.mockResolvedValue({ ok: true, data: { prompt_id: promptId } })
+            mocks.fetchNative.mockImplementation((url: string, options: {
+                signal?: AbortSignal
+                onResponseBodyMode?: (mode: 'streaming' | 'buffered') => void
+            }) => {
+                if (url.includes('/history/')) {
+                    return Promise.resolve(jsonResponse(completedComfyHistory(promptId)))
+                }
+                if (url.includes('/view?')) {
+                    viewAttempts += 1
+                    if (options.signal) viewSignals.push(options.signal)
+                    options.onResponseBodyMode?.('buffered')
+                    return viewAttempts === 1
+                        ? new Promise<Response>(() => {})
+                        : Promise.resolve(imageResponse())
+                }
+                throw new Error(`Unexpected URL: ${url}`)
+            })
+
+            const resultPromise = generateAIImageTyped(
+                'prompt', currentChar, 'negative', 'inlay', 'interactive', {},
+            )
+            await vi.advanceTimersByTimeAsync(601_100)
+
+            expect((await resultPromise).result.ok).toBe(true)
+            expect(viewAttempts).toBe(2)
+            expect(viewSignals[0]?.aborted).toBe(true)
+        } finally {
+            warn.mockRestore()
+            vi.useRealTimers()
+        }
+    })
+
+    it('aborts a byte-idle image stream and retries the attempt', async () => {
+        vi.useFakeTimers()
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+        try {
+            const promptId = 'view-body-stall'
+            let viewAttempts = 0
+            const viewSignals: AbortSignal[] = []
+
+            mocks.db = makeComfyUiDatabase()
+            mocks.globalFetch.mockResolvedValue({ ok: true, data: { prompt_id: promptId } })
+            mocks.fetchNative.mockImplementation((url: string, options: { signal?: AbortSignal }) => {
+                if (url.includes('/history/')) {
+                    return Promise.resolve(jsonResponse(completedComfyHistory(promptId)))
+                }
+                if (url.includes('/view?')) {
+                    viewAttempts += 1
+                    if (options.signal) viewSignals.push(options.signal)
+                    if (viewAttempts > 1) return Promise.resolve(imageResponse())
+                    return Promise.resolve(new Response(new ReadableStream<Uint8Array>({
+                        start(controller) {
+                            controller.enqueue(new Uint8Array([1]))
+                        },
+                        cancel: () => new Promise<void>(() => {}),
+                    })))
                 }
                 throw new Error(`Unexpected URL: ${url}`)
             })
@@ -1230,20 +1617,322 @@ describe('generateAIImage Comfy polling', () => {
             await vi.advanceTimersByTimeAsync(31_100)
             expect((await resultPromise).result.ok).toBe(true)
             expect(viewAttempts).toBe(2)
+            expect(viewSignals[0]?.aborted).toBe(true)
             const viewOptions = mocks.fetchNative.mock.calls
                 .filter(([url]) => String(url).includes('/view?'))
                 .map(([, options]) => options)
             expect(viewOptions).toEqual([
-                expect.objectContaining({ requestTimeoutMs: 30_000, signal: expect.any(AbortSignal) }),
-                expect.objectContaining({ requestTimeoutMs: 30_000, signal: expect.any(AbortSignal) }),
+                expect.objectContaining({ signal: expect.any(AbortSignal) }),
+                expect.objectContaining({ signal: expect.any(AbortSignal) }),
             ])
+            expect(viewOptions.every((options) => options.requestTimeoutMs === undefined)).toBe(true)
         } finally {
             warn.mockRestore()
             vi.useRealTimers()
         }
     })
 
-    it('treats a history 404 as a definite failure with status and path', async () => {
+    it.each([
+        { bodyMode: 'streaming' as const, rejectedBytes: 0 },
+        { bodyMode: 'buffered' as const, rejectedBytes: 0 },
+        { bodyMode: 'streaming' as const, rejectedBytes: 63 },
+        { bodyMode: 'buffered' as const, rejectedBytes: 63 },
+    ])('retries a $bodyMode image response with $rejectedBytes structural bytes', async ({ bodyMode, rejectedBytes }) => {
+        vi.useFakeTimers()
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+        try {
+            const promptId = `view-${bodyMode}-${rejectedBytes}`
+            const emptyQueue = { queue_pending: [], queue_running: [] }
+            let viewAttempts = 0
+
+            mocks.db = makeComfyUiDatabase()
+            mocks.globalFetch.mockResolvedValue({ ok: true, data: { prompt_id: promptId } })
+            mocks.fetchNative.mockImplementation((url: string, options: {
+                onResponseBodyMode?: (mode: 'streaming' | 'buffered') => void
+            }) => {
+                if (url.endsWith('/queue')) return Promise.resolve(jsonResponse(emptyQueue))
+                if (url.includes('/history/')) {
+                    return Promise.resolve(jsonResponse(completedComfyHistory(promptId)))
+                }
+                if (url.includes('/view?')) {
+                    viewAttempts += 1
+                    options.onResponseBodyMode?.(bodyMode)
+                    return Promise.resolve(typedImageResponse(
+                        viewAttempts === 1 ? rejectedBytes : 64,
+                        bodyMode,
+                    ).response)
+                }
+                throw new Error(`Unexpected URL: ${url}`)
+            })
+
+            const resultPromise = generateAIImageTyped(
+                'prompt', currentChar, 'negative', 'inlay', 'interactive', {},
+            )
+            await vi.advanceTimersByTimeAsync(1100)
+
+            expect((await resultPromise).result.ok).toBe(true)
+            expect(viewAttempts).toBe(2)
+        } finally {
+            warn.mockRestore()
+            vi.useRealTimers()
+        }
+    })
+
+    it('retries when reader.read rejects and does not strand the later attempt', async () => {
+        vi.useFakeTimers()
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+        try {
+            const promptId = 'view-reader-rejection'
+            const emptyQueue = { queue_pending: [], queue_running: [] }
+            let viewAttempts = 0
+
+            mocks.db = makeComfyUiDatabase()
+            mocks.globalFetch.mockResolvedValue({ ok: true, data: { prompt_id: promptId } })
+            mocks.fetchNative.mockImplementation((url: string) => {
+                if (url.endsWith('/queue')) return Promise.resolve(jsonResponse(emptyQueue))
+                if (url.includes('/history/')) {
+                    return Promise.resolve(jsonResponse(completedComfyHistory(promptId)))
+                }
+                if (url.includes('/view?')) {
+                    viewAttempts += 1
+                    if (viewAttempts > 1) return Promise.resolve(imageResponse())
+                    return Promise.resolve(new Response(new ReadableStream<Uint8Array>({
+                        start(controller) {
+                            controller.error(new TypeError('reader transport failed'))
+                        },
+                    })))
+                }
+                throw new Error(`Unexpected URL: ${url}`)
+            })
+
+            const resultPromise = generateAIImageTyped(
+                'prompt', currentChar, 'negative', 'inlay', 'interactive', {},
+            )
+            await vi.advanceTimersByTimeAsync(1100)
+
+            expect((await resultPromise).result.ok).toBe(true)
+            expect(viewAttempts).toBe(2)
+        } finally {
+            warn.mockRestore()
+            vi.useRealTimers()
+        }
+    })
+
+    it('attaches a rejection observer to every reader promise before racing it', async () => {
+        const promptId = 'view-reader-observer'
+        const readPromises = [
+            Promise.resolve({ done: false, value: new Uint8Array([1, 2, 3]) }),
+            Promise.resolve({ done: true, value: undefined }),
+        ]
+        const catchSpies = readPromises.map(promise => vi.spyOn(promise, 'catch'))
+        const reader = {
+            read: vi.fn(() => readPromises.shift() ?? Promise.resolve({ done: true, value: undefined })),
+            cancel: vi.fn(() => Promise.resolve()),
+            releaseLock: vi.fn(),
+        }
+
+        mocks.db = makeComfyUiDatabase()
+        mocks.globalFetch.mockResolvedValue({ ok: true, data: { prompt_id: promptId } })
+        mocks.fetchNative.mockImplementation((url: string) => {
+            if (url.includes('/history/')) {
+                return Promise.resolve(jsonResponse(completedComfyHistory(promptId)))
+            }
+            if (url.includes('/view?')) {
+                return Promise.resolve({
+                    ok: true,
+                    status: 200,
+                    headers: new Headers(),
+                    body: { getReader: () => reader },
+                })
+            }
+            throw new Error(`Unexpected URL: ${url}`)
+        })
+
+        const attempt = await generateAIImageTyped(
+            'prompt', currentChar, 'negative', 'inlay', 'interactive', {},
+        )
+
+        expect(attempt.result.ok).toBe(true)
+        expect(reader.read).toHaveBeenCalledTimes(2)
+        expect(catchSpies.every(spy => spy.mock.calls.length === 1)).toBe(true)
+    })
+
+    it('resets the bounded 4xx ladder after transport evidence', async () => {
+        vi.useFakeTimers()
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+        try {
+            const promptId = 'history-ladder-reset'
+            const emptyQueue = { queue_pending: [], queue_running: [] }
+            let historyAttempts = 0
+
+            mocks.db = makeComfyUiDatabase()
+            mocks.globalFetch.mockResolvedValue({ ok: true, data: { prompt_id: promptId } })
+            mocks.fetchNative.mockImplementation((url: string) => {
+                if (url.endsWith('/queue')) return Promise.resolve(jsonResponse(emptyQueue))
+                if (url.includes('/history/')) {
+                    historyAttempts += 1
+                    if (historyAttempts === 2) return Promise.reject(new TypeError('route transport failed'))
+                    if (historyAttempts <= 4) return Promise.resolve(httpErrorResponse(404))
+                    return Promise.resolve(jsonResponse(completedComfyHistory(promptId)))
+                }
+                if (url.includes('/view?')) return Promise.resolve(imageResponse())
+                throw new Error(`Unexpected URL: ${url}`)
+            })
+
+            const resultPromise = generateAIImageTyped(
+                'prompt', currentChar, 'negative', 'inlay', 'interactive', {},
+            )
+            await vi.advanceTimersByTimeAsync(5100)
+
+            expect((await resultPromise).result.ok).toBe(true)
+            expect(historyAttempts).toBe(5)
+        } finally {
+            warn.mockRestore()
+            vi.useRealTimers()
+        }
+    })
+
+    it('survives more than three history 404s while the shared queue poller is unhealthy', async () => {
+        vi.useFakeTimers()
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+        try {
+            const promptId = 'history-route-flap'
+            const emptyQueue = { queue_pending: [], queue_running: [] }
+            const queueRecovery = deferred<ReturnType<typeof jsonResponse>>()
+            const startedAt = Date.now()
+            let queueAttempts = 0
+            let historyAttempts = 0
+            let settled = false
+
+            mocks.db = makeComfyUiDatabase()
+            mocks.globalFetch.mockResolvedValue({ ok: true, data: { prompt_id: promptId } })
+            mocks.fetchNative.mockImplementation((url: string) => {
+                if (url.endsWith('/queue')) {
+                    queueAttempts += 1
+                    if (queueAttempts === 1) return Promise.resolve(httpErrorResponse(502))
+                    if (queueAttempts === 2) return queueRecovery.promise
+                    return Promise.resolve(jsonResponse(emptyQueue))
+                }
+                if (url.includes('/history/')) {
+                    historyAttempts += 1
+                    return Date.now() - startedAt < 8_000
+                        ? Promise.resolve(httpErrorResponse(404))
+                        : Promise.resolve(jsonResponse(completedComfyHistory(promptId)))
+                }
+                if (url.includes('/view?')) return Promise.resolve(imageResponse())
+                throw new Error(`Unexpected URL: ${url}`)
+            })
+
+            const resultPromise = generateAIImageTyped(
+                'prompt', currentChar, 'negative', 'inlay', 'interactive', {},
+            )
+            void resultPromise.then(() => { settled = true })
+            await vi.advanceTimersByTimeAsync(7_900)
+
+            expect(historyAttempts).toBeGreaterThan(3)
+            expect(settled).toBe(false)
+            queueRecovery.resolve(jsonResponse(emptyQueue))
+            await vi.advanceTimersByTimeAsync(1_100)
+
+            expect((await resultPromise).result.ok).toBe(true)
+            expect(queueAttempts).toBeGreaterThanOrEqual(2)
+            expect(mocks.alertError).not.toHaveBeenCalled()
+        } finally {
+            warn.mockRestore()
+            vi.useRealTimers()
+        }
+    })
+
+    it('keeps the queue poller alive so an unhealthy route protects view 404 retries', async () => {
+        vi.useFakeTimers()
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+        try {
+            const promptId = 'view-route-flap'
+            const emptyQueue = { queue_pending: [], queue_running: [] }
+            const queueRecovery = deferred<ReturnType<typeof jsonResponse>>()
+            const startedAt = Date.now()
+            let queueAttempts = 0
+            let viewAttempts = 0
+            let settled = false
+
+            mocks.db = makeComfyUiDatabase()
+            mocks.globalFetch.mockResolvedValue({ ok: true, data: { prompt_id: promptId } })
+            mocks.fetchNative.mockImplementation((url: string) => {
+                if (url.endsWith('/queue')) {
+                    queueAttempts += 1
+                    if (queueAttempts === 1) return Promise.resolve(httpErrorResponse(502))
+                    if (queueAttempts === 2) return queueRecovery.promise
+                    return Promise.resolve(jsonResponse(emptyQueue))
+                }
+                if (url.includes('/history/')) {
+                    return Promise.resolve(jsonResponse(completedComfyHistory(promptId)))
+                }
+                if (url.includes('/view?')) {
+                    viewAttempts += 1
+                    return Date.now() - startedAt < 8_000
+                        ? Promise.resolve(httpErrorResponse(404))
+                        : Promise.resolve(imageResponse())
+                }
+                throw new Error(`Unexpected URL: ${url}`)
+            })
+
+            const resultPromise = generateAIImageTyped(
+                'prompt', currentChar, 'negative', 'inlay', 'interactive', {},
+            )
+            void resultPromise.then(() => { settled = true })
+            await vi.advanceTimersByTimeAsync(7_900)
+
+            expect(viewAttempts).toBeGreaterThan(3)
+            expect(settled).toBe(false)
+            queueRecovery.resolve(jsonResponse(emptyQueue))
+            await vi.advanceTimersByTimeAsync(1_100)
+
+            expect((await resultPromise).result.ok).toBe(true)
+            expect(queueAttempts).toBeGreaterThanOrEqual(2)
+            expect(mocks.alertError).not.toHaveBeenCalled()
+        } finally {
+            warn.mockRestore()
+            vi.useRealTimers()
+        }
+    })
+
+    it('keeps a healthy poller on the bounded three-observation history 404 path', async () => {
+        vi.useFakeTimers()
+        try {
+            const promptId = 'history-healthy-404'
+            const emptyQueue = { queue_pending: [], queue_running: [] }
+            let historyAttempts = 0
+
+            mocks.db = makeComfyUiDatabase()
+            mocks.globalFetch.mockResolvedValue({ ok: true, data: { prompt_id: promptId } })
+            mocks.fetchNative.mockImplementation((url: string) => {
+                if (url.endsWith('/queue')) return Promise.resolve(jsonResponse(emptyQueue))
+                if (url.includes('/history/')) {
+                    historyAttempts += 1
+                    return Promise.resolve(httpErrorResponse(404))
+                }
+                throw new Error(`Unexpected URL: ${url}`)
+            })
+
+            const resultPromise = generateAIImageTyped(
+                'prompt', currentChar, 'negative', 'inlay', 'interactive', {},
+            )
+            await vi.advanceTimersByTimeAsync(3_100)
+            const attempt = await resultPromise
+
+            expect(attempt.result).toEqual({
+                ok: false,
+                certainty: 'definite',
+                reason: 'Image generation failed',
+            })
+            expect(historyAttempts).toBe(3)
+            expect(mocks.alertError).toHaveBeenCalledWith(expect.stringMatching(/404.*\/history/))
+        } finally {
+            vi.useRealTimers()
+        }
+    })
+
+    it('recovers when history returns two transient 404 responses before success', async () => {
         vi.useFakeTimers()
         try {
             const promptId = 'history-404-job'
@@ -1252,9 +1941,12 @@ describe('generateAIImage Comfy polling', () => {
             mocks.db = makeComfyUiDatabase()
             mocks.globalFetch.mockResolvedValue({ ok: true, data: { prompt_id: promptId } })
             mocks.fetchNative.mockImplementation((url: string) => {
+                if (url.endsWith('/queue')) {
+                    return Promise.resolve(jsonResponse({ queue_pending: [], queue_running: [] }))
+                }
                 if (url.includes('/history/')) {
                     historyAttempts += 1
-                    return Promise.resolve(historyAttempts === 1
+                    return Promise.resolve(historyAttempts <= 2
                         ? httpErrorResponse(404)
                         : jsonResponse(completedComfyHistory(promptId)))
                 }
@@ -1265,16 +1957,12 @@ describe('generateAIImage Comfy polling', () => {
             const resultPromise = generateAIImageTyped(
                 'prompt', currentChar, 'negative', 'inlay', 'interactive', {},
             )
-            await vi.advanceTimersByTimeAsync(1000)
+            await vi.advanceTimersByTimeAsync(3100)
             const attempt = await resultPromise
 
-            expect(attempt.result).toEqual({
-                ok: false,
-                certainty: 'definite',
-                reason: 'Image generation failed',
-            })
-            expect(historyAttempts).toBe(1)
-            expect(mocks.alertError).toHaveBeenCalledWith(expect.stringMatching(/404.*\/history\/history-404-job/))
+            expect(attempt.result.ok).toBe(true)
+            expect(historyAttempts).toBe(3)
+            expect(mocks.alertError).not.toHaveBeenCalled()
         } finally {
             vi.useRealTimers()
         }
@@ -1316,7 +2004,7 @@ describe('generateAIImage Comfy polling', () => {
         },
     )
 
-    it('treats a view 404 as a definite failure with status and path', async () => {
+    it('keeps a persistent view 404 definite after two bounded retries', async () => {
         vi.useFakeTimers()
         try {
             const promptId = 'view-404-job'
@@ -1325,14 +2013,15 @@ describe('generateAIImage Comfy polling', () => {
             mocks.db = makeComfyUiDatabase()
             mocks.globalFetch.mockResolvedValue({ ok: true, data: { prompt_id: promptId } })
             mocks.fetchNative.mockImplementation((url: string) => {
+                if (url.endsWith('/queue')) {
+                    return Promise.resolve(jsonResponse({ queue_pending: [], queue_running: [] }))
+                }
                 if (url.includes('/history/')) {
                     return Promise.resolve(jsonResponse(completedComfyHistory(promptId)))
                 }
                 if (url.includes('/view?')) {
                     viewAttempts += 1
-                    return Promise.resolve(viewAttempts === 1
-                        ? httpErrorResponse(404)
-                        : imageResponse())
+                    return Promise.resolve(httpErrorResponse(404))
                 }
                 throw new Error(`Unexpected URL: ${url}`)
             })
@@ -1340,7 +2029,7 @@ describe('generateAIImage Comfy polling', () => {
             const resultPromise = generateAIImageTyped(
                 'prompt', currentChar, 'negative', 'inlay', 'interactive', {},
             )
-            await vi.advanceTimersByTimeAsync(1000)
+            await vi.advanceTimersByTimeAsync(3100)
             const attempt = await resultPromise
 
             expect(attempt.result).toEqual({
@@ -1348,7 +2037,7 @@ describe('generateAIImage Comfy polling', () => {
                 certainty: 'definite',
                 reason: 'Image generation failed',
             })
-            expect(viewAttempts).toBe(1)
+            expect(viewAttempts).toBe(3)
             expect(mocks.alertError).toHaveBeenCalledWith(expect.stringMatching(/404.*\/view/))
         } finally {
             vi.useRealTimers()

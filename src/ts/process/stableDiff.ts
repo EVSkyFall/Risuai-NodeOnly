@@ -35,6 +35,9 @@ const COMFY_QUEUE_POLL_INTERVAL_MS = 1500
 const COMFY_RETRY_INITIAL_MS = 1000
 const COMFY_RETRY_MAX_MS = 15000
 const COMFY_REQUEST_TIMEOUT_MS = 30_000
+const COMFY_PROMPT_REQUEST_TIMEOUT_MS = 600_000
+const COMFY_BUFFERED_DOWNLOAD_TIMEOUT_MS = 600_000
+const COMFY_TRANSIENT_DEFINITE_HTTP_RETRIES = 2
 
 type ComfyCreateUrl = (pathname: string, params?: Record<string, string>) => string
 type ComfyQueueSnapshot =
@@ -61,6 +64,7 @@ type ComfyQueuePoller = {
     inFlight: boolean
     retryDelayMs: number
     transportFailed: boolean
+    latestSnapshotValid: boolean | null
     requestController: AbortController | null
     disposed: boolean
 }
@@ -95,8 +99,31 @@ class ComfyDefiniteHttpError extends Error {
     }
 }
 
+class ComfyPromptUncertainError extends Error {
+    readonly comfyPromptUncertain = true
+
+    constructor(message: string, readonly transportCause?: unknown) {
+        super(message)
+        this.name = 'ComfyPromptUncertainError'
+    }
+}
+
 function isComfyDefiniteHttpError(error: unknown): error is ComfyDefiniteHttpError {
     return isComfyRecord(error) && error.comfyDefinite === true
+}
+
+function isComfyPromptUncertainError(error: unknown): error is ComfyPromptUncertainError {
+    return isComfyRecord(error) && error.comfyPromptUncertain === true
+}
+
+function isGlobalFetchTransportError(error: unknown): error is {
+    globalFetchTransportError: true
+    dispatched: boolean
+    transportCause?: unknown
+} {
+    return isComfyRecord(error)
+        && error.globalFetchTransportError === true
+        && typeof error.dispatched === 'boolean'
 }
 
 function getComfyRequestPath(url: string): string {
@@ -162,6 +189,7 @@ function takeComfyQueueSnapshot(subscriber: ComfyQueueSubscriber): ComfyQueueSna
 
 function publishComfyQueueSnapshot(poller: ComfyQueuePoller, snapshot: ComfyQueueSnapshot) {
     if (poller.disposed) return
+    poller.latestSnapshotValid = snapshot.valid
     for (const subscriber of poller.subscribers.values()) {
         // A request that started before this job subscribed may contain a stale
         // absence, even if its response arrives after the POST completed.
@@ -272,6 +300,7 @@ function subscribeComfyQueue(createUrl: ComfyCreateUrl, id: string): ComfyQueueS
             inFlight: false,
             retryDelayMs: COMFY_RETRY_INITIAL_MS,
             transportFailed: false,
+            latestSnapshotValid: null,
             requestController: null,
             disposed: false,
         }
@@ -321,6 +350,14 @@ function subscribeComfyQueue(createUrl: ComfyCreateUrl, id: string): ComfyQueueS
     }
 }
 
+type ComfyQueueHealth = 'healthy' | 'unhealthy' | 'unknown'
+
+function getComfyQueueHealth(createUrl: ComfyCreateUrl): ComfyQueueHealth {
+    const poller = comfyQueuePollers.get(createUrl('/queue'))
+    if (!poller || poller.disposed || poller.latestSnapshotValid === null) return 'unknown'
+    return poller.latestSnapshotValid ? 'healthy' : 'unhealthy'
+}
+
 export function __resetComfyPollersForTest() {
     for (const poller of comfyQueuePollers.values()) {
         poller.disposed = true
@@ -334,16 +371,42 @@ export function __resetComfyPollersForTest() {
     comfyQueuePollers.clear()
 }
 
-async function retryComfyTransport<T>(label: string, operation: () => Promise<T>): Promise<T> {
+async function retryComfyTransport<T>(
+    label: string,
+    operation: () => Promise<T>,
+    options: {
+        definiteHttpRetries?: number
+        getQueueHealth?: () => ComfyQueueHealth
+    } = {},
+): Promise<T> {
     let retryDelayMs = COMFY_RETRY_INITIAL_MS
     let transportFailed = false
+    let definiteHttpFailures = 0
     while (true) {
         try {
             const value = await operation()
             if (transportFailed) console.warn(`[ComfyUI] ${label} recovered`)
             return value
         } catch (error) {
-            if (isComfyDefiniteHttpError(error)) throw error
+            if (isComfyDefiniteHttpError(error)) {
+                const retryableDefinite4xx = error.status >= 400 && error.status <= 499
+                if (retryableDefinite4xx && options.getQueueHealth?.() === 'unhealthy') {
+                    definiteHttpFailures = 0
+                    if (!transportFailed) {
+                        console.warn(`[ComfyUI] ${label} failed during a shared queue outage; retrying indefinitely.`, error)
+                    }
+                    transportFailed = true
+                    await waitForComfyRetry(retryDelayMs)
+                    retryDelayMs = Math.min(retryDelayMs * 2, COMFY_RETRY_MAX_MS)
+                    continue
+                }
+                if (!retryableDefinite4xx
+                    || definiteHttpFailures >= (options.definiteHttpRetries ?? 0)) throw error
+                definiteHttpFailures += 1
+                await waitForComfyRetry(COMFY_RETRY_INITIAL_MS * definiteHttpFailures)
+                continue
+            }
+            definiteHttpFailures = 0
             if (!transportFailed) {
                 console.warn(`[ComfyUI] ${label} failed; retrying indefinitely.`, error)
             }
@@ -389,28 +452,147 @@ async function readComfyHistory(
             }
             return item
         })
+    }, {
+        definiteHttpRetries: COMFY_TRANSIENT_DEFINITE_HTTP_RETRIES,
+        getQueueHealth: () => getComfyQueueHealth(createUrl),
     })
 }
 
-async function downloadComfyImage(url: string): Promise<ArrayBuffer> {
+function validateComfyImageBytes(byteLength: number, contentType: string): void {
+    if (byteLength === 0) {
+        throw new Error('ComfyUI returned an empty image response')
+    }
+    const mediaType = contentType.split(';', 1)[0]?.trim().toLowerCase() ?? ''
+    if (mediaType.startsWith('image/') && byteLength < 64) {
+        throw new Error(`ComfyUI returned an invalid ${mediaType} response (${byteLength} bytes)`)
+    }
+}
+
+async function downloadComfyImage(
+    url: string,
+    getQueueHealth: () => ComfyQueueHealth,
+): Promise<ArrayBuffer> {
     return retryComfyTransport('Image download', async () => {
-        return withComfyRequestTimeout(async (signal) => {
-            const response = await fetchNative(url, {
-                headers: { 'Content-Type': 'application/json' },
-                method: 'GET',
-                signal,
-                requestTimeoutMs: COMFY_REQUEST_TIMEOUT_MS,
-            })
-            throwForComfyJobHttpError(response, url, 'image')
-            if (typeof response.arrayBuffer !== 'function') {
-                throw new Error('ComfyUI returned an invalid image response')
-            }
-            const body = await response.arrayBuffer()
-            if (Object.prototype.toString.call(body) !== '[object ArrayBuffer]') {
-                throw new Error('ComfyUI returned an invalid image response')
-            }
-            return body
+        const controller = new AbortController()
+        let timeoutId: ReturnType<typeof setTimeout> | null = null
+        let reader: ReadableStreamDefaultReader<Uint8Array> | null = null
+        const responseBodyState: {
+            mode: 'streaming' | 'buffered'
+            bufferedModeSelected: boolean
+        } = {
+            mode: 'streaming',
+            bufferedModeSelected: false,
+        }
+        let rejectOnAbort!: (reason: unknown) => void
+        const abortPromise = new Promise<never>((_resolve, reject) => {
+            rejectOnAbort = reject
         })
+        // Early HTTP/fetch failures can abort during cleanup before a body-read race is attached.
+        void abortPromise.catch(() => {})
+        const onAbort = () => rejectOnAbort(
+            controller.signal.reason ?? new DOMException('The operation was aborted.', 'AbortError'),
+        )
+        controller.signal.addEventListener('abort', onAbort, { once: true })
+
+        const clearWatchdog = () => {
+            if (timeoutId !== null) {
+                clearTimeout(timeoutId)
+                timeoutId = null
+            }
+        }
+        const armWatchdog = (timeoutMs: number, message: string) => {
+            clearWatchdog()
+            timeoutId = setTimeout(() => {
+                controller.abort(new DOMException(message, 'TimeoutError'))
+            }, timeoutMs)
+        }
+
+        armWatchdog(COMFY_REQUEST_TIMEOUT_MS, 'ComfyUI image response headers timed out.')
+        try {
+            const response = await Promise.race([
+                fetchNative(url, {
+                    headers: { 'Content-Type': 'application/json' },
+                    method: 'GET',
+                    signal: controller.signal,
+                    onResponseBodyMode: (mode) => {
+                        if (mode !== 'buffered' || responseBodyState.bufferedModeSelected) return
+                        responseBodyState.bufferedModeSelected = true
+                        responseBodyState.mode = 'buffered'
+                        armWatchdog(
+                            COMFY_BUFFERED_DOWNLOAD_TIMEOUT_MS,
+                            'ComfyUI buffered image request timed out.',
+                        )
+                    },
+                }),
+                abortPromise,
+            ])
+            throwForComfyJobHttpError(response, url, 'image')
+            const contentType = response.headers?.get?.('content-type') ?? ''
+
+            if (responseBodyState.mode === 'buffered') {
+                if (typeof response.arrayBuffer !== 'function') {
+                    throw new Error('ComfyUI returned an invalid image response')
+                }
+                const body = await Promise.race([response.arrayBuffer(), abortPromise])
+                if (Object.prototype.toString.call(body) !== '[object ArrayBuffer]') {
+                    throw new Error('ComfyUI returned an invalid image response')
+                }
+                validateComfyImageBytes(body.byteLength, contentType)
+                return body
+            }
+
+            clearWatchdog()
+            if (!response.body || typeof response.body.getReader !== 'function') {
+                throw new Error('ComfyUI returned an invalid image response')
+            }
+            reader = response.body.getReader()
+            const chunks: Uint8Array[] = []
+            let totalBytes = 0
+            armWatchdog(COMFY_REQUEST_TIMEOUT_MS, 'ComfyUI image response made no byte progress.')
+            while (true) {
+                const readPromise = reader.read()
+                void readPromise.catch(() => {})
+                const { done, value } = await Promise.race([readPromise, abortPromise])
+                if (done) break
+                if (!value || value.byteLength === 0) continue
+                chunks.push(value)
+                totalBytes += value.byteLength
+                armWatchdog(COMFY_REQUEST_TIMEOUT_MS, 'ComfyUI image response made no byte progress.')
+            }
+            clearWatchdog()
+            validateComfyImageBytes(totalBytes, contentType)
+            const body = new Uint8Array(totalBytes)
+            let offset = 0
+            for (const chunk of chunks) {
+                body.set(chunk, offset)
+                offset += chunk.byteLength
+            }
+            return body.buffer
+        } catch (error) {
+            if (!controller.signal.aborted) controller.abort(error)
+            if (reader) {
+                try {
+                    // Cleanup must not turn a timed-out attempt into another unbounded wait.
+                    void reader.cancel(error).catch(() => {})
+                } catch {
+                    // The abort may already have errored the stream.
+                }
+            }
+            throw error
+        } finally {
+            clearWatchdog()
+            controller.signal.removeEventListener('abort', onAbort)
+            if (reader) {
+                try {
+                    reader.releaseLock()
+                } catch {
+                    // A transport-owned pending read can retain the lock briefly after abort.
+                }
+            }
+        }
+    }, {
+        definiteHttpRetries: COMFY_TRANSIENT_DEFINITE_HTTP_RETRIES,
+        getQueueHealth,
     })
 }
 
@@ -1063,12 +1245,68 @@ async function generateAIImageInternal(
             return url.toString()
         }
 
+        const probePromptEndpoint = async (): Promise<boolean> => {
+            const queueUrl = createUrl('/queue')
+            try {
+                const response = await withComfyRequestTimeout((signal) => globalFetch(queueUrl, {
+                    method: 'GET',
+                    headers: { 'Content-Type': 'application/json' },
+                    abortSignal: signal,
+                    requestTimeoutMs: COMFY_REQUEST_TIMEOUT_MS,
+                    throwOnTransportError: true,
+                }))
+                return typeof response.status === 'number'
+                    && response.status > 0
+                    && response.status < 500
+            } catch (error) {
+                // A probe that failed before its own dispatch (auth refresh, URL
+                // prep) observed nothing about the endpoint — it must not count
+                // as unreachability evidence, so the original POST stays uncertain.
+                if (isGlobalFetchTransportError(error) && !error.dispatched) return true
+                return false
+            }
+        }
+
+        const throwPromptUncertainAfterProbe = async (
+            message: string,
+            transportCause?: unknown,
+        ): Promise<never> => {
+            if (!await probePromptEndpoint()) {
+                throw new Error(`${message} The one-shot ComfyUI queue probe could not reach the endpoint.`)
+            }
+            throw new ComfyPromptUncertainError(message, transportCause)
+        }
+
         const fetchWrapper = async (url: string, options = {}) => {
             console.log(url)
-            const response = await globalFetch(url, options)
+            let response
+            try {
+                response = await globalFetch(url, options)
+            } catch (error) {
+                if (isGlobalFetchTransportError(error) && !error.dispatched) {
+                    throw new Error(
+                        `ComfyUI prompt submission failed before dispatch: ${String(error.transportCause)}`,
+                    )
+                }
+                return throwPromptUncertainAfterProbe(
+                    `ComfyUI prompt submission response was lost: ${String(error)}`,
+                    error,
+                )
+            }
             if (!response.ok) {
                 console.log(JSON.stringify(response.data))
-                throw new Error(JSON.stringify(response.data))
+                const message = `ComfyUI prompt request failed with status ${response.status}: ${JSON.stringify(response.data)}`
+                if (typeof response.status === 'number'
+                    && response.status >= 400
+                    && response.status <= 499) {
+                    throw new Error(message)
+                }
+                if (typeof response.status === 'number'
+                    && response.status > 0
+                    && response.status < 400) {
+                    throw new ComfyPromptUncertainError(message)
+                }
+                return throwPromptUncertainAfterProbe(message)
             }
             return response.data
         }
@@ -1275,11 +1513,19 @@ async function generateAIImageInternal(
                 }
             }
 
-            const { prompt_id: id } = await fetchWrapper(createUrl('/prompt'), {
+            const promptResponse = await fetchWrapper(createUrl('/prompt'), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: { 'prompt': prompt }
+                body: { 'prompt': prompt },
+                requestTimeoutMs: COMFY_PROMPT_REQUEST_TIMEOUT_MS,
+                throwOnTransportError: true,
             })
+            const id = isComfyRecord(promptResponse) ? promptResponse.prompt_id : undefined
+            if (typeof id !== 'string' || id.trim().length === 0) {
+                throw new ComfyPromptUncertainError(
+                    'ComfyUI prompt acknowledgement did not contain a usable prompt_id; submission outcome is uncertain.',
+                )
+            }
             console.log(`prompt id: ${id}`)
 
             const queueSubscription = subscribeComfyQueue(createUrl, id)
@@ -1312,8 +1558,6 @@ async function generateAIImageInternal(
                         return false
                     }
                 }
-                queueSubscription.unsubscribe()
-
                 // A history entry also appears when the workflow failed, but then it carries
                 // no outputs — surface the reported cause instead of dying on undefined.
                 const failure = (item.status?.messages ?? []).find((m: any) =>
@@ -1330,11 +1574,14 @@ async function generateAIImageInternal(
                     return false
                 }
 
-                const imgBuffer = await downloadComfyImage(createUrl('/view', {
-                    filename: genImgInfo.filename,
-                    subfolder: genImgInfo.subfolder,
-                    type: genImgInfo.type
-                }))
+                const imgBuffer = await downloadComfyImage(
+                    createUrl('/view', {
+                        filename: genImgInfo.filename,
+                        subfolder: genImgInfo.subfolder,
+                        type: genImgInfo.type,
+                    }),
+                    () => getComfyQueueHealth(createUrl),
+                )
                 const img64 = Buffer.from(imgBuffer).toString('base64')
 
                 if(returnSdData === 'inlay'){
@@ -1364,6 +1611,13 @@ async function generateAIImageInternal(
                 queueSubscription.unsubscribe()
             }
         } catch (error) {
+            if (isComfyPromptUncertainError(error)) {
+                notifyError(error)
+                return {
+                    result: { ok: false, certainty: 'uncertain', reason: error.message },
+                    compatibilityValue: false,
+                }
+            }
             if (isComfyDefiniteHttpError(error)) {
                 alertError(`Error: ${error.message}`)
             } else {
