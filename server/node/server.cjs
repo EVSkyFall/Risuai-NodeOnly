@@ -5541,11 +5541,14 @@ app.post('/api/db/optimize', async (req, res, next) => {
         const dbFilePath = path.join(saveDir, 'risuai.db');
         const preDbSize = statSafe(dbFilePath)?.size ?? 0;
 
+        // VACUUM peaks at ~2x the DB size on disk: the transient copy it builds
+        // (routed to the save dir via SQLITE_TMPDIR) plus the WAL inflating to
+        // roughly the full DB while the copy is written back.
         const { free } = await diskFreeStat(saveDir);
-        if (preDbSize > 0 && free != null && free < preDbSize * 1.2) {
+        if (preDbSize > 0 && free != null && free < preDbSize * 2.2) {
             return res.status(400).json({
                 error: 'Insufficient disk space for VACUUM',
-                required: Math.ceil(preDbSize * 1.2),
+                required: Math.ceil(preDbSize * 2.2),
                 free,
             });
         }
@@ -5559,7 +5562,16 @@ app.post('/api/db/optimize', async (req, res, next) => {
             let gcDeleted = 0;
             try { gcDeleted = gcChunks(); } catch (e) { logger.warn('[Optimize] chunk gc failed:', e?.message || e); }
             try { checkpointWal('TRUNCATE'); } catch (e) { logger.warn('[Optimize] checkpoint failed:', e?.message || e); }
-            sqliteDb.exec('VACUUM');
+            // VACUUM copies the entire DB into a transient database that honors
+            // temp_store. With the session-wide temp_store=MEMORY that copy
+            // lands in RAM and OOM-kills the process on multi-GB DBs, so spill
+            // it to disk (SQLITE_TMPDIR = save dir) for the duration.
+            sqliteDb.pragma('temp_store = FILE');
+            try {
+                sqliteDb.exec('VACUUM');
+            } finally {
+                sqliteDb.pragma('temp_store = MEMORY');
+            }
             // VACUUM streams the whole DB through the WAL; without this checkpoint the
             // -wal file stays inflated until the next 5-min background TRUNCATE.
             try { checkpointWal('TRUNCATE'); } catch (e) { logger.warn('[Optimize] post-VACUUM checkpoint failed:', e?.message || e); }
