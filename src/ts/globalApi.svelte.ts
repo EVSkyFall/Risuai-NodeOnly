@@ -1473,6 +1473,11 @@ export function getUncleanables(db: Database, uptype: 'basename' | 'pure' = 'bas
             addUncleanable(s.path);
         }
     }
+    // Image-gen reference images hang off settings, not off a character. Missing
+    // them here meant cleanChunks deleted an asset the app still points at.
+    addUncleanable(db.NAIImgConfig?.character_image);
+    addUncleanable(db.NAIImgConfig?.image);
+    addUncleanable(db.wavespeedImage?.reference_image);
 
     for (const cha of db.characters) {
         if (cha.image) {
@@ -1519,6 +1524,11 @@ export function getUncleanables(db: Database, uptype: 'basename' | 'pure' = 'bas
     if (db.personas) {
         db.personas.map((v) => {
             addUncleanable(v.icon);
+            // Legacy field: personas imported from character cards in older
+            // versions kept an `image` alongside `icon`. Nothing reads it today,
+            // but it is a live asset reference — omitting it here deleted the
+            // asset for good.
+            addUncleanable((v as unknown as { image?: string }).image);
 
             if(v.embeddedModule){
                 const assets = v.embeddedModule.assets

@@ -5122,6 +5122,9 @@ function buildUncleanableSet(dbObj, { includeModuleAssets = true } = {}) {
     if (Array.isArray(dbObj.personas)) {
         for (const p of dbObj.personas) {
             add(p?.icon);
+            // Legacy `image` alongside `icon` on card-imported personas. Unread
+            // by current code but still a live reference — see getUncleanables.
+            add(p?.image);
             const embedded = p?.embeddedModule;
             if (includeModuleAssets && Array.isArray(embedded?.assets)) for (const a of embedded.assets) add(a?.[1]);
             add(embedded?.icon);
