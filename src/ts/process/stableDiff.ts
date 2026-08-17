@@ -1435,13 +1435,28 @@ async function generateAIImageInternal(
 
                 const SUBJECT_PLACEHOLDER = /\{\{risu_subject_(\d+)(_neg|_x|_y|_left|_top|_width|_height|_strength)?\}\}/g
 
-                const substituteText = (value: string) => value
+                // Export tooling has been observed stripping the braces off the
+                // documented placeholders, leaving a text input that is exactly
+                // `risu_prompt` — a value that cannot plausibly mean anything
+                // else. Healing only the whole-value form keeps embedded prose
+                // untouched while making the stripped export just work.
+                const BARE_PLACEHOLDERS: Record<string, () => string> = {
+                    risu_prompt: () => genPrompt,
+                    risu_neg: () => neg,
+                    risu_subject_count: () => String(subjectPositives.length),
+                }
+
+                const substituteText = (value: string) => {
+                    const bare = BARE_PLACEHOLDERS[value.trim()]
+                    if (bare) return bare()
+                    return value
                     .replaceAll('{{risu_prompt}}', genPrompt)
                     .replaceAll('{{risu_neg}}', neg)
                     .replaceAll('{{risu_subject_count}}', String(subjectPositives.length))
                     .replace(SUBJECT_PLACEHOLDER, (_match, ordinal: string, suffix: string | undefined) => (
                         String(subjectValue(Number(ordinal) - 1, suffix))
                     ))
+                }
 
                 // Comfy area nodes take numbers, not strings. An input whose
                 // ENTIRE value is a geometry placeholder becomes a number; one

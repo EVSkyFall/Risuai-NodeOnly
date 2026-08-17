@@ -388,6 +388,45 @@ describe('generateAIImage Comfy seed threading', () => {
         expect(attempt.seedUsed).toBe(seed)
     })
 
+    it('heals brace-stripped whole-value placeholders from exported workflows', async () => {
+        const runWorkflow = async (positiveText: string, negativeText: string) => {
+            mocks.db = {
+                sdProvider: 'comfyui',
+                comfyUiUrl: 'http://127.0.0.1:8188/',
+                comfyConfig: {
+                    workflow: JSON.stringify({
+                        sampler: { class_type: 'KSampler', inputs: { seed: 17, steps: 28 } },
+                        positive: { class_type: 'CLIPTextEncode', inputs: { text: positiveText } },
+                        negative: { class_type: 'CLIPTextEncode', inputs: { text: negativeText } },
+                        caption: { class_type: 'Note', inputs: { text: 'risu_prompt is embedded prose' } },
+                    }),
+                    timeout: 30,
+                },
+            }
+            mocks.globalFetch.mockReset()
+            mocks.fetchNative.mockReset()
+            mocks.globalFetch.mockResolvedValue({ ok: true, data: { prompt_id: 'job-1' } })
+            mocks.fetchNative
+                .mockResolvedValueOnce(jsonResponse({}))
+                .mockResolvedValueOnce(jsonResponse({ queue_pending: [], queue_running: [] }))
+                .mockResolvedValueOnce(jsonResponse(completedComfyHistory('job-1')))
+                .mockResolvedValueOnce(imageResponse())
+            await generateAIImageTyped('prompt text', currentChar, 'negative text', 'inlay', 'interactive', {})
+            return (mocks.globalFetch.mock.calls[0][1] as { body: { prompt: any } }).body.prompt
+        }
+
+        const braced = await runWorkflow('{{risu_prompt}}', '{{risu_neg}}')
+        const stripped = await runWorkflow('risu_prompt', ' risu_neg ')
+
+        // A whole-value bare placeholder (export tooling strips the braces)
+        // heals to the same substitution the braced form receives; a bare
+        // token embedded in longer prose stays literal.
+        expect(stripped.positive.inputs.text).toBe(braced.positive.inputs.text)
+        expect(stripped.negative.inputs.text).toBe(braced.negative.inputs.text)
+        expect(stripped.caption.inputs.text).toBe('risu_prompt is embedded prose')
+        expect(braced.caption.inputs.text).toBe('risu_prompt is embedded prose')
+    })
+
     it('preserves and reports the workflow seed in legacy Comfy mode when none is supplied', async () => {
         mocks.db = {
             sdProvider: 'comfy',
