@@ -1859,6 +1859,11 @@ function createComfyOrchestrator(options) {
         return registry.removeTemplate(templateId);
     }
 
+    async function updateTemplateMetadata(templateId, patch) {
+        assertAvailable();
+        return registry.updateTemplateMetadata(templateId, patch);
+    }
+
     async function listTemplates(kind = null) {
         assertAvailable();
         return registry.listTemplates(kind);
@@ -1893,6 +1898,7 @@ function createComfyOrchestrator(options) {
         analyzeTemplate,
         registerTemplate,
         removeTemplate,
+        updateTemplateMetadata,
         listTemplates,
         getConfig,
         updateEndpoint,

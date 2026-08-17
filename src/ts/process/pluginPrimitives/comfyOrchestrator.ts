@@ -371,6 +371,12 @@ export function createComfySandboxApi(options: { transport?: ComfyTransport } = 
             )
         ),
         removeTemplate: (id: string) => call<{ id: string; removed: true }>('removeTemplate', { id }),
+        updateTemplateMetadata: (input: { id: string; name?: string; promptProfile?: string }) => (
+            call<{ template: ComfyCustomTemplateSummary }>(
+                'updateTemplateMetadata',
+                input as unknown as Record<string, unknown>,
+            )
+        ),
         listTemplates: (kind?: ComfyTemplateKind) => (
             call<{ templates: ComfyTemplateSummary[] }>('listTemplates', kind === undefined ? {} : { kind })
         ),

@@ -342,5 +342,7 @@ describe('plugin Comfy orchestrator relay', () => {
     expect(v3).toContain("'registerTemplate': '_registerComfyTemplate'")
     expect(v3).toContain("'removeTemplate': '_removeComfyTemplate'")
     expect(v3).toContain("'listTemplates': '_listComfyTemplates'")
+    expect(v3).toContain('_updateComfyTemplateMetadata: (input: any) => comfyApi.updateTemplateMetadata(input)')
+    expect(v3).toContain("'updateTemplateMetadata': '_updateComfyTemplateMetadata'")
   })
 })

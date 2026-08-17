@@ -1674,6 +1674,11 @@ interface ComfyOrchestratorAPI {
         template: ComfyCustomTemplateSummary;
     }>>;
     removeTemplate(id: string): Promise<ComfyResult<{ id: string; removed: true }>>;
+    updateTemplateMetadata(input: {
+        id: string;
+        name?: string;
+        promptProfile?: string;
+    }): Promise<ComfyResult<{ template: ComfyCustomTemplateSummary }>>;
     listTemplates(kind?: ComfyTemplateKind): Promise<ComfyResult<{ templates: ComfyTemplateSummary[] }>>;
     getConfig(): Promise<ComfyResult<{ config: ComfyConfig }>>;
     updateEndpoint(input: { url: string }): Promise<ComfyResult<{ config: ComfyConfig }>>;

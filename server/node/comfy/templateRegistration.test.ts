@@ -858,6 +858,50 @@ describe('Comfy custom template analysis and registration', () => {
     })).rejects.toMatchObject({ code: 'COMFY_TEMPLATE_PROMPT_PROFILE_INVALID' })
   })
 
+  it('updates only name and promptProfile of a registered template and validates the patch', async () => {
+    const { registry } = createRegistry()
+    const registered = await registry.registerTemplate({
+      name: 'Editable video',
+      kind: 'video',
+      mode: 't2v',
+      graphJson: graph({ images: [] }),
+      promptProfile: 'h3-structured',
+    })
+    const templateId = registered.template.id
+
+    const updated = await registry.updateTemplateMetadata(templateId, {
+      name: 'Editable video (NSFW)',
+      promptProfile: 'h3-structured-nsfw',
+    })
+    expect(updated.template).toMatchObject({
+      id: templateId,
+      name: 'Editable video (NSFW)',
+      promptProfile: 'h3-structured-nsfw',
+      kind: 'video',
+      mode: 't2v',
+    })
+    expect(await registry.listTemplates('video')).toContainEqual(expect.objectContaining({
+      id: templateId,
+      name: 'Editable video (NSFW)',
+      promptProfile: 'h3-structured-nsfw',
+    }))
+
+    const renamedOnly = await registry.updateTemplateMetadata(templateId, { name: 'Renamed again' })
+    expect(renamedOnly.template).toMatchObject({
+      name: 'Renamed again',
+      promptProfile: 'h3-structured-nsfw',
+    })
+
+    await expect(registry.updateTemplateMetadata(templateId, { promptProfile: 'h3-structured-vnext' }))
+      .rejects.toMatchObject({ code: 'COMFY_TEMPLATE_PROMPT_PROFILE_INVALID' })
+    await expect(registry.updateTemplateMetadata(templateId, { name: '' }))
+      .rejects.toMatchObject({ code: 'COMFY_TEMPLATE_METADATA_INVALID' })
+    await expect(registry.updateTemplateMetadata('wan-i2v', { name: 'nope' }))
+      .rejects.toMatchObject({ code: 'COMFY_TEMPLATE_BUILTIN_IMMUTABLE' })
+    await expect(registry.updateTemplateMetadata('f'.repeat(64), { name: 'nope' }))
+      .rejects.toMatchObject({ code: 'COMFY_TEMPLATE_NOT_FOUND' })
+  })
+
   it('compiles an explicit duration as a number and injects the registered default when omitted', async () => {
     const { registry } = createRegistry()
     const custom = graph({ images: [] })

@@ -1412,6 +1412,31 @@ function createTemplateRegistry(options = {}) {
         return { id: templateId, removed: true };
     }
 
+    // Graph-bound metadata (kind, mode, slots, output) is immutable — it is
+    // validated against the graph at registration and the content-hash id pins
+    // the graph. Only presentation/strategy fields may change afterwards.
+    async function updateTemplateMetadata(templateId, patch) {
+        if (Object.prototype.hasOwnProperty.call(BUILTIN_META, templateId)) {
+            throw comfyError('COMFY_TEMPLATE_BUILTIN_IMMUTABLE', 'Built-in templates cannot be modified');
+        }
+        if (!CUSTOM_TEMPLATE_ID_PATTERN.test(templateId)) throw comfyError('COMFY_TEMPLATE_ID_INVALID', 'Invalid template ID');
+        if (!store) throw comfyError('COMFY_TEMPLATE_STORE_UNAVAILABLE', 'Custom template storage is unavailable', { httpStatus: 503 });
+        if (!isPlainObject(patch)) throw comfyError('COMFY_TEMPLATE_METADATA_INVALID', 'Metadata update request is invalid');
+        const record = store.getCustomTemplate(templateId);
+        if (!record) throw comfyError('COMFY_TEMPLATE_NOT_FOUND', `Template ${templateId} was not found`, { httpStatus: 404 });
+        const name = patch.name === undefined ? record.name : patch.name;
+        const promptProfile = patch.promptProfile === undefined ? record.promptProfile : patch.promptProfile;
+        if (typeof name !== 'string' || name.trim() === '' || name.length > 200) {
+            throw comfyError('COMFY_TEMPLATE_METADATA_INVALID', 'Template name must be 1 to 200 characters');
+        }
+        if (!PROMPT_PROFILES.has(promptProfile)) {
+            throw comfyError('COMFY_TEMPLATE_PROMPT_PROFILE_INVALID', 'Template promptProfile is invalid');
+        }
+        const updated = store.updateCustomTemplateMetadata(templateId, { name, promptProfile });
+        if (!updated) throw comfyError('COMFY_TEMPLATE_NOT_FOUND', `Template ${templateId} was not found`, { httpStatus: 404 });
+        return { template: publicCustom(updated) };
+    }
+
     async function instantiate(templateId, slots) {
         const template = await loadTemplate(templateId);
         const compiled = instantiateDocument(
@@ -1450,6 +1475,7 @@ function createTemplateRegistry(options = {}) {
         analyzeTemplate,
         registerTemplate,
         removeTemplate,
+        updateTemplateMetadata,
         resolveRuntimeSlots,
         instantiate,
         instantiateSnapshot,

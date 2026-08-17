@@ -4745,6 +4745,13 @@ app.post('/api/comfy/orchestrator', async (req, res, next) => {
                     const removed = await comfyOrchestrator.removeTemplate(body.id);
                     return res.json({ ok: true, ...removed });
                 }
+                case 'updateTemplateMetadata': {
+                    const updated = await comfyOrchestrator.updateTemplateMetadata(body.id, {
+                        name: body.name,
+                        promptProfile: body.promptProfile,
+                    });
+                    return res.json({ ok: true, ...updated });
+                }
                 case 'listTemplates':
                     return res.json({ ok: true, templates: await comfyOrchestrator.listTemplates(body.kind ?? null) });
                 case 'getConfig':

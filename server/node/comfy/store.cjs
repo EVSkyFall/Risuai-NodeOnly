@@ -523,6 +523,14 @@ function createComfyStore(db, options = {}) {
         return db.prepare('DELETE FROM comfy_custom_templates WHERE id = ?').run(id).changes === 1;
     }
 
+    function updateCustomTemplateMetadata(id, { name, promptProfile }) {
+        const changed = db.prepare(`
+          UPDATE comfy_custom_templates SET name = ?, prompt_profile = ? WHERE id = ?
+        `).run(name, promptProfile, id).changes === 1;
+        if (!changed) return null;
+        return rowToCustomTemplate(readCustomTemplate.get(id));
+    }
+
     function purgeForRestore() {
         const run = db.transaction(() => {
             const jobs = db.prepare('DELETE FROM comfy_jobs').run().changes;
@@ -549,6 +557,7 @@ function createComfyStore(db, options = {}) {
         getCustomTemplate,
         listCustomTemplates,
         removeCustomTemplate,
+        updateCustomTemplateMetadata,
         purgeForRestore,
         computeBindingHash,
         isTerminalState: state => TERMINAL_STATES.has(state),
