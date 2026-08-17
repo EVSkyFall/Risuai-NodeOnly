@@ -16,7 +16,7 @@ const OUTPUT_BY_CLASS = Object.freeze({
     SaveImage: Object.freeze({ historyKey: 'images', mediaType: 'image/png' }),
 });
 const ALLOWED_MEDIA_TYPES = new Set(['video/mp4', 'video/webm', 'image/png', 'image/jpeg', 'image/webp']);
-const PROMPT_PROFILES = new Set(['wan-motion', 'h3-structured', 'image-tags']);
+const PROMPT_PROFILES = new Set(['wan-motion', 'h3-structured', 'h3-structured-nsfw', 'image-tags']);
 const MODES_BY_KIND = Object.freeze({
     video: new Set(['t2v', 'i2v', 'l2v', 'flf2v', 'ref2v']),
     image: new Set(['t2i', 'i2i']),

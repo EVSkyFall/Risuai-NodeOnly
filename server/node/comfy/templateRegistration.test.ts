@@ -832,6 +832,32 @@ describe('Comfy custom template analysis and registration', () => {
     }))
   })
 
+  it('accepts the h3-structured-nsfw promptProfile and rejects unknown profiles', async () => {
+    const { registry } = createRegistry()
+    const metadata = {
+      name: 'NSFW checkpoint video',
+      kind: 'video' as const,
+      mode: 't2v' as const,
+      graphJson: graph({ images: [] }),
+    }
+
+    const registered = await registry.registerTemplate({
+      ...metadata,
+      promptProfile: 'h3-structured-nsfw',
+    })
+    expect(registered.template).toMatchObject({ promptProfile: 'h3-structured-nsfw' })
+    expect(await registry.listTemplates('video')).toContainEqual(expect.objectContaining({
+      id: registered.template.id,
+      promptProfile: 'h3-structured-nsfw',
+    }))
+
+    await expect(registry.registerTemplate({
+      ...metadata,
+      name: 'Unknown profile video',
+      promptProfile: 'h3-structured-vnext',
+    })).rejects.toMatchObject({ code: 'COMFY_TEMPLATE_PROMPT_PROFILE_INVALID' })
+  })
+
   it('compiles an explicit duration as a number and injects the registered default when omitted', async () => {
     const { registry } = createRegistry()
     const custom = graph({ images: [] })
