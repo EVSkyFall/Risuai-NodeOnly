@@ -343,6 +343,13 @@ export async function importPlugin(code:string|null = null, argu:{
         let apiInternalVersion: 2|'2.1'|'3.0' = '2.1'
 
         if(apiVersion === '2.1'){
+            // Upstream blocks 2.1 installs outright; NodeOnly keeps it behind an
+            // opt-in (same policy as allowV2Plugin). Already-installed 2.1 plugins
+            // keep running regardless — this only gates new installs/updates.
+            if(!DBState.db.allowV21Plugin){
+                showError('Your plugin specifies API version 2.1, which is outdated and no longer supported. Please update your plugin to use at least API version 3.0.')
+                return
+            }
             const safety = await checkCodeSafety(jsFile)
             if(!safety.isSafe){
                 pluginAlertModalStore.errors = safety.errors
@@ -361,7 +368,7 @@ export async function importPlugin(code:string|null = null, argu:{
         }
         else if(apiVersion === '2.0'){
             if(!DBState.db.allowV2Plugin){
-                showError('Your code does not include //@api or specifies API version 2.0, which is outdated. Please update your plugin to use at least API version 2.1.')
+                showError('Your code does not include //@api or specifies API version 2.0, which is outdated. Please update your plugin to use at least API version 3.0.')
                 return
             }
             apiInternalVersion = 2

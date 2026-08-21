@@ -261,6 +261,9 @@ export function setDatabase(data:Database){
     if(checkNullish(data.allowV2Plugin)){
         data.allowV2Plugin = false
     }
+    if(checkNullish(data.allowV21Plugin)){
+        data.allowV21Plugin = false
+    }
     if(checkNullish(data.elevenLabKey)){
         data.elevenLabKey = ''
     }
@@ -1122,6 +1125,7 @@ export interface Database{
     didFirstSetup: boolean
     showUnrecommended:boolean
     allowV2Plugin:boolean
+    allowV21Plugin:boolean
     elevenLabKey:string
     voicevoxUrl:string
     useExperimental:boolean

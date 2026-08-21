@@ -706,6 +706,7 @@ export const languageEnglish = {
     streamingDisplayOptimizationStrong: "Apply after finish",
     streamingDisplayOptimizationStrongDesc: "Show raw text while streaming, then run scripts once at the end",
     allowV2Plugin: "Allow Deprecated V2.0 Plugins",
+    allowV21Plugin: "Allow Installing Deprecated V2.1 Plugins",
     altGreet: "Alternative First Messages",
     scripts: "Scripts",
     settings: "Settings",

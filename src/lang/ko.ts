@@ -784,6 +784,7 @@ export const languageKorean = {
   streamingDisplayOptimizationStrong: "완료 후 일괄 적용",
   streamingDisplayOptimizationStrongDesc: "스트리밍 중엔 원문만 표시하고, 완료되면 스크립트를 한 번에 적용합니다",
   allowV2Plugin: "비권장 V2.0 플러그인 허용",
+  allowV21Plugin: "비권장 V2.1 플러그인 설치 허용",
   altGreet: "추가 첫 메시지",
   scripts: "스크립트",
   settings: "설정",
