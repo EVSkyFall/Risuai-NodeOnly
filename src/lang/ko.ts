@@ -1779,6 +1779,8 @@ export const languageKorean = {
     "플러그인 {} 이(가) 채팅 내용을 교체할 권한을 요청합니다. 대화 조작에 사용될 수 있습니다. 허용하시겠습니까?",
   providerPermissionConsent:
     "플러그인 {} 이(가) Provider 접근 권한을 요청합니다. 무단 API 호출이 발생할 수 있습니다. 허용하시겠습니까?",
+  inlayPermissionConsent:
+    "플러그인 {}이(가) 인레이에 접근할 권한을 요청하고 있습니다. 인레이 내용을 읽거나 쓰거나 수정할 수 있습니다. 허용하시겠습니까?",
   sendChatConsent:
     "플러그인 {} 이(가) 사용자 대신 채팅 메시지를 전송할 권한을 요청합니다. AI 응답이 트리거됩니다. 허용하시겠습니까?",
   pluginPermissionDenyGuide:
