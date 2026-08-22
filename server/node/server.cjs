@@ -3636,6 +3636,9 @@ app.post('/api/patch', async (req, res, next) => {
         return;
     }
 
+    // Which step of the patch flow was running when the outer catch fired —
+    // without it a bare error name (e.g. RangeError) is undiagnosable.
+    let patchStage = 'load';
     try {
         await queueStorageOperation(async () => {
             const decodedKey = Buffer.from(filePath, 'hex').toString('utf-8');
@@ -3692,14 +3695,18 @@ app.post('/api/patch', async (req, res, next) => {
                 return;
             }
 
+            patchStage = 'hash';
             const serverHash = calculateHash(dbCache[filePath]).toString(16);
 
             if (expectedHash !== serverHash) {
                 console.log(`[Patch] Hash mismatch for ${decodedKey}: expected=${expectedHash}, server=${serverHash}`);
                 let currentEtag = undefined;
                 if (decodedKey === 'database/database.bin') {
-                    currentEtag = computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(dbCache[filePath])));
-                    dbEtag = currentEtag;
+                    // Encode failure must not upgrade this 409 into a 500.
+                    try {
+                        currentEtag = computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(dbCache[filePath])));
+                        dbEtag = currentEtag;
+                    } catch {}
                 }
                 res.status(409).send({
                     error: 'Hash mismatch - data out of sync',
@@ -3708,8 +3715,15 @@ app.post('/api/patch', async (req, res, next) => {
                 return;
             }
 
-            // Apply patch to in-memory database (clone first to prevent partial mutation on failure)
-            const snapshot = JSON.parse(JSON.stringify(dbCache[filePath]));
+            // Apply patch to in-memory database (clone first to prevent partial
+            // mutation on failure). structuredClone instead of a JSON round-trip:
+            // stringifying the whole DB into one JS string hits V8's ~512MB
+            // string ceiling on large databases (RangeError: Invalid string
+            // length), which rejected every patch. The cache is normalized to
+            // plain JSON values at load, so the clone semantics are identical.
+            patchStage = 'clone';
+            const snapshot = structuredClone(dbCache[filePath]);
+            patchStage = 'apply';
             let result;
             try {
                 result = applyPatch(snapshot, patch, true);
@@ -3758,6 +3772,7 @@ app.post('/api/patch', async (req, res, next) => {
             }, SAVE_INTERVAL);
 
             // Update ETag after successful patch (based on stripped version)
+            patchStage = 'etag';
             if (decodedKey === 'database/database.bin') {
                 dbEtag = computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(dbCache[filePath])));
             }
@@ -3774,7 +3789,12 @@ app.post('/api/patch', async (req, res, next) => {
             res.send(responsePayload);
         });
     } catch (error) {
-        logger.error(`[Patch] Error applying patch to ${filePath}:`, error.name);
+        const decodedKeyForLog = isHex(filePath) ? Buffer.from(filePath, 'hex').toString('utf-8') : filePath;
+        logger.error(
+            `[Patch] Error applying patch to ${decodedKeyForLog} (stage=${patchStage}, ops=${Array.isArray(patch) ? patch.length : '?'}): `
+            + `${error?.name}: ${error?.message}`,
+            error?.stack
+        );
         res.status(500).send({
             error: 'Patch application failed: ' + (error && error.message ? error.message : error)
         });
