@@ -147,6 +147,17 @@
         <div class="flex gap-2 mt-4 max-w-full flex-wrap">
             <Button onclick={exportUserPersona}>{language.export}</Button>
             <Button onclick={importUserPersona}>{language.import}</Button>
+            <Button onclick={() => {
+                saveUserPersona()
+                const clone = $state.snapshot(DBState.db.personas[DBState.db.selectedPersona])
+                DBState.db.personas.push({
+                    ...clone,
+                    name: clone.name + ' (Copy)',
+                    id: v4()
+                })
+                changeUserPersona(DBState.db.personas.length - 1, 'noSave')
+                void requestImmediateSave()
+            }}>{language.personaDuplicate}</Button>
 
             <Button styled="danger" onclick={async () => {
                 if(DBState.db.personas.length === 1){
