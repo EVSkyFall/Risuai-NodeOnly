@@ -7,6 +7,7 @@ import { addLog } from 'src/ts/log'
 import { recordRequestLog } from 'src/ts/requestLog'
 import { language } from 'src/lang'
 import { chatGenKey, endGeneration, generationStates, registerAbort, startGeneration } from 'src/ts/process/generationState'
+import { getGenerationModelString } from 'src/ts/process/models/modelString'
 import { clearStatus, endStatus, startStatus } from 'src/ts/status/requestStatus'
 import { authHeader } from './jobFetch'
 import { clearPendingSend, listPendingSends, markResumable, resumableSends, type PendingSendRecord } from './pendingSends'
@@ -279,13 +280,20 @@ async function claimJob(jobId: string): Promise<void> {
 
 // Message shape mirrors the live write path (index.svelte.ts streaming push):
 // data/saying/time/generationInfo, message-level chatId = generationId.
+// generationInfo.model goes through the same formatter as the live path
+// (generationInfo.model = getGenerationModelString(req.model)) so a recovered
+// message shows the same model string a live one would, not "unknown".
+// Jobs from older builds have no model recorded — leave the field unset.
 function insertRecoveredMessage(loc: LocatedChat, job: ModelJobRecord, text: string): void {
     const message: Message = {
         role: 'char',
         data: text,
         time: Date.now(),
         chatId: job.generationId ?? uuidv4(),
-        generationInfo: { generationId: job.generationId ?? undefined },
+        generationInfo: {
+            generationId: job.generationId ?? undefined,
+            model: job.model ? getGenerationModelString(job.model) : undefined,
+        },
     }
     if (loc.char.chaId) message.saying = loc.char.chaId
     loc.chat.message.push(message)

@@ -440,13 +440,17 @@ export function setDatabase(data:Database){
     }
     data.selectedPersona ??= 0
     data.personaPrompt ??= ''
-    data.personas ??= [{
-        name: data.username,
-        personaPrompt: "",
-        icon: data.userIcon,
-        note: data.userNote,
-        largePortrait: false
-    }]
+    // A corrupted/imported DB can carry `personas: []`, which ??= leaves alone —
+    // persona UI then derefs personas[0], so rebuild the default entry too.
+    if(!Array.isArray(data.personas) || data.personas.length === 0){
+        data.personas = [{
+            name: data.username,
+            personaPrompt: "",
+            icon: data.userIcon,
+            note: data.userNote,
+            largePortrait: false
+        }]
+    }
     data.classicMaxWidth ??= false
     data.ooba ??= safeStructuredClone(defaultOoba)
     data.ainconfig ??= safeStructuredClone(defaultAIN)
@@ -759,6 +763,7 @@ export function setDatabase(data:Database){
     data.saveSignatures ??= false
     data.nodeOnlyScrollButtonType ??= 'four'
     data.nodeOnlyHideRecentChats ??= false
+    data.nodeOnlyAutoCleanAssets ??= false
     data.keepSessionAlive ??= 'off'
     data.localNetworkMode ??= false
     if (typeof data.localNetworkMode !== 'boolean') data.localNetworkMode = false
@@ -1551,6 +1556,11 @@ export interface Database{
     dynamicModelRegistry?:boolean
     nodeOnlyScrollButtonType?:'four'|'two'|'off'
     nodeOnlyHideRecentChats?:boolean
+    // Delete unreferenced assets/* on boot (cleanChunks). Default OFF: the
+    // reference walker deleting an asset it simply didn't know about is
+    // unrecoverable, so orphan removal is a deliberate act from the storage
+    // dashboard instead. Remote-character caches are swept regardless.
+    nodeOnlyAutoCleanAssets?:boolean
     // Route main-chat model-preset requests through server-side jobs
     // (/api/model-jobs) so generation survives client disconnects.
     // Default OFF (undefined is falsy) — no migration needed. Toggled in
