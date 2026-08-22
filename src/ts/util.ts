@@ -40,7 +40,12 @@ export function checkNullish(data:any){
 
 export async function selectSingleFile(ext:string[]){
     const v = await selectFileByDom(ext, 'single')
-    const file = v[0]
+    // selectFileByDom resolves [] when the picked file is filtered out by
+    // extension — return null so callers' cancel guards handle it.
+    const file = v?.[0]
+    if(!file){
+        return null
+    }
     return {name: file.name,data:await readFileAsUint8Array(file)}
 }
 
