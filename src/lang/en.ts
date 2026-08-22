@@ -992,6 +992,7 @@ export const languageEnglish = {
     persistentStorageSuccess: "Storage is successfully persisted",
     persistentStorageFail: "Storage is not persisted. Did you deny the request?, or is the browser not supported?",
     persistentStorageRecommended: "Persistent Storage Recommended",
+    unsupportedFileType: "Unsupported file type",
     persistentStorageDesc: "Your browser supports persistent storage. this is recommended for better performance and user experience.",
     enable: "Enable",
     postFile: "Post File",

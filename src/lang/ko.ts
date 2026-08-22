@@ -1079,6 +1079,7 @@ export const languageKorean = {
   persistentStorageFail:
     "저장소 설정에 실패했습니다. 브라우저에서 거부되었을 수 있습니다.",
   persistentStorageRecommended: "영구 저장소 권장됨",
+  unsupportedFileType: "지원하지 않는 파일 형식입니다",
   persistentStorageDesc:
     "당신의 브라우저는 영구 저장소를 지원합니다. 이 기능을 활성화하면, 데이터가 브라우저에 더 오래 남습니다.",
   enable: "활성화",
