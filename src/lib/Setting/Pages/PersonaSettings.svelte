@@ -17,6 +17,12 @@
     import { requestImmediateSave } from "src/ts/globalApi.svelte";
     import { v4 } from "uuid"
 
+    // selectedPersona can point past the array (persona removed by a plugin or
+    // stale index in an imported DB) — clamp before the template dereferences it.
+    if(!DBState.db.personas[DBState.db.selectedPersona] && DBState.db.personas.length > 0){
+        DBState.db.selectedPersona = 0
+    }
+
     let stb: Sortable = null
     let ele: HTMLDivElement = $state()
     let sorted = $state(0)
