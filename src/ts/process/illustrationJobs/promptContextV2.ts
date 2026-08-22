@@ -3,7 +3,13 @@ import {
     IllustrationLedgerValidationError,
     IllustrationPromptTargetUnavailableError,
 } from './errors'
-import { IMAGE_PROMPT_TOKENIZER_ID, isNaiV4ImageModel } from './imagePromptMeasurement'
+import {
+    IMAGE_PROMPT_TOKENIZER_ID,
+    isMeasurableNaiImageModel,
+    isNaiV5ImageModel,
+    resolveNaiImagePromptLimits,
+} from './imagePromptMeasurement'
+import { DEFAULT_NAI_MODEL } from './settingsFingerprint'
 import { sha256Hex } from './sourceHash'
 
 // ---------------------------------------------------------------------------
@@ -40,6 +46,7 @@ export type IllustrationPromptNegativeChannel = 'separate' | 'unsupported'
 
 export type IllustrationPromptMeasurementMode =
     | 'model_exact'
+    | 'model_approximate'
     | 'provider_reported'
     | 'transport_only'
     | 'unmeasured'
@@ -135,10 +142,10 @@ export type IllustrationPromptContextV2 = {
 
 export const NOVELAI_NATIVE_MAX_SUBJECTS = 6
 export const NOVELAI_NATIVE_MEASUREMENT_REVISION = 'novelai-native-t5-spiece-v1/1'
+export const NOVELAI_NATIVE_V5_MEASUREMENT_REVISION = 'novelai-native-t5-approx-v5/2'
 export const NOVELAI_NATIVE_QUEUE_POLICY_REVISION = 'novelai-native-queue/1'
 export const NOVELAI_NATIVE_CONCURRENCY_KEY = 'novelai'
 export const DEFAULT_NAI_ENDPOINT = 'https://image.novelai.net/ai/generate-image'
-const DEFAULT_NAI_MODEL = 'nai-diffusion-4-5-full'
 
 export const NOVELAI_NATIVE_SUBJECT_SLOTS: IllustrationPromptSubjectSlots = Object.freeze({
     maxSubjects: NOVELAI_NATIVE_MAX_SUBJECTS,
@@ -149,13 +156,19 @@ export const NOVELAI_NATIVE_SUBJECT_SLOTS: IllustrationPromptSubjectSlots = Obje
     pipeSerialization: null,
 })
 
-export const NOVELAI_NATIVE_MEASUREMENT: IllustrationPromptMeasurementDescriptor = Object.freeze({
-    mode: 'model_exact',
-    revision: NOVELAI_NATIVE_MEASUREMENT_REVISION,
-    tokenizerId: IMAGE_PROMPT_TOKENIZER_ID,
-    documentedTransportLimit: null,
-    dispatchPolicy: 'require-model-within-limit',
-})
+export function novelAiNativeMeasurement(
+    model: string,
+): IllustrationPromptMeasurementDescriptor {
+    return Object.freeze({
+        mode: isNaiV5ImageModel(model) ? 'model_approximate' : 'model_exact',
+        revision: isNaiV5ImageModel(model)
+            ? NOVELAI_NATIVE_V5_MEASUREMENT_REVISION
+            : NOVELAI_NATIVE_MEASUREMENT_REVISION,
+        tokenizerId: IMAGE_PROMPT_TOKENIZER_ID,
+        documentedTransportLimit: null,
+        dispatchPolicy: 'require-model-within-limit',
+    })
+}
 
 // A resolvable non-NAI provider must NOT be inferred to be a compatible transport
 // (request §2 forbidden inferences). Slice D maps only 'novelai' to a real target.
@@ -222,12 +235,13 @@ export async function computeTargetFingerprint(
 function novelAiNativeExecutionDescriptor(
     db: PromptTargetDatabase,
 ): PromptTargetExecutionDescriptor {
+    const model = db.NAIImgModel ?? DEFAULT_NAI_MODEL
     return {
         schemaVersion: 2,
         providerId: 'novelai',
         transportId: 'novelai-native',
         endpoint: db.NAIImgUrl ?? DEFAULT_NAI_ENDPOINT,
-        modelId: db.NAIImgModel ?? DEFAULT_NAI_MODEL,
+        modelId: model,
         checkpointFingerprint: null,
         workflowFingerprint: null,
         bindingMode: 'request-pinned',
@@ -236,9 +250,9 @@ function novelAiNativeExecutionDescriptor(
         negativeChannel: 'separate',
         textPreservation: 'exact',
         subjectSlots: NOVELAI_NATIVE_SUBJECT_SLOTS,
-        measurement: NOVELAI_NATIVE_MEASUREMENT,
+        measurement: novelAiNativeMeasurement(model),
         // novelai-native never opts into transport-only/unmeasured dispatch: the
-        // T5 model_exact gate is authoritative (request §6).
+        // The bounded model measurement gate is authoritative (request §6).
         allowTransportOnly: false,
         allowUnmeasured: false,
         concurrencyKey: NOVELAI_NATIVE_CONCURRENCY_KEY,
@@ -274,14 +288,13 @@ export async function resolveNovelAiNativeTarget(
     }
 }
 
-// The novelai-native adapter pins `model_exact`/T5 measurement UNCONDITIONALLY
-// (NOVELAI_NATIVE_MEASUREMENT), but imagePromptMeasurement only performs that exact
-// T5 measurement for NAI V4-family models (isNaiV4ImageModel). A non-V4 NovelAI
-// model (e.g. 'nai-diffusion-3') therefore has no honest measurable adapter in
-// Slice D. The effective model mirrors canonicalizeNaiSettings' default so the gate
-// agrees with what measurement will actually see.
+// V4 uses exact T5 measurement while recognized V5 Full/Curated families use the
+// conservative T5 approximation identified by their own revision. Other NovelAI
+// models have no honest measurable adapter. The effective model mirrors
+// canonicalizeNaiSettings' default so this gate agrees with dispatch measurement.
 function novelAiNativeModelIsMeasurable(db: PromptTargetDatabase): boolean {
-    return isNaiV4ImageModel(db.NAIImgModel ?? DEFAULT_NAI_MODEL)
+    const model = db.NAIImgModel ?? DEFAULT_NAI_MODEL
+    return isMeasurableNaiImageModel(model) && resolveNaiImagePromptLimits(model) !== null
 }
 
 // ---------------------------------------------------------------------------
@@ -860,7 +873,7 @@ async function resolveElectedTarget(
 
 // Resolve the durable target for the CURRENTLY configured provider. A non-native
 // transport election (when present) is authoritative and never inferred; without
-// an election only 'novelai' + a V4 model resolves (novelai-native). Everything
+// an election only 'novelai' + a measurable V4/V5 model resolves (novelai-native). Everything
 // else fails closed with a typed preparation failure (request §2/§4/§7).
 export async function resolvePromptTargetV2(
     db: PromptTargetDatabase,
@@ -872,15 +885,15 @@ export async function resolvePromptTargetV2(
     const provider = db.sdProvider ?? ''
     if (provider === 'novelai') {
         // Fail closed BEFORE any durable capture rather than pinning a descriptor
-        // that dishonestly claims exact T5 measurability the model cannot honor.
+        // that claims a measurement profile the model cannot honor.
         // This keeps the unmeasurable-model rejection at the pre-LLM prepare gate
         // (request §6 honest measurement descriptor; §8 mismatch => Plugin LLM 0회)
         // instead of deferring it to the post-LLM measurement receipt.
         if (!novelAiNativeModelIsMeasurable(db)) {
             throw new IllustrationPromptTargetUnavailableError(
                 'novelai-native',
-                'novelai-native provides exact NAI T5 measurement only for NovelAI V4 models; '
-                    + 'this NovelAI model has no measurable transport adapter until a later slice',
+                'novelai-native provides bounded measurement only for NovelAI V4 and recognized V5 models; '
+                    + 'this NovelAI model has no measurable transport adapter',
             )
         }
         return await resolveNovelAiNativeTarget(db)

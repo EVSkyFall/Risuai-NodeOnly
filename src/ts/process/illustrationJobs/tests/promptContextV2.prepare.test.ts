@@ -136,11 +136,10 @@ describe('preparePromptContext atomic capture (request §4/§10-5)', () => {
         expect(decodeTurn('turn-webui')?.promptContext).toBeUndefined()
     })
 
-    test('a non-V4 NovelAI model fails closed at prepare, before the Plugin LLM (request §6/§8)', async () => {
-        // sdProvider='novelai' resolves an adapter, but the pinned model_exact/T5
-        // measurement is honest only for V4. Preparing with a V3 model must reject
-        // up-front — not persist a durable context claiming exact measurability that
-        // only blows up later inside the measurement receipt (after LLM cost).
+    test('an unmeasurable NovelAI model fails closed at prepare, before the Plugin LLM (request §6/§8)', async () => {
+        // sdProvider='novelai' resolves an adapter only when a bounded model
+        // measurement profile exists. V3 must reject before durable capture,
+        // not after Plugin LLM cost inside the measurement receipt.
         harness.database = naiDb('nai-diffusion-3')
         const version = await createTurn('turn-nai-v3')
         await expect(preparePromptContext({

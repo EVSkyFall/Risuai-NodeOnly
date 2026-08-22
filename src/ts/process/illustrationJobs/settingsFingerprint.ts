@@ -2,6 +2,7 @@ import type { Database, NAIImgConfig } from '../../storage/database.svelte'
 import { sha256Hex } from './sourceHash'
 
 export const NAI_SETTINGS_FINGERPRINT_SCHEMA_VERSION = 1
+export const DEFAULT_NAI_MODEL = 'nai-diffusion-4-5-full'
 
 export type NaiSettingsFingerprintDatabase = Pick<
     Database,
@@ -26,12 +27,33 @@ export function serializeCanonicalNaiSettings(settings: CanonicalNaiSettings): s
     return canonicalJson(settings)
 }
 
-function fallbackVibeModel(model: string): string {
+type NaiModelFamilyKey =
+    | 'v4full'
+    | 'v4curated'
+    | 'v4-5full'
+    | 'v4-5curated'
+    | 'v5full'
+    | 'v5curated'
+    | ''
+
+function naiModelFamilyKey(model: string): NaiModelFamilyKey {
     if (model.includes('nai-diffusion-4-full')) return 'v4full'
     if (model.includes('nai-diffusion-4-curated')) return 'v4curated'
     if (model.includes('nai-diffusion-4-5-full')) return 'v4-5full'
     if (model.includes('nai-diffusion-4-5-curated')) return 'v4-5curated'
+    if (model.includes('nai-diffusion-5-full')) return 'v5full'
+    if (model.includes('nai-diffusion-5-curated')) return 'v5curated'
     return ''
+}
+
+function fallbackVibeModel(model: string): string {
+    const family = naiModelFamilyKey(model)
+    return family === 'v4full'
+        || family === 'v4curated'
+        || family === 'v4-5full'
+        || family === 'v4-5curated'
+        ? family
+        : ''
 }
 
 function resolveConfiguredVibeEncoding(model: string, config: NaiConfigLike): {
@@ -61,8 +83,9 @@ function resolveConfiguredVibeEncoding(model: string, config: NaiConfigLike): {
 
 export function canonicalizeNaiSettings(db: NaiSettingsFingerprintDatabase) {
     const config = db.NAIImgConfig as NaiConfigLike
-    const model = db.NAIImgModel ?? 'nai-diffusion-4-5-full'
-    const vibe = resolveConfiguredVibeEncoding(model, config)
+    const model = db.NAIImgModel ?? DEFAULT_NAI_MODEL
+    const usesV5Wire = model.startsWith('nai-diffusion-5')
+    const vibe = usesV5Wire ? undefined : resolveConfiguredVibeEncoding(model, config)
 
     return {
         schemaVersion: NAI_SETTINGS_FINGERPRINT_SCHEMA_VERSION,
@@ -86,21 +109,33 @@ export function canonicalizeNaiSettings(db: NaiSettingsFingerprintDatabase) {
             },
         },
 
-        // §10.2 negative preset. The negative text is a per-job prompt, while
-        // the NAI request preset is fixed and legacy UC is DB-configurable.
-        negativePreset: {
-            ucPreset: 3,
-            legacyUc: config.legacy_uc ?? false,
-        },
+        // §10.2 negative preset. V4 keeps its fixed numeric preset plus DB
+        // legacy UC; V5 fingerprints the string preset IDs and integer hints
+        // that stableDiff actually sends, with legacy UC absent.
+        negativePreset: usesV5Wire
+            ? {
+                ucPresetId: 'none',
+                qualityPresetId: 'none',
+                tagHintQt: 0,
+                tagHintUcPreset: 0,
+            }
+            : {
+                ucPreset: 3,
+                legacyUc: config.legacy_uc ?? false,
+            },
 
         // §10.2 provider-specific NAI options read by stableDiff.ts.
-        providerOptions: {
-            noiseSchedule: config.noise_schedule ?? 'karras',
-            smea: config.sm ?? true,
-            smeaDynamic: config.sm_dyn ?? false,
-            decrisp: config.decrisp ?? false,
-            varietyPlus: config.variety_plus ?? false,
-        },
+        providerOptions: usesV5Wire
+            ? {
+                noiseSchedule: config.noise_schedule ?? 'karras',
+            }
+            : {
+                noiseSchedule: config.noise_schedule ?? 'karras',
+                smea: config.sm ?? true,
+                smeaDynamic: config.sm_dyn ?? false,
+                decrisp: config.decrisp ?? false,
+                varietyPlus: config.variety_plus ?? false,
+            },
 
         // §10.2 img2img/reference-image settings. Empty image ids use the
         // current character at dispatch; the sentinel records that policy.
@@ -113,22 +148,28 @@ export function canonicalizeNaiSettings(db: NaiSettingsFingerprintDatabase) {
             noise: config.noise || 0,
         },
 
-        // §10.2 vibe/reference-image and character-reference settings. Only
-        // the selected vibe encoding is covered; display metadata is incidental.
-        reference: {
-            mode: config.reference_mode ?? '',
-            vibeModelSelection: config.vibe_model_selection ?? '',
-            effectiveVibeModel: vibe.modelKey,
-            informationExtracted: config.InfoExtracted || 1,
-            selectedVibeEncoding: vibe.encoding,
-            strength: config.reference_strength_multiple?.length
-                ? config.reference_strength_multiple[0]
-                : 0.5,
-            characterSource: config.character_image ? 'configured' : 'current-character',
-            characterImageAssetId: config.character_image ?? '',
-            characterImageBase64: config.character_base64image ?? '',
-            styleAware: config.style_aware ?? false,
-        },
+        // V5 launch models ignore both reference families. Omitting the whole
+        // block prevents stale unsupported settings from invalidating paid work.
+        ...(usesV5Wire
+            ? {}
+            : {
+                // §10.2 vibe/reference-image and character-reference settings.
+                // Only the selected encoding is covered; display metadata is incidental.
+                reference: {
+                    mode: config.reference_mode ?? '',
+                    vibeModelSelection: config.vibe_model_selection ?? '',
+                    effectiveVibeModel: vibe!.modelKey,
+                    informationExtracted: config.InfoExtracted || 1,
+                    selectedVibeEncoding: vibe!.encoding,
+                    strength: config.reference_strength_multiple?.length
+                        ? config.reference_strength_multiple[0]
+                        : 0.5,
+                    characterSource: config.character_image ? 'configured' : 'current-character',
+                    characterImageAssetId: config.character_image ?? '',
+                    characterImageBase64: config.character_base64image ?? '',
+                    styleAware: config.style_aware ?? false,
+                },
+            }),
     } as const
 }
 

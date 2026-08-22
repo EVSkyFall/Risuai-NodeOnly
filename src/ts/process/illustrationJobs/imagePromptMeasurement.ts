@@ -16,12 +16,14 @@ import type {
 export const IMAGE_PROMPT_TOKENIZER_ID = 't5-spiece-v1' as const
 export const IMAGE_PROMPT_TOKENIZER_ASSET_URL = '/token/t5/spiece.model'
 
-// NovelAI documents an approximately 512-T5-token combined budget over the
-// base and all character prompts for V4/V4.5. This contract pins 512 per side:
-// https://docs.novelai.net/en/image/models/
-export const NAI_V4_IMAGE_PROMPT_LIMITS = Object.freeze({
-    maxPositiveTokens: 512,
-    maxNegativeTokens: 512,
+// V4/V4.5 use the documented per-side 512-token T5 budget. Delta §33 records
+// V5 Full 1471 / Curated 703 as one pooled budget over positive and negative
+// prompt parts. These are the observed raw values with no extra haircut; T5 is
+// still only an approximation until the Qwen-family tokenizer is available.
+export const NAI_IMAGE_PROMPT_LIMITS_BY_FAMILY = Object.freeze({
+    v4: Object.freeze({ maxPositiveTokens: 512, maxNegativeTokens: 512 }),
+    'nai-diffusion-5-full': Object.freeze({ maxPositiveTokens: 1471, maxNegativeTokens: 1471 }),
+    'nai-diffusion-5-curated': Object.freeze({ maxPositiveTokens: 703, maxNegativeTokens: 703 }),
 } as const)
 
 export type ImagePromptTokenizer = {
@@ -108,6 +110,25 @@ export function isNaiV4ImageModel(model: string): boolean {
     return model.startsWith('nai-diffusion-4')
 }
 
+export function isNaiV5ImageModel(model: string): boolean {
+    return model.startsWith('nai-diffusion-5')
+}
+
+export function isMeasurableNaiImageModel(model: string): boolean {
+    return isNaiV4ImageModel(model) || isNaiV5ImageModel(model)
+}
+
+export function resolveNaiImagePromptLimits(model: string) {
+    if (isNaiV4ImageModel(model)) return NAI_IMAGE_PROMPT_LIMITS_BY_FAMILY.v4
+    if (model.startsWith('nai-diffusion-5-full')) {
+        return NAI_IMAGE_PROMPT_LIMITS_BY_FAMILY['nai-diffusion-5-full']
+    }
+    if (model.startsWith('nai-diffusion-5-curated')) {
+        return NAI_IMAGE_PROMPT_LIMITS_BY_FAMILY['nai-diffusion-5-curated']
+    }
+    return null
+}
+
 export function createImagePromptMeasurementService(
     dependencies: ImagePromptMeasurementDependencies,
 ): ImagePromptMeasurementService {
@@ -151,10 +172,11 @@ export function createImagePromptMeasurementService(
             const prompt = parseIllustrationPromptV1(input.prompt)
             const initialSettings = await resolveSettings(input.settingsFingerprint)
             if (initialSettings.provider !== 'novelai'
-                || !isNaiV4ImageModel(initialSettings.model)) {
+                || !isMeasurableNaiImageModel(initialSettings.model)
+                || !resolveNaiImagePromptLimits(initialSettings.model)) {
                 throw new IllustrationImagePromptContractError(
                     'image_prompt_measurement_unsupported',
-                    'Exact image prompt measurement is supported only for NovelAI V4 models',
+                    'Image prompt measurement is supported only for NovelAI V4 and recognized V5 models',
                 )
             }
 
@@ -171,10 +193,13 @@ export function createImagePromptMeasurementService(
             // Loading the asset/WASM may await. Re-resolve after the cold path so
             // a settings change during initialization still fails closed.
             const settings = await resolveSettings(input.settingsFingerprint)
-            if (settings.provider !== 'novelai' || !isNaiV4ImageModel(settings.model)) {
+            const limits = resolveNaiImagePromptLimits(settings.model)
+            if (settings.provider !== 'novelai'
+                || !isMeasurableNaiImageModel(settings.model)
+                || !limits) {
                 throw new IllustrationImagePromptContractError(
                     'image_prompt_measurement_unsupported',
-                    'Exact image prompt measurement is supported only for NovelAI V4 models',
+                    'Image prompt measurement is supported only for NovelAI V4 and recognized V5 models',
                 )
             }
 
@@ -190,7 +215,7 @@ export function createImagePromptMeasurementService(
                     tokenizer: IMAGE_PROMPT_TOKENIZER_ID,
                     positiveTokens,
                     negativeTokens,
-                    ...NAI_V4_IMAGE_PROMPT_LIMITS,
+                    ...limits,
                 }
             } catch {
                 throw new IllustrationImagePromptContractError(
@@ -233,17 +258,51 @@ export async function measureImagePrompt(
     return await activeMeasurementService.measure(input)
 }
 
+export function evaluateImagePromptLimits(
+    measurement: Pick<
+        IllustrationImagePromptMeasurementV1,
+        | 'model'
+        | 'positiveTokens'
+        | 'negativeTokens'
+        | 'maxPositiveTokens'
+        | 'maxNegativeTokens'
+    >,
+) {
+    const positiveWithinLimits = measurement.positiveTokens <= measurement.maxPositiveTokens
+    const negativeWithinLimits = measurement.negativeTokens <= measurement.maxNegativeTokens
+    const pooled = isNaiV5ImageModel(measurement.model)
+        && resolveNaiImagePromptLimits(measurement.model) !== null
+    const combinedTokens = measurement.positiveTokens + measurement.negativeTokens
+    const combinedLimit = pooled ? measurement.maxPositiveTokens : null
+    return {
+        positiveWithinLimits,
+        negativeWithinLimits,
+        withinLimits: pooled
+            ? combinedTokens <= (combinedLimit as number)
+            : positiveWithinLimits && negativeWithinLimits,
+        pooled,
+        combinedTokens,
+        combinedLimit,
+    }
+}
+
 export function assertImagePromptWithinLimits(
     measurement: IllustrationImagePromptMeasurementV1,
 ): void {
-    if (measurement.positiveTokens <= measurement.maxPositiveTokens
-        && measurement.negativeTokens <= measurement.maxNegativeTokens) return
+    const evaluation = evaluateImagePromptLimits(measurement)
+    if (evaluation.withinLimits) return
     const payload: IllustrationImagePromptOverLimitPayloadV1 = {
         positiveTokens: measurement.positiveTokens,
         negativeTokens: measurement.negativeTokens,
         maxPositiveTokens: measurement.maxPositiveTokens,
         maxNegativeTokens: measurement.maxNegativeTokens,
         model: measurement.model,
+        ...(evaluation.pooled
+            ? {
+                combinedTokens: evaluation.combinedTokens,
+                maxCombinedTokens: evaluation.combinedLimit as number,
+            }
+            : {}),
     }
     throw new IllustrationImagePromptContractError(
         'image_prompt_over_limit',
@@ -266,6 +325,8 @@ export async function measureAndEnforceImagePromptForDispatch(
 ): Promise<IllustrationImagePromptMeasurementV1 | null> {
     const prompt = parseIllustrationPromptV1(input.prompt)
     const settings = await resolveImagePromptMeasurementSettings(input.settingsFingerprint)
+    const hasMeasurementProfile = isMeasurableNaiImageModel(settings.model)
+        && resolveNaiImagePromptLimits(settings.model) !== null
     if (prompt.layout === 'flat') {
         if (settings.provider !== 'novelai') {
             if (options.requireNovelAiProvider) {
@@ -276,11 +337,11 @@ export async function measureAndEnforceImagePromptForDispatch(
             }
             return null
         }
-        if (!isNaiV4ImageModel(settings.model)) return null
-    } else if (settings.provider !== 'novelai' || !isNaiV4ImageModel(settings.model)) {
+        if (!hasMeasurementProfile) return null
+    } else if (settings.provider !== 'novelai' || !hasMeasurementProfile) {
         throw new IllustrationImagePromptContractError(
             'image_prompt_measurement_unsupported',
-            'NAI V4 character prompts require a NovelAI V4 model',
+            'NAI character prompts require a measurable NovelAI V4 or V5 model',
         )
     }
     return await measureAndEnforceImagePrompt({ ...input, prompt })

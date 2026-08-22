@@ -2342,6 +2342,438 @@ describe('generateAIImage WebUI seed threading', () => {
     })
 })
 
+describe('NAI legacy wire baseline', () => {
+    function sentBody() {
+        const [, arg] = mocks.globalFetch.mock.calls[0] as [string, { body: unknown }]
+        return JSON.parse(JSON.stringify(arg.body)) as Record<string, any>
+    }
+
+    type LegacyBodyOptions = {
+        useCoords?: boolean
+        characterPositives?: Array<{ char_caption: string; centers: Array<{ x: number; y: number }> }>
+        characterNegatives?: Array<{ char_caption: string; centers: Array<{ x: number; y: number }> }>
+        referenceImages?: string[]
+        referenceStrengths?: number[]
+        img2img?: { image: string; strength: number; noise: number }
+    }
+
+    function expectedLegacyBody(
+        model: string,
+        v3Smea: boolean,
+        options: LegacyBodyOptions = {},
+    ) {
+        const useCoords = options.useCoords ?? false
+        return {
+            input: 'prompt',
+            model,
+            parameters: {
+                params_version: 3,
+                add_original_image: true,
+                cfg_rescale: 0,
+                controlnet_strength: 1,
+                dynamic_thresholding: v3Smea,
+                n_samples: 1,
+                width: 1024,
+                height: 1024,
+                sampler: 'k_euler',
+                steps: 28,
+                scale: 5,
+                negative_prompt: 'negative',
+                ...(v3Smea ? { sm: true, sm_dyn: true } : {}),
+                noise_schedule: 'native',
+                normalize_reference_strength_multiple: true,
+                ucPreset: 3,
+                uncond_scale: 1,
+                qualityToggle: false,
+                legacy_v3_extend: false,
+                legacy: false,
+                autoSmea: false,
+                use_coords: useCoords,
+                legacy_uc: true,
+                v4_prompt: {
+                    caption: {
+                        base_caption: 'prompt',
+                        char_captions: options.characterPositives ?? [],
+                    },
+                    use_coords: useCoords,
+                    use_order: true,
+                },
+                v4_negative_prompt: {
+                    caption: {
+                        base_caption: 'negative',
+                        char_captions: options.characterNegatives ?? [],
+                    },
+                    legacy_uc: true,
+                },
+                reference_image_multiple: options.referenceImages ?? [],
+                reference_strength_multiple: options.referenceStrengths ?? [],
+                ...(options.img2img ?? {}),
+                seed: 12345,
+                extra_noise_seed: 12345,
+                prefer_brownian: true,
+                deliberate_euler_ancestral_bug: false,
+                skip_cfg_above_sigma: null,
+            },
+            action: options.img2img ? 'img2img' : 'generate',
+        }
+    }
+
+    it.each([
+        ['nai-diffusion-3', true],
+        ['nai-diffusion-4-full', false],
+        ['nai-diffusion-4-5-full', false],
+    ] as const)('pins the complete serialized %s request body', async (model, v3Smea) => {
+        mocks.db.NAIImgModel = model
+        mocks.db.NAIImgConfig.legacy_uc = true
+        mocks.db.NAIImgConfig.sm = true
+        mocks.db.NAIImgConfig.sm_dyn = true
+        mocks.db.NAIImgConfig.decrisp = true
+        mocks.globalFetch.mockResolvedValue(fetchResult({}))
+
+        await generateAIImage('prompt', currentChar, 'negative', 'inlay')
+
+        expect(JSON.stringify(sentBody())).toBe(JSON.stringify(expectedLegacyBody(model, v3Smea)))
+    })
+
+    it.each([
+        ['nai-diffusion-4-full', 0.01889],
+        ['nai-diffusion-4-5-full', 0.05766],
+    ] as const)('pins the Variety+ coefficient for %s', async (model, coefficient) => {
+        mocks.db.NAIImgModel = model
+        mocks.db.NAIImgConfig.variety_plus = true
+        mocks.db.NAIImgConfig.width = 832
+        mocks.db.NAIImgConfig.height = 1216
+        mocks.globalFetch.mockResolvedValue(fetchResult({}))
+
+        await generateAIImage('prompt', currentChar, 'negative', 'inlay')
+
+        expect(sentBody().parameters.skip_cfg_above_sigma)
+            .toBe(Math.sqrt(832 * 1216) * coefficient)
+    })
+
+    it('pins disabled Variety+ to a null sigma skip', async () => {
+        mocks.db.NAIImgModel = 'nai-diffusion-4-5-full'
+        mocks.db.NAIImgConfig.variety_plus = false
+        mocks.globalFetch.mockResolvedValue(fetchResult({}))
+
+        await generateAIImage('prompt', currentChar, 'negative', 'inlay')
+
+        expect(sentBody().parameters.skip_cfg_above_sigma).toBeNull()
+    })
+
+    it.each([
+        'nai-diffusion-4-full',
+        'nai-diffusion-4-5-full',
+    ])('pins the complete serialized %s character-caption request body', async (model) => {
+        const centers = [{ x: 0.25, y: 0.5 }, { x: 0.75, y: 0.5 }]
+        const positives = ['Alice', 'Bob']
+        const negatives = ['not Bob', 'not Alice']
+        mocks.db.NAIImgModel = model
+        mocks.db.NAIImgConfig.legacy_uc = true
+        mocks.globalFetch.mockResolvedValue(fetchResult({}))
+
+        await generateAIImageTyped(
+            'prompt',
+            currentChar,
+            'negative',
+            'inlay',
+            'background',
+            {
+                preservePromptText: true,
+                illustrationPrompt: {
+                    schemaVersion: 1,
+                    layout: 'nai-v4-characters',
+                    basePositive: 'prompt',
+                    characterPositives: positives,
+                    baseNegative: 'negative',
+                    characterNegatives: negatives,
+                    characterCenters: centers,
+                    characterNames: ['Alice', 'Bob'],
+                },
+            },
+        )
+
+        const expectedCaptions = (captions: string[]) => captions.map((char_caption, index) => ({
+            char_caption,
+            centers: [centers[index]],
+        }))
+        expect(JSON.stringify(sentBody())).toBe(JSON.stringify(expectedLegacyBody(model, false, {
+            useCoords: true,
+            characterPositives: expectedCaptions(positives),
+            characterNegatives: expectedCaptions(negatives),
+        })))
+    })
+
+    it.each([
+        ['nai-diffusion-4-full', 'v4full'],
+        ['nai-diffusion-4-5-full', 'v4-5full'],
+    ] as const)('pins the complete serialized %s Vibe request body', async (model, modelKey) => {
+        mocks.db.NAIImgModel = model
+        mocks.db.NAIImgConfig.legacy_uc = true
+        mocks.db.NAIImgConfig.reference_mode = 'vibe'
+        mocks.db.NAIImgConfig.reference_strength_multiple = [0.6]
+        mocks.db.NAIImgConfig.vibe_data = {
+            encodings: {
+                [modelKey]: {
+                    selected: {
+                        encoding: `ENCODED_${modelKey}`,
+                        params: { information_extracted: 1 },
+                    },
+                },
+            },
+        }
+        mocks.globalFetch.mockResolvedValue(fetchResult({}))
+
+        await generateAIImage('prompt', currentChar, 'negative', 'inlay')
+
+        expect(JSON.stringify(sentBody())).toBe(JSON.stringify(expectedLegacyBody(model, false, {
+            referenceImages: [`ENCODED_${modelKey}`],
+            referenceStrengths: [0.6],
+        })))
+    })
+
+    it.each([
+        'nai-diffusion-4-full',
+        'nai-diffusion-4-5-full',
+    ])('pins the complete serialized %s img2img request body', async (model) => {
+        mocks.db.NAIImgModel = model
+        mocks.db.NAIImgConfig.legacy_uc = true
+        mocks.db.NAII2I = true
+        mocks.db.NAIImgConfig.image = 'stored-i2i'
+        mocks.db.NAIImgConfig.base64image = 'SU1BR0U='
+        mocks.db.NAIImgConfig.strength = 0.65
+        mocks.db.NAIImgConfig.noise = 0.2
+        mocks.globalFetch.mockResolvedValue(fetchResult({}))
+
+        await generateAIImage('prompt', currentChar, 'negative', 'inlay')
+
+        expect(JSON.stringify(sentBody())).toBe(JSON.stringify(expectedLegacyBody(model, false, {
+            img2img: { image: 'SU1BR0U=', strength: 0.65, noise: 0.2 },
+        })))
+    })
+})
+
+describe('NAI V5 wire', () => {
+    function sentBody() {
+        const [, arg] = mocks.globalFetch.mock.calls[0] as [string, { body: unknown }]
+        return JSON.parse(JSON.stringify(arg.body)) as Record<string, any>
+    }
+
+    it.each([
+        'nai-diffusion-5-full',
+        'nai-diffusion-5-curated',
+    ])('emits only the V5 preset and alpha field families for %s', async (model) => {
+        mocks.db.NAIImgModel = model
+        mocks.db.NAIImgConfig.legacy_uc = true
+        mocks.db.NAIImgConfig.sm = true
+        mocks.db.NAIImgConfig.sm_dyn = true
+        mocks.db.NAIImgConfig.decrisp = true
+        mocks.db.NAIImgConfig.variety_plus = true
+        mocks.globalFetch.mockResolvedValue(fetchResult({}))
+
+        await generateAIImage('prompt', currentChar, 'negative', 'inlay')
+
+        const body = sentBody()
+        const parameters = body.parameters
+        expect(body).toMatchObject({ input: 'prompt', model, action: 'generate' })
+        expect(parameters).toMatchObject({
+            params_version: 4,
+            ucPresetId: 'none',
+            qualityPresetId: 'none',
+            tag_hint_qt: 0,
+            tag_hint_uc_preset: 0,
+            straight_alpha: true,
+            image_format: 'png',
+            inpaintImg2ImgStrength: 1,
+            add_original_image: true,
+            controlnet_strength: 1,
+            n_samples: 1,
+            normalize_reference_strength_multiple: true,
+            legacy_v3_extend: false,
+            legacy: false,
+            dynamic_thresholding: false,
+            autoSmea: false,
+            skip_cfg_above_sigma: null,
+        })
+        for (const key of ['ucPreset', 'qualityToggle', 'uncond_scale', 'legacy_uc', 'sm', 'sm_dyn']) {
+            expect(parameters).not.toHaveProperty(key)
+        }
+        // A flat prompt has no character slots: the key is omitted outright —
+        // an empty array is an untested wire shape (empty director_reference
+        // arrays already draw HTTP 400 from this API).
+        expect(parameters).not.toHaveProperty('characterPrompts')
+        expect(parameters.v4_negative_prompt).not.toHaveProperty('legacy_uc')
+        expect(parameters).not.toHaveProperty('v5_prompt')
+        expect(body).not.toHaveProperty('use_new_shared_trial')
+        expect(body.input).toBe(parameters.v4_prompt.caption.base_caption)
+        expect(parameters.negative_prompt)
+            .toBe(parameters.v4_negative_prompt.caption.base_caption)
+    })
+
+    it('derives all three V5 character representations from identical normalized centers', async () => {
+        const characterPositives = ['source#1  Alice\r\n', 'target#2\tBob']
+        const characterNegatives = ['Bob features', 'Alice features']
+        const characterCenters = [{ x: 0.123, y: 0.987 }, null]
+        const characterNames = ['Alice', '']
+        mocks.db.NAIImgModel = 'nai-diffusion-5-full'
+        mocks.globalFetch.mockResolvedValue(fetchResult({}))
+
+        await generateAIImageTyped(
+            'base positive',
+            currentChar,
+            'base negative',
+            'inlay',
+            'background',
+            {
+                preservePromptText: true,
+                illustrationPrompt: {
+                    schemaVersion: 1,
+                    layout: 'nai-v4-characters',
+                    basePositive: 'base positive',
+                    characterPositives,
+                    baseNegative: 'base negative',
+                    characterNegatives,
+                    characterCenters,
+                    characterNames,
+                },
+            },
+        )
+
+        const parameters = sentBody().parameters
+        expect(parameters.characterPrompts).toEqual([
+            {
+                prompt: characterPositives[0],
+                uc: characterNegatives[0],
+                center: characterCenters[0],
+                enabled: true,
+                name: 'Alice',
+            },
+            {
+                prompt: characterPositives[1],
+                uc: characterNegatives[1],
+                center: { x: 0.5, y: 0.5 },
+                enabled: true,
+            },
+        ])
+        expect(parameters.v4_prompt.caption.char_captions).toEqual([
+            { char_caption: characterPositives[0], centers: [characterCenters[0]] },
+            { char_caption: characterPositives[1], centers: [{ x: 0.5, y: 0.5 }] },
+        ])
+        expect(parameters.v4_negative_prompt.caption.char_captions).toEqual([
+            { char_caption: characterNegatives[0], centers: [characterCenters[0]] },
+            { char_caption: characterNegatives[1], centers: [{ x: 0.5, y: 0.5 }] },
+        ])
+        for (let index = 0; index < parameters.characterPrompts.length; index += 1) {
+            const center = parameters.characterPrompts[index].center
+            expect(center).toEqual(parameters.v4_prompt.caption.char_captions[index].centers[0])
+            expect(center).toEqual(parameters.v4_negative_prompt.caption.char_captions[index].centers[0])
+        }
+        expect(parameters.characterPrompts[0].name).toBe('Alice')
+        expect(parameters.characterPrompts[1]).not.toHaveProperty('name')
+    })
+
+    it('pins neutral centers when every V5 character is unplaced', async () => {
+        // Wire-shape pin only: whether V5 treats use_coords:false plus explicit
+        // neutral characterPrompts centers as intended still needs live testing.
+        for (const characterCenters of [undefined, [null, null]] as const) {
+            mocks.db.NAIImgModel = 'nai-diffusion-5-full'
+            mocks.globalFetch.mockResolvedValue(fetchResult({}))
+
+            await generateAIImageTyped(
+                'base positive',
+                currentChar,
+                'base negative',
+                'inlay',
+                'background',
+                {
+                    preservePromptText: true,
+                    illustrationPrompt: {
+                        schemaVersion: 1,
+                        layout: 'nai-v4-characters',
+                        basePositive: 'base positive',
+                        characterPositives: ['Alice', 'Bob'],
+                        baseNegative: 'base negative',
+                        characterNegatives: ['', ''],
+                        ...(characterCenters ? { characterCenters: [...characterCenters] } : {}),
+                    },
+                },
+            )
+
+            const parameters = sentBody().parameters
+            expect(parameters.use_coords).toBe(false)
+            expect(parameters.v4_prompt.use_coords).toBe(false)
+            expect(parameters.characterPrompts).toEqual([
+                { prompt: 'Alice', uc: '', center: { x: 0.5, y: 0.5 }, enabled: true },
+                { prompt: 'Bob', uc: '', center: { x: 0.5, y: 0.5 }, enabled: true },
+            ])
+            mocks.globalFetch.mockClear()
+        }
+    })
+
+    it('warns once and drops even an explicitly selected V4 vibe encoding on V5', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+        mocks.db.NAIImgModel = 'nai-diffusion-5-full'
+        mocks.db.NAIImgConfig.reference_mode = 'vibe'
+        mocks.db.NAIImgConfig.vibe_model_selection = 'v4full'
+        mocks.db.NAIImgConfig.reference_strength_multiple = [0.6]
+        mocks.db.NAIImgConfig.vibe_data = {
+            encodings: {
+                v4full: {
+                    selected: {
+                        encoding: 'MUST_NOT_REACH_V5',
+                        params: { information_extracted: 1 },
+                    },
+                },
+            },
+        }
+        mocks.globalFetch.mockResolvedValue(fetchResult({}))
+
+        try {
+            await generateAIImage('prompt', currentChar, 'negative', 'inlay')
+
+            const parameters = sentBody().parameters
+            expect(parameters).not.toHaveProperty('reference_image_multiple')
+            expect(parameters).not.toHaveProperty('reference_strength_multiple')
+            expect(parameters.normalize_reference_strength_multiple).toBe(true)
+            expect(warn).toHaveBeenCalledOnce()
+            expect(warn).toHaveBeenCalledWith(
+                'NovelAI Diffusion V5 does not support Vibe Transfer; the configured Vibe reference was ignored.',
+            )
+        } finally {
+            warn.mockRestore()
+        }
+    })
+
+    it('warns once and drops a stored character reference on V5', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+        mocks.db.NAIImgModel = 'nai-diffusion-5-full'
+        mocks.db.NAIImgConfig.reference_mode = 'character'
+        mocks.db.NAIImgConfig.character_image = 'stored-reference'
+        mocks.db.NAIImgConfig.character_base64image = 'QkFTRTY0'
+        mocks.globalFetch.mockResolvedValue(fetchResult({}))
+
+        try {
+            await generateAIImage('prompt', currentChar, 'negative', 'inlay')
+
+            const parameters = sentBody().parameters
+            expect(warn).toHaveBeenCalledOnce()
+            expect(warn).toHaveBeenCalledWith(
+                'NovelAI Diffusion V5 does not support Precise Reference; the configured character reference was ignored.',
+            )
+            for (const key of [
+                'director_reference_images',
+                'director_reference_descriptions',
+                'director_reference_information_extracted',
+                'director_reference_strength_values',
+            ]) {
+                expect(parameters).not.toHaveProperty(key)
+            }
+        } finally {
+            warn.mockRestore()
+        }
+    })
+})
+
 describe('NAI director reference fields', () => {
     const DIRECTOR_REFERENCE_KEYS = [
         'director_reference_images',

@@ -5,6 +5,7 @@ import {
 } from '../errors'
 import {
     NOVELAI_NATIVE_MEASUREMENT_REVISION,
+    NOVELAI_NATIVE_V5_MEASUREMENT_REVISION,
     NOVELAI_NATIVE_QUEUE_POLICY_REVISION,
     resolveNovelAiNativeTarget,
     resolvePromptTargetV2,
@@ -13,6 +14,7 @@ import {
     validateTagProfileRef,
     type PromptTargetDatabase,
 } from '../promptContextV2'
+import { DEFAULT_NAI_MODEL, canonicalizeNaiSettings } from '../settingsFingerprint'
 
 // promptContextV2 pulls imagePromptMeasurement, which imports the DB module at
 // load; the pure target logic never reads it, so a bare stub is enough.
@@ -64,7 +66,8 @@ describe('novelai-native target resolution (request §7.1)', () => {
                 priorityPolicy: 'interactive-first',
             },
         })
-        expect(target.targetFingerprint).toMatch(/^[0-9a-f]{64}$/)
+        expect(target.targetFingerprint)
+            .toBe('95a323db347863c658c6f51c2ff6cb6e3c55897578e4eae1beb5d80b8899eda0')
     })
 
     test('resolvePromptTargetV2 dispatches the novelai provider to novelai-native', async () => {
@@ -73,18 +76,16 @@ describe('novelai-native target resolution (request §7.1)', () => {
     })
 })
 
-describe('novelai-native gates on an actually-measurable V4 model (request §6/§8)', () => {
-    // The adapter pins model_exact/T5 measurement unconditionally, but exact T5
-    // measurement only exists for NAI V4 models. A non-V4 NovelAI model must fail
-    // closed at resolve/prepare rather than persist a descriptor claiming exact
-    // measurability the model cannot honor (which would only surface post-LLM at
-    // the measurement receipt).
+describe('novelai-native gates on a recognized measurable model (request §6/§8)', () => {
+    // The adapter selects exact V4 or approximate V5 T5 measurement. Every other
+    // NovelAI model fails before durable capture instead of persisting a target
+    // with no measurement profile (which would surface only after the Plugin LLM).
     test.each([
         'nai-diffusion-3',
         'nai-diffusion-2',
         'nai-diffusion-furry-3',
         'safe-diffusion',
-    ])('a non-V4 NovelAI model %s yields a typed target-unavailable failure', async (model) => {
+    ])('an unsupported NovelAI model %s yields a typed target-unavailable failure', async (model) => {
         await expect(resolvePromptTargetV2(db({ NAIImgModel: model }))).rejects.toMatchObject({
             code: 'prompt_target_unavailable',
             transportId: 'novelai-native',
@@ -105,10 +106,45 @@ describe('novelai-native gates on an actually-measurable V4 model (request §6/�
         }
     })
 
+    test.each([
+        'nai-diffusion-5-full',
+        'nai-diffusion-5-full-inpainting',
+        'nai-diffusion-5-curated',
+    ])('V5 model %s resolves with an explicitly approximate measurement descriptor', async (model) => {
+        const target = await resolvePromptTargetV2(db({ NAIImgModel: model }))
+        expect(NOVELAI_NATIVE_V5_MEASUREMENT_REVISION)
+            .toBe('novelai-native-t5-approx-v5/2')
+        expect(target).toMatchObject({
+            modelId: model,
+            measurement: {
+                mode: 'model_approximate',
+                revision: NOVELAI_NATIVE_V5_MEASUREMENT_REVISION,
+                tokenizerId: 't5-spiece-v1',
+                documentedTransportLimit: null,
+                dispatchPolicy: 'require-model-within-limit',
+            },
+        })
+    })
+
+    test('an unknown V5 suffix fails closed before prompt preparation', async () => {
+        await expect(resolvePromptTargetV2(db({ NAIImgModel: 'nai-diffusion-5-experimental' })))
+            .rejects.toMatchObject({
+                code: 'prompt_target_unavailable',
+                transportId: 'novelai-native',
+            })
+    })
+
     test('an unset model defaults to the V4.5 checkpoint and stays measurable', async () => {
-        const target = await resolvePromptTargetV2(db({ NAIImgModel: undefined }))
+        const database = {
+            ...db({ NAIImgModel: undefined }),
+            NAII2I: false,
+            NAIImgConfig: {},
+        } as any
+        const target = await resolvePromptTargetV2(database)
         expect(target.transportId).toBe('novelai-native')
-        expect(target.modelId).toBe('nai-diffusion-4-5-full')
+        expect(DEFAULT_NAI_MODEL).toBe('nai-diffusion-4-5-full')
+        expect(target.modelId).toBe(DEFAULT_NAI_MODEL)
+        expect(canonicalizeNaiSettings(database).model).toBe(DEFAULT_NAI_MODEL)
     })
 })
 
@@ -156,7 +192,7 @@ describe('post-capture drift detection (request §10-6)', () => {
             db({ sdProvider: 'webui' }),
             captured,
         )).toBe(false)
-        // A post-capture switch to a non-V4 NovelAI model likewise resolves no
+        // A post-capture switch to an unsupported NovelAI model likewise resolves no
         // valid novelai-native target: a definite mismatch, never a silent pass.
         expect(await targetFingerprintMatchesCurrentDb(
             db({ NAIImgModel: 'nai-diffusion-3' }),

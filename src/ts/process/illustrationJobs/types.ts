@@ -56,6 +56,8 @@ export type IllustrationPromptV1 = {
     characterPositives: string[]
     baseNegative: string
     characterNegatives: string[]
+    /** Optional V5 slot names, parallel to `characterPositives`. */
+    characterNames?: string[]
     /**
      * Optional per-character placement, parallel to `characterPositives`.
      * `null` for a character the caller does not want to place.
@@ -93,7 +95,10 @@ export type IllustrationImagePromptOverLimitPayloadV1 = Pick<
     | 'maxPositiveTokens'
     | 'maxNegativeTokens'
     | 'model'
->
+> & {
+    combinedTokens?: number
+    maxCombinedTokens?: number
+}
 
 export type IllustrationJobState =
     | 'prepared'

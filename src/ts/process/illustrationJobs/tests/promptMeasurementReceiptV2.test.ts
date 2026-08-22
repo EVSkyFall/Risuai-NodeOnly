@@ -62,6 +62,21 @@ describe('dispatch eligibility table (request §6/§10-11/§10-12)', () => {
         })).toEqual({ dispatchEligible: false, eligibilityBasis: 'over-limit' })
     })
 
+    test('model_approximate is labeled honestly while enforcing the conservative limit', () => {
+        expect(computeDispatchEligibility({
+            mode: 'model_approximate',
+            modelVerdict: 'within_limit',
+            transportVerdict: 'unknown',
+            dispatchPolicy: 'require-model-within-limit',
+        })).toEqual({ dispatchEligible: true, eligibilityBasis: 'model-approximate' })
+        expect(computeDispatchEligibility({
+            mode: 'model_approximate',
+            modelVerdict: 'over_limit',
+            transportVerdict: 'unknown',
+            dispatchPolicy: 'require-model-within-limit',
+        })).toEqual({ dispatchEligible: false, eligibilityBasis: 'over-limit' })
+    })
+
     test('provider_reported needs an authoritative within-limit AND the allow policy', () => {
         expect(computeDispatchEligibility({
             mode: 'provider_reported',
@@ -203,6 +218,92 @@ describe('novelai-native model_exact receipt (request §6)', () => {
                 settingsFingerprint: await computeNaiSettingsFingerprint(db),
                 envelope: flatEnvelope({ basePositive: 'x' }),
             })).rejects.toMatchObject({ code: 'prompt_measurement_mode_unsupported' })
+        } finally {
+            restore()
+        }
+    })
+})
+
+describe('novelai-native model_approximate V5 receipt', () => {
+    test('produces an eligible receipt with the V5 approximation mode and limit', async () => {
+        const db = naiDb('nai-diffusion-5-full')
+        const restore = installImagePromptMeasurementTestService(() => db)
+        try {
+            const target = await resolveNovelAiNativeTarget(db)
+            const envelope = flatEnvelope({ basePositive: 'x' })
+            const envelopeHash = await computeEnvelopeHash(envelope)
+            const receipt = await measurePromptEnvelopeReceiptV2({
+                protocolVersion: 2,
+                target,
+                settingsFingerprint: await computeNaiSettingsFingerprint(db),
+                envelope,
+            })
+
+            expect(receipt).toMatchObject({
+                targetFingerprint: target.targetFingerprint,
+                envelopeHash,
+                measurementMode: 'model_approximate',
+                measurementRevision: target.measurement.revision,
+                modelVerdict: 'within_limit',
+                dispatchEligible: true,
+                eligibilityBasis: 'model-approximate',
+            })
+            expect(receipt.dimensions).toEqual([
+                { scope: 'positive', unit: 'token', measured: 1, limit: 1471, verdict: 'within_limit' },
+                { scope: 'negative', unit: 'token', measured: 0, limit: 1471, verdict: 'within_limit' },
+                { scope: 'combined', unit: 'token', measured: 1, limit: 1471, verdict: 'within_limit' },
+            ])
+            expect(() => assertReceiptDispatchEligibleForTarget(receipt, target, envelopeHash))
+                .not.toThrow()
+
+            const oldRevisionReceipt = {
+                ...receipt,
+                measurementRevision: 'novelai-native-t5-approx-v5/1',
+            }
+            expect(() => assertReceiptDispatchEligibleForTarget(oldRevisionReceipt, target, envelopeHash))
+                .toThrowError(expect.objectContaining({ code: 'prompt_receipt_binding_mismatch' }))
+        } finally {
+            restore()
+        }
+    })
+
+    test('keeps V5 approximation over-limit and mode-drift receipts ineligible', async () => {
+        const db = naiDb('nai-diffusion-5-full')
+        const restore = installImagePromptMeasurementTestService(
+            () => db,
+            (text) => text === 'positive' || text === 'negative' ? 800 : 0,
+        )
+        try {
+            const target = await resolveNovelAiNativeTarget(db)
+            const envelope = flatEnvelope({ basePositive: 'positive', baseNegative: 'negative' })
+            const envelopeHash = await computeEnvelopeHash(envelope)
+            const receipt = await measurePromptEnvelopeReceiptV2({
+                protocolVersion: 2,
+                target,
+                settingsFingerprint: await computeNaiSettingsFingerprint(db),
+                envelope,
+            })
+
+            expect(receipt).toMatchObject({
+                measurementMode: 'model_approximate',
+                modelVerdict: 'over_limit',
+                dispatchEligible: false,
+                eligibilityBasis: 'over-limit',
+            })
+            expect(receipt.dimensions).toEqual([
+                { scope: 'positive', unit: 'token', measured: 800, limit: 1471, verdict: 'within_limit' },
+                { scope: 'negative', unit: 'token', measured: 800, limit: 1471, verdict: 'within_limit' },
+                { scope: 'combined', unit: 'token', measured: 1600, limit: 1471, verdict: 'over_limit' },
+            ])
+            expect(() => assertReceiptDispatchEligibleForTarget(receipt, target, envelopeHash))
+                .toThrowError(expect.objectContaining({ code: 'prompt_dispatch_ineligible' }))
+
+            const modeDrift: IllustrationPromptTargetV2 = {
+                ...target,
+                measurement: { ...target.measurement, mode: 'model_exact' },
+            }
+            expect(() => assertReceiptDispatchEligibleForTarget(receipt, modeDrift, envelopeHash))
+                .toThrowError(expect.objectContaining({ code: 'prompt_receipt_binding_mismatch' }))
         } finally {
             restore()
         }

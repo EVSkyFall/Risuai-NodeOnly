@@ -8,6 +8,7 @@ import {
     assertImagePromptWithinLimits,
     createImagePromptMeasurementService,
     createImagePromptTokenizerLoader,
+    evaluateImagePromptLimits,
     measureAndEnforceImagePromptForDispatch,
     setImagePromptMeasurementServiceForTests,
 } from '../imagePromptMeasurement'
@@ -58,6 +59,45 @@ describe('IllustrationPromptV1 validation', () => {
         expect(parseIllustrationPromptV1(prompt)).toEqual(prompt)
     })
 
+    test('preserves optional character names byte-for-byte, including empty slots', () => {
+        const prompt = {
+            schemaVersion: 1,
+            layout: 'nai-v4-characters',
+            basePositive: 'two characters',
+            characterPositives: ['Alice', 'Bob'],
+            baseNegative: '',
+            characterNegatives: ['', ''],
+            characterNames: [' Alice\r\n', ''],
+        } as const
+
+        expect(parseIllustrationPromptV1(prompt)).toEqual(prompt)
+    })
+
+    test('rejects character names outside the structured parallel-array contract', () => {
+        expect(() => parseIllustrationPromptV1({
+            ...flatPrompt,
+            characterNames: [],
+        })).toThrowError(expect.objectContaining({ code: 'image_prompt_invalid' }))
+
+        const structured = {
+            schemaVersion: 1,
+            layout: 'nai-v4-characters',
+            basePositive: 'two characters',
+            characterPositives: ['Alice', 'Bob'],
+            baseNegative: '',
+            characterNegatives: ['', ''],
+        } as const
+        for (const characterNames of [
+            ['Alice'],
+            ['Alice', 42],
+            new Array(2),
+            ['a'.repeat(MAX_ILLUSTRATION_PROMPT_BYTES + 1), ''],
+        ]) {
+            expect(() => parseIllustrationPromptV1({ ...structured, characterNames }))
+                .toThrowError(expect.objectContaining({ code: 'image_prompt_invalid' }))
+        }
+    })
+
     test('rejects malformed layouts, cardinality, sparse/accessor arrays, and aggregate bytes', () => {
         expect(() => parseIllustrationPromptV1({ ...flatPrompt, extra: true }))
             .toThrowError(expect.objectContaining({ code: 'image_prompt_invalid' }))
@@ -100,7 +140,7 @@ describe('IllustrationPromptV1 validation', () => {
     })
 })
 
-describe('exact NAI V4 image prompt measurement', () => {
+describe('NAI image prompt measurement', () => {
     // Request §4 rows 1-2: measurement reports over-limit; the gate carries exact payload.
     test('returns over-limit counts without rejecting and gates the final prompt separately', async () => {
         const db = database()
@@ -165,6 +205,92 @@ describe('exact NAI V4 image prompt measurement', () => {
             'base-', 'negative one', 'negative two',
         ])
         expect(measurement).toMatchObject({ positiveTokens: 14, negativeTokens: 27 })
+    })
+
+    test.each([
+        ['nai-diffusion-5-full', 1471],
+        ['nai-diffusion-5-full-inpainting', 1471],
+        ['nai-diffusion-5-curated', 703],
+    ] as const)('uses the observed pooled budget without a haircut for %s', async (model, limit) => {
+        const db = database(model)
+        const service = createImagePromptMeasurementService({
+            getDatabase: () => db,
+            tokenizerLoader: fakeLoader((text) => text.length),
+        })
+
+        const measurement = await service.measure({
+            protocolVersion: 1,
+            settingsFingerprint: await computeNaiSettingsFingerprint(db),
+            prompt: flatPrompt,
+        })
+
+        expect(measurement).toMatchObject({
+            model,
+            tokenizer: 't5-spiece-v1',
+            maxPositiveTokens: limit,
+            maxNegativeTokens: limit,
+        })
+    })
+
+    test('evaluates V5 as pooled while preserving V4 per-side limits', () => {
+        const v5 = {
+            model: 'nai-diffusion-5-full',
+            tokenizer: 't5-spiece-v1' as const,
+            positiveTokens: 800,
+            negativeTokens: 800,
+            maxPositiveTokens: 1471,
+            maxNegativeTokens: 1471,
+        }
+        expect(evaluateImagePromptLimits(v5)).toEqual({
+            positiveWithinLimits: true,
+            negativeWithinLimits: true,
+            withinLimits: false,
+            pooled: true,
+            combinedTokens: 1600,
+            combinedLimit: 1471,
+        })
+        expect(() => assertImagePromptWithinLimits(v5)).toThrowError(expect.objectContaining({
+            code: 'image_prompt_over_limit',
+            payload: expect.objectContaining({
+                combinedTokens: 1600,
+                maxCombinedTokens: 1471,
+            }),
+        }))
+
+        expect(evaluateImagePromptLimits({
+            ...v5,
+            model: 'nai-diffusion-4-5-full',
+            positiveTokens: 513,
+            negativeTokens: 0,
+            maxPositiveTokens: 512,
+            maxNegativeTokens: 512,
+        })).toEqual({
+            positiveWithinLimits: false,
+            negativeWithinLimits: true,
+            withinLimits: false,
+            pooled: false,
+            combinedTokens: 513,
+            combinedLimit: null,
+        })
+    })
+
+    test('rejects an unknown V5 suffix before loading the tokenizer', async () => {
+        const db = database('nai-diffusion-5-experimental')
+        const loadModel = vi.fn(async () => new ArrayBuffer(0))
+        const service = createImagePromptMeasurementService({
+            getDatabase: () => db,
+            tokenizerLoader: createImagePromptTokenizerLoader({
+                loadModel,
+                createTokenizer: async () => ({ encode: () => ({ length: 1 }) }),
+            }),
+        })
+
+        await expect(service.measure({
+            protocolVersion: 1,
+            settingsFingerprint: await computeNaiSettingsFingerprint(db),
+            prompt: flatPrompt,
+        })).rejects.toMatchObject({ code: 'image_prompt_measurement_unsupported' })
+        expect(loadModel).not.toHaveBeenCalled()
     })
 
     // Request §4 rows 6-7: mismatch/unsupported fail before tokenization; transient load retries.
@@ -240,6 +366,52 @@ describe('exact NAI V4 image prompt measurement', () => {
                 input,
                 { requireNovelAiProvider: true },
             )).rejects.toMatchObject({ code: 'image_prompt_measurement_unsupported' })
+        } finally {
+            restore()
+        }
+    })
+
+    test.each([
+        'nai-diffusion-3',
+        'nai-diffusion-5-experimental',
+    ])('keeps flat unrecognized NovelAI model %s dispatch unmeasured', async (model) => {
+        const db = database(model)
+        const service = createImagePromptMeasurementService({
+            getDatabase: () => db,
+            tokenizerLoader: fakeLoader(() => 1),
+        })
+        const restore = setImagePromptMeasurementServiceForTests(service)
+        try {
+            await expect(measureAndEnforceImagePromptForDispatch({
+                protocolVersion: 1,
+                settingsFingerprint: await computeNaiSettingsFingerprint(db),
+                prompt: flatPrompt,
+            })).resolves.toBeNull()
+        } finally {
+            restore()
+        }
+    })
+
+    test('keeps an unrecognized V5 structured prompt fail-closed', async () => {
+        const db = database('nai-diffusion-5-experimental')
+        const service = createImagePromptMeasurementService({
+            getDatabase: () => db,
+            tokenizerLoader: fakeLoader(() => 1),
+        })
+        const restore = setImagePromptMeasurementServiceForTests(service)
+        try {
+            await expect(measureAndEnforceImagePromptForDispatch({
+                protocolVersion: 1,
+                settingsFingerprint: await computeNaiSettingsFingerprint(db),
+                prompt: {
+                    schemaVersion: 1,
+                    layout: 'nai-v4-characters',
+                    basePositive: 'base',
+                    characterPositives: ['Alice'],
+                    baseNegative: '',
+                    characterNegatives: [''],
+                },
+            })).rejects.toMatchObject({ code: 'image_prompt_measurement_unsupported' })
         } finally {
             restore()
         }

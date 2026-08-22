@@ -173,6 +173,105 @@ describe('NAI settings fingerprint', () => {
             .not.toBe(await computeNaiSettingsFingerprint(firstOrder))
     })
 
+    test.each([
+        ['nai-diffusion-4-full', 'v4full'],
+        ['nai-diffusion-4-curated', 'v4curated'],
+        ['nai-diffusion-4-5-full', 'v4-5full'],
+        ['nai-diffusion-4-5-curated', 'v4-5curated'],
+    ])('pins the fallback vibe model key for %s', (model, modelKey) => {
+        const database = makeDatabase()
+        database.NAIImgModel = model
+        database.NAIImgConfig.vibe_model_selection = ''
+        database.NAIImgConfig.vibe_data.encodings = {
+            [modelKey]: {
+                selected: {
+                    encoding: `encoding-${modelKey}`,
+                    params: { information_extracted: 1 },
+                },
+            },
+        }
+
+        expect(canonicalizeNaiSettings(database).reference).toMatchObject({
+            effectiveVibeModel: modelKey,
+            selectedVibeEncoding: `encoding-${modelKey}`,
+        })
+    })
+
+    test.each([
+        'nai-diffusion-5-full',
+        'nai-diffusion-5-curated',
+    ])('uses the V5 wire preset identity without inventing a vibe fallback for %s', (model) => {
+        const database = makeDatabase()
+        database.NAIImgModel = model
+        database.NAIImgConfig.vibe_model_selection = ''
+
+        const canonical = canonicalizeNaiSettings(database)
+        expect(canonical.negativePreset).toEqual({
+            ucPresetId: 'none',
+            qualityPresetId: 'none',
+            tagHintQt: 0,
+            tagHintUcPreset: 0,
+        })
+        expect(canonical.providerOptions).toEqual({ noiseSchedule: 'karras' })
+        expect(canonical).not.toHaveProperty('reference')
+    })
+
+    test('does not fingerprint legacy UC for V5 because the wire omits it', async () => {
+        const baseline = makeDatabase()
+        baseline.NAIImgModel = 'nai-diffusion-5-full'
+        baseline.NAIImgConfig.legacy_uc = false
+        const changed = cloneDatabase(baseline)
+        changed.NAIImgConfig.legacy_uc = true
+
+        expect(await computeNaiSettingsFingerprint(changed))
+            .toBe(await computeNaiSettingsFingerprint(baseline))
+    })
+
+    test('excludes every V5 no-op reference and legacy provider axis from the fingerprint', async () => {
+        const baseline = makeDatabase()
+        baseline.NAIImgModel = 'nai-diffusion-5-full'
+        const changed = cloneDatabase(baseline)
+        changed.NAIImgConfig.variety_plus = true
+        changed.NAIImgConfig.sm = false
+        changed.NAIImgConfig.sm_dyn = true
+        changed.NAIImgConfig.decrisp = true
+        changed.NAIImgConfig.reference_mode = 'character'
+        changed.NAIImgConfig.vibe_model_selection = 'v4full'
+        changed.NAIImgConfig.InfoExtracted = 2
+        changed.NAIImgConfig.reference_strength_multiple = [0.9]
+        changed.NAIImgConfig.vibe_data.encodings['v4-5full'].first.encoding = 'ignored-v5-encoding'
+        changed.NAIImgConfig.character_image = 'ignored-v5-character-id'
+        changed.NAIImgConfig.character_base64image = 'ignored-v5-character-bytes'
+        changed.NAIImgConfig.style_aware = true
+
+        expect(await computeNaiSettingsFingerprint(changed))
+            .toBe(await computeNaiSettingsFingerprint(baseline))
+    })
+
+    test('keeps V5 noise schedule as a fingerprinted wire axis', async () => {
+        const baseline = makeDatabase()
+        baseline.NAIImgModel = 'nai-diffusion-5-full'
+        const changed = cloneDatabase(baseline)
+        changed.NAIImgConfig.noise_schedule = 'exponential'
+
+        expect(await computeNaiSettingsFingerprint(changed))
+            .not.toBe(await computeNaiSettingsFingerprint(baseline))
+    })
+
+    test('does not inspect Vibe encodings while canonicalizing V5 settings', () => {
+        const database = makeDatabase()
+        database.NAIImgModel = 'nai-diffusion-5-full'
+        database.NAIImgConfig.vibe_model_selection = 'v4full'
+        Object.defineProperty(database.NAIImgConfig.vibe_data, 'encodings', {
+            enumerable: true,
+            get() {
+                throw new Error('V5 canonicalization read an unsupported Vibe axis')
+            },
+        })
+
+        expect(() => canonicalizeNaiSettings(database)).not.toThrow()
+    })
+
     test('pins request-effective defaults and the current-character source sentinel', async () => {
         const zeroValues = makeDatabase()
         zeroValues.NAIImgConfig.strength = 0
@@ -219,5 +318,10 @@ describe('NAI settings fingerprint', () => {
 
     test('returns a lowercase SHA-256 hex fingerprint', async () => {
         expect(await computeNaiSettingsFingerprint(makeDatabase())).toMatch(/^[0-9a-f]{64}$/)
+    })
+
+    test('pins the pre-V5 canonical settings fingerprint', async () => {
+        expect(await computeNaiSettingsFingerprint(makeDatabase()))
+            .toBe('6b2958d81abcd6a85b76f41ab375d6dcc6bccd337422699deb67860959c42853')
     })
 })

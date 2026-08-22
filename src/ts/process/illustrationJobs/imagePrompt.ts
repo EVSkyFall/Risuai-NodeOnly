@@ -26,6 +26,7 @@ const promptKeys = new Set([
 // placement existed must keep producing a byte-identical request.
 const optionalPromptKeys = new Set([
     'characterCenters',
+    'characterNames',
 ])
 
 function invalidPrompt(message: string): never {
@@ -101,6 +102,20 @@ function parseCharacterCenters(
     })
 }
 
+function parseCharacterNames(value: unknown, prompt: IllustrationPromptV1): string[] {
+    assertStringArray(value, 'prompt.characterNames')
+    if (prompt.layout !== 'nai-v4-characters') {
+        invalidPrompt('prompt.characterNames requires the nai-v4-characters layout')
+    }
+    if (value.length !== prompt.characterPositives.length) {
+        invalidPrompt('prompt.characterNames must have one entry per character caption')
+    }
+    if (utf8PartBytes(value) > MAX_ILLUSTRATION_PROMPT_BYTES) {
+        invalidPrompt('character names must total at most 16 KiB UTF-8')
+    }
+    return [...value]
+}
+
 export function parseIllustrationPromptV1(value: unknown): IllustrationPromptV1 {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
         invalidPrompt('prompt must be an object')
@@ -149,6 +164,9 @@ export function parseIllustrationPromptV1(value: unknown): IllustrationPromptV1 
     }
     if (Object.hasOwn(input, 'characterCenters')) {
         prompt.characterCenters = parseCharacterCenters(input.characterCenters, prompt)
+    }
+    if (Object.hasOwn(input, 'characterNames')) {
+        prompt.characterNames = parseCharacterNames(input.characterNames, prompt)
     }
     if (utf8PartBytes([prompt.basePositive, ...prompt.characterPositives])
         > MAX_ILLUSTRATION_PROMPT_BYTES) {

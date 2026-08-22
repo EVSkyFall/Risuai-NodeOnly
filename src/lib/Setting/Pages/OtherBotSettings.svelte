@@ -78,6 +78,11 @@
     }
     // End HypaV3
 
+    // Mirrors isNaiV5ImageModel() in stableDiff's wire builder: the core gates on
+    // the family prefix, so the settings UI must too or a future V5 variant would
+    // offer controls the wire silently drops.
+    const isNaiV5Model = $derived(DBState.db.NAIImgModel?.startsWith('nai-diffusion-5') ?? false)
+
     // wavespeed
     interface WavespeedModel {
         model_id: string;
@@ -291,6 +296,8 @@
 
             <span class="text-textcolor">Model <Help key="naiModel"/></span>
             <SelectInput className="mt-2 mb-4" bind:value={DBState.db.NAIImgModel} >
+                <OptionInput value="nai-diffusion-5-full" >nai-diffusion-5-full</OptionInput>
+                <OptionInput value="nai-diffusion-5-curated" >nai-diffusion-5-curated</OptionInput>
                 <OptionInput value="nai-diffusion-4-5-full" >nai-diffusion-4-5-full</OptionInput>
                 <OptionInput value="nai-diffusion-4-5-curated" >nai-diffusion-4-5-curated</OptionInput>
                 <OptionInput value="nai-diffusion-4-full" >nai-diffusion-4-full</OptionInput>
@@ -310,7 +317,8 @@
             {#if DBState.db.NAIImgModel === 'nai-diffusion-4-full'
             || DBState.db.NAIImgModel === 'nai-diffusion-4-curated-preview'
             || DBState.db.NAIImgModel === 'nai-diffusion-4-5-full'
-            || DBState.db.NAIImgModel === 'nai-diffusion-4-5-curated'}
+            || DBState.db.NAIImgModel === 'nai-diffusion-4-5-curated'
+            || isNaiV5Model}
                 <SelectInput className="mt-2 mb-4" bind:value={DBState.db.NAIImgConfig.sampler}>
                     <OptionInput value="k_euler_ancestral" >Euler Ancestral</OptionInput>
                     <OptionInput value="k_dpmpp_2s_ancestral" >DPM++ 2S Ancestral</OptionInput>
@@ -346,16 +354,18 @@
             <span class="text-textcolor">CFG rescale <Help key="naiCFGRescale"/></span>
             <NumberInput className="mt-2" marginBottom min={0} max={1} bind:value={DBState.db.NAIImgConfig.cfg_rescale}/>
 
-            <span class="text-textcolor">Image Reference <Help key="naiImageReference"/></span>
-            <SelectInput className="mt-2 mb-4" bind:value={DBState.db.NAIImgConfig.reference_mode}>
-                <OptionInput value="" >None</OptionInput>
-                <OptionInput value="vibe" >Vibe Trasfer</OptionInput>
-                {#if DBState.db.NAIImgModel === 'nai-diffusion-4-5-full' || DBState.db.NAIImgModel === 'nai-diffusion-4-5-curated'}
-                    <OptionInput value="character" >Character Reference</OptionInput>
-                {/if}
-            </SelectInput>
+            {#if !isNaiV5Model}
+                <span class="text-textcolor">Image Reference <Help key="naiImageReference"/></span>
+                <SelectInput className="mt-2 mb-4" bind:value={DBState.db.NAIImgConfig.reference_mode}>
+                    <OptionInput value="" >None</OptionInput>
+                    <OptionInput value="vibe" >Vibe Trasfer</OptionInput>
+                    {#if DBState.db.NAIImgModel === 'nai-diffusion-4-5-full' || DBState.db.NAIImgModel === 'nai-diffusion-4-5-curated'}
+                        <OptionInput value="character" >Character Reference</OptionInput>
+                    {/if}
+                </SelectInput>
+            {/if}
 
-            {#if DBState.db.NAIImgConfig.reference_mode === 'vibe'}
+            {#if DBState.db.NAIImgConfig.reference_mode === 'vibe' && !isNaiV5Model}
                 <div class="relative">
                 <button class="mb-4" onclick={async () => {
                     const file = await selectSingleFile(['naiv4vibe'])

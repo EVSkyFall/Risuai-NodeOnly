@@ -1379,6 +1379,7 @@ type PluginInlayMediaReadResult =
     | { status: 'definite_failure'; error: string; code: string };
 
 interface PluginImagePromptCharacter {
+    name?: string;
     positive: string;
     negative?: string;
     center?: { x: number; y: number };

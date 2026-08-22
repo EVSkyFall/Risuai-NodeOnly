@@ -8,6 +8,7 @@ import type { OpenAIChat } from "./index.svelte"
 import { processZipWithMetadata } from "./processzip"
 import random from "lodash/random"
 import type { IllustrationPromptV1 } from "./illustrationJobs/types"
+import { isNaiV5ImageModel } from "./illustrationJobs/imagePromptMeasurement"
 
 export type ImageGenerationResult =
     | { ok: true; bytesOrDataUrl: string; providerStatus: number }
@@ -820,6 +821,7 @@ async function generateAIImageInternal(
         }
 
         let reqlist:any = {}
+        const isNaiV5Model = isNaiV5ImageModel(db.NAIImgModel)
 
         // Character captions can be placed regionally. Placement is opt-in and
         // driven entirely by the caller: `use_coords` turns on only when the
@@ -842,12 +844,25 @@ async function generateAIImageInternal(
             char_caption,
             centers: [naiCenters[index] ?? NEUTRAL_CENTER],
         })
-        const characterPositives = options.illustrationPrompt?.layout === 'nai-v4-characters'
-            ? options.illustrationPrompt.characterPositives.map(toCaption)
+        const v5Characters = isNaiV5Model
+            && options.illustrationPrompt?.layout === 'nai-v4-characters'
+            ? options.illustrationPrompt.characterPositives.map((prompt, index) => ({
+                prompt,
+                uc: options.illustrationPrompt.characterNegatives[index],
+                center: naiCenters[index] ?? NEUTRAL_CENTER,
+                name: options.illustrationPrompt.characterNames?.[index],
+            }))
             : []
-        const characterNegatives = options.illustrationPrompt?.layout === 'nai-v4-characters'
-            ? options.illustrationPrompt.characterNegatives.map(toCaption)
-            : []
+        const characterPositives = isNaiV5Model
+            ? v5Characters.map(({ prompt, center }) => ({ char_caption: prompt, centers: [center] }))
+            : options.illustrationPrompt?.layout === 'nai-v4-characters'
+                ? options.illustrationPrompt.characterPositives.map(toCaption)
+                : []
+        const characterNegatives = isNaiV5Model
+            ? v5Characters.map(({ uc, center }) => ({ char_caption: uc, centers: [center] }))
+            : options.illustrationPrompt?.layout === 'nai-v4-characters'
+                ? options.illustrationPrompt.characterNegatives.map(toCaption)
+                : []
         const naiSeed = options.seed ?? random(0, 2**32-1)
         const naiExtraNoiseSeed = options.seed ?? random(0, 2**32-1)
 
@@ -858,7 +873,7 @@ async function generateAIImageInternal(
                 "input": genPrompt,
                 "model": db.NAIImgModel,
                 "parameters": {
-                    "params_version": 3,
+                    "params_version": isNaiV5Model ? 4 : 3,
                     "add_original_image": true,
                     "cfg_rescale": db.NAIImgConfig.cfg_rescale,
                     "controlnet_strength": 1,
@@ -874,15 +889,19 @@ async function generateAIImageInternal(
                     "sm_dyn": db.NAIImgModel.includes('nai-diffusion-3') || db.NAIImgModel.includes('nai-diffusion-furry-3') ? db.NAIImgConfig.sm_dyn : undefined,
                     "noise_schedule": db.NAIImgConfig.noise_schedule,
                     "normalize_reference_strength_multiple":true,
-                    "ucPreset": 3,
-                    "uncond_scale": 1,
-                    "qualityToggle": false,
+                    "ucPreset": isNaiV5Model ? undefined : 3,
+                    "uncond_scale": isNaiV5Model ? undefined : 1,
+                    "qualityToggle": isNaiV5Model ? undefined : false,
+                    "ucPresetId": isNaiV5Model ? 'none' : undefined,
+                    "qualityPresetId": isNaiV5Model ? 'none' : undefined,
+                    "tag_hint_qt": isNaiV5Model ? 0 : undefined,
+                    "tag_hint_uc_preset": isNaiV5Model ? 0 : undefined,
                     "legacy_v3_extend": false,
                     "legacy": false,
                     //add v4
                     "autoSmea": false,
                     "use_coords": useCoords,
-                    "legacy_uc": db.NAIImgConfig.legacy_uc,
+                    "legacy_uc": isNaiV5Model ? undefined : db.NAIImgConfig.legacy_uc,
                     "v4_prompt":{
                         caption:{
                             base_caption:genPrompt,
@@ -898,10 +917,28 @@ async function generateAIImageInternal(
                             base_caption:neg,
                             char_captions: characterNegatives
                         },
-                        legacy_uc: db.NAIImgConfig.legacy_uc,
+                        legacy_uc: isNaiV5Model ? undefined : db.NAIImgConfig.legacy_uc,
                     },
-                    "reference_image_multiple" : [],
-                    "reference_strength_multiple" : [],
+                    // Names come only from the optional parallel prompt channel;
+                    // absent and empty slots omit the wire key rather than
+                    // inventing a provider-visible identity.
+                    // Flat prompts omit the key entirely: an empty array is an
+                    // untested wire shape, and empty director_reference arrays
+                    // are already known to draw HTTP 400 from this API.
+                    "characterPrompts": isNaiV5Model && v5Characters.length > 0
+                        ? v5Characters.map(({ prompt, uc, center, name }) => ({
+                            prompt,
+                            uc,
+                            center,
+                            enabled: true,
+                            ...(name ? { name } : {}),
+                        }))
+                        : undefined,
+                    "straight_alpha": isNaiV5Model ? true : undefined,
+                    "image_format": isNaiV5Model ? 'png' : undefined,
+                    "inpaintImg2ImgStrength": isNaiV5Model ? 1 : undefined,
+                    "reference_image_multiple" : isNaiV5Model ? undefined : [],
+                    "reference_strength_multiple" : isNaiV5Model ? undefined : [],
                     //add reference image
                     "image": undefined, 
                     "strength": undefined,
@@ -935,6 +972,8 @@ async function generateAIImageInternal(
 
         // Add Variety+ option 
         if(db.NAIImgConfig.variety_plus) {
+            // NovelAI has not published a V5 Variety+ coefficient, so V5 keeps
+            // the initialized null instead of borrowing a legacy model's value.
             if(db.NAIImgModel.includes('nai-diffusion-4-full') || db.NAIImgModel.includes('nai-diffusion-4-curated')
             || db.NAIImgModel.includes('nai-diffusion-3') || db.NAIImgModel.includes('nai-diffusion-furry-3')) {
                 commonReq.body.parameters.skip_cfg_above_sigma = Math.sqrt(db.NAIImgConfig.width * db.NAIImgConfig.height) * 0.01889;
@@ -945,7 +984,10 @@ async function generateAIImageInternal(
         }
 
         // Add vibe reference_image_multiple if exists
-        if(db.NAIImgConfig.reference_mode === 'vibe' && db.NAIImgConfig.vibe_data) {
+        if(db.NAIImgConfig.reference_mode === 'vibe' && db.NAIImgConfig.vibe_data && isNaiV5Model) {
+            console.warn('NovelAI Diffusion V5 does not support Vibe Transfer; the configured Vibe reference was ignored.')
+        }
+        if(db.NAIImgConfig.reference_mode === 'vibe' && db.NAIImgConfig.vibe_data && !isNaiV5Model) {
             const vibeData = db.NAIImgConfig.vibe_data;
             // Determine which model to use based on vibe_model_selection or fallback to current model
             const modelKey = db.NAIImgConfig.vibe_model_selection || 
@@ -984,6 +1026,11 @@ async function generateAIImageInternal(
             }
         }
 
+        if(db.NAIImgConfig.reference_mode === 'character' && isNaiV5Model &&
+            (db.NAIImgConfig.character_image || db.NAIImgConfig.character_base64image)
+        ) {
+            console.warn('NovelAI Diffusion V5 does not support Precise Reference; the configured character reference was ignored.')
+        }
         if(db.NAIImgConfig.reference_mode === 'character' &&
             (db.NAIImgModel.includes('nai-diffusion-4-5-full') || db.NAIImgModel.includes('nai-diffusion-4-5-curated'))
         ) {

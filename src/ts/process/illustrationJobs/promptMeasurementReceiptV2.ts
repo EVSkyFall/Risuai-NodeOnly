@@ -1,5 +1,5 @@
 import { IllustrationPromptV2ContractError } from './errors'
-import { measureImagePrompt } from './imagePromptMeasurement'
+import { evaluateImagePromptLimits, measureImagePrompt } from './imagePromptMeasurement'
 import {
     computeEnvelopeHash,
     serializeEnvelopeForTransport,
@@ -20,10 +20,9 @@ import type { IllustrationPromptV1 } from './types'
 // A receipt is a side-effect-free measurement result bound to a specific target
 // fingerprint + envelope hash + measurement revision. The executor consults
 // `dispatchEligible` (NOT `modelVerdict`) and re-verifies the binding against the
-// current target before any provider call. Slice D can PRODUCE only 'model_exact'
-// receipts (reusing the existing NAI V4 T5 machinery, unchanged budgets); the
-// other three modes are typed and their eligibility table is implemented, but no
-// live producer exists for them yet.
+// current target before any provider call. NovelAI-native produces exact V4 T5
+// receipts and explicitly approximate V5 T5 receipts; non-model modes retain
+// their separate eligibility policies.
 // ---------------------------------------------------------------------------
 
 export const PROMPT_MEASUREMENT_RECEIPT_SCHEMA_VERSION = 2 as const
@@ -32,6 +31,7 @@ export type IllustrationPromptMeasurementVerdict = 'within_limit' | 'over_limit'
 
 export type IllustrationPromptEligibilityBasis =
     | 'model-exact'
+    | 'model-approximate'
     | 'provider-authoritative'
     | 'transport-only-explicit'
     | 'unmeasured-explicit'
@@ -71,7 +71,7 @@ export type DispatchEligibilityResult = {
 }
 
 // The §6 eligibility table, implemented as a pure function. Invariants:
-//  - model_exact over-limit is ALWAYS ineligible ('over-limit').
+//  - bounded model measurements are ALWAYS ineligible when over limit.
 //  - transport_only never sets modelVerdict to within_limit and is eligible ONLY
 //    with an explicit allow-transport-only dispatch policy AND a passing transport
 //    verdict; otherwise 'policy-rejected'/'over-limit'.
@@ -85,6 +85,10 @@ export function computeDispatchEligibility(
         case 'model_exact':
             if (input.modelVerdict === 'over_limit') return { dispatchEligible: false, eligibilityBasis: 'over-limit' }
             if (input.modelVerdict === 'within_limit') return { dispatchEligible: true, eligibilityBasis: 'model-exact' }
+            return { dispatchEligible: false, eligibilityBasis: 'policy-rejected' }
+        case 'model_approximate':
+            if (input.modelVerdict === 'over_limit') return { dispatchEligible: false, eligibilityBasis: 'over-limit' }
+            if (input.modelVerdict === 'within_limit') return { dispatchEligible: true, eligibilityBasis: 'model-approximate' }
             return { dispatchEligible: false, eligibilityBasis: 'policy-rejected' }
         case 'provider_reported':
             if (input.modelVerdict === 'over_limit') return { dispatchEligible: false, eligibilityBasis: 'over-limit' }
@@ -147,10 +151,9 @@ export type MeasurePromptEnvelopeReceiptInputV2 = {
     envelope: IllustrationPromptEnvelopeV2
 }
 
-// Produce a receipt for a compiled envelope against a resolved target. Slice D
-// implements the 'model_exact' path only, delegating token counting to the
-// existing NAI V4 T5 service (which re-verifies the settings fingerprint and the
-// NovelAI V4 model gate). Other modes fail closed with a typed error.
+// Produce a receipt for a compiled envelope against a resolved target. Bounded
+// model modes delegate to the NAI measurement service, which re-verifies the
+// settings fingerprint and the selected model-family profile.
 export async function measurePromptEnvelopeReceiptV2(
     input: MeasurePromptEnvelopeReceiptInputV2,
 ): Promise<IllustrationPromptMeasurementReceiptV2> {
@@ -167,7 +170,9 @@ export async function measurePromptEnvelopeReceiptV2(
 
     switch (measurement.mode) {
         case 'model_exact':
-            return await measureModelExactReceipt(input, envelopeHash)
+            return await measureBoundedModelReceipt(input, envelopeHash, 'model_exact')
+        case 'model_approximate':
+            return await measureBoundedModelReceipt(input, envelopeHash, 'model_approximate')
         case 'transport_only':
             return measureTransportOnlyReceipt(input, envelopeHash)
         case 'unmeasured':
@@ -187,9 +192,10 @@ export async function measurePromptEnvelopeReceiptV2(
     }
 }
 
-async function measureModelExactReceipt(
+async function measureBoundedModelReceipt(
     input: MeasurePromptEnvelopeReceiptInputV2,
     envelopeHash: string,
+    mode: 'model_exact' | 'model_approximate',
 ): Promise<IllustrationPromptMeasurementReceiptV2> {
     const { measurement } = input.target
     const measured = await measureImagePrompt({
@@ -197,44 +203,57 @@ async function measureModelExactReceipt(
         settingsFingerprint: input.settingsFingerprint,
         prompt: envelopeToPromptV1(input.envelope),
     })
-    const positiveVerdict: IllustrationPromptMeasurementVerdict =
-        measured.positiveTokens <= measured.maxPositiveTokens ? 'within_limit' : 'over_limit'
-    const negativeVerdict: IllustrationPromptMeasurementVerdict =
-        measured.negativeTokens <= measured.maxNegativeTokens ? 'within_limit' : 'over_limit'
-    const modelVerdict: IllustrationPromptMeasurementVerdict =
-        positiveVerdict === 'within_limit' && negativeVerdict === 'within_limit'
-            ? 'within_limit'
-            : 'over_limit'
+    const limitEvaluation = evaluateImagePromptLimits(measured)
+    const positiveVerdict: IllustrationPromptMeasurementVerdict = limitEvaluation.positiveWithinLimits
+        ? 'within_limit'
+        : 'over_limit'
+    const negativeVerdict: IllustrationPromptMeasurementVerdict = limitEvaluation.negativeWithinLimits
+        ? 'within_limit'
+        : 'over_limit'
+    const modelVerdict: IllustrationPromptMeasurementVerdict = limitEvaluation.withinLimits
+        ? 'within_limit'
+        : 'over_limit'
 
     const eligibility = computeDispatchEligibility({
-        mode: 'model_exact',
+        mode,
         modelVerdict,
         transportVerdict: 'unknown',
         dispatchPolicy: measurement.dispatchPolicy,
     })
 
+    const dimensions: IllustrationPromptMeasurementDimensionV2[] = [
+        {
+            scope: 'positive',
+            unit: 'token',
+            measured: measured.positiveTokens,
+            limit: measured.maxPositiveTokens,
+            verdict: positiveVerdict,
+        },
+        {
+            scope: 'negative',
+            unit: 'token',
+            measured: measured.negativeTokens,
+            limit: measured.maxNegativeTokens,
+            verdict: negativeVerdict,
+        },
+    ]
+    if (limitEvaluation.pooled) {
+        dimensions.push({
+            scope: 'combined',
+            unit: 'token',
+            measured: limitEvaluation.combinedTokens,
+            limit: limitEvaluation.combinedLimit,
+            verdict: modelVerdict,
+        })
+    }
+
     return {
         schemaVersion: PROMPT_MEASUREMENT_RECEIPT_SCHEMA_VERSION,
         targetFingerprint: input.target.targetFingerprint,
         envelopeHash,
-        measurementMode: 'model_exact',
+        measurementMode: mode,
         measurementRevision: measurement.revision,
-        dimensions: [
-            {
-                scope: 'positive',
-                unit: 'token',
-                measured: measured.positiveTokens,
-                limit: measured.maxPositiveTokens,
-                verdict: positiveVerdict,
-            },
-            {
-                scope: 'negative',
-                unit: 'token',
-                measured: measured.negativeTokens,
-                limit: measured.maxNegativeTokens,
-                verdict: negativeVerdict,
-            },
-        ],
+        dimensions,
         modelVerdict,
         dispatchEligible: eligibility.dispatchEligible,
         eligibilityBasis: eligibility.eligibilityBasis,

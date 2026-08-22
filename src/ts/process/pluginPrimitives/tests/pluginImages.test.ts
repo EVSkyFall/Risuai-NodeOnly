@@ -23,7 +23,8 @@ vi.mock('../../files/inlays', () => ({
         throw new Error('the default inlay path must never run in tests')
     },
 }))
-vi.mock('../../illustrationJobs/imagePromptMeasurement', () => ({
+vi.mock('../../illustrationJobs/imagePromptMeasurement', async (importOriginal) => ({
+    ...await importOriginal<typeof import('../../illustrationJobs/imagePromptMeasurement')>(),
     measureImagePrompt: async () => {
         throw new Error('the default measurement path must never run in tests')
     },
@@ -119,6 +120,36 @@ describe('measurePrompt', () => {
         expect(measurement.provider).toBe('novelai')
         expect(measurement.model).toBe('nai-diffusion-4-5-full')
         expect(measurement.configRevision).toMatch(/^[0-9a-f]{64}$/)
+    })
+
+    it('reports V5 pooled T5 measurement as approximate rather than exact', async () => {
+        const api = createPluginImagesApi(makeDeps({
+            getDatabase: () => ({
+                ...NAI_SETTINGS,
+                NAIImgModel: 'nai-diffusion-5-full',
+            }),
+            measure: async () => ({
+                positiveTokens: 800,
+                negativeTokens: 800,
+                maxPositiveTokens: 1471,
+                maxNegativeTokens: 1471,
+                model: 'nai-diffusion-5-full',
+                tokenizer: 't5-spiece-v1',
+            }),
+        }))
+
+        const measurement = await api.measurePrompt({ prompt: FLAT_PROMPT })
+
+        expect(measurement).toMatchObject({
+            exact: false,
+            units: 1600,
+            limit: 1471,
+            withinLimits: false,
+            accepted: false,
+            model: 'nai-diffusion-5-full',
+            tokenizer: 't5-spiece-v1',
+        })
+        expect(measurement.reason).toMatch(/V5.*approximation/i)
     })
 
     it('rejects a prompt over the model budget instead of letting it dispatch', async () => {
@@ -411,6 +442,27 @@ describe('generateToInlay', () => {
         expect(response.status).toBe('succeeded')
         expect(deps.generated[0].prompt.characterPositives).toEqual(['1girl, silver hair', '1girl, dark hair'])
         expect(deps.generated[0].prompt.characterNegatives).toEqual(['blurry', ''])
+        expect(deps.generated[0].prompt).not.toHaveProperty('characterNames')
+    })
+
+    it('forwards optional character names as a parallel prompt channel', async () => {
+        const deps = makeDeps()
+        const api = createPluginImagesApi(deps)
+        const response = await api.generateToInlay(generateInput({
+            prompt: {
+                layout: 'nai-v4-characters',
+                positive: 'three figures',
+                negative: '',
+                characters: [
+                    { positive: 'a', name: 'Alice' },
+                    { positive: 'b', name: '' },
+                    { positive: 'c' },
+                ],
+            },
+        }))
+
+        expect(response.status).toBe('succeeded')
+        expect(deps.generated[0].prompt.characterNames).toEqual(['Alice', '', ''])
     })
 
     it('rejects an asset id that would corrupt the inlay token', async () => {

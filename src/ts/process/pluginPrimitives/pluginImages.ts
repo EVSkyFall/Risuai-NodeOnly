@@ -22,7 +22,11 @@ import { getCurrentCharacter } from 'src/ts/storage/database.svelte'
 import { generateAIImageTyped, type ImageGenerationAttempt, type ImageGenerationResult } from '../stableDiff'
 import { getInlayAsset, removeInlayAsset, writeInlayImage } from '../files/inlays'
 import { parseIllustrationPromptV1 } from '../illustrationJobs/imagePrompt'
-import { measureImagePrompt } from '../illustrationJobs/imagePromptMeasurement'
+import {
+    evaluateImagePromptLimits,
+    isNaiV5ImageModel,
+    measureImagePrompt,
+} from '../illustrationJobs/imagePromptMeasurement'
 import {
     canonicalizeNaiSettings,
     computeCanonicalNaiSettingsFingerprint,
@@ -32,6 +36,7 @@ import type { IllustrationPromptV1 } from '../illustrationJobs/types'
 // ── wire types ──────────────────────────────────────────────────────────────
 
 export interface PluginImagePromptCharacter {
+    name?: string
     positive: string
     negative?: string
     center?: { x: number; y: number }
@@ -48,9 +53,9 @@ export interface PluginImagePromptInput {
 export interface PluginImageMeasurement {
     /** False when no exact tokenizer exists for the configured provider. */
     exact: boolean
-    /** Positive-side token count, or null when `exact` is false. */
+    /** Effective measured units; V5 reports the pooled count. Null only when unavailable. */
     units: number | null
-    /** Positive-side budget, or null when no budget is known. */
+    /** Effective budget; V5 reports the pooled limit. Null when no budget is known. */
     limit: number | null
     withinLimits: boolean
     accepted: boolean
@@ -209,6 +214,9 @@ function toIllustrationPrompt(input: PluginImagePromptInput): IllustrationPrompt
     const placed = characters.some((character) => (
         character && typeof character === 'object' && character.center !== undefined && character.center !== null
     ))
+    const named = characters.some((character) => (
+        character && typeof character === 'object' && Object.hasOwn(character, 'name')
+    ))
     return parseIllustrationPromptV1({
         schemaVersion: 1,
         layout: input.layout,
@@ -216,6 +224,9 @@ function toIllustrationPrompt(input: PluginImagePromptInput): IllustrationPrompt
         baseNegative: String(input.negative ?? ''),
         characterPositives: characters.map((character) => String(character?.positive ?? '')),
         characterNegatives: characters.map((character) => String(character?.negative ?? '')),
+        ...(named
+            ? { characterNames: characters.map((character) => character?.name ?? '') }
+            : {}),
         ...(placed
             ? { characterCenters: characters.map((character) => character?.center ?? null) }
             : {}),
@@ -287,18 +298,26 @@ export function createPluginImagesApi(deps: PluginImagesDependencies): PluginIma
 
             try {
                 const measured = await deps.measure(prompt)
-                const withinLimits = measured.positiveTokens <= measured.maxPositiveTokens
-                    && measured.negativeTokens <= measured.maxNegativeTokens
+                const effectiveModel = measured.model || model
+                const limitEvaluation = evaluateImagePromptLimits({
+                    ...measured,
+                    model: effectiveModel,
+                })
+                const approximate = provider === 'novelai' && isNaiV5ImageModel(effectiveModel)
                 return {
-                    exact: true,
-                    units: measured.positiveTokens,
-                    limit: measured.maxPositiveTokens,
-                    withinLimits,
-                    accepted: withinLimits,
+                    exact: !approximate,
+                    units: limitEvaluation.pooled
+                        ? limitEvaluation.combinedTokens
+                        : measured.positiveTokens,
+                    limit: limitEvaluation.pooled
+                        ? limitEvaluation.combinedLimit
+                        : measured.maxPositiveTokens,
+                    withinLimits: limitEvaluation.withinLimits,
+                    accepted: limitEvaluation.withinLimits,
                     configRevision,
                     provider,
                     supportsRegional: REGIONAL_PROVIDERS.has(provider),
-                    model: measured.model || model,
+                    model: effectiveModel,
                     tokenizer: measured.tokenizer,
                     detail: {
                         positiveTokens: measured.positiveTokens,
@@ -306,6 +325,11 @@ export function createPluginImagesApi(deps: PluginImagesDependencies): PluginIma
                         maxPositiveTokens: measured.maxPositiveTokens,
                         maxNegativeTokens: measured.maxNegativeTokens,
                     },
+                    ...(approximate
+                        ? {
+                            reason: 'NovelAI V5 measurement uses the T5 approximation because the exact Qwen-family tokenizer is unavailable.',
+                        }
+                        : {}),
                 }
             } catch (error) {
                 // No exact tokenizer for this provider. Report that plainly
