@@ -4,7 +4,7 @@ import { getCurrentCharacter, getDatabase, setDatabase, setDatabaseLite } from "
 import { alertConfirm, alertError, alertPluginConfirm } from "../alert";
 import { selectSingleFile, sleep } from "../util";
 import type { OpenAIChat } from "../process/index.svelte";
-import { fetchNative, globalFetch, readImage, requestImmediateSave, saveAsset, toGetter } from "../globalApi.svelte";
+import { fetchNative, globalFetch, hydratePluginStorageForOwners, markPluginStorageClearAll, markPluginStorageDirty, readImage, requestImmediateSave, saveAsset, toGetter } from "../globalApi.svelte";
 import { DBState, hotReloading, pluginAlertModalStore, selectedCharID } from "../stores.svelte";
 import type { ScriptMode } from "../process/scripts";
 import { checkCodeSafety } from "./pluginSafety";
@@ -442,7 +442,11 @@ export async function loadPlugins() {
     console.log('Loading plugins...')
     let db = getDatabase()
 
-
+    const enabledPluginNames = (db.plugins ?? [])
+        .filter((plugin: RisuPlugin) => plugin.enabled)
+        .map((plugin: RisuPlugin) => plugin.name)
+    await hydratePluginStorageForOwners(enabledPluginNames)
+    db = getDatabase()
     const enabledPlugins = safeStructuredClone(db.plugins).filter((p: RisuPlugin) => p.enabled)
     const pluginV2 = enabledPlugins.filter((a: RisuPlugin) => a.version === 2 || a.version === '2.1')
     const pluginV3 = enabledPlugins.filter((a: RisuPlugin) => a.version === '3.0')
@@ -689,12 +693,17 @@ export const getV2PluginAPIs = () => {
                 set(target, prop, value) {
                     if (typeof prop === 'string' && allowedDbKeys.includes(prop)) {
                         (target as any)[prop] = value;
+                        if (prop === 'pluginCustomStorage') {
+                            markPluginStorageClearAll();
+                            markPluginStorageDirty();
+                        }
                         return true;
                     }
                     else{
                         console.log('Setting custom db property', prop.toString(), value);
                         target.pluginCustomStorage ??= {}
                         target.pluginCustomStorage[prop.toString()] = value;
+                        markPluginStorageDirty();
                         return true;
                     }
                 },
@@ -724,15 +733,19 @@ export const getV2PluginAPIs = () => {
                 const db = getDatabase();
                 db.pluginCustomStorage ??= {}
                 db.pluginCustomStorage[key] = value;
+                markPluginStorageDirty();
             },
             removeItem: (key: string) => {
                 const db = getDatabase();
                 db.pluginCustomStorage ??= {}
                 delete db.pluginCustomStorage[key];
+                markPluginStorageDirty();
             },
             clear: () => {
                 const db = getDatabase();
                 db.pluginCustomStorage = {};
+                markPluginStorageClearAll();
+                markPluginStorageDirty();
             },
             key: (index: number) => {
                 const db = getDatabase();
@@ -757,9 +770,14 @@ export const getV2PluginAPIs = () => {
             for (const key of Object.keys(newDb)) {
                 if (allowedDbKeys.includes(key)) {
                     (db as any)[key] = newDb[key];
+                    if (key === 'pluginCustomStorage') {
+                        markPluginStorageClearAll();
+                        markPluginStorageDirty();
+                    }
                 }
                 else{
                     db.pluginCustomStorage[key] = newDb[key];
+                    markPluginStorageDirty();
                 }
             }
             DBState.db = db;
@@ -775,9 +793,14 @@ export const getV2PluginAPIs = () => {
                 
                 if (allowedDbKeys.includes(key)) {
                     (db as any)[key] = newDb[key];
+                    if (key === 'pluginCustomStorage') {
+                        markPluginStorageClearAll();
+                        markPluginStorageDirty();
+                    }
                 }
                 else{
                     db.pluginCustomStorage[key] = newDb[key];
+                    markPluginStorageDirty();
                 }
             }
             setDatabase(db);

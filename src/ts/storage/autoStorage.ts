@@ -1,4 +1,11 @@
-import { NodeStorage, type PatchItemResult, type ExportBackupOptions } from "./nodeStorage"
+import {
+    NodeStorage,
+    type PatchItemResult,
+    type ExportBackupOptions,
+    type AssetManifestDescriptor,
+    type AssetManifestOperation,
+    type PluginStorageManifestDescriptor,
+} from "./nodeStorage"
 
 export class AutoStorage{
     isAccount:boolean = false
@@ -83,6 +90,52 @@ export class AutoStorage{
     // ── Bulk asset operations ──────────────────────────────────────────────────
     async getItems(keys: string[]) { return this.realStorage.getItems(keys) }
     async setItems(entries: {key: string, value: Uint8Array}[]) { return this.realStorage.setItems(entries) }
+
+    // ── Lazy asset-reference manifests ────────────────────────────────────────
+    async getAssetManifestPage(manifestId: string, options?: { offset?: number; limit?: number; search?: string }) {
+        await this.Init()
+        return this.realStorage.getAssetManifestPage(manifestId, options)
+    }
+    async getAllAssetManifestItems(manifest: AssetManifestDescriptor) {
+        await this.Init()
+        return this.realStorage.getAllAssetManifestItems(manifest)
+    }
+    async resolveAssetManifestNames(
+        owners: Array<{ kind?: string; ownerId?: string; manifestId?: string }>,
+        names: string[],
+    ) {
+        await this.Init()
+        return this.realStorage.resolveAssetManifestNames(owners, names)
+    }
+    async editAssetManifest(
+        ownerKind: string,
+        ownerId: string,
+        expectedManifestId: string,
+        operations: AssetManifestOperation[],
+    ) {
+        await this.Init()
+        return this.realStorage.editAssetManifest(ownerKind, ownerId, expectedManifestId, operations)
+    }
+
+    async getPluginStorageManifestIndex(snapshotId: string) {
+        await this.Init()
+        return this.realStorage.getPluginStorageManifestIndex(snapshotId)
+    }
+    async loadPluginStorageManifest(
+        snapshotId: string,
+        options?: { owners?: string[]; keys?: string[]; includeUnowned?: boolean },
+    ) {
+        await this.Init()
+        return this.realStorage.loadPluginStorageManifest(snapshotId, options)
+    }
+    async syncPluginStorageManifest(
+        snapshotId: string,
+        values: Record<string, unknown>,
+        loadedKeys: string[],
+    ): Promise<PluginStorageManifestDescriptor> {
+        await this.Init()
+        return this.realStorage.syncPluginStorageManifest(snapshotId, values, loadedKeys)
+    }
 
     // ── Server-side backup ─────────────────────────────────────────────────────
     async saveServerBackup(onProgress?: (current: number, total: number, bytes: number, totalBytes: number) => void) { await this.Init(); return this.realStorage.saveServerBackup(onProgress) }

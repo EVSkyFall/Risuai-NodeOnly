@@ -114,6 +114,45 @@ export interface SettingsBackupEstimate {
     moduleAssets: { count: number, bytes: number, moduleCount: number }
 }
 
+export type AssetManifestTuple = [string, string] | [string, string, string]
+
+export interface AssetManifestDescriptor {
+    id: string
+    version: number
+    count: number
+    sha256: string
+    ownerKind?: 'module' | 'character' | 'persona-module'
+    ownerId?: string
+}
+
+export interface PluginStorageManifestDescriptor {
+    id: string
+    version: number
+    count: number
+    sha256: string
+}
+
+export interface PluginStorageManifestIndexEntry {
+    key: string
+    sha256: string
+    bytes: number
+    owner: string | null
+}
+
+export interface AssetManifestPage {
+    total: number
+    offset: number
+    limit: number
+    items: AssetManifestTuple[]
+}
+
+export type AssetManifestOperation =
+    | { type: 'append'; item: AssetManifestTuple }
+    | { type: 'insert'; index: number; item: AssetManifestTuple }
+    | { type: 'remove'; index: number }
+    | { type: 'rename'; index: number; name: string }
+    | { type: 'replace'; index: number; item: AssetManifestTuple }
+
 export class NodeStorage{
     private static readonly BULK_WRITE_CLIENT_BATCH = 20
 
@@ -626,6 +665,111 @@ export class NodeStorage{
             })
             if (da.status < 200 || da.status >= 300) throw await this.storageRequestError('setItems', da)
         }
+    }
+
+    // ── Lazy asset-reference manifests ────────────────────────────────────────
+    async getAssetManifestPage(
+        manifestId: string,
+        options: { offset?: number; limit?: number; search?: string } = {},
+    ): Promise<AssetManifestPage> {
+        const params = new URLSearchParams()
+        if (options.offset != null) params.set('offset', String(options.offset))
+        if (options.limit != null) params.set('limit', String(options.limit))
+        if (options.search) params.set('search', options.search)
+        const query = params.toString()
+        const da = await this.authFetch(`/api/asset-manifests/${encodeURIComponent(manifestId)}${query ? `?${query}` : ''}`)
+        if (!da.ok) throw new Error(`asset manifest read error: ${da.status}`)
+        return await da.json()
+    }
+
+    async getAllAssetManifestItems(manifest: AssetManifestDescriptor): Promise<AssetManifestTuple[]> {
+        const pageSize = 500
+        const items: AssetManifestTuple[] = []
+        while (items.length < manifest.count) {
+            const page = await this.getAssetManifestPage(manifest.id, { offset: items.length, limit: pageSize })
+            items.push(...page.items)
+            if (page.items.length === 0 || items.length >= page.total) break
+        }
+        if (items.length !== manifest.count) {
+            throw new Error(`asset manifest count mismatch: expected ${manifest.count}, got ${items.length}`)
+        }
+        return items
+    }
+
+    async resolveAssetManifestNames(
+        owners: Array<{ kind?: string; ownerId?: string; manifestId?: string }>,
+        names: string[],
+    ): Promise<Record<string, string>> {
+        const da = await this.authFetch('/api/asset-manifests/resolve', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ owners, names }),
+        })
+        if (!da.ok) throw new Error(`asset manifest resolve error: ${da.status}`)
+        const body = await da.json()
+        return body.resolved ?? {}
+    }
+
+    async editAssetManifest(
+        ownerKind: string,
+        ownerId: string,
+        expectedManifestId: string,
+        operations: AssetManifestOperation[],
+    ): Promise<AssetManifestDescriptor> {
+        const da = await this.authFetch(
+            `/api/asset-manifests/owner/${encodeURIComponent(ownerKind)}/${encodeURIComponent(ownerId)}`,
+            {
+                method: 'PATCH',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ expectedManifestId, operations }),
+            },
+        )
+        if (da.status === 409) throw new ConflictError('Asset manifest revision conflict', '')
+        if (!da.ok) throw new Error(`asset manifest edit error: ${da.status}`)
+        return await da.json()
+    }
+
+    // ── Lazy save-bound plugin storage ───────────────────────────────────────
+    async getPluginStorageManifestIndex(snapshotId: string): Promise<PluginStorageManifestIndexEntry[]> {
+        const da = await this.authFetch(
+            `/api/plugin-storage-manifests/${encodeURIComponent(snapshotId)}/index`,
+        )
+        if (!da.ok) throw new Error(`plugin storage index error: ${da.status}`)
+        const body = await da.json()
+        return body.entries ?? []
+    }
+
+    async loadPluginStorageManifest(
+        snapshotId: string,
+        options: { owners?: string[]; keys?: string[]; includeUnowned?: boolean } = {},
+    ): Promise<{ values: Record<string, unknown>; loadedKeys: string[] }> {
+        const da = await this.authFetch(
+            `/api/plugin-storage-manifests/${encodeURIComponent(snapshotId)}/load`,
+            {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify(options),
+            },
+        )
+        if (!da.ok) throw new Error(`plugin storage load error: ${da.status}`)
+        return await da.json()
+    }
+
+    async syncPluginStorageManifest(
+        snapshotId: string,
+        values: Record<string, unknown>,
+        loadedKeys: string[],
+    ): Promise<PluginStorageManifestDescriptor> {
+        const da = await this.authFetch(
+            `/api/plugin-storage-manifests/${encodeURIComponent(snapshotId)}`,
+            {
+                method: 'PATCH',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ values, loadedKeys }),
+            },
+        )
+        if (!da.ok) throw new Error(`plugin storage sync error: ${da.status}`)
+        return await da.json()
     }
 
     async exportBackup(opts?: ExportBackupOptions): Promise<Response> {

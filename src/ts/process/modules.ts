@@ -1,11 +1,12 @@
 import { language } from "src/lang"
 import { alertClear, alertConfirm, alertError, alertModuleSelect, alertNormal, alertStore, alertWait, notifySuccess } from "../alert"
 import { getCurrentCharacter, getCurrentChat, getDatabase, setCurrentCharacter, setDatabase, type customscript, type loreBook, type triggerscript } from "../storage/database.svelte"
-import { AppendableBuffer, downloadFile, forageStorage, LocalWriter, readImage, saveAsset, VirtualWriter } from "../globalApi.svelte"
+import { AppendableBuffer, downloadFile, forageStorage, loadAssetManifestItems, LocalWriter, readImage, saveAsset, VirtualWriter } from "../globalApi.svelte"
 import { checkPersonaBinded, selectSingleFile, sleep } from "../util"
 import { v4 } from "uuid"
 import { convertExternalLorebook } from "./lorebook.svelte"
 import { compressImage } from '../media'
+import type { AssetManifestDescriptor } from '../storage/nodeStorage'
 import { decodeRPack, encodeRPack } from "../rpack/rpack_js"
 import { HideIconStore, moduleBackgroundEmbedding, ReloadGUIPointer } from "../stores.svelte"
 import {get} from "svelte/store"
@@ -28,15 +29,25 @@ export interface RisuModule{
     hideIcon?: boolean
     backgroundEmbedding?:string
     assets?:[string,string,string][]
+    assetManifest?:AssetManifestDescriptor
     namespace?:string
     customModuleToggle?:string
     mcp?:MCPModule
     icon?:string
 }
 
+export async function hydrateModuleAssets(module: RisuModule): Promise<RisuModule> {
+    if (Array.isArray(module.assets) || !module.assetManifest) return module
+    const hydrated = safeStructuredClone(module)
+    hydrated.assets = await loadAssetManifestItems(module.assetManifest) as [string, string, string][]
+    delete hydrated.assetManifest
+    return hydrated
+}
+
 export async function exportModule(module:RisuModule, arg:{
     alertEnd?:boolean
 } = {}){
+    module = await hydrateModuleAssets(module)
     const alertEnd = arg.alertEnd ?? true
 
     const char = convertModuleToCharacter(module)
@@ -62,6 +73,7 @@ export async function exportModuleLegacy(module:RisuModule, arg:{
     alertEnd?:boolean
     saveData?:boolean
 } = {}){
+    module = await hydrateModuleAssets(module)
     const alertEnd = arg.alertEnd ?? true
     const saveData = arg.saveData ?? true
     const apb = new AppendableBuffer()

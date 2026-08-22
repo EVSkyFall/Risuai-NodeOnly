@@ -5,6 +5,7 @@ import { DBState } from 'src/ts/stores.svelte'
 import { pickHashRand } from 'src/ts/util'
 import { type MCPTool, MCPToolHandler, type RPCToolCallContent } from '../mcplib'
 import { getCharacter } from './utils'
+import { editAssetManifest, loadAssetManifestItems } from 'src/ts/globalApi.svelte'
 
 export class CharacterHandler extends MCPToolHandler {
   private promptAccess(tool: string, action: string) {
@@ -840,7 +841,8 @@ export class CharacterHandler extends MCPToolHandler {
         },
       ]
     }
-    const assets = (char.additionalAssets || []).map((asset) => ({
+    const sourceAssets = char.additionalAssets ?? await loadAssetManifestItems(char.additionalAssetManifest)
+    const assets = sourceAssets.map((asset) => ({
       name: asset[0] || 'Unnamed ' + pickHashRand(5515, asset[1] + asset[2]),
       path: asset[1],
       ext: asset[2],
@@ -876,6 +878,25 @@ export class CharacterHandler extends MCPToolHandler {
           text: 'Access denied by user.',
         },
       ]
+    }
+
+    if (char.additionalAssetManifest && !char.additionalAssets) {
+      const assets = await loadAssetManifestItems(char.additionalAssetManifest)
+      const assetIndex = assets.findIndex((asset) => {
+        const displayName = asset[0] || 'Unnamed ' + pickHashRand(5515, asset[1] + asset[2])
+        return displayName === assetName
+      })
+      if (assetIndex === -1) {
+        return [{ type: 'text', text: `Error: Additional asset with name "${assetName}" not found.` }]
+      }
+      char.additionalAssetManifest = await editAssetManifest(
+        char.additionalAssetManifest,
+        [{ type: 'remove', index: assetIndex }],
+      )
+      return [{
+        type: 'text',
+        text: `Successfully deleted additional asset "${assetName}" from character ${char.name || char.chaId}`,
+      }]
     }
 
     if (!char.additionalAssets) {

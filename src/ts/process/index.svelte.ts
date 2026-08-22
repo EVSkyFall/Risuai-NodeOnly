@@ -25,8 +25,8 @@ import { runLuaEditTrigger } from "./scriptings";
 import { getModelInfo, LLMFlags } from "../model/modellist";
 import { resolveChatModelBinding, resolvePresetMaxOutputTokens, presetSupportsVision } from "./request/modelPresetBinding";
 import { hypaMemoryV3 } from "./memory/hypav3";
-import { getModuleAssets, getModuleToggles } from "./modules";
-import { forageStorage, readImage } from "../globalApi.svelte";
+import { getModuleAssets, getModules, getModuleToggles } from "./modules";
+import { forageStorage, readImage, resolveAssetManifestNames } from "../globalApi.svelte";
 import { chatGenKey, chatProcessStage, endGeneration, isChatGenerating, setGenerationStage, startGeneration } from "./generationState";
 import { clearPendingSend, registerPendingSend } from "./request/pendingSends";
 
@@ -964,7 +964,25 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     })
                 })())
             }
-            else if(p1 === 'icon'){
+            else {
+                const manifests = getModules()
+                    .map((module) => module?.assetManifest)
+                    .filter((manifest) => !!manifest)
+                if (currentChar.additionalAssetManifest) manifests.push(currentChar.additionalAssetManifest)
+                if (manifests.length > 0 && p1 !== 'icon') {
+                    assetPromises.push((async () => {
+                        const resolved = await resolveAssetManifestNames(manifests, [p1])
+                        const path = resolved[p1.toLocaleLowerCase()]
+                        if (!path) return
+                        const assetDataBuf = await readImage(path)
+                        multimodal.push({
+                            type: "image",
+                            base64: `data:image/png;base64,${Buffer.from(assetDataBuf).toString('base64')}`
+                        })
+                    })())
+                }
+            }
+            if(p1 === 'icon'){
                 assetPromises.push((async () => {
                     const assetDataBuf = await readImage(currentChar.image ?? '')
                     multimodal.push({

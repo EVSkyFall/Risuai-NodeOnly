@@ -25,6 +25,12 @@
     import { getDatabase } from 'src/ts/storage/database.svelte'
     import { SafeLocalStorage, SafeLocalPluginStorage } from 'src/ts/plugins/pluginSafeClass'
     import { getOwners, removeOwner } from 'src/ts/plugins/pluginStorageMeta'
+    import {
+        hydratePluginStorageKeys,
+        listPluginStorageManifestEntries,
+        markPluginStorageClearAll,
+        markPluginStorageKeysForSync,
+    } from 'src/ts/globalApi.svelte'
     import { language } from 'src/lang'
 
     type BackendId = 'save' | 'local' | 'idb'
@@ -39,6 +45,7 @@
         size: number
         type: string
         owner?: string
+        loaded?: boolean
     }
 
     const BACKENDS: { id: BackendId; label: () => string; desc: () => string }[] = [
@@ -157,6 +164,7 @@
             const db = getDatabase()
             db.pluginCustomStorage ??= {}
             delete db.pluginCustomStorage[key]
+            markPluginStorageKeysForSync([key])
         } else if (backend === 'local') {
             safeLocal.removeItem(key)
         } else {
@@ -180,7 +188,29 @@
             let keys: string[]
             let read: (key: string) => unknown | Promise<unknown>
             if (backend === 'save') {
-                const store = $state.snapshot(getDatabase().pluginCustomStorage ?? {}) as Record<string, unknown>
+                const db = getDatabase()
+                const store = $state.snapshot(db.pluginCustomStorage ?? {}) as Record<string, unknown>
+                if (db.pluginStorageManifest) {
+                    const index = await listPluginStorageManifestEntries()
+                    if (token !== loadToken) return
+                    loadTotal = index.length
+                    entries = index.map((entry) => {
+                        const loaded = Object.hasOwn(store, entry.key)
+                        const raw = loaded ? store[entry.key] : undefined
+                        const str = loaded ? valueToString(raw) : ''
+                        return {
+                            key: entry.key,
+                            raw,
+                            str,
+                            size: entry.bytes,
+                            type: loaded ? detectType(str) : 'lazy',
+                            owner: entry.owner ?? undefined,
+                            loaded,
+                        }
+                    }).sort((a, b) => a.key.localeCompare(b.key))
+                    loadProgress = index.length
+                    return
+                }
                 keys = Object.keys(store)
                 read = (k) => store[k] ?? null
             } else if (backend === 'local') {
@@ -227,7 +257,19 @@
         }
     }
 
-    function openDetail(entry: Entry) {
+    async function openDetail(entry: Entry) {
+        if (backend === 'save' && !entry.loaded) {
+            try {
+                await hydratePluginStorageKeys([entry.key])
+                const raw = getDatabase().pluginCustomStorage?.[entry.key]
+                const str = valueToString(raw)
+                entry = { ...entry, raw, str, type: detectType(str), loaded: true }
+                entries = entries.map((item) => item.key === entry.key ? entry : item)
+            } catch (e) {
+                notifyError(e instanceof Error ? e.message : String(e))
+                return
+            }
+        }
         selected = entry
         editing = false
         editText = prettyPrint(entry.str)
@@ -317,6 +359,8 @@
                 const db = getDatabase()
                 db.pluginCustomStorage ??= {}
                 for (const e of targets) delete db.pluginCustomStorage[e.key]
+                if (isAll) markPluginStorageClearAll()
+                else markPluginStorageKeysForSync(targets.map((entry) => entry.key))
                 for (const e of targets) await removeOwner('save', e.key)
             } else {
                 for (const e of targets) await backendRemove(e.key)

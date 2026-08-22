@@ -2,7 +2,7 @@ import DOMPurify from 'dompurify';
 import markdownit from 'markdown-it'
 import { appVer, getCurrentCharacter, getDatabase, type Database, type character, type customscript, type triggerscript } from '../storage/database.svelte';
 import { DBState, selIdState } from '../stores.svelte';
-import { aiWatermarkingLawApplies, getFileSrc } from '../globalApi.svelte';
+import { aiWatermarkingLawApplies, getFileSrc, loadAssetManifestItems, resolveAssetManifestNames } from '../globalApi.svelte';
 import { isNodeServer } from "src/ts/platform"
 import { getChatVar, setChatVar, getGlobalChatVar } from './chatVar.svelte';
 import { processScriptFull } from '../process/scripts';
@@ -500,6 +500,26 @@ async function parseAdditionalAssets(data:string, char:simpleCharacterArgument|c
     const assetPaths = assetsCache ?? {}
     const emoPaths = emoAssetsCache ?? {}
 
+    const manifests = getModules()
+        .map((module) => module?.assetManifest)
+        .filter((manifest) => !!manifest)
+    if (char.additionalAssetManifest) manifests.push(char.additionalAssetManifest)
+    if (manifests.length > 0) {
+        const names = [...data.matchAll(assetRegex)]
+            .map((match) => String(match[2] ?? '').toLocaleLowerCase())
+            .filter((name) => name.length > 0)
+        if (names.length > 0) {
+            try {
+                const resolved = await resolveAssetManifestNames(manifests, names)
+                for (const [name, path] of Object.entries(resolved)) {
+                    assetPaths[name] = { srcPaths: [path] }
+                }
+            } catch (error) {
+                console.warn('[Assets] Failed to resolve parser asset manifests', error)
+            }
+        }
+    }
+
     let needsSourceAccess = false
     let cx: number|null = null
 
@@ -879,6 +899,7 @@ export function resolveInlayPlaceholders(root: HTMLElement) {
 export interface simpleCharacterArgument{
     type: 'simple'
     additionalAssets?: [string, string, string][]
+    additionalAssetManifest?: import('../storage/nodeStorage').AssetManifestDescriptor
     customscript: customscript[]
     chaId: string,
     virtualscript?: string
@@ -921,6 +942,16 @@ export async function ParseMarkdown(
     let char = (typeof(charArg) === 'string') ? (findCharacterbyId(charArg)) : (charArg)
 
     if(char){
+        // CBS list functions are synchronous. Only when a prompt explicitly
+        // asks for a complete asset list do we hydrate the corresponding full
+        // manifests into the bounded compatibility cache.
+        if (/\{\{(?:assetlist|chardisplayasset|module_?assetlist)(?:::|\}\})/i.test(data)) {
+            const manifests = getModules()
+                .map((module) => module?.assetManifest)
+                .filter((manifest) => !!manifest)
+            if (char.additionalAssetManifest) manifests.push(char.additionalAssetManifest)
+            await Promise.all(manifests.map((manifest) => loadAssetManifestItems(manifest)))
+        }
         data = await parseAdditionalAssets(data, char, additionalAssetMode, {
             ch: chatID
         })

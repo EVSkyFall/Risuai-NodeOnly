@@ -20,6 +20,7 @@ export function convertModuleToCharacter(m: RisuModule): character {
     char.hideChatIcon = m.hideIcon || false
     char.backgroundHTML = m.backgroundEmbedding || ""
     char.additionalAssets = m.assets || []
+    char.additionalAssetManifest = m.assetManifest
     char.customModuleToggle = m.customModuleToggle || ""
     char.image = m.icon || ""
 
@@ -62,6 +63,7 @@ export function convertCharacterToModule(c: character): RisuModule {
         hideIcon: c.hideChatIcon,
         backgroundEmbedding: c.backgroundHTML,
         assets: c.additionalAssets,
+        assetManifest: c.additionalAssetManifest,
         customModuleToggle: c.customModuleToggle,
         id: v4(),
         icon: c.image

@@ -1506,6 +1506,8 @@ export interface Database{
     dynamicOutput?:DynamicOutput
     hubServerType?:string
     pluginCustomStorage:{[key:string]:any}
+    /** NodeOnly: immutable snapshot backing lazily loaded pluginCustomStorage values. */
+    pluginStorageManifest?: import('./nodeStorage').PluginStorageManifestDescriptor
     // Best-effort "which plugin last wrote this key" sidecar for the save-file
     // plugin storage. Additive metadata only — never wraps the value itself, so
     // existing plugins read their keys unchanged. Populated for new V3 writes;
@@ -1717,6 +1719,7 @@ export interface character{
     }
     supaMemory?:boolean
     additionalAssets?:[string, string, string][]
+    additionalAssetManifest?:import('./nodeStorage').AssetManifestDescriptor
     ttsReadOnlyQuoted?:boolean
     replaceGlobalNote:string
     backgroundHTML?:string
