@@ -26,6 +26,7 @@ import {
     setPatchSyncBaseline,
     getDbBackups,
     getUncleanables,
+    extractAssetRefs,
     getBasename,
     checkCharOrder
 } from "./globalApi.svelte";
@@ -517,6 +518,21 @@ async function cleanChunks() {
     const cleanAssets = db.nodeOnlyAutoCleanAssets === true
     const uncleanable = new Set(getUncleanables(db))
     const indexes = await forageStorage.keys()
+    // V3 plugin persistent storage lives outside the DB (cache/plugin-storage/*)
+    // and may hold saveAsset paths — treat anything it references as in use.
+    if (cleanAssets) {
+        for (const key of indexes) {
+            if (!key.startsWith('cache/plugin-storage/')) continue
+            try {
+                const payload = await forageStorage.getItem(key)
+                if (!payload) continue
+                const text = new TextDecoder().decode(payload)
+                for (const ref of extractAssetRefs(text)) {
+                    uncleanable.add(getBasename(ref))
+                }
+            } catch { /* unreadable entry — skip */ }
+        }
+    }
     const allKeys = new Set(indexes)
     const characterIds = new Set<string>(
         db.characters.map((v) => v.chaId)

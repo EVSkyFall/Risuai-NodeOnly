@@ -1437,8 +1437,30 @@ export function getBasename(data: string) {
 }
 
 /**
+ * Extracts "assets/..." path references from an arbitrary value. Non-string
+ * values are serialized first so references nested inside plugin-stored JSON
+ * (objects, arrays) are found too.
+ *
+ * @param {unknown} value - The value to scan.
+ * @returns {string[]} - The asset paths found in the value.
+ */
+export function extractAssetRefs(value: unknown): string[] {
+    let text: string;
+    if (typeof value === 'string') {
+        text = value;
+    } else {
+        try {
+            text = JSON.stringify(value) ?? '';
+        } catch {
+            return [];
+        }
+    }
+    return Array.from(text.matchAll(/assets[/\\][\w-]+\.\w+/g), (m) => m[0]);
+}
+
+/**
  * Retrieves uncleanable resources from the database.
- * 
+ *
  * @param {Database} db - The database to retrieve uncleanable resources from.
  * @param {'basename'|'pure'} [uptype='basename'] - The type of uncleanable resources to retrieve.
  * @returns {string[]} - An array of uncleanable resources.
@@ -1505,6 +1527,9 @@ export function getUncleanables(db: Database, uptype: 'basename' | 'pure' = 'bas
                 addUncleanable(asset.uri);
             }
         }
+        // GPT-SoVITS reference audio is uploaded via saveAsset and read back on
+        // every TTS run — assetId holds the full "assets/..." path.
+        addUncleanable(cha.gptSoVitsConfig?.ref_audio_data?.assetId);
     }
 
     if (db.modules) {
@@ -1550,6 +1575,17 @@ export function getUncleanables(db: Database, uptype: 'basename' | 'pure' = 'bas
                 addUncleanable(item.imgFile);
             }
         })
+    }
+
+    // Plugins can persist asset paths (from risuai.saveAsset) anywhere inside
+    // their storage — as plain strings or nested in JSON values — so scan the
+    // serialized text for "assets/..." references instead of assuming a structure.
+    if (db.pluginCustomStorage) {
+        for (const value of Object.values(db.pluginCustomStorage)) {
+            for (const ref of extractAssetRefs(value)) {
+                addUncleanable(ref);
+            }
+        }
     }
     return Array.from(uncleanable);
 }

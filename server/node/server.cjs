@@ -5088,6 +5088,37 @@ function statsBasename(s) {
     return String(s).replace(/\\/g, '/').split('/').pop();
 }
 
+// Pull "assets/..." path references out of an arbitrary value. Non-string
+// values are serialized first so references nested inside plugin-stored JSON
+// (objects, arrays) are found too. Mirrors globalApi's extractAssetRefs.
+function extractAssetRefsFromText(value) {
+    let text;
+    if (typeof value === 'string') text = value;
+    else {
+        try { text = JSON.stringify(value) ?? ''; } catch { return []; }
+    }
+    return Array.from(text.matchAll(/assets[/\\][\w-]+\.\w+/g), (m) => m[0]);
+}
+
+// V3 plugin persistent storage lives in kv (cache/plugin-storage/*.json), not
+// in the DB blob, and may hold saveAsset paths. Returns basenames so callers
+// can union it with buildUncleanableSet before deciding what is orphaned.
+function collectPluginStorageAssetRefs() {
+    const set = new Set();
+    for (const key of kvList('cache/plugin-storage/')) {
+        try {
+            const raw = kvGet(key);
+            if (!raw) continue;
+            const text = Buffer.isBuffer(raw) ? raw.toString('utf-8') : String(raw);
+            for (const ref of extractAssetRefsFromText(text)) {
+                const bn = statsBasename(ref);
+                if (bn) set.add(bn);
+            }
+        } catch { /* unreadable entry — skip */ }
+    }
+    return set;
+}
+
 // Every asset reference reachable from the DB. Mirrors
 // src/ts/globalApi.svelte.ts:getUncleanables, plus the settings-level image-gen
 // references that walker misses (NAIImgConfig, wavespeedImage).
@@ -5131,6 +5162,8 @@ function buildUncleanableSet(dbObj, { includeModuleAssets = true } = {}) {
             if (Array.isArray(cha.additionalAssets)) for (const em of cha.additionalAssets) add(em?.[1]);
             if (cha.vits?.files) for (const k of Object.keys(cha.vits.files)) add(cha.vits.files[k]);
             if (Array.isArray(cha.ccAssets)) for (const a of cha.ccAssets) add(a?.uri);
+            // GPT-SoVITS reference audio — assetId holds the full "assets/..." path.
+            add(cha.gptSoVitsConfig?.ref_audio_data?.assetId);
         }
     }
     if (Array.isArray(dbObj.modules)) {
@@ -5153,6 +5186,14 @@ function buildUncleanableSet(dbObj, { includeModuleAssets = true } = {}) {
     if (Array.isArray(dbObj.characterOrder)) {
         for (const item of dbObj.characterOrder) {
             if (item && typeof item === 'object' && 'imgFile' in item) add(item.imgFile);
+        }
+    }
+    // Plugins can persist asset paths (from risuai.saveAsset) anywhere inside
+    // their storage — as plain strings or nested in JSON values — so scan the
+    // serialized text for "assets/..." references instead of assuming a structure.
+    if (dbObj.pluginCustomStorage && typeof dbObj.pluginCustomStorage === 'object') {
+        for (const value of Object.values(dbObj.pluginCustomStorage)) {
+            for (const ref of extractAssetRefsFromText(value)) add(ref);
         }
     }
     return set;
@@ -5319,6 +5360,7 @@ app.get('/api/db/stats', async (req, res, next) => {
         // every stored asset as an orphan.
         if (stripped && Array.isArray(stripped.characters)) {
             const uncleanable = buildUncleanableSet(stripped);
+            for (const bn of collectPluginStorageAssetRefs()) uncleanable.add(bn);
             for (const it of kvListWithSizes('assets/')) {
                 if (!uncleanable.has(statsBasename(it.key))) {
                     orphan.count++;
@@ -5433,6 +5475,7 @@ app.get('/api/db/stats/characters', async (req, res, next) => {
         }
 
         const uncleanable = buildUncleanableSet(dbObj);
+        for (const bn of collectPluginStorageAssetRefs()) uncleanable.add(bn);
         let orphanCount = 0, orphanTotal = 0;
         for (const it of kvListWithSizes('assets/')) {
             if (!uncleanable.has(statsBasename(it.key))) {
@@ -5528,10 +5571,12 @@ app.post('/api/db/assets/purge-orphans', async (req, res, next) => {
             const assets = kvListWithSizes('assets/');
             // A walker that returns nothing while assets exist means the decode
             // produced a shape we do not understand — every asset would look
-            // orphaned. Refuse rather than delete the library.
+            // orphaned. Refuse rather than delete the library. Checked before
+            // plugin-storage refs are unioned in so those can't mask a bad walk.
             if (uncleanable.size === 0 && assets.length > 0) {
                 return { error: 'Reference scan produced no references — refusing to purge' };
             }
+            for (const bn of collectPluginStorageAssetRefs()) uncleanable.add(bn);
 
             const victims = assets.filter((it) => !uncleanable.has(statsBasename(it.key)));
             // One commit for the whole sweep: thousands of autocommitted deletes
