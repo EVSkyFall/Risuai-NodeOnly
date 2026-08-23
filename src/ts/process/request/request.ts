@@ -32,11 +32,11 @@ import {
     type AdapterToolCall, type AdapterToolDef, type AdapterUsage,
 } from "src/ts/preset/adapter";
 import { formatReasoningParts } from "src/ts/preset/adapter/reasoning";
-import { TOOL_CAPABLE_ADAPTER_KINDS, VISION_CAPABLE_ADAPTER_KINDS, type AdapterKind, type ModelPreset } from "src/ts/preset/types";
+import { TOOL_CAPABLE_ADAPTER_KINDS, type AdapterKind, type ModelPreset } from "src/ts/preset/types";
 import { resolveWireModelId } from "src/ts/preset/adapter/wireInvariants";
 import { pumpPresetStream } from "./presetStreamPump";
 import { makeJobFetch } from "./jobFetch";
-import { resolveChatModelBinding, buildModelPresetCredential, applyPromptPresetParams } from "./modelPresetBinding";
+import { resolveChatModelBinding, buildModelPresetCredential, applyPromptPresetParams, presetSupportsVision } from "./modelPresetBinding";
 import { expandAdapterMessages, toAdapterMessage, toolResponseText } from "./modelPresetMessages";
 import { isLocalNetworkUrl } from "src/ts/network/localNetwork";
 import { createRequestLogScope, type RequestLogRoute, type RequestLogSource, type RequestLogUsage } from "src/ts/requestLog";
@@ -824,8 +824,7 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
     // the preset's imageInput toggle (for profiles like ollama / openai-compatible
     // whose snapshot does not declare 'vision'). Additive — both branches default
     // off, so OFF is byte-identical to the prior text-only behavior.
-    const supportsVision = VISION_CAPABLE_ADAPTER_KINDS.includes(kind)
-        && ((caps?.includes('vision') ?? false) || preset.imageInput === true)
+    const supportsVision = presetSupportsVision(preset)
 
     // Gemini context caching: MAIN chat requests on the google-gemini adapter
     // (AI Studio key auth OR Vertex native service-account auth) — tool runs and
