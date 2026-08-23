@@ -6247,17 +6247,52 @@ app.post('/api/self-update', async (req, res) => {
         } catch { /* no user certs */ }
 
         // Keep set — matches updater.cjs + user data/config that must survive updates
-        const keep = new Set(['save', 'backups', '.installed-version', '.update-tmp', 'scripts', '.env', '.npmrc', '.portable']);
+        const keep = new Set(['save', 'backups', '.installed-version', '.installed-manifest', '.update-tmp', 'scripts', '.env', '.npmrc', '.portable']);
         if (isWin) keep.add('bin');
+
+        // Managed set — only entries the app shipped (new package contents ∪
+        // previously recorded manifest) may be removed. Anything else in the
+        // app root is a user file and must survive the update untouched.
+        const manifestPath = path.join(appDir, '.installed-manifest');
+        let oldManifest = [];
+        let hasOldManifest = false;
+        try {
+            oldManifest = (await fs.readFile(manifestPath, 'utf-8'))
+                .split('\n').map(s => s.trim()).filter(Boolean);
+            hasOldManifest = true;
+        } catch { /* pre-manifest install */ }
+        const newEntries = await fs.readdir(sourceDir);
+        const managed = new Set([...newEntries, ...oldManifest]);
+
+        // A user file whose name collides with an entry the new release
+        // introduces would be overwritten in Phase 2 — evacuate it to backups/
+        // instead of losing it. Only decidable when a previous manifest exists.
+        const isConflict = (e) => hasOldManifest
+            && !oldManifest.includes(e) && newEntries.includes(e);
+        const conflictDir = path.join(appDir, 'backups', `update-conflict-v${targetVersion}`);
+        // A retried update may have evacuated the same name before — never overwrite
+        const conflictDest = (e) => {
+            let dest = path.join(conflictDir, e);
+            for (let n = 1; existsSync(dest); n++) dest = path.join(conflictDir, `${e}.${n}`);
+            return dest;
+        };
 
         // Phase 1: move old files to backup — rollback immediately on any failure
         const backupDir = path.join(updateTmp, 'backup');
         await fs.mkdir(backupDir, { recursive: true });
 
+        const preserved = [];
         const oldEntries = await fs.readdir(appDir);
         for (const e of oldEntries) {
             if (keep.has(e)) continue;
+            if (!managed.has(e)) { preserved.push(e); continue; }
             try {
+                if (isConflict(e)) {
+                    console.log(`[Update] User file "${e}" collides with a new app file — moving it to backups/update-conflict-v${targetVersion}/`);
+                    await fs.mkdir(conflictDir, { recursive: true });
+                    await moveAcrossVolumes(path.join(appDir, e), conflictDest(e));
+                    continue;
+                }
                 await fs.rename(path.join(appDir, e), path.join(backupDir, e));
             } catch (backupErr) {
                 logger.error(`[Update] Failed to back up ${e}: ${backupErr.message}`);
@@ -6268,13 +6303,15 @@ app.post('/api/self-update', async (req, res) => {
                     : 'Update failed: some files are in use. Stop the server first, then try again.');
             }
         }
+        if (preserved.length) {
+            console.log(`[Update] Preserving user files: ${preserved.join(', ')}`);
+        }
 
         // Phase 2: move new files from extracted to app root
         const skipMove = new Set(['save', 'scripts']);
         if (isWin) skipMove.add('bin');
         const moved = [];
         try {
-            const newEntries = await fs.readdir(sourceDir);
             for (const e of newEntries) {
                 if (skipMove.has(e)) continue;
                 const dest = path.join(appDir, e);
@@ -6309,6 +6346,10 @@ app.post('/api/self-update', async (req, res) => {
                 await fs.copyFile(path.join(newScripts, f), path.join(appDir, 'scripts', f));
             }
         } catch { /* no scripts in release */ }
+
+        // Record what this release shipped, so the next update knows which
+        // entries are app-managed and leaves everything else alone.
+        await fs.writeFile(manifestPath, newEntries.join('\n') + '\n').catch(() => {});
 
         // Phase 4 (Windows): stage bin/ for restart script to apply after exit
         if (isWin) {
