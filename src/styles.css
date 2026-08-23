@@ -2,6 +2,22 @@
 
 @plugin '@tailwindcss/typography';
 
+/*
+  Treat keyboard focus as the keyboard equivalent of hover. Existing hover:*
+  utilities keep their pointer behavior and also apply to :focus-visible.
+*/
+@custom-variant hover {
+  &:focus-visible {
+    @slot;
+  }
+
+  @media (hover: hover) {
+    &:hover {
+      @slot;
+    }
+  }
+}
+
 @theme {
   --breakpoint-xs: 25rem;
 
@@ -124,6 +140,66 @@
 }
 
 /*
+  Shared interaction vocabulary. These classes describe intent while the
+  hover variant above keeps pointer hover and keyboard focus-visible aligned.
+  Component-specific motion and layout effects should remain local.
+*/
+@utility risu-interactive-accent {
+  @apply hover:text-primary;
+}
+
+@utility risu-interactive-foreground {
+  @apply hover:text-textcolor;
+}
+
+@utility risu-interactive-danger {
+  @apply hover:text-draculared;
+}
+
+@utility risu-interactive-surface {
+  @apply hover:bg-selected/30;
+}
+
+@utility risu-interactive-surface-strong {
+  @apply hover:bg-selected/50;
+}
+
+@utility risu-interactive-surface-solid {
+  @apply hover:bg-selected;
+}
+
+@utility risu-interactive-primary {
+  @apply hover:bg-primary/90;
+}
+
+@utility risu-interactive-primary-soft {
+  @apply hover:bg-primary/20;
+}
+
+@utility risu-interactive-border {
+  @apply hover:border-borderc;
+}
+
+@utility risu-interactive-border-subtle {
+  @apply hover:border-borderc/30;
+}
+
+@utility risu-interactive-reveal {
+  @apply hover:opacity-100;
+}
+
+/* Full-viewport modal scrim. 100dvh follows mobile browser chrome as it
+   expands and collapses; 100vh remains the fallback for older engines. */
+@utility risu-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100vh;
+  height: 100dvh;
+  background-color: var(--risu-black-50);
+}
+
+/*
   The default border color has changed to `currentcolor` in Tailwind CSS v4,
   so we've added these compatibility styles to make sure everything still
   looks the same as it did with Tailwind CSS v3.
@@ -200,6 +276,7 @@ body {
      Part of ColorScheme: updateColorScheme() overrides it per theme. The default
      here is a fallback for the brief boot window before updateColorScheme runs. */
   --risu-theme-primary: #3b82f6;
+  --risu-black-50: rgb(0 0 0 / 50%);
   --risu-height-size: 100%;
   --risu-font-family: Arial, sans-serif, serif;
 
