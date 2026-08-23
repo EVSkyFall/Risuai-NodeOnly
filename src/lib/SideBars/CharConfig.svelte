@@ -42,6 +42,10 @@ import ShButton from "../UI/GUI/ShButton.svelte";
     let pkgIncludeInlays = $state(false)
     let viewSubMenu = $state(0)
     let emos:[string, string][] = $state([])
+    // Undefined while no character is selected (id -1) or right after deletion —
+    // the mobile shell keeps this component mounted in that state, so every
+    // effect below and the template bail out instead of crashing on undefined.
+    const currentCharacter = $derived(DBState.db.characters[$selectedCharID])
     let iconButtonSize = window.innerWidth > 360 ? 24 as const : 20 as const
     let tokens = $state({
         desc: 0,
@@ -72,27 +76,34 @@ import ShButton from "../UI/GUI/ShButton.svelte";
     const firstMsgTok = { t: null as ReturnType<typeof setTimeout> | null, seq: 0 }
     const localNoteTok = { t: null as ReturnType<typeof setTimeout> | null, seq: 0 }
     $effect.pre(() => {
+        if (!currentCharacter) return
         tokenizeField(() => (DBState.db.characters[$selectedCharID] as character).desc ?? '', n => tokens.desc = n, descTok)
     });
     $effect.pre(() => {
+        if (!currentCharacter) return
         tokenizeField(() => DBState.db.characters[$selectedCharID].firstMessage ?? '', n => tokens.firstMsg = n, firstMsgTok)
     });
     $effect.pre(() => {
         const chara = DBState.db.characters[$selectedCharID]
+        if (!chara) return
         tokenizeField(() => chara.chats[chara.chatPage].note ?? '', n => tokens.localNote = n, localNoteTok)
     });
 
 
     let assetFileExtensions:string[] = $state([])
     let assetFilePath:string[] = $state([])
-    let licensed = $state((DBState.db.characters[$selectedCharID].type === 'character') ? (DBState.db.characters[$selectedCharID] as character).license : '')
+    // Starts empty and is filled by the effect below before first paint —
+    // initializing from the character directly crashes when none is selected.
+    let licensed = $state('')
 
     $effect.pre(() => {
+        if (!currentCharacter) return
         emos = DBState.db.characters[$selectedCharID].emotionImages
     });
 
 
     $effect.pre(() => {
+        if (!currentCharacter) return
         if(DBState.db.characters[$selectedCharID].type ==='character' && DBState.db.useAdditionalAssetsPreview){
             if((DBState.db.characters[$selectedCharID] as character).additionalAssets){
                 for(let i = 0; i < (DBState.db.characters[$selectedCharID] as character).additionalAssets.length; i++){
@@ -109,9 +120,11 @@ import ShButton from "../UI/GUI/ShButton.svelte";
     });
 
     $effect.pre(() => {
+        if (!currentCharacter) return
         licensed = (DBState.db.characters[$selectedCharID].type === 'character') ? (DBState.db.characters[$selectedCharID] as character).license : ''
     });
     $effect.pre(() => {
+        if (!currentCharacter) return
         if (DBState.db.characters[$selectedCharID].ttsMode === 'novelai' && (DBState.db.characters[$selectedCharID] as character).naittsConfig === undefined) {
             (DBState.db.characters[$selectedCharID] as character).naittsConfig = {
                 customvoice: false,
@@ -121,6 +134,7 @@ import ShButton from "../UI/GUI/ShButton.svelte";
         }
     });
     $effect.pre(() => {
+        if (!currentCharacter) return
         if (DBState.db.characters[$selectedCharID].ttsMode === 'gptsovits' && (DBState.db.characters[$selectedCharID] as character).gptSoVitsConfig === undefined) {
             (DBState.db.characters[$selectedCharID] as character).gptSoVitsConfig = {
                 url: '',
@@ -152,6 +166,7 @@ import ShButton from "../UI/GUI/ShButton.svelte";
     }[] = $state([])
 
     $effect.pre(() => {
+        if (!currentCharacter) return
         if (DBState.db.characters[$selectedCharID].ttsMode === 'openai' && (DBState.db.characters[$selectedCharID] as character).oaiTTSConfig === undefined) {
             (DBState.db.characters[$selectedCharID] as character).oaiTTSConfig = {
                 enabled: false,
@@ -161,6 +176,7 @@ import ShButton from "../UI/GUI/ShButton.svelte";
     });
 
     $effect.pre(() => {
+        if (!currentCharacter) return
         if (DBState.db.characters[$selectedCharID].ttsMode === 'fishspeech' && (DBState.db.characters[$selectedCharID] as character).fishSpeechConfig === undefined) {
             (DBState.db.characters[$selectedCharID] as character).fishSpeechConfig = {
                 model: {
@@ -226,6 +242,7 @@ import ShButton from "../UI/GUI/ShButton.svelte";
 
 </script>
 
+{#if currentCharacter}
 {#if licensed !== 'private' && !$MobileGUI}
     <div class="flex mb-2" class:gap-2={iconButtonSize === 24} class:gap-1={iconButtonSize < 24}>
         <button class={$CharConfigSubMenu === 0 ? 'text-textcolor ' : 'text-textcolor2'} onclick={() => {$CharConfigSubMenu = 0}}>
@@ -1200,6 +1217,7 @@ import ShButton from "../UI/GUI/ShButton.svelte";
             {language.applyModule}
         </Button>
 
+{/if}
 {/if}
 
 

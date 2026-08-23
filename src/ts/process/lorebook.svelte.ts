@@ -667,18 +667,41 @@ export async function loadLoreBookV3Prompt(){
 
 export async function importLoreBook(mode:'global'|'local'|'sglobal'){
     const selectedID = get(selectedCharID)
-    const page = mode === 'sglobal' ? -1 : DBState.db.characters[selectedID].chatPage
-    let lore = 
-        mode === 'global' ? DBState.db.characters[selectedID].globalLore : 
-        DBState.db.characters[selectedID].chats[page].localLore
+    // Capture the import target as object references before the file dialog
+    // opens. The dialog can stay open indefinitely while the user switches
+    // character/chat/page, so the target is re-validated by identity after the
+    // await instead of trusting indexes captured beforehand. ($state proxies
+    // are cached per object, so identity comparisons against re-reads hold.)
+    const character = mode === 'sglobal' ? null : DBState.db.characters[selectedID]
+    const chat = mode === 'local' ? character?.chats[character.chatPage] : null
+    const globalPage = mode === 'sglobal' ? DBState.db.loreBook[DBState.db.loreBookPage] : null
+
+    if(mode === 'sglobal' ? !globalPage : !character){
+        return
+    }
+    if(mode === 'local' && !chat){
+        return
+    }
+
     const lorebook = (await selectSingleFile(['json', 'lorebook']))?.data
     if(!lorebook){
         return
     }
- 
-
 
     try {
+        const targetStillExists =
+            mode === 'sglobal' ? DBState.db.loreBook.includes(globalPage) :
+            mode === 'global' ? DBState.db.characters.includes(character) :
+            DBState.db.characters.includes(character) && character.chats.includes(chat)
+        if(!targetStillExists){
+            alertError('The import target was removed while the file dialog was open. Please try again.')
+            return
+        }
+        const lore =
+            mode === 'sglobal' ? globalPage.data :
+            mode === 'global' ? character.globalLore :
+            (chat.localLore ??= [])
+
         const importedlore = JSON.parse(Buffer.from(lorebook).toString('utf-8'))
         if(importedlore.type === 'risu' && importedlore.data){
             const datas:loreBook[] = importedlore.data
@@ -689,12 +712,6 @@ export async function importLoreBook(mode:'global'|'local'|'sglobal'){
         else if(importedlore.entries){
             const entries:{[key:string]:CCLorebook} = importedlore.entries
             lore.push(...convertExternalLorebook(entries))
-        }
-        if(mode === 'global'){
-            DBState.db.characters[selectedID].globalLore = lore
-        }
-        else{
-            DBState.db.characters[selectedID].chats[page].localLore = lore
         }
     } catch (error) {
         alertError(error)
@@ -747,10 +764,12 @@ export function convertExternalLorebook(entries:{[key:string]:CCLorebook}){
 export async function exportLoreBook(mode:'global'|'local'|'sglobal'){
     try {
         const selectedID = get(selectedCharID)
-        const page = mode === 'sglobal' ? -1 : DBState.db.characters[selectedID].chatPage
-        const lore = 
-            mode === 'global' ? DBState.db.characters[selectedID].globalLore : 
-            DBState.db.characters[selectedID].chats[page].localLore        
+        // sglobal reads the global lorebook page — it must not touch
+        // characters[selectedID] (selectedID can be -1, and chats[-1] crashes).
+        const lore =
+            mode === 'sglobal' ? DBState.db.loreBook[DBState.db.loreBookPage].data :
+            mode === 'global' ? DBState.db.characters[selectedID].globalLore :
+            DBState.db.characters[selectedID].chats[DBState.db.characters[selectedID].chatPage].localLore
         const stringl = Buffer.from(JSON.stringify({
             type: 'risu',
             ver: 1,

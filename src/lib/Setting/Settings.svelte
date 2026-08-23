@@ -29,6 +29,7 @@
     import PluginDefinedIcon from "../Others/PluginDefinedIcon.svelte";
     import DevPanel from "src/lib/_dev/DevPanel.svelte";
     import SettingsSearch from "./SettingsSearch.svelte";
+    import { MediaQuery } from "svelte/reactivity";
 
     // Dev panel is opt-in via localStorage['risu-dev-panel']='1' in devtools.
     // Read once on mount — flag changes require reload. Gates both the menu
@@ -38,16 +39,33 @@
 
     let openLoreList = $state(false)
     let searchOpen = $state(false)
-    if(window.innerWidth >= 900 && $SettingsMenuIndex === -1 && !$MobileGUI){
-        $SettingsMenuIndex = 1
-    }
+
+    // Reactive breakpoints: the raw window.innerWidth reads these replace were
+    // evaluated outside Svelte's reactivity, so the layout never responded to
+    // window resizes. Three distinct thresholds — do not merge them.
+    const wide900 = new MediaQuery('(min-width: 900px)')
+    const wide700 = new MediaQuery('(min-width: 700px)')
+    const wide768 = new MediaQuery('(min-width: 768px)')
+
+    $effect(() => {
+        if(wide900.current && $SettingsMenuIndex === -1 && !$MobileGUI){
+            $SettingsMenuIndex = 1
+        }
+    })
+    $effect(() => {
+        // The hotkey page only renders at >=768px; route back to the menu when
+        // the viewport drops below that so the panel doesn't go blank.
+        if(!wide768.current && !$MobileGUI && $SettingsMenuIndex === 15){
+            $SettingsMenuIndex = -1
+        }
+    })
 
 </script>
 <div class="h-full w-full flex justify-center rs-setting-cont" class:bg-bgcolor={$MobileGUI} class:setting-bg={!$MobileGUI}>
     <div class="h-full max-w-4xl w-full flex relative rs-setting-cont-2">
-        {#if (window.innerWidth >= 700 && !$MobileGUI) || $SettingsMenuIndex === -1}
+        {#if (wide700.current && !$MobileGUI) || $SettingsMenuIndex === -1}
             <div class="flex h-full flex-col p-4 pt-8 gap-2 overflow-y-auto relative rs-setting-cont-3 shrink-0"
-                class:w-full={window.innerWidth < 700 || $MobileGUI}
+                class:w-full={!wide700.current || $MobileGUI}
                 class:bg-darkbg={!$MobileGUI} class:bg-bgcolor={$MobileGUI}
             >
                 <!-- Fake-input trigger: the actual search lives in a dialog
@@ -246,14 +264,14 @@
                     {/each}
 
                 {/if}
-                {#if window.innerWidth < 700 && !$MobileGUI}
+                {#if !wide700.current && !$MobileGUI}
                     <button class="absolute top-2 right-2 hover:text-primary text-textcolor" onclick={() => {
                         settingsOpen.set(false)
                     }}> <CircleXIcon size={DBState.db.settingsCloseButtonSize} /> </button>
                 {/if}
             </div>
         {/if}
-        {#if (window.innerWidth >= 700 && !$MobileGUI) || $SettingsMenuIndex !== -1}
+        {#if (wide700.current && !$MobileGUI) || $SettingsMenuIndex !== -1}
             {#key $SettingsMenuIndex}
                 <div class="grow py-6 px-4 bg-bgcolor flex flex-col text-textcolor overflow-y-auto relative rs-setting-cont-4 min-w-0">
                     <div class="w-full max-w-2xl mx-auto flex flex-col">
@@ -289,7 +307,7 @@
                             <PromptSettings onGoBack={() => {
                                 $SettingsMenuIndex = 1
                             }}/>
-                        {:else if $SettingsMenuIndex === 15 && window.innerWidth >= 768}
+                        {:else if $SettingsMenuIndex === 15 && wide768.current}
                             <HotkeySettings/>
                         {:else if $SettingsMenuIndex === 16}
                             <ModelPresetSettings/>
