@@ -769,34 +769,50 @@
               <SidebarAvatar src="slot" size="56" rounded={IconRounded} bordered name={char.name} color={char.color} backgroundimg={char.img ? getCharImage(char.img, "plain") : ""}
               oncontextmenu={async (e) => {
                 e.preventDefault()
+                // Resolve the folder by id, re-looked-up after every await:
+                // the render index (ind) can go stale while a modal is open
+                // (characterOrder splices from drops/imports/checkCharOrder),
+                // which used to redirect these edits to the wrong folder.
                 const sel = parseInt(await alertSelect([language.renameFolder,language.changeFolderColor,language.changeFolderImage,language.cancel]))
                 if(sel === 0){
                   const v = await alertInput(language.changeFolderName, [], char.name)
                   const db = DBState.db
                   if(v){
-                    const oder = db.characterOrder[ind]
+                    const folderIndex = getFolderIndex(char.id)
+                    if(folderIndex === -1){
+                      return
+                    }
+                    const oder = db.characterOrder[folderIndex]
                     if(typeof(oder) === 'string'){
                       return
                     }
                     oder.name = v
-                    db.characterOrder[ind] = oder
+                    db.characterOrder[folderIndex] = oder
                   }
                 }
                 else if(sel === 1){
                   const colors = ["red","green","blue","yellow","indigo","purple","pink","default"]
                   const sel = parseInt(await alertSelect(colors))
                   const db = DBState.db
-                  const oder = db.characterOrder[ind]
+                  const folderIndex = getFolderIndex(char.id)
+                  if(folderIndex === -1){
+                    return
+                  }
+                  const oder = db.characterOrder[folderIndex]
                   if(typeof(oder) === 'string'){
                     return
                   }
                   oder.color = colors[sel].toLocaleLowerCase()
-                  db.characterOrder[ind] = oder
+                  db.characterOrder[folderIndex] = oder
                 }
                 else if(sel === 2) {
                   const sel = parseInt(await alertSelect(['Reset to Default Image', 'Select Image File']))
                   const db = DBState.db
-                  const oder = db.characterOrder[ind]
+                  const folderIndex = getFolderIndex(char.id)
+                  if(folderIndex === -1){
+                    return
+                  }
+                  const oder = db.characterOrder[folderIndex]
                   if(typeof(oder) === 'string'){
                     return
                   }
@@ -806,7 +822,7 @@
                       oder.imgFile = null
                       oder.img = ''
                       break;
-                  
+
                     case 1:
                       const folderImage = await selectSingleFile([
                         'png',
@@ -822,7 +838,11 @@
 
                       oder.imgFile = folderImageData
                       oder.img = await getFileSrc(folderImageData)
-                      db.characterOrder[ind] = oder
+                      const writeIndex = getFolderIndex(char.id)
+                      if(writeIndex === -1){
+                        return
+                      }
+                      db.characterOrder[writeIndex] = oder
                       break;
                   }
                 }

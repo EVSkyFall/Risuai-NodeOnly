@@ -13,6 +13,7 @@
     import type { Snippet } from 'svelte';
     import { Dialog } from 'bits-ui';
     import { XIcon } from '@lucide/svelte';
+    import { handleDialogCloseAutoFocus } from './dialogFocusPolicy';
     import { cn } from 'src/lib/utils';
 
     interface Props {
@@ -87,6 +88,7 @@
             class={cn(contentBase, tierClasses[tier], sizeClasses[size], contentClass)}
             escapeKeydownBehavior={closeOnEscape ? 'close' : 'ignore'}
             interactOutsideBehavior={closeOnOutsideClick ? 'close' : 'ignore'}
+            onCloseAutoFocus={handleDialogCloseAutoFocus}
         >
             {#if title || description || closable}
                 <div class="flex flex-col gap-1 pr-8 relative">
