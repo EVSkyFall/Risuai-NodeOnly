@@ -1470,11 +1470,15 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         previewBody: arg.previewPrompt,
         escape: nowChatroom.type === 'character' && nowChatroom.escapeOutput,
         rememberToolUsage: DBState.db.rememberToolUsage,
+        generationInfo,
     }, 'model', abortSignal)
 
     console.log(req)
     if(req.model){
-        generationInfo.model = getGenerationModelString(req.model)
+        // Preset requests carry a user-facing label; the wire model id then
+        // moves to generationInfo.modelId so both survive on the message.
+        generationInfo.model = req.modelLabel ?? getGenerationModelString(req.model)
+        if(req.modelLabel) generationInfo.modelId = req.model
         console.log(generationInfo.model, req.model)
     }
 

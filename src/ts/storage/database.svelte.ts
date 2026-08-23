@@ -2198,6 +2198,7 @@ export interface Message{
 
 export interface MessageGenerationInfo{
     model?: string
+    modelId?: string
     generationId?: string
     inputTokens?: number
     outputTokens?: number
