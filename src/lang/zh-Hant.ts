@@ -1546,6 +1546,7 @@ export const languageChineseTraditional = {
     "hideLeftBarCollapseButton": "隱藏左側欄摺疊按鈕",
     "importTranslationCacheFailed": "已匯入 {0} 筆項目，但有 {1} 筆無法儲存。儲存空間可能已滿。",
     "nodeOnlyStandardChatWidth": "對話寬度",
+    "pluginPermissionDenyGuide": "已拒絕外掛「{}」的權限請求。被拒絕的權限不會再次詢問。\n\n若是誤按，可在 [設定] > [外掛] 中使用該外掛的「重設權限回應」復原。",
     "resetPluginPermission": "重設權限回應",
     "resetPluginPermissionConfirm": "清除外掛「{}」所有已儲存的權限回應（允許 / 拒絕紀錄）？\n\n下次此外掛請求權限時，系統會再次詢問。",
     "resetPluginPermissionDone": "外掛「{}」的權限回應已重設",

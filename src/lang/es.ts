@@ -1284,6 +1284,7 @@ export const languageSpanish = {
     "mainDomAccessConsent": "El plugin {} está solicitando acceso al Documento principal, lo que podría exponer información confidencial. ¿Desea permitir esto?",
     "replacerPermissionConsent": "El plugin {} está solicitando permiso para reemplazar contenido en el chat, lo que podría usarse para manipular la conversación. ¿Desea permitir esto?",
     "providerPermissionConsent": "El plugin {} está solicitando permiso para acceder al proveedor, lo que podría permitirle realizar llamadas API no autorizadas. ¿Desea permitir esto?",
+    "pluginPermissionDenyGuide": "Se ha denegado la solicitud de permiso del plugin \"{}\". Los permisos denegados no se volverán a preguntar.\n\nSi fue un error, puede deshacerlo en [Ajustes] > [Plugins] restableciendo las respuestas de permisos de ese plugin.",
     "sendChatConsent": "El plugin {} está solicitando permiso para enviar mensajes de chat en su nombre, lo que activará respuestas de IA. ¿Desea permitir esto?",
     "pluginV2Warning": "Los plugins V2 y V2.1 se consideran inseguros y dejarán de funcionar en futuras versiones. **Por favor, no use estas versiones de plugins.** Si usted es el desarrollador de este plugin, actualícelo a V3 lo antes posible.",
     "disableAbove": "Mensajes cortados para la IA",

@@ -1779,6 +1779,8 @@ export const languageKorean = {
     "플러그인 {} 이(가) Provider 접근 권한을 요청합니다. 무단 API 호출이 발생할 수 있습니다. 허용하시겠습니까?",
   sendChatConsent:
     "플러그인 {} 이(가) 사용자 대신 채팅 메시지를 전송할 권한을 요청합니다. AI 응답이 트리거됩니다. 허용하시겠습니까?",
+  pluginPermissionDenyGuide:
+    '플러그인 "{}"의 권한 요청을 거부했습니다. 거부한 권한은 다시 묻지 않습니다.\n\n실수로 거부했다면 [설정] > [플러그인]에서 해당 플러그인의 "권한 응답 초기화"로 되돌릴 수 있습니다.',
   resetPluginPermission: "권한 응답 초기화",
   resetPluginPermissionConfirm:
     '플러그인 "{}"의 저장된 권한 응답(허용/거부 이력)을 모두 삭제하시겠습니까?\n\n다음에 플러그인이 권한을 요청할 때 다시 묻게 됩니다.',

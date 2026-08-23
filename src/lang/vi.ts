@@ -1282,6 +1282,7 @@ export const languageVietnamese = {
     "getFullDatabaseConsent": "Plugin {} đang yêu cầu truy cập vào toàn bộ cơ sở dữ liệu, điều này có thể làm lộ thông tin nhạy cảm. Bạn có muốn cho phép điều này không?",
     "replacerPermissionConsent": "Plugin {} đang yêu cầu quyền thay thế nội dung trong cuộc trò chuyện, điều này có thể được sử dụng để thao túng cuộc đối thoại. Bạn có muốn cho phép không?",
     "providerPermissionConsent": "Plugin {} đang yêu cầu quyền truy cập Provider, điều này có thể cho phép nó thực hiện các lệnh gọi API trái phép. Bạn có muốn cho phép không?",
+    "pluginPermissionDenyGuide": "Đã từ chối yêu cầu quyền của plugin \"{}\". Các quyền bị từ chối sẽ không được hỏi lại.\n\nNếu đây là nhầm lẫn, bạn có thể hoàn tác trong [Cài đặt] > [Plugin] bằng cách đặt lại phản hồi quyền của plugin đó.",
     "sendChatConsent": "Plugin {} đang yêu cầu quyền gửi tin nhắn trò chuyện thay mặt bạn, điều này sẽ kích hoạt phản hồi AI. Bạn có muốn cho phép không?",
     "pluginV2Warning": "Plugin V2 và V2.1 bị coi là không an toàn và sẽ ngừng hoạt động trong các phiên bản sau. **Vui lòng không sử dụng các phiên bản plugin này.** Nếu bạn là nhà phát triển của plugin này, vui lòng cập nhật lên V3 càng sớm càng tốt.",
     "enableScrollToActiveChar": "Bật cuộn đến nhân vật đang hoạt động",

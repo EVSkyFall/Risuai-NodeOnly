@@ -7,7 +7,7 @@ import DOMPurify from 'dompurify';
 import { additionalChatMenu, additionalFloatingActionButtons, additionalHamburgerMenu, additionalSettingsMenu, bodyIntercepterStore, chatPanelStore, DBState, selectedCharID, type MenuDef } from "src/ts/stores.svelte";
 import { v4 } from "uuid";
 import { sleep } from "src/ts/util";
-import { alertConfirm, alertError, alertNormal } from "src/ts/alert";
+import { alertConfirm, alertError, alertNormal, alertNormalWait } from "src/ts/alert";
 import { language } from "src/lang";
 import { checkCharOrder, forageStorage, getFetchLogs } from "src/ts/globalApi.svelte";
 import { changeColorScheme, updateColorScheme, updateTextThemeAndCSS, type ColorScheme } from "src/ts/gui/colorscheme";
@@ -682,14 +682,11 @@ const isPermissionResolved = async (
 const getPluginPermission = async (pluginName: string, permissionDesc: PluginPermissionDesc, reconfirm: boolean|'periodically' = false) => {
     await ensurePluginPermissionStateLoaded()
 
-    // Recomputed (not captured) so a periodic reconfirm reflects the latest
-    // lastGrantTime: when several identical requests queue together, an earlier
-    // one may refresh it, making the reconfirm no longer due for the rest.
+    // 'periodically' grants are permanent: a (plugin, permission) pair is asked
+    // once and only re-prompted for permissions the plugin never requested
+    // before, matching the Android/extension model. Upstream's 3-day expiry was
+    // removed — it re-asked when nothing changed. Per-plugin reset still clears.
     const computeRequiresReconfirm = () => {
-        if(reconfirm === 'periodically'){
-            const lastGrantTime = permissionCache.get(permissionKeyOf(pluginName, permissionDesc) + '_lastGrantTime') as number | undefined;
-            return !lastGrantTime || Date.now() - lastGrantTime > 3 * 24 * 60 * 60 * 1000; //3 days
-        }
         return reconfirm === true;
     }
 
@@ -702,8 +699,8 @@ const getPluginPermission = async (pluginName: string, permissionDesc: PluginPer
 
     const showDialog = async (): Promise<boolean> => {
         // Re-check under the lock: an earlier queued dialog for the same plugin
-        // may have already granted/denied (or refreshed a periodic grant) while
-        // we were waiting our turn — recompute reconfirm so we don't re-prompt.
+        // may have already granted/denied while we were waiting our turn, so we
+        // don't re-prompt.
         const requiresReconfirm = computeRequiresReconfirm()
         const recheck = await isPermissionResolved(pluginName, permissionDesc, requiresReconfirm)
         if (recheck.resolved) {
@@ -728,14 +725,14 @@ const getPluginPermission = async (pluginName: string, permissionDesc: PluginPer
             permissionGivenPlugins.add(permissionKey);
             permissionDeniedPlugins.delete(permissionKey);
             permissionCache.set(pluginHash, true);
-            if(reconfirm === 'periodically'){
-                permissionCache.set(permissionKeyOf(pluginName, permissionDesc) + '_lastGrantTime', Date.now());
-            }
             await persistPluginPermissionState()
             return true;
         }
         permissionDeniedPlugins.add(permissionKey);
         await persistPluginPermissionState()
+        // Denials are permanent, so tell the user how to undo a misclick.
+        // Awaited so the next queued permission dialog doesn't overwrite it.
+        await alertNormalWait(language.pluginPermissionDenyGuide.replace("{}", pluginName))
         return false;
     }
 
@@ -807,7 +804,10 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             let provs = get(customProviderStore)
             provs.push(name)
             pluginV2.providers.set(name, async (arg, abortSignal) => {
-               await getPluginPermission(plugin.name, 'provider', 'periodically');
+               const conf = await getPluginPermission(plugin.name, 'provider', 'periodically');
+               if(!conf){
+                   return { success: false, content: `Provider permission denied for plugin '${plugin.name}'` };
+               }
                //mode is overridden to v3, due to vulnerabilities using mode.
                //Alternative to mode will be added in future
                arg.mode = 'v3'

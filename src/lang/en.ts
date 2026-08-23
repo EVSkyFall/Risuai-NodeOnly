@@ -1637,6 +1637,7 @@ export const languageEnglish = {
     replacerPermissionConsent: "Plugin {} is requesting permission to replace content in the chat, which may be used to manipulate the conversation. Do you want to allow this?",
     providerPermissionConsent: "Plugin {} is requesting permission to access the provider, which may allow it to make unauthorized API calls. Do you want to allow this?",
     sendChatConsent: "Plugin {} is requesting permission to send chat messages on your behalf, which will trigger AI responses. Do you want to allow this?",
+    pluginPermissionDenyGuide: "Permission request from plugin \"{}\" was denied. Denied permissions will not be asked again.\n\nIf this was a mistake, you can undo it with \"Reset permission responses\" for this plugin in [Settings] > [Plugins].",
     resetPluginPermission: "Reset permission responses",
     resetPluginPermissionConfirm: "Clear all saved permission responses (granted / denied history) for plugin \"{}\"?\n\nThe plugin will be asked again the next time it requests permission.",
     resetPluginPermissionDone: "Permission responses for \"{}\" have been reset",
