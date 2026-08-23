@@ -45,6 +45,151 @@
     let lastParsed = ''
     let lastCharArg:string|simpleCharacterArgument = null
     let lastChatId = -10
+    type TranslationRequest = {
+        data: string
+        charArg: string | simpleCharacterArgument
+        chatID: number
+        retranslate: boolean
+    }
+
+    let translationFlight: Promise<string> | null = null
+    let translationPendingData: string | null = null
+    let translationPendingCharArg:string|simpleCharacterArgument = null
+    let translationPendingChatID: number | null = null
+    let translationPendingRetranslate = false
+    let translationActiveRequest: TranslationRequest | null = null
+
+    const translationLoadingHTML = `<div style="display:flex;justify-content:center;align-items:center;height:48px;"><div style="animation: spin 1s linear infinite; border-radius: 50%; height: 32px; width: 32px; border: 2px solid #3b82f6; border-top: 2px solid transparent;"></div></div><style>@keyframes spin { to { transform: rotate(360deg); } }</style>`
+
+    const hasRenderableResult = (result: string | null | undefined) => {
+        return typeof result === 'string' && result.trim().length > 0
+    }
+
+    const isSameTranslationTarget = (a: TranslationRequest | null, b: TranslationRequest | null) => {
+        return !!a && !!b && a.data === b.data && a.chatID === b.chatID && isEqual(a.charArg, b.charArg)
+    }
+
+    const shouldQueueTranslation = (request: TranslationRequest, existing: TranslationRequest | null) => {
+        if(!existing){
+            return true
+        }
+        if(!isSameTranslationTarget(request, existing)){
+            return true
+        }
+        return request.retranslate && !existing.retranslate
+    }
+
+    const getPendingTranslationRequest = (): TranslationRequest | null => {
+        if(translationPendingData === null || translationPendingChatID === null){
+            return null
+        }
+        return {
+            data: translationPendingData,
+            charArg: translationPendingCharArg,
+            chatID: translationPendingChatID,
+            retranslate: translationPendingRetranslate,
+        }
+    }
+
+    const queueLatestTranslation = (request: TranslationRequest) => {
+        const queued = getPendingTranslationRequest()
+        const existing = queued ?? translationActiveRequest
+        if(!shouldQueueTranslation(request, existing)){
+            return
+        }
+        translationPendingData = request.data
+        translationPendingCharArg = request.charArg
+        translationPendingChatID = request.chatID
+        translationPendingRetranslate = request.retranslate
+    }
+
+    const takePendingTranslation = () => {
+        const queued = getPendingTranslationRequest()
+        translationPendingData = null
+        translationPendingCharArg = null
+        translationPendingChatID = null
+        translationPendingRetranslate = false
+        return queued
+    }
+
+    const translateOnce = async (request: TranslationRequest, mode: 'notrim', fallbackParsed: string) => {
+        let transResult = ''
+
+        if(DBState.db.translatorType === 'llm' && DBState.db.translateBeforeHTMLFormatting){
+            await sleep(100)
+            const translatedData = await translateHTML(request.data, false, request.charArg, request.chatID, request.retranslate)
+            const marked = await ParseMarkdown(translatedData, request.charArg, mode, request.chatID, getCbsCondition())
+            transResult = marked
+        }
+        else if(!DBState.db.legacyTranslation){
+            const marked = await ParseMarkdown(request.data, request.charArg, 'pretranslate', request.chatID, getCbsCondition())
+            const translated = await postTranslationParse(await translateHTML(marked, false, request.charArg, request.chatID, request.retranslate))
+            transResult = translated
+        }
+        else{
+            const marked = await ParseMarkdown(request.data, request.charArg, mode, request.chatID, getCbsCondition())
+            const translated = await translateHTML(marked, false, request.charArg, request.chatID, request.retranslate)
+            transResult = translated
+        }
+
+        setTimeout(() => {
+            retranslate = false
+        }, 10);
+
+        if(hasRenderableResult(transResult)){
+            lastParsed = transResult
+            lastCharArg = request.charArg
+            return transResult
+        }
+
+        return lastParsed === translationLoadingHTML ? fallbackParsed : lastParsed
+    }
+
+    const startTranslationFlight = (request: TranslationRequest, mode: 'notrim') => {
+        const fallbackParsed = lastParsed
+        let finalResult = fallbackParsed
+
+        translationFlight = (async () => {
+            if (DBState.db.showTranslationLoading && !hasRenderableResult(lastParsed)) {
+                lastParsed = translationLoadingHTML
+            }
+            translating = true
+
+            try {
+                let currentRequest = request
+                while(true){
+                    translationActiveRequest = currentRequest
+                    const translatedResult = await translateOnce(currentRequest, mode, fallbackParsed)
+                    if(hasRenderableResult(translatedResult)){
+                        finalResult = translatedResult
+                    }
+
+                    const queued = takePendingTranslation()
+                    if(!queued){
+                        return finalResult
+                    }
+                    if(isSameTranslationTarget(currentRequest, queued) && !queued.retranslate){
+                        return finalResult
+                    }
+                    currentRequest = queued
+                }
+            }
+            finally {
+                if(!hasRenderableResult(finalResult) && lastParsed === translationLoadingHTML){
+                    lastParsed = fallbackParsed
+                }
+                translating = false
+                translationActiveRequest = null
+                translationFlight = null
+                translationPendingData = null
+                translationPendingCharArg = null
+                translationPendingChatID = null
+                translationPendingRetranslate = false
+            }
+        })()
+
+        return translationFlight
+    }
 
     function getCbsCondition(){
         try{
@@ -101,52 +246,34 @@
                     // State change of `translated` triggers markParsing again,
                     // causing redundant translation attempts
                     if (lastTranslated !== translateText) {
-                        return;
+                        lastParsedQueue = lastParsed
+                        return lastParsed;
                     }
                 } catch (error) {
                     console.error(error)
                 }
             }
             if(retranslate || translated){
-                if (DBState.db.showTranslationLoading) {
-                    lastParsed = `<div style="display:flex;justify-content:center;align-items:center;height:48px;"><div style="animation: spin 1s linear infinite; border-radius: 50%; height: 32px; width: 32px; border: 2px solid #3b82f6; border-top: 2px solid transparent;"></div></div><style>@keyframes spin { to { transform: rotate(360deg); } }</style>`
+                const translationRequest = {
+                    data,
+                    charArg,
+                    chatID,
+                    retranslate,
                 }
-
-                let transResult
                 
-                if(DBState.db.translatorType === 'llm' && DBState.db.translateBeforeHTMLFormatting){
-                    await sleep(100)
-                    translating = true
-                    data = await translateHTML(data, false, charArg, chatID, retranslate)
-                    translating = false
-                    const marked = await ParseMarkdown(data, charArg, mode, chatID, getCbsCondition())
-                    lastParsedQueue = marked
-                    lastCharArg = charArg
-                    transResult = marked
-                }
-                else if(!DBState.db.legacyTranslation){
-                    const marked = await ParseMarkdown(data, charArg, 'pretranslate', chatID, getCbsCondition())
-                    translating = true
-                    const translated = await postTranslationParse(await translateHTML(marked, false, charArg, chatID, retranslate))
-                    translating = false
-                    lastParsedQueue = translated
-                    lastCharArg = charArg
-                    transResult = translated
-                }
-                else{
-                    const marked = await ParseMarkdown(data, charArg, mode, chatID, getCbsCondition())
-                    translating = true
-                    const translated = await translateHTML(marked, false, charArg, chatID, retranslate)
-                    translating = false
-                    lastParsedQueue = translated
-                    lastCharArg = charArg
-                    transResult = translated
+                if(translationFlight){
+                    queueLatestTranslation(translationRequest)
+                    const transResult = await translationFlight
+                    if(hasRenderableResult(transResult)){
+                        lastParsedQueue = transResult
+                    }
+                    return transResult
                 }
 
-                setTimeout(() => {
-                    retranslate = false
-                }, 10);
-
+                const transResult = await startTranslationFlight(translationRequest, mode)
+                if(hasRenderableResult(transResult)){
+                    lastParsedQueue = transResult
+                }
                 return transResult
             }
             else{
@@ -159,14 +286,22 @@
             //retry
             if(tries > 2){
 
-                alertError(`Error while parsing chat message: ${translated}, ${error.message}, ${error.stack}`)
-                return data
+                const err = error as Error
+                alertError(`Error while parsing chat message: ${translated}, ${err.message}, ${err.stack}`)
+                lastParsedQueue = hasRenderableResult(data) ? data : lastParsed
+                return lastParsedQueue
             }
-            return await markParsing(data, charArg, chatID, (tries ?? 0) + 1)
+            const retryResult = await markParsing(data, charArg, chatID, (tries ?? 0) + 1)
+            if(hasRenderableResult(retryResult)){
+                lastParsedQueue = retryResult
+            }
+            return retryResult
         }
         finally{
             //since trimMarkdown is fast, we don't need to cache it
-            lastParsed = lastParsedQueue
+            if(hasRenderableResult(lastParsedQueue)){
+                lastParsed = lastParsedQueue
+            }
         }
     }
 
