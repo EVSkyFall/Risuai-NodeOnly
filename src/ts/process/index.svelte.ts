@@ -66,10 +66,12 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     usedContinueTokens?:number,
     preview?:boolean
     previewPrompt?:boolean
+    responseStartedAt?:number
 } = {}):Promise<boolean> {
 
     chatProcessStage.set(0)
     const abortSignal = arg.signal ?? (new AbortController()).signal
+    const responseStartedAt = arg.responseStartedAt ?? performance.now()
     
     // NOTE: `throwError()` can be called before these are populated (e.g. HypaV3 early validation errors).
     // Keep them declared up-front to avoid TDZ ReferenceErrors in production builds.
@@ -1768,6 +1770,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     if(needsAutoContinue){
         endGeneration(genKey, { keepPendingAbort: true })
         return await sendChat(chatProcessIndex, {
+            responseStartedAt,
             chatAdditonalTokens: arg.chatAdditonalTokens,
             continue: true,
             signal: abortSignal,
@@ -1812,24 +1815,49 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         
         endGeneration(genKey, { keepPendingAbort: true })
         return await sendChat(chatProcessIndex, {
+            responseStartedAt,
             signal: abortSignal
         })
     }
 
     if(DBState.db.notification){
-        try {
-            const permission = await Notification.requestPermission()
-            if(permission === 'granted'){
-                const noti = new Notification('Risuai', {
-                    body: result
+        void (async () => {
+            let termuxNotified = false
+
+            try {
+                const elapsedMs = performance.now() - responseStartedAt
+                const response = await fetch('/api/termux-notify', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        elapsedMs,
+                        character: currentChar?.name ?? ''
+                    })
                 })
-                noti.onclick = () => {
-                    window.focus()
-                }
+
+                termuxNotified = response.ok
+            } catch {}
+
+            if(termuxNotified){
+                return
             }
-        } catch (error) {
-            
-        }
+
+            try {
+                const permission = await Notification.requestPermission()
+                if(permission === 'granted'){
+                    const noti = new Notification('Risuai', {
+                        body: result
+                    })
+                    noti.onclick = () => {
+                        window.focus()
+                    }
+                }
+            } catch (error) {
+
+            }
+        })()
     }
 
     if(req.special){
