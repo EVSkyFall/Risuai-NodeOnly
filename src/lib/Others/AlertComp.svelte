@@ -258,14 +258,19 @@
                     }}>✖</button>
                 </div>
                 {#if generationInfoMenuIndex === 0}
+                    <!-- Recovered messages from older jobs can lack maxContext
+                         (and tokens); fall back to 0% instead of a NaN% gradient. -->
+                    {@const graphMaxContext = $alertGenerationInfoStore.genInfo.maxContext ?? 0}
+                    {@const graphInputPct = graphMaxContext > 0 ? (($alertGenerationInfoStore.genInfo.inputTokens ?? 0) / graphMaxContext) * 100 : 0}
+                    {@const graphTotalPct = graphMaxContext > 0 ? ((($alertGenerationInfoStore.genInfo.outputTokens ?? 0) + ($alertGenerationInfoStore.genInfo.inputTokens ?? 0)) / graphMaxContext) * 100 : 0}
                     <div class="mt-4 flex justify-center w-full">
                         <div class="w-32 h-32 border-darkborderc border-4 rounded-lg" style:background={
                             `linear-gradient(0deg,
                             rgb(59,130,246) 0%,
-                            rgb(59,130,246) ${($alertGenerationInfoStore.genInfo.inputTokens / $alertGenerationInfoStore.genInfo.maxContext) * 100}%,
-                            rgb(34 197 94) ${($alertGenerationInfoStore.genInfo.inputTokens / $alertGenerationInfoStore.genInfo.maxContext) * 100}%,
-                            rgb(34 197 94) ${(($alertGenerationInfoStore.genInfo.outputTokens + $alertGenerationInfoStore.genInfo.inputTokens) / $alertGenerationInfoStore.genInfo.maxContext) * 100}%,
-                            rgb(156 163 175) ${(($alertGenerationInfoStore.genInfo.outputTokens + $alertGenerationInfoStore.genInfo.inputTokens) / $alertGenerationInfoStore.genInfo.maxContext) * 100}%,
+                            rgb(59,130,246) ${graphInputPct}%,
+                            rgb(34 197 94) ${graphInputPct}%,
+                            rgb(34 197 94) ${graphTotalPct}%,
+                            rgb(156 163 175) ${graphTotalPct}%,
                             rgb(156 163 175) 100%)`
                         }>
 
