@@ -90,6 +90,9 @@ jobs:
         run: |
           cd portable
           echo "node-linker=hoisted" > .npmrc
+          # Skip onnxruntime-node's CUDA postinstall download (~210MB, linux
+          # x64 only) — nothing loads onnxruntime-node at runtime.
+          echo "onnxruntime-node-install-cuda=skip" >> .npmrc
           pnpm install --prod --frozen-lockfile
 
       - name: Extract version
