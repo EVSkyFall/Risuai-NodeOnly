@@ -33,6 +33,7 @@ const {
 const { createRequestLogs } = require('./request-logs.cjs');
 const { applyPatch } = require('fast-json-patch');
 const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, normalizeForwardHeaders, hasRemoteBlocks } = require('./utils.cjs');
+const { clonePatchSnapshot } = require('./patch-selective-clone.cjs');
 const { spawn, execSync } = require('child_process');
 const os = require('os');
 const { Readable, Transform } = require('stream');
@@ -3810,7 +3811,9 @@ app.post('/api/patch', async (req, res, next) => {
             // length), which rejected every patch. The cache is normalized to
             // plain JSON values at load, so the clone semantics are identical.
             patchStage = 'clone';
-            const snapshot = structuredClone(dbCache[filePath]);
+            const snapshot = decodedKey === 'database/database.bin'
+                ? clonePatchSnapshot(dbCache[filePath], patch)
+                : structuredClone(dbCache[filePath]);
             patchStage = 'apply';
             let result;
             try {
