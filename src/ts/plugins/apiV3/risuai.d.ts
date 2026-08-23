@@ -1697,6 +1697,15 @@ interface ProviderOptions {
 // Risuai Global API
 // ============================================================================
 
+/** Scalar identifiers for the current character and chat. */
+interface CurrentContextLite {
+    chaId: string | null;
+    name: string | null;
+    chatPage: number | null;
+    chatId: string | null;
+    chatName: string | null;
+}
+
 /**
  * Risuai Plugin API v3.0
  *
@@ -1787,6 +1796,9 @@ interface RisuaiPluginAPI {
      * ```
      */
     getCharacter(): Promise<any>;
+
+    /** Gets scalar identifiers for the current character and chat. */
+    getCurrentContextLite(): Promise<CurrentContextLite>;
 
     /**
      * Sets the current character

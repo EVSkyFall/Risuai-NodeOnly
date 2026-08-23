@@ -797,6 +797,14 @@ interface getDatabaseOptions{
     snapshot?:boolean
 }
 
+export interface CurrentContextLite{
+    chaId: string | null
+    name: string | null
+    chatPage: number | null
+    chatId: string | null
+    chatName: string | null
+}
+
 export function getDatabase(options:getDatabaseOptions = {}):Database{
     if(options.snapshot){
         return $state.snapshot(DBState.db) as Database
@@ -805,12 +813,29 @@ export function getDatabase(options:getDatabaseOptions = {}):Database{
 }
 
 export function getCurrentCharacter(options:getDatabaseOptions = {}):character{
+    if(options.snapshot){
+        const char = DBState.db.characters?.[get(selectedCharID)]
+        return char === undefined ? char : $state.snapshot(char) as character
+    }
     const db = getDatabase(options)
     if(!db.characters){
         db.characters = []
     }
     const char = db.characters?.[get(selectedCharID)]
     return char
+}
+
+export function getCurrentContextLite():CurrentContextLite{
+    const char = DBState.db.characters?.[get(selectedCharID)]
+    const chatPage = char?.chatPage
+    const chat = chatPage == null ? undefined : char?.chats?.[chatPage]
+    return {
+        chaId: char?.chaId ?? null,
+        name: char?.name ?? null,
+        chatPage: chatPage ?? null,
+        chatId: chat?.id ?? null,
+        chatName: chat?.name ?? null,
+    }
 }
 
 export function setCurrentCharacter(char:character){
@@ -821,6 +846,10 @@ export function setCurrentCharacter(char:character){
 }
 
 export function getCharacterByIndex(index:number,options:getDatabaseOptions = {}):character{
+    if(options.snapshot){
+        const char = DBState.db.characters?.[index]
+        return char === undefined ? char : $state.snapshot(char) as character
+    }
     const db = getDatabase(options)
     if(!db.characters){
         db.characters = []

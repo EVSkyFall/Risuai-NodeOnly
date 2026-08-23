@@ -54,20 +54,30 @@ function writeLocalMeta(map: Record<string, PluginOwnerRecord>): void {
 // ── write side (called from V3 storage wrappers) ────────────────────────────
 export function recordOwner(backend: PluginStorageBackend, key: string, plugin: string): void | Promise<void> {
     if (!plugin) return;
-    const record: PluginOwnerRecord = { plugin, updatedAt: Date.now() };
     if (backend === "save") {
         const db = getDatabase();
+        if (db.pluginStorageMeta?.[key]?.plugin === plugin) return;
+        const record: PluginOwnerRecord = { plugin, updatedAt: Date.now() };
         db.pluginStorageMeta ??= {};
         db.pluginStorageMeta[key] = record;
         return;
     }
     if (backend === "local") {
         const map = readLocalMeta();
+        if (map[key]?.plugin === plugin) return;
+        const record: PluginOwnerRecord = { plugin, updatedAt: Date.now() };
         map[key] = record;
         writeLocalMeta(map);
         return;
     }
-    return writePersistentJson(makeEncodedStorageKey(IDB_META_PREFIX, key), record);
+    const storageKey = makeEncodedStorageKey(IDB_META_PREFIX, key);
+    // Best-effort sidecar: an unreadable record must fall through to the old
+    // blind overwrite, never fail the primary storage write it rides on.
+    return readPersistentJson<PluginOwnerRecord>(storageKey).catch(() => null).then((existing) => {
+        if (existing?.plugin === plugin) return;
+        const record: PluginOwnerRecord = { plugin, updatedAt: Date.now() };
+        return writePersistentJson(storageKey, record);
+    });
 }
 
 export function removeOwner(backend: PluginStorageBackend, key: string): void | Promise<void> {

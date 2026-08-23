@@ -1,6 +1,6 @@
 import { allowedDbKeys, customProviderStore, getV2PluginAPIs, handlePluginInstallViaPlugin, pluginV2, type PluginV2ProviderArgument, type PluginV2ProviderOptions, type RisuPlugin } from "../plugins.svelte";
 import { SandboxHost } from "./factory";
-import { getDatabase, normalizeChat } from "src/ts/storage/database.svelte";
+import { getCurrentContextLite, getDatabase, normalizeChat } from "src/ts/storage/database.svelte";
 import { SafeLocalPluginStorage, tagWhitelist } from "../pluginSafeClass";
 import { recordOwner, removeOwner, clearOwners } from "../pluginStorageMeta";
 import DOMPurify from 'dompurify';
@@ -923,6 +923,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
                 }
             }
         },
+        getCurrentContextLite: getCurrentContextLite,
         getCharacterFromIndex: (index:number) => {
             const db = DBState.db
             const charIds = Object.keys(db.characters);

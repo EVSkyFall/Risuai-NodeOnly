@@ -7,6 +7,31 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 const read = (path: string) => readFileSync(join(HERE, path), 'utf8')
 
 describe('plugin startup bridge contracts', () => {
+    test('V2 and V3 current-character names share the scoped snapshot helper', () => {
+        const v2 = read('../plugins.svelte.ts')
+        const v3 = read('v3.svelte.ts')
+
+        expect(v2).toMatch(/getChar:\s*\(\)\s*=>\s*\{\s*return getCurrentCharacter\(\{\s*snapshot:\s*true\s*\}\)\s*\}/s)
+        expect(v3).toMatch(/getChar:\s*oldApis\.getChar/)
+        expect(v3).toMatch(/getCharacter:\s*oldApis\.getChar/)
+    })
+
+    test('lite current context is a typed top-level root method, not an alias', () => {
+        const v3 = read('v3.svelte.ts')
+        const dts = read('risuai.d.ts')
+        const contextType = dts.match(/interface CurrentContextLite\s*\{([\s\S]*?)\}/)?.[1] ?? ''
+
+        expect(v3).toMatch(/getCurrentContextLite:\s*getCurrentContextLite/)
+        expect(v3).not.toContain("'getCurrentContextLite'")
+        expect(v3).not.toContain('_getCurrentContextLite')
+        expect(contextType).toContain('chaId: string | null;')
+        expect(contextType).toContain('name: string | null;')
+        expect(contextType).toContain('chatPage: number | null;')
+        expect(contextType).toContain('chatId: string | null;')
+        expect(contextType).toContain('chatName: string | null;')
+        expect(dts).toMatch(/getCurrentContextLite\(\):\s*Promise<CurrentContextLite>/)
+    })
+
     test('normal pluginStorage exposes ordered getMany through one host method', () => {
         const v3 = read('v3.svelte.ts')
         const dts = read('risuai.d.ts')
