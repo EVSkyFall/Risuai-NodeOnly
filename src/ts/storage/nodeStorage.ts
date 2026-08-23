@@ -155,6 +155,10 @@ export class NodeStorage{
         return token
     }
 
+    getSessionId(): string {
+        return NodeStorage.sessionId
+    }
+
     // Called once after JWT auth is confirmed. Issues a session cookie so that
     // <img src="/api/asset/..."> can be served without JS-injected headers.
     private async initSession() {

@@ -24,7 +24,7 @@ const getVips = () => {
     return _vipsPromise
 }
 const { kvGet, kvSet, kvDel, kvList,
-        kvDelPrefix, kvListWithSizes, kvSize, kvGetUpdatedAt, kvCopyValue, clearEntities, checkpointWal,
+        kvDelPrefix, kvListWithSizes, kvListWithSizesAndUpdatedAt, kvSize, kvGetUpdatedAt, kvCopyValue, clearEntities, checkpointWal,
         gcChunks, reclaimableChunkBytes, isDbBlobChunked, snapshotFootprint, db: sqliteDb } = require('./db.cjs');
 const {
     addLogBatch, queryLogs, clearLogs, countLogs,
@@ -3443,6 +3443,9 @@ app.get('/api/remove', async (req, res, next) => {
     }
     try {
         const key = Buffer.from(filePath, 'hex').toString('utf-8');
+        if (key.startsWith('assets/') || key.startsWith('remotes/')) {
+            return res.status(409).send({ error: 'asset removal must go through server-side cleanup' });
+        }
         if (key.startsWith('inlay/')) {
             const id = key.slice('inlay/'.length)
             await deleteInlayFile(id)
@@ -5167,6 +5170,7 @@ app.post('/api/migrate/save-folder/cleanup/execute', async (req, res, next) => {
 const DB_BLOB_KEY = 'database/database.bin';
 const DB_BACKUP_PREFIX = 'database/dbbackup-';
 const ASSET_PREFIXES = ['assets/', 'remotes/', 'inlay/', 'inlay_thumb/', 'inlay_meta/', 'inlay_info/', 'coldstorage/'];
+const AUTO_SWEEP_GRACE_MS = 7 * 24 * 60 * 60 * 1000;
 
 function statsBasename(s) {
     if (!s) return '';
@@ -5282,6 +5286,107 @@ function buildUncleanableSet(dbObj, { includeModuleAssets = true } = {}) {
         }
     }
     return set;
+}
+
+function decodeRemoteMetaLastUsed(raw) {
+    try {
+        if (!raw) return null;
+        const text = Buffer.isBuffer(raw) ? raw.toString('utf-8') : String(raw);
+        const parsed = JSON.parse(text);
+        const lastUsed = Number(parsed?.lastUsed);
+        return Number.isFinite(lastUsed) ? lastUsed : null;
+    } catch {
+        return null;
+    }
+}
+
+async function computeAssetSweep({ includeAssets, assetGraceMs = 0, includeRemotes = false, checkpointLabel = 'AssetSweep' } = {}) {
+    await flushPendingDb();
+    const raw = kvGet(DB_BLOB_KEY);
+    if (!raw) return { error: 'No database blob' };
+    const dbObj = await decodeRisuSave(raw);
+    if (!dbObj || !Array.isArray(dbObj.characters)) return { error: 'Database decode failed' };
+
+    const uncleanable = buildUncleanableSet(dbObj);
+    const assets = includeAssets ? kvListWithSizesAndUpdatedAt('assets/') : [];
+    // A walker that returns nothing while assets exist means the decode
+    // produced a shape we do not understand — every asset would look orphaned.
+    // Refuse rather than delete the library. Checked before plugin-storage refs
+    // are unioned in so those can't mask a bad walk.
+    if (uncleanable.size === 0 && assets.length > 0) {
+        return { error: 'Reference scan produced no references — refusing to purge' };
+    }
+    for (const bn of collectPluginStorageAssetRefs()) uncleanable.add(bn);
+
+    const now = Date.now();
+    const assetVictims = includeAssets
+        ? assets.filter((it) => {
+            if (uncleanable.has(statsBasename(it.key))) return false;
+            if (assetGraceMs > 0 && now - Number(it.updated_at || 0) <= assetGraceMs) return false;
+            return true;
+        })
+        : [];
+
+    const remoteVictims = [];
+    const remoteMetaCreates = [];
+    let remotesScanned = 0;
+    if (includeRemotes) {
+        const characterIds = new Set(dbObj.characters.map((v) => v?.chaId).filter(Boolean));
+        const remoteRows = kvListWithSizesAndUpdatedAt('remotes/');
+        const remoteByKey = new Map(remoteRows.map((it) => [it.key, it]));
+        for (const it of remoteRows) {
+            if (it.key.endsWith('.meta')) continue;
+            remotesScanned++;
+            const base = statsBasename(it.key);
+            if (!base.endsWith('.local.bin')) continue;
+            const chaId = base.slice(0, -'.local.bin'.length);
+            if (characterIds.has(chaId)) continue;
+
+            const metaKey = `${it.key}.meta`;
+            const meta = remoteByKey.get(metaKey);
+            if (!meta) {
+                remoteMetaCreates.push(metaKey);
+                continue;
+            }
+            const lastUsed = decodeRemoteMetaLastUsed(kvGet(metaKey));
+            const newestUse = Math.max(Number(it.updated_at || 0), lastUsed ?? 0);
+            if (now - newestUse > AUTO_SWEEP_GRACE_MS) {
+                remoteVictims.push(it);
+                remoteVictims.push(meta);
+            }
+        }
+
+        for (const it of remoteRows) {
+            if (!it.key.endsWith('.meta')) continue;
+            const remoteKey = it.key.slice(0, -'.meta'.length);
+            if (!remoteByKey.has(remoteKey)) {
+                remoteVictims.push(it);
+            }
+        }
+    }
+
+    const victims = [...assetVictims, ...remoteVictims];
+    sqliteDb.transaction(() => {
+        for (const key of remoteMetaCreates) {
+            kvSet(key, Buffer.from(JSON.stringify({ lastUsed: now })));
+        }
+        for (const it of victims) kvDel(it.key);
+    })();
+
+    const deleted = victims.length;
+    const bytes = victims.reduce((sum, it) => sum + it.size, 0);
+    if (deleted > 0) {
+        try { checkpointWal('TRUNCATE'); } catch (e) { logger.warn(`[${checkpointLabel}] checkpoint failed:`, e?.message || e); }
+    }
+
+    return {
+        ok: true,
+        deleted: assetVictims.length,
+        assetsDeleted: assetVictims.length,
+        remotesDeleted: remoteVictims.length,
+        bytes,
+        scanned: assets.length + remotesScanned,
+    };
 }
 
 function statSafe(p) {
@@ -5644,41 +5749,31 @@ app.post('/api/db/assets/purge-orphans', async (req, res, next) => {
     if (!checkActiveSession(req, res)) return;
     try {
         const result = await queueStorageOperation(async () => {
-            // Land any debounced write first — otherwise the blob we walk is
-            // older than the assets the client just attached.
-            await flushPendingDb();
-            const raw = kvGet(DB_BLOB_KEY);
-            if (!raw) return { error: 'No database blob' };
-            const dbObj = await decodeRisuSave(raw);
-            if (!dbObj || !Array.isArray(dbObj.characters)) return { error: 'Database decode failed' };
-
-            const uncleanable = buildUncleanableSet(dbObj);
-            const assets = kvListWithSizes('assets/');
-            // A walker that returns nothing while assets exist means the decode
-            // produced a shape we do not understand — every asset would look
-            // orphaned. Refuse rather than delete the library. Checked before
-            // plugin-storage refs are unioned in so those can't mask a bad walk.
-            if (uncleanable.size === 0 && assets.length > 0) {
-                return { error: 'Reference scan produced no references — refusing to purge' };
-            }
-            for (const bn of collectPluginStorageAssetRefs()) uncleanable.add(bn);
-
-            const victims = assets.filter((it) => !uncleanable.has(statsBasename(it.key)));
-            // One commit for the whole sweep: thousands of autocommitted deletes
-            // would each hit the WAL, and a crash mid-loop would leave the
-            // library half-swept.
-            sqliteDb.transaction(() => {
-                for (const it of victims) kvDel(it.key);
-            })();
-            const deleted = victims.length;
-            const bytes = victims.reduce((sum, it) => sum + it.size, 0);
-            if (deleted > 0) {
-                try { checkpointWal('TRUNCATE'); } catch (e) { logger.warn('[PurgeOrphans] checkpoint failed:', e?.message || e); }
-            }
-            return { ok: true, deleted, bytes, scanned: assets.length };
+            const sweep = await computeAssetSweep({ includeAssets: true, checkpointLabel: 'PurgeOrphans' });
+            if (sweep.error) return sweep;
+            return { ok: true, deleted: sweep.deleted, bytes: sweep.bytes, scanned: sweep.scanned };
         });
         if (result.error) return res.status(400).json(result);
         logger.info(`[PurgeOrphans] removed ${result.deleted}/${result.scanned} assets (${result.bytes} bytes)`);
+        res.json(result);
+    } catch (err) { next(err); }
+});
+
+app.post('/api/db/assets/auto-sweep', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    if (!checkActiveSession(req, res)) return;
+    try {
+        const includeAssets = req.body?.assets === true;
+        const result = await queueStorageOperation(async () => {
+            return computeAssetSweep({
+                includeAssets,
+                assetGraceMs: AUTO_SWEEP_GRACE_MS,
+                includeRemotes: true,
+                checkpointLabel: 'AutoSweep',
+            });
+        });
+        if (result.error) return res.status(400).json(result);
+        logger.info(`[AutoSweep] removed assets=${result.assetsDeleted}, remotes=${result.remotesDeleted}, scanned=${result.scanned}, bytes=${result.bytes}`);
         res.json(result);
     } catch (err) { next(err); }
 });

@@ -38,6 +38,11 @@ export class AutoStorage{
         return this.realStorage.createAuth()
     }
 
+    async getSessionId(): Promise<string> {
+        await this.Init()
+        return this.realStorage.getSessionId()
+    }
+
     async exportBackup(opts?: ExportBackupOptions) {
         await this.Init()
         return this.realStorage.exportBackup(opts)
