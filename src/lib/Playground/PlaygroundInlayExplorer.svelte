@@ -18,6 +18,7 @@
   } from 'src/ts/process/files/inlays'
   import Button from '../UI/GUI/Button.svelte'
   import CheckInput from '../UI/GUI/CheckInput.svelte'
+  import { isOrphanMessageInlay } from '../Setting/Pages/inlayGalleryClassification'
 
   const PAGE_SIZE = 36
 
@@ -50,7 +51,7 @@
       if (specialFilter === 'meta-missing' && item.hasMeta) return false
       if (specialFilter === 'orphan-character' && !isOrphanCharacter(item)) return false
       if (specialFilter === 'orphan-chat' && !isOrphanChat(item)) return false
-      if (specialFilter === 'orphan-message' && (scanResult?.refCounts[item.id] ?? 0) > 0) return false
+      if (specialFilter === 'orphan-message' && !isOrphanMessageInlay(item.id, scanResult?.refCounts[item.id] ?? 0)) return false
 
       return true
     })

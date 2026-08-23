@@ -244,4 +244,35 @@ describe('sandbox result envelope', () => {
             expect(result).toMatchObject({ ok: false, code: 'PLUGIN_ATOMIC_NO_INSTALL_ID' })
         }
     })
+
+    it('reserves host-internal mutation keys without blocking reads', async () => {
+        const t = makeTransport()
+        t.setResponder((body) => ({
+            status: 200,
+            body: body.op === 'read'
+                ? { key: body.key, revision: 0, value: null, deleted: false }
+                : { applied: true, revision: 1 },
+        }))
+        const api = createPluginAtomicSandboxApi({
+            installId: INSTALL_A,
+            client: new PluginAtomicClient({ transport: t.transport }),
+        })
+        const key = '__risu_internal__/pluginInlays/putImage/claim'
+
+        expect(await api.cas({ key, value: {}, operationKey: 'reserved-cas' })).toEqual({
+            ok: false,
+            code: 'PLUGIN_ATOMIC_RESERVED_KEY',
+            message: 'keys under "__risu_internal__/" are reserved for host use',
+        })
+        expect(await api.remove({ key, operationKey: 'reserved-remove' })).toEqual({
+            ok: false,
+            code: 'PLUGIN_ATOMIC_RESERVED_KEY',
+            message: 'keys under "__risu_internal__/" are reserved for host use',
+        })
+        expect(t.requests).toHaveLength(0)
+
+        await expect(api.read(key)).resolves.toMatchObject({ ok: true, key, revision: 0 })
+        expect(t.requests).toHaveLength(1)
+        expect(t.requests[0]).toMatchObject({ op: 'read', key: `${NS_A}${key}` })
+    })
 })

@@ -1119,6 +1119,7 @@ interface PluginAtomicFailure {
      *   with `list()`
      * - `PLUGIN_ATOMIC_VALUE_TOO_LARGE` — value exceeds the 16 MiB cap
      * - `PLUGIN_ATOMIC_BAD_KEY` / `PLUGIN_ATOMIC_BAD_REQUEST` — malformed input
+     * - `PLUGIN_ATOMIC_RESERVED_KEY` — host-internal mutation key; reads remain allowed
      * - `PLUGIN_ATOMIC_NO_INSTALL_ID` — this installation has no persisted
      *   identity, so no namespace can be resolved; every call fails closed
      */
@@ -1448,7 +1449,20 @@ interface PluginImagesAPI {
     generateToInlay(input: PluginImageGenerateInput): Promise<PluginImageGenerateResult>;
 }
 
+interface PluginInlayPutImageInput {
+    operationKey: string;
+    dataUrl: string;
+}
+
+type PluginInlayPutImageResult =
+    | { status: 'succeeded'; result: { assetId: string } }
+    | { status: 'precondition_failed'; code: string; error: string }
+    | { status: 'definite_failure'; code: string; error: string }
+    | { status: 'ambiguous'; code: string; error: string };
+
 interface PluginInlaysAPI {
+    /** Optional V1 extension that stores caller-supplied image bytes as a canonical inlay. */
+    putImage?(input: PluginInlayPutImageInput): Promise<PluginInlayPutImageResult>;
     remove(input: { operationKey: string; assetId: string }): Promise<any>;
     read(input: { assetId: string }): Promise<any>;
     /** Optional V1 extension that returns image or video bytes as a Blob. */

@@ -20,7 +20,16 @@ import { getDatabase } from 'src/ts/storage/database.svelte'
 import type { character } from 'src/ts/storage/database.svelte'
 import { getCurrentCharacter } from 'src/ts/storage/database.svelte'
 import { generateAIImageTyped, type ImageGenerationAttempt, type ImageGenerationResult } from '../stableDiff'
-import { getInlayAsset, removeInlayAsset, writeInlayImage } from '../files/inlays'
+import {
+    getInlayAsset,
+    getInlayAssetBlobFromStorage,
+    getInlayInfosBatch,
+    removeInlayAsset,
+    writeInlayImage,
+    writeInlayImageBytes,
+} from '../files/inlays'
+import type { PluginAtomicSandboxApi } from './pluginAtomic'
+import { INSTALL_ID_PATTERN } from 'src/ts/plugins/pluginInstallId'
 import { parseIllustrationPromptV1 } from '../illustrationJobs/imagePrompt'
 import {
     evaluateImagePromptLimits,
@@ -139,6 +148,17 @@ export type PluginInlayReadResult =
     }
     | { status: 'definite_failure'; error: string; code: string }
 
+export interface PluginInlayPutImageInput {
+    operationKey: string
+    dataUrl: string
+}
+
+export type PluginInlayPutImageResult =
+    | { status: 'succeeded'; result: { assetId: string } }
+    | { status: 'precondition_failed'; code: string; error: string }
+    | { status: 'definite_failure'; code: string; error: string }
+    | { status: 'ambiguous'; code: string; error: string }
+
 export class PluginImageError extends Error {
     readonly code: string
     constructor(code: string, message: string) {
@@ -180,6 +200,11 @@ function canonicalize(value: unknown): unknown {
 
 async function sha256Hex(text: string): Promise<string> {
     const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+    return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
+async function sha256BytesHex(bytes: Uint8Array): Promise<string> {
+    const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes as BufferSource)
     return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('')
 }
 
@@ -268,6 +293,29 @@ export interface PluginImagesDependencies {
         width?: number
         height?: number
     } | null>
+    putImage?: {
+        installId?: string
+        atomic?: Pick<PluginAtomicSandboxApi, 'read' | 'cas'>
+        inspectInlay(assetId: string): Promise<{
+            asset: {
+                data: Blob
+                ext: string
+                name: string
+                type: string
+            } | null
+            info: {
+                ext: string
+                name: string
+                type: string
+            } | null
+        }>
+        writeInlayBytes(bytes: Uint8Array, input: {
+            assetId: string
+            ext: string
+            mimeType: string
+            name: string
+        }): Promise<string>
+    }
 }
 
 export interface PluginImagesApi {
@@ -276,8 +324,353 @@ export interface PluginImagesApi {
 }
 
 export interface PluginInlaysApi {
+    putImage(input: PluginInlayPutImageInput): Promise<PluginInlayPutImageResult>
     remove(input: PluginInlayRemoveInput): Promise<PluginInlayRemoveResult>
     read(input: PluginInlayReadInput): Promise<PluginInlayReadResult>
+}
+
+const PUT_IMAGE_EXT_BY_MIME: Readonly<Record<string, string>> = Object.freeze({
+    'image/png': 'png',
+    'image/jpeg': 'jpg',
+    'image/jpg': 'jpg',
+    'image/webp': 'webp',
+    'image/gif': 'gif',
+})
+const PUT_IMAGE_RECEIPT_VERSION = 1 as const
+
+type DecodedPluginImage = {
+    bytes: Uint8Array
+    ext: string
+    mimeType: string
+}
+
+type PluginInlayPutClaim = {
+    schemaVersion: typeof PUT_IMAGE_RECEIPT_VERSION
+    operationHash: string
+    byteHash: string
+    assetId: string
+    ext: string
+    mimeType: string
+}
+
+type PutClaimResolution =
+    | { ok: true, claim: PluginInlayPutClaim }
+    | { ok: false, result: PluginInlayPutImageResult }
+
+function decodeBase64ImagePayload(payload: string): Uint8Array {
+    const compact = payload.replace(/[\t\n\f\r ]/g, '')
+    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(compact)) {
+        throw new PluginImageError('inlay_data_url_decode_failed', 'image data URL has invalid base64 characters')
+    }
+    const firstPadding = compact.indexOf('=')
+    if (firstPadding !== -1) {
+        const paddingLength = compact.length - firstPadding
+        if (paddingLength > 2 || compact.length % 4 !== 0) {
+            throw new PluginImageError('inlay_data_url_decode_failed', 'image data URL has invalid base64 padding')
+        }
+    } else if (compact.length % 4 === 1) {
+        throw new PluginImageError('inlay_data_url_decode_failed', 'image data URL has invalid base64 length')
+    }
+
+    let binary: string
+    try {
+        binary = atob(compact)
+    } catch (error) {
+        throw new PluginImageError(
+            'inlay_data_url_decode_failed',
+            `image data URL could not be decoded: ${error instanceof Error ? error.message : String(error)}`,
+        )
+    }
+    const bytes = new Uint8Array(binary.length)
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+    return bytes
+}
+
+function decodePercentImagePayload(payload: string): Uint8Array {
+    const bytes: number[] = []
+    for (let i = 0; i < payload.length; i++) {
+        const code = payload.charCodeAt(i)
+        if (code === 0x25) {
+            const hex = payload.slice(i + 1, i + 3)
+            if (hex.length !== 2 || !/^[0-9a-f]{2}$/i.test(hex)) {
+                throw new PluginImageError('inlay_data_url_decode_failed', 'image data URL has invalid percent encoding')
+            }
+            bytes.push(Number.parseInt(hex, 16))
+            i += 2
+            continue
+        }
+        if (code > 0x7f) {
+            throw new PluginImageError(
+                'inlay_data_url_decode_failed',
+                'non-ASCII image data URL octets must be percent encoded',
+            )
+        }
+        bytes.push(code)
+    }
+    return Uint8Array.from(bytes)
+}
+
+function decodePluginImageDataUrl(dataUrl: unknown): DecodedPluginImage {
+    if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:')) {
+        throw new PluginImageError('inlay_data_url_invalid', 'dataUrl must be an image data URL')
+    }
+    const comma = dataUrl.indexOf(',')
+    if (comma < 5) {
+        throw new PluginImageError('inlay_data_url_invalid', 'image data URL is malformed')
+    }
+    const fields = dataUrl.slice(5, comma).split(';')
+    const declaredMime = String(fields.shift() ?? '').trim().toLowerCase()
+    const ext = PUT_IMAGE_EXT_BY_MIME[declaredMime]
+    if (!ext) {
+        throw new PluginImageError(
+            'inlay_image_mime_unsupported',
+            'dataUrl must declare a canonical image MIME type',
+        )
+    }
+    const mimeType = declaredMime === 'image/jpg' ? 'image/jpeg' : declaredMime
+    const base64 = fields.some(field => field.trim().toLowerCase() === 'base64')
+    const payload = dataUrl.slice(comma + 1)
+    const bytes = base64
+        ? decodeBase64ImagePayload(payload)
+        : decodePercentImagePayload(payload)
+    if (bytes.length === 0) {
+        throw new PluginImageError('inlay_image_data_empty', 'image data URL decodes to no bytes')
+    }
+    return { bytes, ext, mimeType }
+}
+
+function preconditionFailure(code: string, error: string): PluginInlayPutImageResult {
+    return { status: 'precondition_failed', code, error }
+}
+
+function ambiguousFailure(code: string, error: string): PluginInlayPutImageResult {
+    return { status: 'ambiguous', code, error }
+}
+
+function resolveStoredPutClaim(value: unknown, expected: PluginInlayPutClaim): PutClaimResolution {
+    if (!value || typeof value !== 'object') {
+        return {
+            ok: false,
+            result: {
+                status: 'definite_failure',
+                code: 'inlay_receipt_invalid',
+                error: 'the durable putImage receipt is malformed',
+            },
+        }
+    }
+    const stored = value as Record<string, unknown>
+    if (stored.schemaVersion !== PUT_IMAGE_RECEIPT_VERSION
+        || stored.operationHash !== expected.operationHash
+        || typeof stored.assetId !== 'string'
+        || typeof stored.byteHash !== 'string'
+        || typeof stored.ext !== 'string'
+        || typeof stored.mimeType !== 'string') {
+        return {
+            ok: false,
+            result: {
+                status: 'definite_failure',
+                code: 'inlay_receipt_invalid',
+                error: 'the durable putImage receipt is malformed',
+            },
+        }
+    }
+    if (stored.assetId !== expected.assetId) {
+        return {
+            ok: false,
+            result: {
+                status: 'definite_failure',
+                code: 'inlay_receipt_invalid',
+                error: 'the durable putImage receipt points to an unexpected asset',
+            },
+        }
+    }
+    if (stored.byteHash !== expected.byteHash
+        || stored.ext !== expected.ext
+        || stored.mimeType !== expected.mimeType) {
+        return {
+            ok: false,
+            result: preconditionFailure(
+                'inlay_operation_key_reused',
+                'operationKey was already used with different image bytes or media metadata',
+            ),
+        }
+    }
+    return { ok: true, claim: stored as unknown as PluginInlayPutClaim }
+}
+
+function atomicPutFailure(failure: any): PluginInlayPutImageResult {
+    if (failure?.code === 'PLUGIN_ATOMIC_NO_INSTALL_ID') {
+        return preconditionFailure('inlay_install_id_unavailable', 'plugin installation identity is unavailable')
+    }
+    if (failure?.code === 'PLUGIN_ATOMIC_RECEIPT_MISMATCH') {
+        return preconditionFailure(
+            'inlay_operation_key_reused',
+            'operationKey was already used with different image bytes or media metadata',
+        )
+    }
+    if (failure?.code === 'PLUGIN_ATOMIC_BAD_KEY'
+        || failure?.code === 'PLUGIN_ATOMIC_BAD_REQUEST'
+        || failure?.code === 'PLUGIN_ATOMIC_VALUE_TOO_LARGE') {
+        return {
+            status: 'definite_failure',
+            code: failure.code,
+            error: failure?.message || 'the durable putImage receipt request was rejected',
+        }
+    }
+    return ambiguousFailure(
+        'inlay_receipt_state_uncertain',
+        failure?.message || 'the durable putImage receipt state could not be determined',
+    )
+}
+
+async function claimPluginInlayPut(
+    put: NonNullable<PluginImagesDependencies['putImage']>,
+    expected: PluginInlayPutClaim,
+    recordKey: string,
+    atomicOperationKey: string,
+): Promise<PutClaimResolution> {
+    const atomic = put.atomic!
+    let record: any
+    try {
+        record = await atomic.read(recordKey)
+    } catch (error) {
+        return {
+            ok: false,
+            result: ambiguousFailure(
+                'inlay_receipt_state_uncertain',
+                error instanceof Error ? error.message : String(error),
+            ),
+        }
+    }
+    if (record?.ok !== true) return { ok: false, result: atomicPutFailure(record) }
+    if (record.value !== null && record.value !== undefined && record.deleted !== true) {
+        return resolveStoredPutClaim(record.value, expected)
+    }
+    if (record.revision !== 0 || record.deleted === true) {
+        return {
+            ok: false,
+            result: {
+                status: 'definite_failure',
+                code: 'inlay_receipt_invalid',
+                error: 'the durable putImage receipt record is unexpectedly empty',
+            },
+        }
+    }
+
+    let claimed: any
+    try {
+        claimed = await atomic.cas({
+            key: recordKey,
+            value: expected,
+            operationKey: atomicOperationKey,
+            expectedRevision: 0,
+        })
+    } catch (error) {
+        return {
+            ok: false,
+            result: ambiguousFailure(
+                'inlay_receipt_state_uncertain',
+                error instanceof Error ? error.message : String(error),
+            ),
+        }
+    }
+    if (claimed?.ok === true) return { ok: true, claim: expected }
+    if (claimed?.code !== 'PLUGIN_ATOMIC_CONFLICT') {
+        return { ok: false, result: atomicPutFailure(claimed) }
+    }
+
+    try {
+        const winner: any = await atomic.read(recordKey)
+        if (winner?.ok !== true) return { ok: false, result: atomicPutFailure(winner) }
+        if (winner.value === null || winner.value === undefined || winner.deleted === true) {
+            return {
+                ok: false,
+                result: ambiguousFailure(
+                    'inlay_receipt_state_uncertain',
+                    'a concurrent putImage claim did not publish a readable receipt',
+                ),
+            }
+        }
+        return resolveStoredPutClaim(winner.value, expected)
+    } catch (error) {
+        return {
+            ok: false,
+            result: ambiguousFailure(
+                'inlay_receipt_state_uncertain',
+                error instanceof Error ? error.message : String(error),
+            ),
+        }
+    }
+}
+
+function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
+    if (left.length !== right.length) return false
+    for (let i = 0; i < left.length; i++) {
+        if (left[i] !== right[i]) return false
+    }
+    return true
+}
+
+async function isCompleteClaimedInlay(
+    put: NonNullable<PluginImagesDependencies['putImage']>,
+    claim: PluginInlayPutClaim,
+    decoded: DecodedPluginImage,
+): Promise<boolean> {
+    const state = await put.inspectInlay(claim.assetId)
+    const asset = state.asset
+    const info = state.info
+    if (!asset || !info || !(asset.data instanceof Blob)) return false
+    if (asset.type !== 'image'
+        || asset.ext !== claim.ext
+        || asset.name !== claim.assetId
+        || asset.data.type !== claim.mimeType
+        || info.type !== 'image'
+        || info.ext !== claim.ext
+        || info.name !== claim.assetId) {
+        return false
+    }
+    const storedBytes = new Uint8Array(await asset.data.arrayBuffer())
+    return equalBytes(storedBytes, decoded.bytes)
+}
+
+async function materializeClaimedInlay(
+    put: NonNullable<PluginImagesDependencies['putImage']>,
+    claim: PluginInlayPutClaim,
+    decoded: DecodedPluginImage,
+): Promise<PluginInlayPutImageResult> {
+    try {
+        if (await isCompleteClaimedInlay(put, claim, decoded)) {
+            return { status: 'succeeded', result: { assetId: claim.assetId } }
+        }
+    } catch {
+        // The claim owns this deterministic id, so a repair write remains safe.
+    }
+
+    let writeError: unknown = null
+    try {
+        await put.writeInlayBytes(decoded.bytes, {
+            assetId: claim.assetId,
+            ext: claim.ext,
+            mimeType: claim.mimeType,
+            name: claim.assetId,
+        })
+    } catch (error) {
+        writeError = error
+    }
+
+    try {
+        if (await isCompleteClaimedInlay(put, claim, decoded)) {
+            return { status: 'succeeded', result: { assetId: claim.assetId } }
+        }
+    } catch (error) {
+        if (writeError === null) writeError = error
+    }
+    return ambiguousFailure(
+        'inlay_write_uncertain',
+        `the canonical inlay pair could not be verified: ${
+            writeError instanceof Error ? writeError.message : String(writeError ?? 'incomplete payload or sidecar')
+        }`,
+    )
 }
 
 export function createPluginImagesApi(deps: PluginImagesDependencies): PluginImagesApi & PluginInlaysApi {
@@ -478,6 +871,78 @@ export function createPluginImagesApi(deps: PluginImagesDependencies): PluginIma
             }
         },
 
+        async putImage(input) {
+            let operationKey: string
+            let decoded: DecodedPluginImage
+            try {
+                operationKey = typeof input?.operationKey === 'string' ? input.operationKey : ''
+                if (!operationKey) {
+                    throw new PluginImageError(
+                        'inlay_operation_key_invalid',
+                        'operationKey must be a non-empty string',
+                    )
+                }
+                decoded = decodePluginImageDataUrl(input?.dataUrl)
+            } catch (error) {
+                return {
+                    status: 'definite_failure',
+                    code: error instanceof PluginImageError ? error.code : 'inlay_data_url_invalid',
+                    error: error instanceof Error ? error.message : String(error),
+                }
+            }
+
+            const put = deps.putImage
+            const installId = put?.installId
+            if (!put || !put.atomic
+                || typeof installId !== 'string'
+                || !INSTALL_ID_PATTERN.test(installId)) {
+                return preconditionFailure(
+                    'inlay_install_id_unavailable',
+                    'plugin installation identity or durable receipt storage is unavailable',
+                )
+            }
+
+            let operationHash: string
+            let byteHash: string
+            let assetId: string
+            try {
+                [operationHash, byteHash, assetId] = await Promise.all([
+                    sha256Hex(operationKey),
+                    sha256BytesHex(decoded.bytes),
+                    sha256Hex(`${installId}\u0000${operationKey}`).then(hash => `plugin-inlay-${hash}`),
+                ])
+            } catch (error) {
+                return preconditionFailure(
+                    'inlay_digest_unavailable',
+                    error instanceof Error ? error.message : String(error),
+                )
+            }
+
+            const expected: PluginInlayPutClaim = {
+                schemaVersion: PUT_IMAGE_RECEIPT_VERSION,
+                operationHash,
+                byteHash,
+                assetId,
+                ext: decoded.ext,
+                mimeType: decoded.mimeType,
+            }
+            const recordKey = `__risu_internal__/pluginInlays/putImage/${operationHash}`
+            const atomicOperationKey = `risu:pluginInlays.putImage:${installId}:${operationHash}`
+
+            try {
+                const resolution = await claimPluginInlayPut(put, expected, recordKey, atomicOperationKey)
+                if (resolution.ok !== true) {
+                    return (resolution as Extract<PutClaimResolution, { ok: false }>).result
+                }
+                return await materializeClaimedInlay(put, resolution.claim, decoded)
+            } catch (error) {
+                return ambiguousFailure(
+                    'inlay_put_uncertain',
+                    error instanceof Error ? error.message : String(error),
+                )
+            }
+        },
+
         async remove(input) {
             const assetId = String(input?.assetId ?? '')
             if (!assetId) {
@@ -578,6 +1043,30 @@ export const defaultPluginImagesDependencies: PluginImagesDependencies = {
     readInlay: async (assetId) => await getInlayAsset(assetId),
 }
 
-export function createDefaultPluginImagesApi(): PluginImagesApi & PluginInlaysApi {
-    return createPluginImagesApi(defaultPluginImagesDependencies)
+export interface DefaultPluginImagesApiOptions {
+    installId?: string
+    atomic?: Pick<PluginAtomicSandboxApi, 'read' | 'cas'>
+}
+
+export function createDefaultPluginImagesApi(
+    options: DefaultPluginImagesApiOptions = {},
+): PluginImagesApi & PluginInlaysApi {
+    return createPluginImagesApi({
+        ...defaultPluginImagesDependencies,
+        putImage: {
+            installId: options.installId,
+            atomic: options.atomic,
+            inspectInlay: async (assetId) => {
+                const infos = await getInlayInfosBatch([assetId])
+                const asset = await getInlayAssetBlobFromStorage(assetId)
+                return { asset, info: infos[assetId] ?? null }
+            },
+            writeInlayBytes: async (bytes, input) => await writeInlayImageBytes(bytes, {
+                id: input.assetId,
+                ext: input.ext,
+                mimeType: input.mimeType,
+                name: input.name,
+            }),
+        },
+    })
 }

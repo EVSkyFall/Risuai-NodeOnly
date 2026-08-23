@@ -140,6 +140,13 @@ export class PluginAtomicBadRequestError extends PluginAtomicError {
     }
 }
 
+export class PluginAtomicReservedKeyError extends PluginAtomicError {
+    constructor(message = 'keys under "__risu_internal__/" are reserved for host use') {
+        super(message, 'PLUGIN_ATOMIC_RESERVED_KEY')
+        this.name = 'PluginAtomicReservedKeyError'
+    }
+}
+
 /**
  * Host-side only: the plugin installation has no usable persisted identity, so
  * there is no namespace to scope its storage to. Fail closed rather than
@@ -360,8 +367,11 @@ export interface PluginNamespacedAtomicApiOptions {
     client?: PluginAtomicClient
 }
 
-export function createPluginNamespacedAtomicApi(
+const PLUGIN_ATOMIC_INTERNAL_PREFIX = '__risu_internal__/'
+
+function createNamespacedAtomicApi(
     options: PluginNamespacedAtomicApiOptions,
+    allowInternalMutations: boolean,
 ): PluginScopedAtomicApi {
     const installId = options.installId
     if (typeof installId !== 'string' || !INSTALL_ID_PATTERN.test(installId)) {
@@ -374,6 +384,13 @@ export function createPluginNamespacedAtomicApi(
 
     const abs = (key: unknown): string => `${prefix}${typeof key === 'string' ? key : ''}`
     const rel = (key: string): string => (key.startsWith(prefix) ? key.slice(prefix.length) : key)
+    const assertMutableKey = (key: unknown): void => {
+        if (!allowInternalMutations
+            && typeof key === 'string'
+            && key.startsWith(PLUGIN_ATOMIC_INTERNAL_PREFIX)) {
+            throw new PluginAtomicReservedKeyError()
+        }
+    }
 
     return {
         async read<T = unknown>(key: string) {
@@ -397,9 +414,11 @@ export function createPluginNamespacedAtomicApi(
             }
         },
         cas(input) {
+            assertMutableKey(input?.key)
             return client.cas({ ...input, key: abs(input?.key) })
         },
         remove(input) {
+            assertMutableKey(input?.key)
             return client.remove({ ...input, key: abs(input?.key) })
         },
         getReceipt(operationKey: string) {
@@ -414,6 +433,12 @@ export function createPluginNamespacedAtomicApi(
             return { ...page, changedKeys: page.changedKeys.map(rel) }
         },
     }
+}
+
+export function createPluginNamespacedAtomicApi(
+    options: PluginNamespacedAtomicApiOptions,
+): PluginScopedAtomicApi {
+    return createNamespacedAtomicApi(options, false)
 }
 
 // ── Sandbox-facing surface (V3 plugins) ─────────────────────────────────────
@@ -486,13 +511,14 @@ async function envelope<T>(run: () => Promise<T>): Promise<PluginAtomicResult<T>
  * every call fails closed with PLUGIN_ATOMIC_NO_INSTALL_ID, which is loud,
  * recoverable, and can never write to a guessed namespace.
  */
-export function createPluginAtomicSandboxApi(
+function createAtomicSandboxApi(
     options: PluginNamespacedAtomicApiOptions,
+    allowInternalMutations: boolean,
 ): PluginAtomicSandboxApi {
     let scoped: PluginScopedAtomicApi | null = null
     let identityFailure: PluginAtomicFailure | null = null
     try {
-        scoped = createPluginNamespacedAtomicApi(options)
+        scoped = createNamespacedAtomicApi(options, allowInternalMutations)
     } catch (error) {
         identityFailure = toPluginAtomicFailure(error)
     }
@@ -511,4 +537,17 @@ export function createPluginAtomicSandboxApi(
         getReceipt: (operationKey) => call(async (api) => ({ receipt: await api.getReceipt(operationKey) })),
         changes: (input) => call((api) => api.changes(input ?? {})),
     }
+}
+
+export function createPluginAtomicSandboxApi(
+    options: PluginNamespacedAtomicApiOptions,
+): PluginAtomicSandboxApi {
+    return createAtomicSandboxApi(options, false)
+}
+
+/** Host-only envelope. Never expose this surface through the V3 alias map. */
+export function createPluginInternalAtomicSandboxApi(
+    options: PluginNamespacedAtomicApiOptions,
+): PluginAtomicSandboxApi {
+    return createAtomicSandboxApi(options, true)
 }

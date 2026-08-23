@@ -4,6 +4,7 @@ import type { InlayAsset } from '../inlays'
 import {
     getInlayAsset,
     getInlayAssetBlob,
+    getInlayAssetBlobFromStorage,
     getCharacterChatIndex,
     getInlayInfosBatch,
     getInlayMeta,
@@ -14,6 +15,7 @@ import {
     repairInlayAssetRecords,
     removeInlayAsset,
     setInlayAsset,
+    writeInlayImageBytes,
     writeInlayImage,
     __resetInlayStorageForTest,
 } from '../inlays'
@@ -186,6 +188,38 @@ describe('setInlayAsset', () => {
             type: 'image',
             width: 20,
         })
+    })
+})
+
+describe('writeInlayImageBytes', () => {
+    test('stores caller bytes without canvas conversion or normalization', async () => {
+        const bytes = Uint8Array.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x80, 0xfe, 0xff, 0xd9])
+
+        const id = await writeInlayImageBytes(bytes, {
+            id: 'exact-jpeg',
+            ext: 'jpg',
+            mimeType: 'image/jpeg',
+            name: 'exact-jpeg',
+        })
+
+        const stored = await getInlayAssetBlob(id)
+        expect(stored).toMatchObject({
+            ext: 'jpg',
+            name: 'exact-jpeg',
+            type: 'image',
+        })
+        expect(new Uint8Array(await stored!.data.arrayBuffer())).toEqual(bytes)
+        expect(fakeCtx.drawImage).not.toHaveBeenCalled()
+
+        const truncated = Uint8Array.from([0xff, 0xd8, 0xff])
+        nodeStorageMap.set('inlay/exact-jpeg', new TextEncoder().encode(JSON.stringify({
+            data: `data:image/jpeg;base64,${Buffer.from(truncated).toString('base64')}`,
+            ext: 'jpg',
+            name: 'exact-jpeg',
+            type: 'image',
+        })))
+        expect(new Uint8Array(await (await getInlayAssetBlob(id))!.data.arrayBuffer())).toEqual(bytes)
+        expect(new Uint8Array(await (await getInlayAssetBlobFromStorage(id))!.data.arrayBuffer())).toEqual(truncated)
     })
 })
 

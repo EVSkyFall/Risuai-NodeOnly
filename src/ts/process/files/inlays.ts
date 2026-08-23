@@ -70,6 +70,14 @@ export type InlayImageWriteOptions = {
     decodeTimeoutMs?: number
 }
 
+export type InlayImageBytesWriteOptions = {
+    id: string
+    ext: string
+    mimeType: string
+    name?: string
+    target?: InlayTarget
+}
+
 export type InlayAssetIntegrity = {
     status: 'complete' | 'repairable' | 'missing'
     hasAsset: boolean
@@ -658,6 +666,24 @@ export async function writeInlayImage(imgObj: HTMLImageElement, arg: InlayImageW
     return `${imgid}`
 }
 
+export async function writeInlayImageBytes(
+    bytes: Uint8Array,
+    arg: InlayImageBytesWriteOptions,
+): Promise<string> {
+    const data = new Blob([bytes.slice().buffer], { type: arg.mimeType })
+    await setInlayAsset(
+        arg.id,
+        {
+            name: arg.name ?? arg.id,
+            data,
+            ext: arg.ext,
+            type: 'image',
+        },
+        arg.target,
+    )
+    return arg.id
+}
+
 export type InlaySignature = {
     signatures: {
         type: 'function' | 'text'
@@ -709,6 +735,13 @@ export async function getInlayAssetBlob(id: string) {
             await getInlayInfoStorage().setItem(id, buildInlayExplorerInfo(toCoreInlayAsset(img)))
         }
     }
+    return { ...toCoreInlayAsset(img), data }
+}
+
+export async function getInlayAssetBlobFromStorage(id: string) {
+    const img = await getInlayStorage().getItemFromStorage<InlayAsset | null>(id)
+    if (img === null) return null
+    const data = typeof img.data === 'string' ? base64ToBlob(img.data) : img.data
     return { ...toCoreInlayAsset(img), data }
 }
 

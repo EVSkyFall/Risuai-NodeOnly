@@ -27,6 +27,7 @@
   import SettingTabs from '../../UI/GUI/SettingTabs.svelte'
   import SettingRenderer from '../SettingRenderer.svelte'
   import { inlayImageSettingsItems } from 'src/ts/setting/inlayImageSettingsData'
+  import { isOrphanMessageInlay } from './inlayGalleryClassification'
 
 
   const PAGE_SIZE = 40
@@ -82,7 +83,7 @@
         if (specialFilter === 'meta-missing' && item.hasMeta) return false
         if (specialFilter === 'orphan-character' && !isOrphanCharacter(item)) return false
         if (specialFilter === 'orphan-chat' && !isOrphanChat(item)) return false
-        if (specialFilter === 'orphan-message' && (scanResult?.refCounts[item.id] ?? 0) > 0) return false
+        if (specialFilter === 'orphan-message' && !isOrphanMessageInlay(item.id, scanResult?.refCounts[item.id] ?? 0)) return false
         return true
       })
   })

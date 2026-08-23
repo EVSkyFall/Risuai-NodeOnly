@@ -16,10 +16,19 @@ vi.mock('../../files/inlays', () => ({
     writeInlayImage: async () => {
         throw new Error('the default inlay path must never run in tests')
     },
+    writeInlayImageBytes: async () => {
+        throw new Error('the default inlay path must never run in tests')
+    },
     removeInlayAsset: async () => {
         throw new Error('the default inlay path must never run in tests')
     },
     getInlayAsset: async () => {
+        throw new Error('the default inlay path must never run in tests')
+    },
+    getInlayAssetBlobFromStorage: async () => {
+        throw new Error('the default inlay path must never run in tests')
+    },
+    getInlayInfosBatch: async () => {
         throw new Error('the default inlay path must never run in tests')
     },
 }))
