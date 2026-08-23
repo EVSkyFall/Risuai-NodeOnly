@@ -26,7 +26,7 @@ import { getModelInfo, LLMFlags } from "../model/modellist";
 import { resolveChatModelBinding, resolvePresetMaxOutputTokens } from "./request/modelPresetBinding";
 import { hypaMemoryV3 } from "./memory/hypav3";
 import { getModuleAssets, getModuleToggles } from "./modules";
-import { readImage } from "../globalApi.svelte";
+import { forageStorage, readImage } from "../globalApi.svelte";
 import { chatGenKey, chatProcessStage, endGeneration, isChatGenerating, setGenerationStage, startGeneration } from "./generationState";
 import { clearPendingSend, registerPendingSend } from "./request/pendingSends";
 
@@ -55,6 +55,11 @@ export interface requestTokenPart{
 }
 
 export { doingChat, chatProcessStage } from "./generationState"
+
+// 403 (not loopback) and 503 (not a Termux environment) cannot change within
+// a session, so remember the verdict instead of probing on every response.
+let termuxNotifyUnavailable = false
+
 export let requestTokenParts:{[key:string]:requestTokenPart[]} = {}
 export let previewFormated:OpenAIChat[] = []
 export let previewBody:string = ''
@@ -1824,21 +1829,27 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         void (async () => {
             let termuxNotified = false
 
-            try {
-                const elapsedMs = performance.now() - responseStartedAt
-                const response = await fetch('/api/termux-notify', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        elapsedMs,
-                        character: currentChar?.name ?? ''
+            if(!termuxNotifyUnavailable){
+                try {
+                    const elapsedMs = performance.now() - responseStartedAt
+                    const response = await fetch('/api/termux-notify', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'risu-auth': await forageStorage.createAuth()
+                        },
+                        body: JSON.stringify({
+                            elapsedMs,
+                            character: currentChar?.name ?? ''
+                        })
                     })
-                })
 
-                termuxNotified = response.ok
-            } catch {}
+                    if(response.status === 403 || response.status === 503){
+                        termuxNotifyUnavailable = true
+                    }
+                    termuxNotified = response.ok
+                } catch {}
+            }
 
             if(termuxNotified){
                 return

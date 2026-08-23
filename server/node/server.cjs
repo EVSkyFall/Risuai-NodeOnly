@@ -766,12 +766,19 @@ app.use(express.static(path.join(process.cwd(), 'dist'), {index: false, maxAge: 
 app.use(express.json({ limit: '100mb' }));
 
 // PocketRisu -> Termux native Android notification
-app.post('/api/termux-notify', (req, res) => {
+app.post('/api/termux-notify', async (req, res) => {
+    if (!await checkAuth(req, res)) return;
+
+    // A request relayed through a local reverse proxy arrives with a loopback
+    // remoteAddress even when the browser is remote, so any forwarded request
+    // counts as non-local.
     const addr = String(req.socket.remoteAddress || '');
     const isLoopback =
-        addr === '127.0.0.1' ||
-        addr === '::1' ||
-        addr === '::ffff:127.0.0.1';
+        !req.headers['x-forwarded-for'] && (
+            addr === '127.0.0.1' ||
+            addr === '::1' ||
+            addr === '::ffff:127.0.0.1'
+        );
 
     if (!isLoopback) {
         return res.status(403).json({ error: 'localhost only' });
