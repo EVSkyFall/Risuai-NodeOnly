@@ -976,7 +976,9 @@ function convertCharbook(arg:{
         }
 
         //extention migration
-        const extensions = book.extensions ?? {}
+        // Clone so the delete-based migration below can't strip fields from the
+        // source card object, which may be converted again (e.g. import retry).
+        const extensions = safeStructuredClone(book.extensions ?? {})
 
         if(extensions.useProbability && extensions.probability !== undefined && extensions.probability !== 100){
             content = `@@probability ${extensions.probability}\n` + content

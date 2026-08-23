@@ -887,12 +887,12 @@ export const searchTagList = (query:string) => {
     const result: string[] = []
 
     for(const tag of TagList){
-        if(tag.value.startsWith(realQuery)){
+        if(tag.value.toLowerCase().startsWith(realQuery)){
             result.push(tag.value)
             continue
         }
         for(const alias of tag.alias){
-            if(alias.startsWith(realQuery)){
+            if(alias.toLowerCase().startsWith(realQuery)){
                 result.push(tag.value)
                 break
             }

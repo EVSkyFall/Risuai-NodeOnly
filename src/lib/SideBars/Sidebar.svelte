@@ -81,8 +81,8 @@
   // sort is cheap; the $derived is only read while on the home screen.
   let recentChars = $derived(
     DBState.db.characters
-      .map((c, index) => ({ index, name: c.name, image: c.image, lastInteraction: c.lastInteraction ?? 0 }))
-      .filter((c) => c.lastInteraction > 0)
+      .map((c, index) => ({ index, name: c.name, image: c.image, lastInteraction: c.lastInteraction ?? 0, trashTime: c.trashTime }))
+      .filter((c) => c.lastInteraction > 0 && !c.trashTime)
       .sort((a, b) => b.lastInteraction - a.lastInteraction)
   );
   // Progressive reveal: render `recentVisible` items, "Load more" adds 10.
