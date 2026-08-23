@@ -899,7 +899,10 @@ export const searchTagList = (query:string) => {
         }
     }
 
-    return result.filter(v => splited.indexOf(v) === -1)
+    // Case-insensitive dedup: `splited` holds the user's raw input while
+    // `result` holds canonical tag casing (e.g. typed "male" vs tag "Male").
+    const splitedLower = splited.map(v => v.toLowerCase())
+    return result.filter(v => splitedLower.indexOf(v.toLowerCase()) === -1)
 }
 
 export const isKnownUri = (uri:string) => {
