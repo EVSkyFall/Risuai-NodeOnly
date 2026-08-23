@@ -15,6 +15,22 @@ import { v4 } from "uuid";
 
 export function addLorebook(type:number) {
     const selectedID = get(selectedCharID)
+    // -1 = settings-page global lorebook; it must not touch characters[selectedID]
+    // (selectedID can be -1 on the settings screen).
+    if(type === -1){
+        const globalData = DBState.db.loreBook[DBState.db.loreBookPage].data
+        globalData.push({
+            key: '',
+            comment: `New Lore ${globalData.length + 1}`,
+            content: '',
+            mode: 'normal',
+            insertorder: 100,
+            alwaysActive: false,
+            secondkey: "",
+            selective: false
+        })
+        return
+    }
     if(type === 0){
         DBState.db.characters[selectedID].globalLore.push({
             key: '',
@@ -45,6 +61,20 @@ export function addLorebook(type:number) {
 export function addLorebookFolder(type:number) {
     const selectedID = get(selectedCharID)
     const id = v4()
+    // -1 = settings-page global lorebook (see addLorebook).
+    if(type === -1){
+        DBState.db.loreBook[DBState.db.loreBookPage].data.push({
+            key: '\uf000folder:' + id,
+            comment: `New Folder`,
+            content: '',
+            mode: 'folder',
+            insertorder: 100,
+            alwaysActive: false,
+            secondkey: "",
+            selective: false,
+        })
+        return
+    }
     if(type === 0){
         DBState.db.characters[selectedID].globalLore.push({
             key: '\uf000folder:' + id,
