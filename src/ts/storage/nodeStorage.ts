@@ -10,6 +10,33 @@ import { alertInput, waitAlert, notifyError } from "../alert"
 import { decodeRisuSave, encodeRisuSaveLegacy } from "./risuSave"
 import { normalizeChat } from "./database.svelte"
 
+const AUTH_FETCH_TRANSIENT_MAX_RETRIES = 3
+const AUTH_FETCH_TRANSIENT_BASE_DELAY_MS = 500
+const AUTH_FETCH_TRANSIENT_JITTER_MIN = 0.5
+const AUTH_FETCH_TRANSIENT_JITTER_MAX = 1.5
+const AUTH_FETCH_TRANSIENT_STATUS = new Set([502, 503, 504])
+
+export type StorageFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
+
+export interface AuthFetchRetryOptions {
+    maxRetries: number
+    baseDelayMs: number
+    jitterMin: number
+    jitterMax: number
+    random: () => number
+    delay: (ms: number) => Promise<void>
+}
+
+const defaultStorageFetch: StorageFetch = (input, init) => fetch(input, init)
+const defaultAuthFetchRetryOptions: AuthFetchRetryOptions = {
+    maxRetries: AUTH_FETCH_TRANSIENT_MAX_RETRIES,
+    baseDelayMs: AUTH_FETCH_TRANSIENT_BASE_DELAY_MS,
+    jitterMin: AUTH_FETCH_TRANSIENT_JITTER_MIN,
+    jitterMax: AUTH_FETCH_TRANSIENT_JITTER_MAX,
+    random: Math.random,
+    delay: (ms) => new Promise(resolve => setTimeout(resolve, ms)),
+}
+
 // ── User-gesture recency for the write lock ─────────────────────────────────
 // The server moves the single-writer lock only on writes that follow a real
 // user gesture (x-user-active header). The app also writes automatically —
@@ -34,6 +61,19 @@ export class ConflictError extends Error {
         super(message)
         this.name = 'ConflictError'
         this.currentEtag = currentEtag
+    }
+}
+
+export class StorageRequestError extends Error {
+    constructor(
+        message: string,
+        public readonly op: string,
+        public readonly status?: number,
+        public readonly serverMessage?: string
+    ) {
+        super(message)
+        this.name = 'StorageRequestError'
+        Object.setPrototypeOf(this, StorageRequestError.prototype)
     }
 }
 
@@ -100,6 +140,11 @@ export class NodeStorage{
     private static sessionInitialized = false
     private static sessionPending: Promise<void> | null = null
     private refreshPending: Promise<string> | null = null
+
+    constructor(
+        private readonly fetchFn: StorageFetch = defaultStorageFetch,
+        private readonly retryOptions: Partial<AuthFetchRetryOptions> = {}
+    ) {}
 
     async createAuth(){
         const now = Date.now()
@@ -209,14 +254,80 @@ export class NodeStorage{
         }
     }
 
+    private getAuthFetchRetryOptions(): AuthFetchRetryOptions {
+        return {
+            ...defaultAuthFetchRetryOptions,
+            ...this.retryOptions,
+        }
+    }
+
+    private getTransientRetryDelay(attempt: number, options: AuthFetchRetryOptions): number {
+        if (options.baseDelayMs <= 0) return 0
+        const jitterRange = options.jitterMax - options.jitterMin
+        const jitter = options.jitterMin + (options.random() * jitterRange)
+        return options.baseDelayMs * (2 ** attempt) * jitter
+    }
+
+    private isAbortError(error: unknown): boolean {
+        return error instanceof DOMException && error.name === 'AbortError'
+            || error instanceof Error && error.name === 'AbortError'
+    }
+
+    private isTransientStatus(status: number): boolean {
+        return AUTH_FETCH_TRANSIENT_STATUS.has(status)
+    }
+
+    private abortReason(signal: AbortSignal): unknown {
+        return (signal as AbortSignal & { reason?: unknown }).reason
+            ?? new DOMException('The operation was aborted.', 'AbortError')
+    }
+
     private async authFetch(input: RequestInfo | URL, init: RequestInit = {}, retry = true) {
+        const retryOptions = this.getAuthFetchRetryOptions()
+        let transientRetries = 0
+
+        while (true) {
+            if (init.signal?.aborted) {
+                throw this.abortReason(init.signal)
+            }
+
+            try {
+                const response = await this.authFetchOnce(input, init, retry)
+                if (!this.isTransientStatus(response.status) || transientRetries >= retryOptions.maxRetries) {
+                    return response
+                }
+
+                const delayMs = this.getTransientRetryDelay(transientRetries, retryOptions)
+                transientRetries += 1
+                await retryOptions.delay(delayMs)
+            } catch (error) {
+                if (init.signal?.aborted || this.isAbortError(error)) {
+                    throw error
+                }
+                // Only genuine network failures retry — fetch rejects those as
+                // TypeError. Auth/login errors and bugs must surface at once.
+                if (!(error instanceof TypeError)) {
+                    throw error
+                }
+                if (transientRetries >= retryOptions.maxRetries) {
+                    throw error
+                }
+
+                const delayMs = this.getTransientRetryDelay(transientRetries, retryOptions)
+                transientRetries += 1
+                await retryOptions.delay(delayMs)
+            }
+        }
+    }
+
+    private async authFetchOnce(input: RequestInfo | URL, init: RequestInit = {}, retry = true) {
         await this.checkAuth()
         const headers = new Headers(init.headers)
         headers.set('risu-auth', await this.createAuth())
         headers.set('x-session-id', NodeStorage.sessionId)
         if (isUserActive()) headers.set('x-user-active', '1')
 
-        const response = await fetch(input, {
+        const response = await this.fetchFn(input, {
             ...init,
             headers
         })
@@ -229,10 +340,39 @@ export class NodeStorage{
             this.authChecked = false
             this.cachedJwt = null
             await this.checkAuth()
-            return this.authFetch(input, init, false)
+            return this.authFetchOnce(input, init, false)
         }
 
         return response
+    }
+
+    private async readStorageServerMessage(response: Response): Promise<string | undefined> {
+        try {
+            const data = await response.clone().json()
+            return typeof data?.error === 'string' ? data.error : undefined
+        } catch {
+            return undefined
+        }
+    }
+
+    private buildStorageRequestMessage(op: string, status?: number, serverMessage?: string): string {
+        let message = status === 413 && (op === 'setItem' || op === 'setItems')
+            ? language.errors.storageRequestTooLarge
+            : `${op} failed${status ? ` with HTTP ${status}` : ''}`
+        if (serverMessage) {
+            message += `: ${serverMessage}`
+        }
+        return message
+    }
+
+    private async storageRequestError(op: string, response: Response): Promise<StorageRequestError> {
+        const serverMessage = await this.readStorageServerMessage(response)
+        return new StorageRequestError(
+            this.buildStorageRequestMessage(op, response.status, serverMessage),
+            op,
+            response.status,
+            serverMessage
+        )
     }
 
     async setItem(key:string, value:Uint8Array, etag?:string) {
@@ -253,7 +393,7 @@ export class NodeStorage{
             throw new ConflictError(data.error, data.currentEtag)
         }
         if(da.status < 200 || da.status >= 300){
-            throw "setItem Error"
+            throw await this.storageRequestError('setItem', da)
         }
         const data = await da.json()
         if(data.error){
@@ -271,7 +411,7 @@ export class NodeStorage{
 
         const da = await this.authFetch('/api/read', { method: "GET", headers })
         if(da.status < 200 || da.status >= 300){
-            throw "getItem Error"
+            throw await this.storageRequestError('getItem', da)
         }
 
         // Capture ETag for database.bin
@@ -298,7 +438,7 @@ export class NodeStorage{
             headers
         })
         if(da.status < 200 || da.status >= 300){
-            throw "listItem Error"
+            throw await this.storageRequestError('listItem', da)
         }
         const data = await da.json()
         if(data.error){
@@ -314,7 +454,7 @@ export class NodeStorage{
             }
         })
         if(da.status < 200 || da.status >= 300){
-            throw "removeItem Error"
+            throw await this.storageRequestError('removeItem', da)
         }
         const data = await da.json()
         if(data.error){
@@ -480,7 +620,7 @@ export class NodeStorage{
                     'content-type': 'application/json'
                 }
             })
-            if (da.status < 200 || da.status >= 300) throw 'setItems Error'
+            if (da.status < 200 || da.status >= 300) throw await this.storageRequestError('setItems', da)
         }
     }
 

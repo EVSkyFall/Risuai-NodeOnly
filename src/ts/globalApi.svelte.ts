@@ -34,6 +34,16 @@ import {
 
 export const forageStorage = new AutoStorage()
 
+function errorMessage(error: unknown): string {
+    if (error instanceof Error && error.message) return error.message
+    if (typeof error === 'string') return error
+    try {
+        return JSON.stringify(error) ?? String(error)
+    } catch {
+        return String(error)
+    }
+}
+
 export async function downloadFile(name: string, dat: Uint8Array | ArrayBuffer | string) {
     if (typeof (dat) === 'string') {
         dat = Buffer.from(dat, 'utf-8')
@@ -830,7 +840,7 @@ export async function saveDb() {
         }
 
         // ── Save changed chat content to server ─────────────────────────
-        const failedChats: [string, string][] = []
+        const failedChats: { chaId: string, chatId: string, message: string }[] = []
         for (const [chaId, chatId] of collectChatsToPersist(db, toSave)) {
             const char = db.characters.find(c => c.chaId === chaId)
             if (!char) continue
@@ -843,11 +853,13 @@ export async function saveDb() {
                 await saveChatToServer(chaId, chatIndex, chatId, chat)
             } catch (e) {
                 console.error(`[Save] Failed to save chat ${chaId}/${chatId}:`, e)
-                failedChats.push([chaId, chatId])
+                failedChats.push({ chaId, chatId, message: errorMessage(e) })
             }
         }
         if (failedChats.length > 0) {
-            throw new Error(`Failed to save ${failedChats.length} chat${failedChats.length === 1 ? '' : 's'}`)
+            throw new Error(
+                `Failed to save ${failedChats.length} chat${failedChats.length === 1 ? '' : 's'}: ${failedChats[0].message}`
+            )
         }
 
         // ── database.bin: exclude chat payload (stubs only via encoder) ──

@@ -42,6 +42,8 @@ export const languageKorean = {
     persistFailureTitle:
       "서버 저장 실패 — 변경사항이 디스크에 반영되지 않습니다",
     persistFailureAttemptedSize: "시도 크기",
+    storageRequestTooLarge:
+      "저장 요청이 너무 커서 실패했습니다 (HTTP 413). 서버 또는 리버스 프록시(Nginx 등)의 요청 본문 크기 제한을 확인하세요.",
     chatGuardTitle: "채팅 데이터 보호 작동 — 안전 저장 모드로 전환됨",
     chatGuardDesc:
       "비정상적인 저장 패턴이 차단되어 안전 저장(full-write)으로 전환됐어요. 변경사항은 그 경로로 디스크에 저장됩니다. 반복되면 브라우저 콘솔 로그와 함께 제보해주세요.",
