@@ -524,6 +524,63 @@ describe('recoverModelJobs', () => {
         vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('Failed to fetch') }))
         await expect(recovery.recoverModelJobs()).resolves.toBeUndefined()
     })
+
+    test('a failed pass retries with backoff and recovers once the network is back', async () => {
+        // The field failure this covers: visibilitychange fires the moment the
+        // tab resumes, but the radio needs a few more seconds — the pass dies
+        // on an unreachable job API and, without a retry, the finished job
+        // sits unclaimed until the NEXT return.
+        vi.useFakeTimers()
+        const { recovery } = await loadModules()
+        const chat = makeChat()
+        mocks.db.characters = [makeChar(chat)]
+        vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('Failed to fetch') }))
+        await recovery.recoverModelJobs()
+        expect(chat.message).toHaveLength(0)
+
+        // Network is back before the first retry fires.
+        setupServer({ unclaimed: [makeJob()], active: [], journals: { 'job-1': OPENAI_SSE } })
+        await vi.advanceTimersByTimeAsync(3000)
+        expect(chat.message).toHaveLength(1)
+        expect(chat.message[0].data).toBe('Hello')
+    })
+
+    test('a swallowed per-job failure still schedules a retry (list ok, journal down)', async () => {
+        // The list fetch can succeed while the journal read dies (network came
+        // back mid-pass). The per-job catch keeps the pass alive, but the
+        // failure must still count against the retry budget — otherwise the
+        // job sits unclaimed until the next return.
+        vi.useFakeTimers()
+        const { recovery } = await loadModules()
+        const chat = makeChat()
+        mocks.db.characters = [makeChar(chat)]
+        const behavior: ServerBehavior = {
+            unclaimed: [makeJob()],
+            active: [],
+            journals: { 'job-1': OPENAI_SSE },
+            streamStatus: { 'job-1': 503 },
+        }
+        setupServer(behavior)
+        await recovery.recoverModelJobs()
+        expect(chat.message).toHaveLength(0)
+
+        delete behavior.streamStatus!['job-1'] // journal reachable again
+        await vi.advanceTimersByTimeAsync(3000)
+        expect(chat.message).toHaveLength(1)
+        expect(chat.message[0].data).toBe('Hello')
+    })
+
+    test('discovery retries are bounded, not an open-ended poll', async () => {
+        vi.useFakeTimers()
+        const { recovery } = await loadModules()
+        const failing = vi.fn(async (..._args: unknown[]) => { throw new TypeError('Failed to fetch') })
+        vi.stubGlobal('fetch', failing)
+        await recovery.recoverModelJobs()
+        await vi.advanceTimersByTimeAsync(60 * 60 * 1000)
+        // Initial pass + 3 bounded retries, each listing the unclaimed jobs once.
+        const passes = failing.mock.calls.filter((c) => String(c[0]) === '/api/model-jobs?unclaimed=1')
+        expect(passes).toHaveLength(4)
+    })
 })
 
 // --- pending sends ----------------------------------------------------------

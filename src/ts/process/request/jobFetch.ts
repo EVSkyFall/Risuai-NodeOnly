@@ -135,12 +135,49 @@ export function makeJobFetch(opts: JobFetchOptions): typeof fetch {
         const detach = () => signal?.removeEventListener('abort', abortJob)
 
         // 2. Attach to the journal stream (replay from byte 0 + live tail).
-        let streamRes: Response
-        try {
-            streamRes = await fetch(`/api/model-jobs/${jobId}/stream`, { headers: await authHeader(), signal })
-        } catch (err) {
+        //
+        // Retried with the same backoff policy as mid-stream reattach: the
+        // dominant mobile pattern is "send, then background the tab" — the tab
+        // freezes with this fetch in flight and it rejects the moment the tab
+        // resumes, while the radio may take several more seconds to come back.
+        // The job is already running server-side and the journal replays from
+        // byte 0 on every attach, so attaching late loses nothing. Only fetch
+        // REJECTIONS (network-level) retry; an HTTP response is the server's
+        // definitive answer and falls through unchanged. On exhaustion this is
+        // a lost connection, not a lost generation — surface the same
+        // ModelJobConnectionLostError the mid-stream path uses (recovery picks
+        // the job up at the next return), never the raw TypeError.
+        const baseDelay = opts.reconnectBaseDelayMs ?? 1000
+        const abortError = () => new DOMException('The operation was aborted.', 'AbortError')
+        const sleepAbortable = (ms: number) => new Promise<void>((resolve, reject) => {
+            const cleanup = () => {
+                clearTimeout(timer)
+                signal?.removeEventListener('abort', onAbort)
+            }
+            const onAbort = () => { cleanup(); reject(abortError()) }
+            const timer = setTimeout(() => { cleanup(); resolve() }, ms)
+            if (signal?.aborted) { onAbort(); return }
+            signal?.addEventListener('abort', onAbort)
+        })
+
+        let streamRes: Response | null = null
+        for (let attempt = 0; attempt < RECONNECT_MAX_ATTEMPTS; attempt++) {
+            try {
+                if (attempt > 0) {
+                    await sleepAbortable(baseDelay * 2 ** (attempt - 1))
+                }
+                streamRes = await fetch(`/api/model-jobs/${jobId}/stream`, { headers: await authHeader(), signal })
+                break
+            } catch (err) {
+                if (signal?.aborted) {
+                    detach()
+                    throw err
+                }
+            }
+        }
+        if (streamRes === null) {
             detach()
-            throw err
+            throw new ModelJobConnectionLostError()
         }
         const upstreamStatus = streamRes.headers.get('x-model-job-upstream-status')
         if (!streamRes.ok || upstreamStatus === null || !streamRes.body) {
@@ -169,19 +206,6 @@ export function makeJobFetch(opts: JobFetchOptions): typeof fetch {
         let skipRemaining = 0
         let progressSinceAttach = true // first attach counts as progress
         let noProgressCycles = 0
-        const baseDelay = opts.reconnectBaseDelayMs ?? 1000
-
-        const abortError = () => new DOMException('The operation was aborted.', 'AbortError')
-        const sleepAbortable = (ms: number) => new Promise<void>((resolve, reject) => {
-            const cleanup = () => {
-                clearTimeout(timer)
-                signal?.removeEventListener('abort', onAbort)
-            }
-            const onAbort = () => { cleanup(); reject(abortError()) }
-            const timer = setTimeout(() => { cleanup(); resolve() }, ms)
-            if (signal?.aborted) { onAbort(); return }
-            signal?.addEventListener('abort', onAbort)
-        })
 
         // Re-attach to the journal stream. True = a fresh reader is installed
         // (replay from 0; skip what was already delivered). False = job gone
