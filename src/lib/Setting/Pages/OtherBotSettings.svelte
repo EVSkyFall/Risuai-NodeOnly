@@ -353,13 +353,16 @@
             <span class="text-textcolor">Image Reference <Help key="naiImageReference"/></span>
             <SelectInput className="mt-2 mb-4" bind:value={DBState.db.NAIImgConfig.reference_mode}>
                 <OptionInput value="" >None</OptionInput>
-                <OptionInput value="vibe" >Vibe Trasfer</OptionInput>
+                {#if DBState.db.NAIImgModel !== 'nai-diffusion-5-full' && DBState.db.NAIImgModel !== 'nai-diffusion-5-curated'}
+                    <OptionInput value="vibe" >Vibe Trasfer</OptionInput>
+                {/if}
                 {#if DBState.db.NAIImgModel === 'nai-diffusion-4-5-full' || DBState.db.NAIImgModel === 'nai-diffusion-4-5-curated'}
                     <OptionInput value="character" >Character Reference</OptionInput>
                 {/if}
             </SelectInput>
 
-            {#if DBState.db.NAIImgConfig.reference_mode === 'vibe'}
+            {#if DBState.db.NAIImgConfig.reference_mode === 'vibe'
+                && DBState.db.NAIImgModel !== 'nai-diffusion-5-full' && DBState.db.NAIImgModel !== 'nai-diffusion-5-curated'}
                 <div class="relative">
                 <button class="mb-4" onclick={async () => {
                     const file = await selectSingleFile(['naiv4vibe'])
