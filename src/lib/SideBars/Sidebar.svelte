@@ -38,6 +38,7 @@
     import {
   addCharacter,
     changeChar,
+    deselectCharacter,
     getCharImage,
   } from "../../ts/characters";
     import CharConfig from "./CharConfig.svelte";
@@ -562,7 +563,7 @@
   )}
   onclick={() => {
     reseter();
-    selectedCharID.set(-1)
+    deselectCharacter()
     PlaygroundStore.set(0)
     OpenRealmStore.set(false)
   }}
@@ -608,7 +609,7 @@
   )}
   onclick={() => {
     reseter();
-    selectedCharID.set(-1)
+    deselectCharacter()
     PlaygroundStore.set(1)
   }}
 >
@@ -661,7 +662,7 @@
       <BarIcon
         onClick={() => {
           reseter();
-          selectedCharID.set(-1)
+          deselectCharacter()
           PlaygroundStore.set(0)
           OpenRealmStore.set(false)
         }}><HomeIcon /></BarIcon>
@@ -673,7 +674,7 @@
             PlaygroundStore.set(0)
             return
           }
-          selectedCharID.set(-1)
+          deselectCharacter()
           PlaygroundStore.set(1)
         }}
       ><ShellIcon /></BarIcon>
@@ -1036,7 +1037,7 @@
       <BarIcon
         onClick={() => {
           reseter();
-          selectedCharID.set(-1)
+          deselectCharacter()
           PlaygroundStore.set(0)
           OpenRealmStore.set(false)
         }}><HomeIcon /></BarIcon>
@@ -1048,7 +1049,7 @@
             PlaygroundStore.set(0)
             return
           }
-          selectedCharID.set(-1)
+          deselectCharacter()
           PlaygroundStore.set(1)
         }}
       ><ShellIcon /></BarIcon>

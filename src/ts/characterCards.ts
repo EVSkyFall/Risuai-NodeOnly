@@ -1671,6 +1671,12 @@ export async function downloadRisuHub(id:string, arg:{
                 const index = db.characters.length-1
                 characterFormatUpdate(index);
                 selectedCharID.set(index);
+                try {
+                    const char = db.characters[index]
+                    if (char?.chaId) {
+                        localStorage.setItem('risu-last-active-character', char.chaId)
+                    }
+                } catch {}
             }   
             return
         }
@@ -1688,6 +1694,12 @@ export async function downloadRisuHub(id:string, arg:{
             const index = db.characters.length-1
             characterFormatUpdate(index);
             selectedCharID.set(index);
+            try {
+                const char = db.characters[index]
+                if (char?.chaId) {
+                    localStorage.setItem('risu-last-active-character', char.chaId)
+                }
+            } catch {}
             alertStore.set({
                 type: 'none',
                 msg: ''
