@@ -82,6 +82,9 @@ function createPluginStorageManifestStore(db, options = {}) {
       FROM plugin_storage_live l JOIN plugin_storage_snapshots s ON s.snapshot_id = l.snapshot_id
       WHERE l.singleton_id = 1
     `);
+    const deleteOtherSnapshotsStmt = db.prepare('DELETE FROM plugin_storage_snapshots WHERE snapshot_id <> ?');
+    const listValueHashesStmt = db.prepare('SELECT value_hash FROM plugin_storage_values');
+    const deleteValueStmt = db.prepare('DELETE FROM plugin_storage_values WHERE value_hash = ?');
 
     const valueCache = new Map();
     let cacheBytes = 0;
@@ -101,26 +104,38 @@ function createPluginStorageManifestStore(db, options = {}) {
         }
     }
 
-    function loadValue(hash) {
+    function decodeValueRow(row, expectedHash) {
+        if (!row) throw new Error(`Plugin storage value is missing: ${expectedHash}`);
+        const raw = zlib.inflateRawSync(row.payload);
+        if (raw.length !== row.raw_bytes || sha256(raw) !== expectedHash || row.value_hash !== expectedHash) {
+            throw new Error(`Plugin storage value checksum mismatch: ${expectedHash}`);
+        }
+        return { value: JSON.parse(raw.toString('utf8')), rawBytes: raw.length };
+    }
+
+    function copyValue(value) {
+        return value === null || typeof value !== 'object'
+            ? value
+            : structuredClone(value);
+    }
+
+    function loadValueShared(hash) {
         const cached = valueCache.get(hash);
         if (cached) {
             valueCache.delete(hash);
             valueCache.set(hash, cached);
             return cached.value;
         }
-        const row = getValueStmt.get(hash);
-        if (!row) throw new Error(`Plugin storage value is missing: ${hash}`);
-        const raw = zlib.inflateRawSync(row.payload);
-        if (raw.length !== row.raw_bytes || sha256(raw) !== hash) {
-            throw new Error(`Plugin storage value checksum mismatch: ${hash}`);
-        }
-        const value = JSON.parse(raw.toString('utf8'));
-        cacheValue(hash, value, raw.length);
-        return value;
+        const decoded = decodeValueRow(getValueStmt.get(hash), hash);
+        cacheValue(hash, decoded.value, decoded.rawBytes);
+        return decoded.value;
     }
 
-    function loadMap(snapshotId) {
-        const row = getSnapshotStmt.get(snapshotId);
+    function loadValue(hash) {
+        return copyValue(loadValueShared(hash));
+    }
+
+    function decodeMapRow(row, snapshotId) {
         if (!row) throw new Error(`Plugin storage snapshot is missing: ${snapshotId}`);
         if (row.format_version !== FORMAT_VERSION) {
             throw new Error(`Unsupported plugin storage snapshot version: ${row.format_version}`);
@@ -142,6 +157,10 @@ function createPluginStorageManifestStore(db, options = {}) {
         return entries;
     }
 
+    function loadMap(snapshotId) {
+        return decodeMapRow(getSnapshotStmt.get(snapshotId), snapshotId);
+    }
+
     const storeMapTx = db.transaction((entries, activate) => {
         const raw = Buffer.from(JSON.stringify(entries), 'utf8');
         const contentHash = sha256(raw);
@@ -155,7 +174,21 @@ function createPluginStorageManifestStore(db, options = {}) {
             zlib.deflateRawSync(raw, { level: 3 }),
             now,
         );
-        if (activate) setLiveStmt.run(contentHash, now);
+        // INSERT OR IGNORE may have hit an existing content-addressed row.
+        // Verify the persisted bytes before making it live.
+        decodeMapRow(getSnapshotStmt.get(contentHash), contentHash);
+        if (activate) {
+            setLiveStmt.run(contentHash, now);
+            deleteOtherSnapshotsStmt.run(contentHash);
+            const retainedHashes = new Set(entries.map((entry) => entry[1]));
+            for (const row of listValueHashesStmt.all()) {
+                if (retainedHashes.has(row.value_hash)) continue;
+                deleteValueStmt.run(row.value_hash);
+                const cached = valueCache.get(row.value_hash);
+                if (cached) cacheBytes -= cached.rawBytes;
+                valueCache.delete(row.value_hash);
+            }
+        }
         return {
             id: contentHash,
             version: FORMAT_VERSION,
@@ -171,6 +204,7 @@ function createPluginStorageManifestStore(db, options = {}) {
         for (const key of Object.keys(storage)) {
             const encoded = encodeValue(storage[key]);
             putValueStmt.run(encoded.hash, encoded.raw.length, encoded.payload, now);
+            decodeValueRow(getValueStmt.get(encoded.hash), encoded.hash);
             entries.push([key, encoded.hash]);
         }
         return storeMapTx.immediate(entries, activate);
@@ -205,6 +239,18 @@ function createPluginStorageManifestStore(db, options = {}) {
 
     const applyTx = db.transaction((baseSnapshotId, values, loadedKeys, activate) => {
         assertStorage(values);
+        const live = getLiveStmt.get();
+        if (live && live.snapshot_id !== baseSnapshotId) {
+            const error = new Error(`Plugin storage snapshot conflict: expected ${baseSnapshotId}, current ${live.snapshot_id}`);
+            error.code = 'PLUGIN_STORAGE_CONFLICT';
+            error.current = {
+                id: live.snapshot_id,
+                version: FORMAT_VERSION,
+                count: live.item_count,
+                sha256: live.content_hash,
+            };
+            throw error;
+        }
         const loaded = new Set((loadedKeys || []).map(String));
         const valueKeys = Object.keys(values);
         for (const key of valueKeys) loaded.add(key);
@@ -220,6 +266,7 @@ function createPluginStorageManifestStore(db, options = {}) {
             if (!Object.hasOwn(values, key)) continue;
             const encoded = encodeValue(values[key]);
             putValueStmt.run(encoded.hash, encoded.raw.length, encoded.payload, Date.now());
+            decodeValueRow(getValueStmt.get(encoded.hash), encoded.hash);
             next.push([key, encoded.hash]);
             existing.add(key);
         }
@@ -227,6 +274,7 @@ function createPluginStorageManifestStore(db, options = {}) {
             if (existing.has(key)) continue;
             const encoded = encodeValue(values[key]);
             putValueStmt.run(encoded.hash, encoded.raw.length, encoded.payload, Date.now());
+            decodeValueRow(getValueStmt.get(encoded.hash), encoded.hash);
             next.push([key, encoded.hash]);
         }
         return storeMapTx.immediate(next, activate);

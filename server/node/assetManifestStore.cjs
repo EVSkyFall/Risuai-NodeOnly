@@ -357,11 +357,15 @@ function createAssetManifestStore(db, options = {}) {
         const loadedOwners = [];
         for (const owner of owners || []) {
             if (!owner) continue;
-            const descriptor = owner.manifestId
+            let descriptor = owner.manifestId
                 ? { id: owner.manifestId }
                 : getLiveDescriptor(owner.kind, owner.ownerId);
             if (!descriptor) continue;
-            const items = loadItemsShared(descriptor.id);
+            let items = loadItemsShared(descriptor.id);
+            if (!items && owner.kind && owner.ownerId) {
+                descriptor = getLiveDescriptor(owner.kind, owner.ownerId);
+                items = descriptor ? loadItemsShared(descriptor.id) : null;
+            }
             if (!items) continue;
             loadedOwners.push(items);
             for (const item of items) {
@@ -476,6 +480,22 @@ function createAssetManifestStore(db, options = {}) {
         return stmtMigrationList.all();
     }
 
+    function listLiveDescriptors() {
+        return db.prepare(`
+          SELECT m.manifest_id, m.owner_kind, m.owner_id, m.item_count, m.content_hash
+          FROM asset_manifest_live l
+          JOIN asset_manifests m ON m.manifest_id = l.manifest_id
+          ORDER BY m.owner_kind, m.owner_id
+        `).all().map((row) => ({
+            id: row.manifest_id,
+            version: MANIFEST_FORMAT_VERSION,
+            count: row.item_count,
+            sha256: row.content_hash,
+            ownerKind: row.owner_kind,
+            ownerId: row.owner_id,
+        }));
+    }
+
     function stats() {
         const manifest = db.prepare(`
           SELECT COUNT(*) AS count, COALESCE(SUM(item_count), 0) AS items,
@@ -506,6 +526,7 @@ function createAssetManifestStore(db, options = {}) {
         verifyManifest,
         recordMigrationFailure,
         listMigrationState,
+        listLiveDescriptors,
         stats,
     };
 }

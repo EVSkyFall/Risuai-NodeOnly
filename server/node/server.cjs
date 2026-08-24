@@ -4013,7 +4013,11 @@ app.post('/api/asset-manifests/resolve', async (req, res, next) => {
         if (owners.length > 200 || names.length > 1000) {
             return res.status(413).json({ error: 'Too many asset manifest owners or names' });
         }
-        res.json({ resolved: assetManifestStore.resolveNames(owners, names) });
+        res.json({
+            resolved: assetManifestStore.resolveNames(owners, names, {
+                maxDistance: req.body?.maxDistance,
+            }),
+        });
     } catch (error) { next(error); }
 });
 
@@ -4044,6 +4048,15 @@ app.get('/api/plugin-storage-manifests/stats', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     try { res.json(pluginStorageManifestStore.stats()); }
     catch (error) { next(error); }
+});
+
+app.get('/api/plugin-storage-manifests/live', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    try {
+        const descriptor = pluginStorageManifestStore.getLiveDescriptor();
+        if (!descriptor) return res.status(404).json({ error: 'Plugin storage snapshot not found' });
+        res.json(descriptor);
+    } catch (error) { next(error); }
 });
 
 app.get('/api/plugin-storage-manifests/:snapshotId/index', async (req, res, next) => {
@@ -4109,7 +4122,12 @@ app.patch('/api/plugin-storage-manifests/:snapshotId', async (req, res, next) =>
                 { activate: true },
             ));
         res.json(descriptor);
-    } catch (error) { next(error); }
+    } catch (error) {
+        if (error?.code === 'PLUGIN_STORAGE_CONFLICT') {
+            return res.status(409).json({ error: error.message, current: error.current });
+        }
+        next(error);
+    }
 });
 
 // ─── Bulk asset endpoints (3-2-B) ─────────────────────────────────────────────
@@ -5532,6 +5550,32 @@ async function computeAssetSweep({ includeAssets, assetGraceMs = 0, includeRemot
 
     const uncleanable = buildUncleanableSet(dbObj);
     const assets = includeAssets ? kvListWithSizesAndUpdatedAt('assets/') : [];
+
+    // The persisted blob is currently hydrated for upstream compatibility, but
+    // manifests are authoritative for the lazy client view and will remain so
+    // after a future slim-database cutover. Union live manifest paths now so a
+    // partial/stripped blob can never make referenced assets look orphaned.
+    try {
+        for (const descriptor of assetManifestStore.listLiveDescriptors()) {
+            for (const item of assetManifestStore.loadItems(descriptor.id) || []) {
+                const basename = statsBasename(item?.[1]);
+                if (basename) uncleanable.add(basename);
+            }
+        }
+        const pluginSnapshot = pluginStorageManifestStore.getLiveDescriptor();
+        if (pluginSnapshot) {
+            const pluginStorage = pluginStorageManifestStore.loadSnapshot(pluginSnapshot.id);
+            for (const value of Object.values(pluginStorage)) {
+                for (const ref of extractAssetRefsFromText(value)) {
+                    const basename = statsBasename(ref);
+                    if (basename) uncleanable.add(basename);
+                }
+            }
+        }
+    } catch (error) {
+        return { error: `Manifest reference scan failed — refusing to purge: ${error?.message || error}` };
+    }
+
     // A walker that returns nothing while assets exist means the decode
     // produced a shape we do not understand — every asset would look orphaned.
     // Refuse rather than delete the library. Checked before plugin-storage refs

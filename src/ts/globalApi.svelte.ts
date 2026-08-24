@@ -71,7 +71,7 @@ export async function hydratePluginStorageForOwners(owners: string[]): Promise<v
     if (!manifest?.id) return
 
     if (pluginStorageIndexSnapshotId !== manifest.id) {
-        const index = await forageStorage.getPluginStorageManifestIndex(manifest.id)
+        const index = await forageStorage.getPluginStorageManifestIndex(manifest)
         knownPluginStorageKeys = new Set(index.map((entry) => entry.key))
         pluginStorageIndexSnapshotId = manifest.id
     }
@@ -81,7 +81,7 @@ export async function hydratePluginStorageForOwners(owners: string[]): Promise<v
     const includeUnowned = !loadedPluginStorageOwners.has('(legacy/unowned)')
     if (wantedOwners.length === 0 && !includeUnowned) return
 
-    const loaded = await forageStorage.loadPluginStorageManifest(manifest.id, {
+    const loaded = await forageStorage.loadPluginStorageManifest(manifest, {
         owners: wantedOwners,
         includeUnowned,
     })
@@ -99,7 +99,7 @@ export async function hydratePluginStorageKeys(keys: string[]): Promise<void> {
     if (!manifest?.id || keys.length === 0) return
     const missing = [...new Set(keys)].filter((key) => !loadedPluginStorageKeys.has(key))
     if (missing.length === 0) return
-    const loaded = await forageStorage.loadPluginStorageManifest(manifest.id, { keys: missing })
+    const loaded = await forageStorage.loadPluginStorageManifest(manifest, { keys: missing })
     db.pluginCustomStorage ??= {}
     Object.assign(db.pluginCustomStorage, loaded.values)
     for (const key of loaded.loadedKeys) loadedPluginStorageKeys.add(key)
@@ -108,7 +108,7 @@ export async function hydratePluginStorageKeys(keys: string[]): Promise<void> {
 export async function listPluginStorageManifestEntries() {
     const manifest = getDatabase().pluginStorageManifest
     if (!manifest?.id) return []
-    return forageStorage.getPluginStorageManifestIndex(manifest.id)
+    return forageStorage.getPluginStorageManifestIndex(manifest)
 }
 
 export function markPluginStorageClearAll() {
@@ -136,7 +136,17 @@ async function syncLoadedPluginStorage(db: Database): Promise<PluginStorageManif
     for (const key of keysToSync) {
         if (Object.hasOwn(current, key)) values[key] = current[key]
     }
-    const descriptor = await forageStorage.syncPluginStorageManifest(manifest.id, values, keysToSync)
+    let descriptor: PluginStorageManifestDescriptor
+    try {
+        descriptor = await forageStorage.syncPluginStorageManifest(manifest.id, values, keysToSync)
+    } catch (error) {
+        if (!(error instanceof ConflictError)) throw error
+        const current = (error as ConflictError & { current?: PluginStorageManifestDescriptor }).current
+            ?? await forageStorage.getLivePluginStorageManifest()
+        if (!current) throw error
+        Object.assign(manifest, current)
+        descriptor = await forageStorage.syncPluginStorageManifest(manifest.id, values, keysToSync)
+    }
     db.pluginStorageManifest = descriptor
     pluginStorageIndexSnapshotId = descriptor.id
     for (const key of keysToSync) {
@@ -169,8 +179,12 @@ export async function resolveAssetManifestNames(
 ): Promise<Record<string, string>> {
     const owners = manifests
         .filter((manifest) => manifest?.id)
-        .map((manifest) => ({ manifestId: manifest.id }))
-    return forageStorage.resolveAssetManifestNames(owners, names)
+        .map((manifest) => ({
+            manifestId: manifest.id,
+            kind: manifest.ownerKind,
+            ownerId: manifest.ownerId,
+        }))
+    return forageStorage.resolveAssetManifestNames(owners, names, getDatabase().assetMaxDifference ?? 4)
 }
 
 export async function editAssetManifest(
@@ -180,12 +194,24 @@ export async function editAssetManifest(
     if (!manifest.ownerKind || !manifest.ownerId) {
         throw new Error('Asset manifest owner information is missing')
     }
-    return forageStorage.editAssetManifest(
-        manifest.ownerKind,
-        manifest.ownerId,
-        manifest.id,
-        operations,
-    )
+    try {
+        return await forageStorage.editAssetManifest(
+            manifest.ownerKind,
+            manifest.ownerId,
+            manifest.id,
+            operations,
+        )
+    } catch (error) {
+        if (!(error instanceof ConflictError)) throw error
+        const current = (error as ConflictError & { current?: AssetManifestDescriptor }).current
+            ?? await forageStorage.getAssetManifestOwner(manifest.ownerKind, manifest.ownerId)
+        if (current) Object.assign(manifest, current)
+        // Asset operations are positional and not generally idempotent. Do not
+        // replay automatically: a lost response followed by a 409 could append
+        // twice or remove the next tuple. The refreshed descriptor lets the UI
+        // reload safely before the user retries the edit.
+        throw error
+    }
 }
 
 export async function downloadFile(name: string, dat: Uint8Array | ArrayBuffer | string) {

@@ -92,9 +92,13 @@ export class AutoStorage{
     async setItems(entries: {key: string, value: Uint8Array}[]) { return this.realStorage.setItems(entries) }
 
     // ── Lazy asset-reference manifests ────────────────────────────────────────
-    async getAssetManifestPage(manifestId: string, options?: { offset?: number; limit?: number; search?: string }) {
+    async getAssetManifestPage(manifest: string | AssetManifestDescriptor, options?: { offset?: number; limit?: number; search?: string }) {
         await this.Init()
-        return this.realStorage.getAssetManifestPage(manifestId, options)
+        return this.realStorage.getAssetManifestPage(manifest, options)
+    }
+    async getAssetManifestOwner(ownerKind: string, ownerId: string) {
+        await this.Init()
+        return this.realStorage.getAssetManifestOwner(ownerKind, ownerId)
     }
     async getAllAssetManifestItems(manifest: AssetManifestDescriptor) {
         await this.Init()
@@ -103,9 +107,10 @@ export class AutoStorage{
     async resolveAssetManifestNames(
         owners: Array<{ kind?: string; ownerId?: string; manifestId?: string }>,
         names: string[],
+        maxDistance: number,
     ) {
         await this.Init()
-        return this.realStorage.resolveAssetManifestNames(owners, names)
+        return this.realStorage.resolveAssetManifestNames(owners, names, maxDistance)
     }
     async editAssetManifest(
         ownerKind: string,
@@ -117,16 +122,20 @@ export class AutoStorage{
         return this.realStorage.editAssetManifest(ownerKind, ownerId, expectedManifestId, operations)
     }
 
-    async getPluginStorageManifestIndex(snapshotId: string) {
+    async getLivePluginStorageManifest() {
         await this.Init()
-        return this.realStorage.getPluginStorageManifestIndex(snapshotId)
+        return this.realStorage.getLivePluginStorageManifest()
+    }
+    async getPluginStorageManifestIndex(snapshot: string | PluginStorageManifestDescriptor) {
+        await this.Init()
+        return this.realStorage.getPluginStorageManifestIndex(snapshot)
     }
     async loadPluginStorageManifest(
-        snapshotId: string,
+        snapshot: string | PluginStorageManifestDescriptor,
         options?: { owners?: string[]; keys?: string[]; includeUnowned?: boolean },
     ) {
         await this.Init()
-        return this.realStorage.loadPluginStorageManifest(snapshotId, options)
+        return this.realStorage.loadPluginStorageManifest(snapshot, options)
     }
     async syncPluginStorageManifest(
         snapshotId: string,

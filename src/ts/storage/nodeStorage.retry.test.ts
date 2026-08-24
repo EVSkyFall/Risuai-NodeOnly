@@ -126,3 +126,51 @@ describe('NodeStorage authFetch transient retry', () => {
         expect(delay).not.toHaveBeenCalled()
     })
 })
+
+describe('NodeStorage manifest revision recovery', () => {
+    beforeEach(() => {
+        vi.restoreAllMocks()
+    })
+
+    test('refreshes an asset owner descriptor after a pruned revision returns 404', async () => {
+        const fetchMock = vi.fn()
+            .mockResolvedValueOnce(jsonResponse(404, { error: 'not found' }))
+            .mockResolvedValueOnce(jsonResponse(200, {
+                id: 'live-id', version: 1, count: 1, sha256: 'live-hash',
+                ownerKind: 'module', ownerId: 'module-a',
+            }))
+            .mockResolvedValueOnce(jsonResponse(200, {
+                total: 1, offset: 0, limit: 100, items: [['new', 'assets/new.png', 'png']],
+            }))
+        const { storage } = setUpStorage(fetchMock)
+        const descriptor = {
+            id: 'stale-id', version: 1, count: 1, sha256: 'stale-hash',
+            ownerKind: 'module' as const, ownerId: 'module-a',
+        }
+
+        await expect(storage.getAssetManifestPage(descriptor)).resolves.toMatchObject({ total: 1 })
+        expect(descriptor.id).toBe('live-id')
+        expect(String(fetchMock.mock.calls[1][0])).toContain('/api/asset-manifests/owner/module/module-a')
+    })
+
+    test('forwards the configured fuzzy distance to the resolver', async () => {
+        const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse(200, { resolved: {} }))
+        const { storage } = setUpStorage(fetchMock)
+
+        await storage.resolveAssetManifestNames([{ manifestId: 'id' }], ['name'], 9)
+        const init = fetchMock.mock.calls[0][1] as RequestInit
+        expect(JSON.parse(String(init.body))).toMatchObject({ maxDistance: 9 })
+    })
+
+    test('refreshes a pruned plugin snapshot before loading its index', async () => {
+        const fetchMock = vi.fn()
+            .mockResolvedValueOnce(jsonResponse(404, { error: 'not found' }))
+            .mockResolvedValueOnce(jsonResponse(200, { id: 'live', version: 1, count: 0, sha256: 'live' }))
+            .mockResolvedValueOnce(jsonResponse(200, { entries: [] }))
+        const { storage } = setUpStorage(fetchMock)
+        const descriptor = { id: 'stale', version: 1, count: 1, sha256: 'stale' }
+
+        await expect(storage.getPluginStorageManifestIndex(descriptor)).resolves.toEqual([])
+        expect(descriptor.id).toBe('live')
+    })
+})

@@ -39,7 +39,7 @@
         if (!currentModule.assetManifest) return
         manifestLoading = true
         try {
-            const page = await forageStorage.getAssetManifestPage(currentModule.assetManifest.id, {
+            const page = await forageStorage.getAssetManifestPage(currentModule.assetManifest, {
                 offset,
                 limit: manifestPageSize,
             })

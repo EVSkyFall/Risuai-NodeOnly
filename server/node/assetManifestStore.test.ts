@@ -203,4 +203,19 @@ describe('asset manifest store', () => {
         expect(store.resolveNames(owners, ['sm.png'], { maxDistance: 3 })).toEqual({ 'sm.png': 'assets/smile' })
         expect(store.resolveNames(owners, ['smile.webp'], { maxDistance: 0 })).toEqual({ 'smile.webp': 'assets/smile' })
     })
+
+    it('falls back to the live owner when a supplied manifest revision was pruned', () => {
+        const { store } = freshStore()
+        const stale = store.putManifest('module', 'module-a', [['old', 'assets/old.png', 'png']])
+        const live = store.putManifest('module', 'module-a', [['new', 'assets/new.png', 'png']])
+
+        expect(store.loadItems(stale.id)).toBeNull()
+        expect(store.resolveNames(
+            [{ manifestId: stale.id, kind: 'module', ownerId: 'module-a' }],
+            ['new'],
+        )).toEqual({ new: 'assets/new.png' })
+        expect(store.listLiveDescriptors()).toEqual([
+            { ...live, ownerKind: 'module', ownerId: 'module-a' },
+        ])
+    })
 })

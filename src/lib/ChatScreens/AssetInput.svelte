@@ -19,7 +19,7 @@
 
     async function loadManifestPage(offset = 0) {
         if (!currentCharacter.additionalAssetManifest) return
-        const page = await forageStorage.getAssetManifestPage(currentCharacter.additionalAssetManifest.id, {
+        const page = await forageStorage.getAssetManifestPage(currentCharacter.additionalAssetManifest, {
             offset,
             limit: manifestPageSize,
         })

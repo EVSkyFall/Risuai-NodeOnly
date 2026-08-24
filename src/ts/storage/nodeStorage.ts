@@ -669,16 +669,40 @@ export class NodeStorage{
 
     // ── Lazy asset-reference manifests ────────────────────────────────────────
     async getAssetManifestPage(
-        manifestId: string,
+        manifest: string | AssetManifestDescriptor,
         options: { offset?: number; limit?: number; search?: string } = {},
     ): Promise<AssetManifestPage> {
+        const descriptor = typeof manifest === 'string' ? null : manifest
+        let manifestId = typeof manifest === 'string' ? manifest : manifest.id
         const params = new URLSearchParams()
         if (options.offset != null) params.set('offset', String(options.offset))
         if (options.limit != null) params.set('limit', String(options.limit))
         if (options.search) params.set('search', options.search)
         const query = params.toString()
-        const da = await this.authFetch(`/api/asset-manifests/${encodeURIComponent(manifestId)}${query ? `?${query}` : ''}`)
-        if (!da.ok) throw new Error(`asset manifest read error: ${da.status}`)
+        for (let attempt = 0; attempt < 2; attempt++) {
+            const da = await this.authFetch(`/api/asset-manifests/${encodeURIComponent(manifestId)}${query ? `?${query}` : ''}`)
+            if (da.ok) return await da.json()
+            if (da.status !== 404 || !descriptor?.ownerKind || !descriptor.ownerId || attempt > 0) {
+                throw new Error(`asset manifest read error: ${da.status}`)
+            }
+
+            // Superseded manifest rows are pruned on activation. A 404 for a
+            // descriptor that carries owner information means the client must
+            // refresh the owner's live descriptor and retry once.
+            const live = await this.getAssetManifestOwner(descriptor.ownerKind, descriptor.ownerId)
+            if (!live) throw new Error('asset manifest owner is no longer live')
+            Object.assign(descriptor, live)
+            manifestId = live.id
+        }
+        throw new Error('asset manifest read retry exhausted')
+    }
+
+    async getAssetManifestOwner(ownerKind: string, ownerId: string): Promise<AssetManifestDescriptor | null> {
+        const da = await this.authFetch(
+            `/api/asset-manifests/owner/${encodeURIComponent(ownerKind)}/${encodeURIComponent(ownerId)}`,
+        )
+        if (da.status === 404) return null
+        if (!da.ok) throw new Error(`asset manifest owner read error: ${da.status}`)
         return await da.json()
     }
 
@@ -686,7 +710,14 @@ export class NodeStorage{
         const pageSize = 500
         const items: AssetManifestTuple[] = []
         while (items.length < manifest.count) {
-            const page = await this.getAssetManifestPage(manifest.id, { offset: items.length, limit: pageSize })
+            const requestedManifestId = manifest.id
+            const page = await this.getAssetManifestPage(manifest, { offset: items.length, limit: pageSize })
+            if (manifest.id !== requestedManifestId) {
+                // The old revision disappeared between pages. Restart from the
+                // beginning so tuples from two revisions are never mixed.
+                items.length = 0
+                continue
+            }
             items.push(...page.items)
             if (page.items.length === 0 || items.length >= page.total) break
         }
@@ -699,11 +730,12 @@ export class NodeStorage{
     async resolveAssetManifestNames(
         owners: Array<{ kind?: string; ownerId?: string; manifestId?: string }>,
         names: string[],
+        maxDistance: number,
     ): Promise<Record<string, string>> {
         const da = await this.authFetch('/api/asset-manifests/resolve', {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ owners, names }),
+            body: JSON.stringify({ owners, names, maxDistance }),
         })
         if (!da.ok) throw new Error(`asset manifest resolve error: ${da.status}`)
         const body = await da.json()
@@ -724,35 +756,75 @@ export class NodeStorage{
                 body: JSON.stringify({ expectedManifestId, operations }),
             },
         )
-        if (da.status === 409) throw new ConflictError('Asset manifest revision conflict', '')
+        if (da.status === 409) {
+            const body = await da.json().catch(() => ({}))
+            const error = new ConflictError('Asset manifest revision conflict', '') as ConflictError & {
+                current?: AssetManifestDescriptor
+            }
+            error.current = body?.current
+            throw error
+        }
         if (!da.ok) throw new Error(`asset manifest edit error: ${da.status}`)
         return await da.json()
     }
 
     // ── Lazy save-bound plugin storage ───────────────────────────────────────
-    async getPluginStorageManifestIndex(snapshotId: string): Promise<PluginStorageManifestIndexEntry[]> {
-        const da = await this.authFetch(
-            `/api/plugin-storage-manifests/${encodeURIComponent(snapshotId)}/index`,
-        )
-        if (!da.ok) throw new Error(`plugin storage index error: ${da.status}`)
-        const body = await da.json()
-        return body.entries ?? []
+    async getLivePluginStorageManifest(): Promise<PluginStorageManifestDescriptor | null> {
+        const da = await this.authFetch('/api/plugin-storage-manifests/live')
+        if (da.status === 404) return null
+        if (!da.ok) throw new Error(`plugin storage live descriptor error: ${da.status}`)
+        return await da.json()
+    }
+
+    async getPluginStorageManifestIndex(
+        snapshot: string | PluginStorageManifestDescriptor,
+    ): Promise<PluginStorageManifestIndexEntry[]> {
+        const descriptor = typeof snapshot === 'string' ? null : snapshot
+        let snapshotId = typeof snapshot === 'string' ? snapshot : snapshot.id
+        for (let attempt = 0; attempt < 2; attempt++) {
+            const da = await this.authFetch(
+                `/api/plugin-storage-manifests/${encodeURIComponent(snapshotId)}/index`,
+            )
+            if (da.ok) {
+                const body = await da.json()
+                return body.entries ?? []
+            }
+            if (da.status !== 404 || !descriptor || attempt > 0) {
+                throw new Error(`plugin storage index error: ${da.status}`)
+            }
+            const live = await this.getLivePluginStorageManifest()
+            if (!live) throw new Error('plugin storage snapshot is no longer live')
+            Object.assign(descriptor, live)
+            snapshotId = live.id
+        }
+        throw new Error('plugin storage index retry exhausted')
     }
 
     async loadPluginStorageManifest(
-        snapshotId: string,
+        snapshot: string | PluginStorageManifestDescriptor,
         options: { owners?: string[]; keys?: string[]; includeUnowned?: boolean } = {},
     ): Promise<{ values: Record<string, unknown>; loadedKeys: string[] }> {
-        const da = await this.authFetch(
-            `/api/plugin-storage-manifests/${encodeURIComponent(snapshotId)}/load`,
-            {
-                method: 'POST',
-                headers: { 'content-type': 'application/json' },
-                body: JSON.stringify(options),
-            },
-        )
-        if (!da.ok) throw new Error(`plugin storage load error: ${da.status}`)
-        return await da.json()
+        const descriptor = typeof snapshot === 'string' ? null : snapshot
+        let snapshotId = typeof snapshot === 'string' ? snapshot : snapshot.id
+        for (let attempt = 0; attempt < 2; attempt++) {
+            const da = await this.authFetch(
+                `/api/plugin-storage-manifests/${encodeURIComponent(snapshotId)}/load`,
+                {
+                    method: 'POST',
+                    headers: { 'content-type': 'application/json' },
+                    body: JSON.stringify(options),
+                },
+            )
+            if (da.ok) return await da.json()
+            if (da.status !== 404 || !descriptor || attempt > 0) {
+                throw new Error(`plugin storage load error: ${da.status}`)
+            }
+            const live = await this.getLivePluginStorageManifest()
+            if (!live) throw new Error('plugin storage snapshot is no longer live')
+            Object.assign(descriptor, live)
+            snapshotId = live.id
+        }
+        throw new Error('plugin storage load retry exhausted')
     }
 
     async syncPluginStorageManifest(
@@ -768,6 +840,14 @@ export class NodeStorage{
                 body: JSON.stringify({ values, loadedKeys }),
             },
         )
+        if (da.status === 409) {
+            const body = await da.json().catch(() => ({}))
+            const error = new ConflictError('Plugin storage snapshot conflict', '') as ConflictError & {
+                current?: PluginStorageManifestDescriptor
+            }
+            error.current = body?.current
+            throw error
+        }
         if (!da.ok) throw new Error(`plugin storage sync error: ${da.status}`)
         return await da.json()
     }

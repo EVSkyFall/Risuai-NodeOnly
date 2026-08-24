@@ -110,7 +110,7 @@ import ShButton from "../UI/GUI/ShButton.svelte";
         if (!manifest) return
         manifestLoading = true
         try {
-            const page = await forageStorage.getAssetManifestPage(manifest.id, {
+            const page = await forageStorage.getAssetManifestPage(manifest, {
                 offset,
                 limit: manifestPageSize,
             })
