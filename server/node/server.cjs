@@ -54,6 +54,12 @@ const enablePatchSync = true;
 // In-memory database cache for patch-based sync
 // dbCache stores the STRIPPED (stubs-only) version matching what the client sees.
 // fullChatStore keeps the actual chat data keyed by chaId→chatId.
+// Invariant: server code never mutates a cached database's nested branches
+// in place. /api/patch derives the next root via clonePatchSnapshot (untouched
+// top-level branches are shared with the previous root) and keeps per-branch
+// hashes in databasePatchHashCache keyed on the root object — an in-place edit
+// would silently alias into the previous snapshot and leave a stale hash.
+// Replace the branch (or the whole root) instead.
 let dbCache = {};
 let saveTimers = {};
 const SAVE_INTERVAL = 5000;
@@ -3808,6 +3814,20 @@ app.post('/api/patch', async (req, res, next) => {
                 return;
             }
 
+            // Nothing to apply: the client already matches the server. Skip the
+            // clone/apply/persist work and hand back the current revision.
+            if (Array.isArray(patch) && patch.length === 0) {
+                const emptyPayload = {
+                    success: true,
+                    appliedOperations: 0,
+                    etag: decodedKey === 'database/database.bin' ? dbEtag : undefined,
+                };
+                const emptyWarning = currentPersistWarning();
+                if (emptyWarning) emptyPayload.persistWarning = emptyWarning;
+                res.send(emptyPayload);
+                return;
+            }
+
             // Apply patch to in-memory database (clone first to prevent partial
             // mutation on failure). structuredClone instead of a JSON round-trip:
             // stringifying the whole DB into one JS string hits V8's ~512MB
@@ -3827,10 +3847,21 @@ app.post('/api/patch', async (req, res, next) => {
                 delete dbCache[filePath];
                 throw patchErr;
             }
-            if (decodedKey === 'database/database.bin') {
-                databasePatchHashCache.update(dbCache[filePath], snapshot, patch);
+            // Root-level ops (path "") replace the document instead of mutating
+            // the snapshot, so the applied result must be taken from newDocument.
+            const next = result.newDocument;
+            // A root op may hand back a primitive/null/array; that is never a
+            // valid document and must not reach the cache or disk.
+            const validRoot = next !== null && typeof next === 'object'
+                && (decodedKey !== 'database/database.bin' || !Array.isArray(next));
+            if (!validRoot) {
+                res.status(400).send({ error: 'Patch must leave the document as an object' });
+                return;
             }
-            dbCache[filePath] = snapshot;
+            if (decodedKey === 'database/database.bin') {
+                databasePatchHashCache.update(dbCache[filePath], next, patch);
+            }
+            dbCache[filePath] = next;
 
             // Schedule save to KV (debounced) — merge full chats back for database.bin
             if (saveTimers[filePath]) {

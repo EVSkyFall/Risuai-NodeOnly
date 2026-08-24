@@ -68,6 +68,13 @@ describe('selective patch snapshot', () => {
         expect(snapshot.right.copied).toEqual({ n: 2 })
         expect(db.left.moved).toEqual({ n: 1 })
         expect((db.right as any).moved).toBeUndefined()
+
+        // copy must deep-copy: a by-reference copy would alias the destination
+        // into the live cache's source branch.
+        expect(snapshot.right.copied).not.toBe(db.left.copied)
+        snapshot.right.copied.n = 99
+        expect(db.left.copied).toEqual({ n: 2 })
+        expect(snapshot.left.copied).toEqual({ n: 2 })
     })
 
     it('preserves the live database when a later patch operation throws', () => {
