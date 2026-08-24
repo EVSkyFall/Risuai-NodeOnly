@@ -6,6 +6,24 @@ const zlib = require('zlib');
 const MANIFEST_FORMAT_VERSION = 1;
 const OWNER_KINDS = new Set(['module', 'character', 'persona-module']);
 const DEFAULT_CACHE_BYTES = 64 * 1024 * 1024;
+// Mirrors the client parser default (`data.assetMaxDifference ??= 4` in
+// src/ts/storage/database.svelte.ts). Callers wiring the user setting through
+// should pass it as { maxDistance } to resolveNames.
+const DEFAULT_FUZZY_DISTANCE = 4;
+
+// Mirrors trimmer() in src/ts/parser/parser.svelte.ts so the server-side
+// fuzzy fallback scores the same strings the client parser scores.
+const TRIMMED_EXTENSIONS = ['webp', 'png', 'jpg', 'jpeg', 'gif', 'mp4', 'webm', 'avi', 'm4p', 'm4v', 'mp3', 'wav', 'ogg'];
+function trimAssetName(str) {
+    for (const ext of TRIMMED_EXTENSIONS) {
+        if (str.endsWith('.' + ext)) {
+            str = str.substring(0, str.length - ext.length - 1);
+        }
+    }
+    // The character class is copied verbatim from the client: ` -.` is a
+    // range, so separators like "_", " ", "-" and "." all collapse away.
+    return str.trim().replace(/[_ -.]/g, '');
+}
 
 function assertOwner(kind, ownerId) {
     if (!OWNER_KINDS.has(kind)) throw new Error(`Unsupported asset manifest owner kind: ${kind}`);
@@ -171,6 +189,14 @@ function createAssetManifestStore(db, options = {}) {
         error = excluded.error,
         updated_at = excluded.updated_at
     `);
+    const stmtOwnerStaleList = db.prepare(`
+      SELECT manifest_id FROM asset_manifests
+      WHERE owner_kind = ? AND owner_id = ? AND manifest_id != ?
+    `);
+    const stmtOwnerStaleDelete = db.prepare(`
+      DELETE FROM asset_manifests
+      WHERE owner_kind = ? AND owner_id = ? AND manifest_id != ?
+    `);
     const stmtMigrationList = db.prepare(`
       SELECT owner_kind, owner_id, manifest_id, source_hash, item_count, status, error, updated_at
       FROM asset_manifest_migration ORDER BY owner_kind, owner_id
@@ -202,7 +228,14 @@ function createAssetManifestStore(db, options = {}) {
         }
     }
 
-    function loadItems(manifestId) {
+    function cacheEvict(manifestId) {
+        const entry = cache.get(manifestId);
+        if (!entry) return;
+        cache.delete(manifestId);
+        cacheBytes -= entry.rawBytes;
+    }
+
+    function loadItemsShared(manifestId) {
         const cached = cacheGet(manifestId);
         if (cached) return cached;
         const row = stmtManifestGet.get(manifestId);
@@ -210,6 +243,20 @@ function createAssetManifestStore(db, options = {}) {
         const decoded = decodeAndValidateRow(row);
         cachePut(manifestId, decoded.items, decoded.rawBytes);
         return decoded.items;
+    }
+
+    // Cached arrays are shared instances, and existing code paths mutate
+    // asset arrays in place (module/character edit screens push tuples, the
+    // asset re-save loop rewrites paths). Anything handed to a caller must be
+    // a structural copy, or a caller mutation would poison the cache and leak
+    // into every later hydration and disk write.
+    function copyItems(items) {
+        return items.map((item) => item.slice());
+    }
+
+    function loadItems(manifestId) {
+        const items = loadItemsShared(manifestId);
+        return items ? copyItems(items) : null;
     }
 
     function descriptorForRow(row) {
@@ -240,7 +287,22 @@ function createAssetManifestStore(db, options = {}) {
         if (stored.owner_kind !== kind || stored.owner_id !== ownerId || stored.content_hash !== encoded.hash) {
             throw new Error(`Asset manifest owner mismatch: ${manifestId}`);
         }
-        if (activate) stmtLiveSet.run(kind, ownerId, manifestId, now);
+        if (activate) {
+            stmtLiveSet.run(kind, ownerId, manifestId, now);
+            // Superseded revisions have no readers left: canonical data is
+            // still the hydrated database.bin, and a client holding an old
+            // descriptor must refetch the live one anyway (stale edits 409).
+            // Dropping them on activation keeps risuai.db from growing by a
+            // full manifest copy on every asset edit.
+            // Constraint: descriptors issued by a { activate: false } strip
+            // are only valid until this owner's next activation — hydrate
+            // them before yielding to other writers, or re-strip on the
+            // resulting fail-closed hydrate error.
+            for (const stale of stmtOwnerStaleList.all(kind, ownerId, manifestId)) {
+                cacheEvict(stale.manifest_id);
+            }
+            stmtOwnerStaleDelete.run(kind, ownerId, manifestId);
+        }
         stmtMigrationSet.run(kind, ownerId, manifestId, encoded.hash, items.length, 'verified', null, now);
         cachePut(manifestId, decoded.items, decoded.rawBytes);
         return {
@@ -270,7 +332,7 @@ function createAssetManifestStore(db, options = {}) {
     }
 
     function getPage(manifestId, { offset = 0, limit = 100, search = '' } = {}) {
-        const items = loadItems(manifestId);
+        const items = loadItemsShared(manifestId);
         if (!items) return null;
         const safeOffset = Math.max(0, Math.trunc(Number(offset) || 0));
         const safeLimit = Math.min(500, Math.max(1, Math.trunc(Number(limit) || 100)));
@@ -282,11 +344,11 @@ function createAssetManifestStore(db, options = {}) {
             total: filtered.length,
             offset: safeOffset,
             limit: safeLimit,
-            items: filtered.slice(safeOffset, safeOffset + safeLimit),
+            items: copyItems(filtered.slice(safeOffset, safeOffset + safeLimit)),
         };
     }
 
-    function resolveNames(owners, names) {
+    function resolveNames(owners, names, { maxDistance = DEFAULT_FUZZY_DISTANCE } = {}) {
         const wanted = new Set((names || []).map((name) => String(name).toLocaleLowerCase()));
         // Asset names are imported data. A null-prototype result keeps names
         // such as "__proto__" and "constructor" as ordinary lookup keys.
@@ -299,7 +361,7 @@ function createAssetManifestStore(db, options = {}) {
                 ? { id: owner.manifestId }
                 : getLiveDescriptor(owner.kind, owner.ownerId);
             if (!descriptor) continue;
-            const items = loadItems(descriptor.id);
+            const items = loadItemsShared(descriptor.id);
             if (!items) continue;
             loadedOwners.push(items);
             for (const item of items) {
@@ -308,30 +370,29 @@ function createAssetManifestStore(db, options = {}) {
             }
             if (Object.keys(resolved).length >= wanted.size) break;
         }
-        // Preserve the legacy fuzzy fallback without sending every manifest
-        // name to the browser. It is only evaluated for exact misses.
+        // Legacy fuzzy fallback, matching getClosestMatch in the client
+        // parser: extensions are trimmed before scoring and the ceiling is
+        // the user's assetMaxDifference setting, passed in as maxDistance.
+        // It is only evaluated for exact misses.
+        const distanceCeiling = Math.max(0, Math.trunc(Number(maxDistance) || 0));
         for (const name of wanted) {
-            if (Object.hasOwn(resolved, name) || name.length < 3) continue;
-            const dot = name.lastIndexOf('.');
-            const prefix = dot > 0 ? name.slice(0, dot) : '';
+            if (Object.hasOwn(resolved, name)) continue;
+            const trimmedName = trimAssetName(name);
             let bestDistance = Number.POSITIVE_INFINITY;
             let bestPath = '';
             for (const items of loadedOwners) {
                 for (const item of items) {
-                    const candidate = item[0].toLocaleLowerCase();
-                    if (!candidate.startsWith(prefix)) continue;
-                    const distance = stringDistance(name, candidate);
+                    const candidate = trimAssetName(item[0].toLocaleLowerCase());
+                    // Length difference is a lower bound on edit distance.
+                    if (Math.abs(candidate.length - trimmedName.length) > distanceCeiling) continue;
+                    const distance = stringDistance(trimmedName, candidate);
                     if (distance < bestDistance) {
                         bestDistance = distance;
                         bestPath = item[1];
                     }
                 }
             }
-            // A nearest neighbour is not necessarily a useful match. Without
-            // a distance ceiling an unrelated missing name can silently turn
-            // into the first asset in a manifest.
-            const maxDistance = Math.max(1, Math.floor(name.length * 0.35));
-            if (bestPath && bestDistance <= maxDistance) resolved[name] = bestPath;
+            if (bestPath && bestDistance <= distanceCeiling) resolved[name] = bestPath;
         }
         return resolved;
     }

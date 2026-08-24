@@ -28,7 +28,7 @@ describe('asset manifest store', () => {
         expect(store.verifyManifest(descriptor.id)).toMatchObject({ ok: true, count: 3 })
     })
 
-    it('is content-addressed and keeps previous versions immutable', () => {
+    it('is content-addressed and prunes superseded revisions on activation', () => {
         const { db, store } = freshStore()
         const v1 = store.putManifest('module', 'module-a', [['a', 'assets/a.png', 'png']])
         const duplicate = store.putManifest('module', 'module-a', [['a', 'assets/a.png', 'png']])
@@ -40,8 +40,9 @@ describe('asset manifest store', () => {
         expect(duplicate.id).toBe(v1.id)
         expect(v2.id).not.toBe(v1.id)
         expect(store.getLiveDescriptor('module', 'module-a')).toEqual(v2)
-        expect(store.loadItems(v1.id)).toEqual([['a', 'assets/a.png', 'png']])
-        expect(db.prepare('SELECT COUNT(*) AS count FROM asset_manifests').get().count).toBe(2)
+        expect(store.loadItems(v1.id)).toBeNull()
+        expect(db.prepare('SELECT COUNT(*) AS count FROM asset_manifests').get().count).toBe(1)
+        expect(store.stats()).toMatchObject({ manifests: 1, liveManifests: 1, items: 2, cacheEntries: 1 })
     })
 
     it('keeps owners independent even when their content is identical', () => {
@@ -123,15 +124,25 @@ describe('asset manifest store', () => {
         expect(store.verifyManifest(descriptor.id)).toMatchObject({ ok: false, manifestId: descriptor.id })
     })
 
-    it('never activates an existing corrupt content-addressed row', () => {
+    it('never re-activates a corrupt content-addressed row hidden by a warm cache', () => {
         const { db, store } = freshStore()
-        const oldItems = [['old', 'assets/old.png', 'png']]
-        const old = store.putManifest('module', 'module-a', oldItems)
-        const current = store.putManifest('module', 'module-a', [['current', 'assets/current.png', 'png']])
+        const items = [['current', 'assets/current.png', 'png']]
+        const current = store.putManifest('module', 'module-a', items)
         db.prepare('UPDATE asset_manifests SET payload = ? WHERE manifest_id = ?')
-            .run(Buffer.from('not-deflate'), old.id)
+            .run(Buffer.from('not-deflate'), current.id)
 
-        expect(() => store.putManifest('module', 'module-a', oldItems)).toThrow()
+        expect(() => store.putManifest('module', 'module-a', items)).toThrow()
+    })
+
+    it('never activates a corrupt inactive row and leaves the live pointer unchanged', () => {
+        const { db, store } = freshStore()
+        const current = store.putManifest('module', 'module-a', [['current', 'assets/current.png', 'png']])
+        const pendingItems = [['pending', 'assets/pending.png', 'png']]
+        const pending = store.putManifest('module', 'module-a', pendingItems, { activate: false })
+        db.prepare('UPDATE asset_manifests SET payload = ? WHERE manifest_id = ?')
+            .run(Buffer.from('not-deflate'), pending.id)
+
+        expect(() => store.putManifest('module', 'module-a', pendingItems)).toThrow()
         expect(store.getLiveDescriptor('module', 'module-a')).toEqual(current)
     })
 
@@ -158,10 +169,7 @@ describe('asset manifest store', () => {
             { type: 'append', item: ['c', 'assets/c.webp', 'webp'] },
         ])
 
-        expect(store.loadItems(v1.id)).toEqual([
-            ['a', 'assets/a.png', 'png'],
-            ['b', 'assets/b.png', 'png'],
-        ])
+        expect(store.loadItems(v1.id)).toBeNull()
         expect(store.loadItems(v2.id)).toEqual([
             ['renamed', 'assets/a.png', 'png'],
             ['c', 'assets/c.webp', 'webp'],
@@ -169,5 +177,30 @@ describe('asset manifest store', () => {
         expect(() => store.applyOperations('module', 'editable', v1.id, [
             { type: 'remove', index: 0 },
         ])).toThrow(/revision conflict/)
+    })
+
+    it('returns defensive copies so caller mutation cannot poison the cache', () => {
+        const { store } = freshStore()
+        const descriptor = store.putManifest('module', 'module-a', [['a', 'assets/a.png', 'png']])
+
+        const first = store.loadItems(descriptor.id)
+        first.push(['injected', 'assets/evil', 'png'])
+        first[0][0] = 'mutated'
+        expect(store.loadItems(descriptor.id)).toEqual([['a', 'assets/a.png', 'png']])
+
+        const page = store.getPage(descriptor.id)
+        page.items[0][1] = 'assets/other'
+        expect(store.getPage(descriptor.id).items).toEqual([['a', 'assets/a.png', 'png']])
+    })
+
+    it('honors the caller-provided fuzzy distance ceiling and trims extensions like the parser', () => {
+        const { store } = freshStore()
+        store.putManifest('module', 'module-a', [['smile.png', 'assets/smile', 'png']])
+        const owners = [{ kind: 'module', ownerId: 'module-a' }]
+
+        expect(store.resolveNames(owners, ['smiles.png'])).toEqual({ 'smiles.png': 'assets/smile' })
+        expect(store.resolveNames(owners, ['smiles.png'], { maxDistance: 0 })).toEqual({})
+        expect(store.resolveNames(owners, ['sm.png'], { maxDistance: 3 })).toEqual({ 'sm.png': 'assets/smile' })
+        expect(store.resolveNames(owners, ['smile.webp'], { maxDistance: 0 })).toEqual({ 'smile.webp': 'assets/smile' })
     })
 })

@@ -77,6 +77,18 @@ describe('asset manifest migration compatibility layer', () => {
         expect(hydrateAssetManifests(stripped, store)).toEqual(source)
     })
 
+    it('hydrates independent arrays so consumer mutation cannot corrupt later hydrations', () => {
+        const store = freshStore()
+        const source = { modules: [{ id: 'm1', assets: [['a', 'assets/a.png', 'png']] }] }
+        const stripped = stripAssetManifests(source, store).db
+
+        const first = hydrateAssetManifests(stripped, store)
+        first.modules[0].assets.push(['injected', 'assets/evil', 'png'])
+        first.modules[0].assets[0][0] = 'mutated'
+
+        expect(hydrateAssetManifests(stripped, store)).toEqual(source)
+    })
+
     it('rejects descriptor owner or version tampering', () => {
         const store = freshStore()
         const source = { modules: [{ id: 'm1', assets: [['safe', 'assets/safe.png', 'png']] }] }
