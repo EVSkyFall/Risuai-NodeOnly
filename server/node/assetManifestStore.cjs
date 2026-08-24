@@ -1,0 +1,459 @@
+'use strict';
+
+const crypto = require('crypto');
+const zlib = require('zlib');
+
+const MANIFEST_FORMAT_VERSION = 1;
+const OWNER_KINDS = new Set(['module', 'character', 'persona-module']);
+const DEFAULT_CACHE_BYTES = 64 * 1024 * 1024;
+
+function assertOwner(kind, ownerId) {
+    if (!OWNER_KINDS.has(kind)) throw new Error(`Unsupported asset manifest owner kind: ${kind}`);
+    if (typeof ownerId !== 'string' || ownerId.length === 0) throw new Error('Asset manifest owner id is required');
+}
+
+function assertItems(items) {
+    if (!Array.isArray(items)) throw new Error('Asset manifest items must be an array');
+    for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (!Array.isArray(item) || item.length < 2 || item.length > 3) {
+            throw new Error(`Invalid asset tuple at index ${i}`);
+        }
+        if (typeof item[0] !== 'string' || typeof item[1] !== 'string') {
+            throw new Error(`Invalid asset tuple strings at index ${i}`);
+        }
+        if (item.length === 3 && item[2] != null && typeof item[2] !== 'string') {
+            throw new Error(`Invalid asset tuple extension at index ${i}`);
+        }
+    }
+}
+
+function encodeItems(items) {
+    assertItems(items);
+    // JSON is intentional here: tuples contain only strings, and using a stable,
+    // portable representation makes the integrity hash independent of msgpack
+    // library versions. Tuple length/order and every string are preserved.
+    const raw = Buffer.from(JSON.stringify(items), 'utf8');
+    const hash = crypto.createHash('sha256').update(raw).digest('hex');
+    const payload = zlib.deflateRawSync(raw, { level: 3 });
+    return { raw, payload, hash };
+}
+
+function decodeItems(payload, expectedHash) {
+    const raw = zlib.inflateRawSync(payload);
+    const hash = crypto.createHash('sha256').update(raw).digest('hex');
+    if (expectedHash && hash !== expectedHash) {
+        throw new Error(`Asset manifest checksum mismatch: expected ${expectedHash}, got ${hash}`);
+    }
+    const items = JSON.parse(raw.toString('utf8'));
+    assertItems(items);
+    return { items, rawBytes: raw.length, hash };
+}
+
+function manifestIdFor(kind, ownerId, contentHash) {
+    return crypto.createHash('sha256')
+        .update(`${kind}\0${ownerId}\0${contentHash}`)
+        .digest('hex');
+}
+
+function decodeAndValidateRow(row) {
+    if (!row) throw new Error('Asset manifest row is missing');
+    if (row.format_version !== MANIFEST_FORMAT_VERSION) {
+        throw new Error(`Unsupported asset manifest version: ${row.format_version}`);
+    }
+    const expectedId = manifestIdFor(row.owner_kind, row.owner_id, row.content_hash);
+    if (row.manifest_id !== expectedId) {
+        throw new Error(`Asset manifest identity mismatch: ${row.manifest_id}`);
+    }
+    const decoded = decodeItems(row.payload, row.content_hash);
+    if (decoded.items.length !== row.item_count || decoded.rawBytes !== row.raw_bytes) {
+        throw new Error(`Asset manifest metadata mismatch: ${row.manifest_id}`);
+    }
+    return decoded;
+}
+
+function stringDistance(a, b) {
+    if (a === b) return 0;
+    if (!a.length) return b.length;
+    if (!b.length) return a.length;
+    let previous = Array.from({ length: b.length + 1 }, (_, i) => i);
+    for (let i = 1; i <= a.length; i++) {
+        const current = [i];
+        for (let j = 1; j <= b.length; j++) {
+            current[j] = Math.min(
+                current[j - 1] + 1,
+                previous[j] + 1,
+                previous[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1),
+            );
+        }
+        previous = current;
+    }
+    return previous[b.length];
+}
+
+function createAssetManifestStore(db, options = {}) {
+    const maxCacheBytes = Number.isFinite(options.maxCacheBytes)
+        ? Math.max(0, options.maxCacheBytes)
+        : DEFAULT_CACHE_BYTES;
+
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS asset_manifests (
+        manifest_id   TEXT    PRIMARY KEY,
+        owner_kind    TEXT    NOT NULL,
+        owner_id      TEXT    NOT NULL,
+        format_version INTEGER NOT NULL,
+        item_count    INTEGER NOT NULL,
+        content_hash  TEXT    NOT NULL,
+        raw_bytes     INTEGER NOT NULL,
+        payload       BLOB    NOT NULL,
+        created_at    INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_asset_manifests_owner
+        ON asset_manifests(owner_kind, owner_id, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS asset_manifest_live (
+        owner_kind   TEXT NOT NULL,
+        owner_id     TEXT NOT NULL,
+        manifest_id  TEXT NOT NULL,
+        updated_at   INTEGER NOT NULL,
+        PRIMARY KEY(owner_kind, owner_id),
+        FOREIGN KEY(manifest_id) REFERENCES asset_manifests(manifest_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS asset_manifest_migration (
+        owner_kind   TEXT NOT NULL,
+        owner_id     TEXT NOT NULL,
+        manifest_id  TEXT,
+        source_hash  TEXT,
+        item_count   INTEGER NOT NULL DEFAULT 0,
+        status       TEXT NOT NULL,
+        error        TEXT,
+        updated_at   INTEGER NOT NULL,
+        PRIMARY KEY(owner_kind, owner_id)
+      );
+    `);
+
+    const stmtManifestGet = db.prepare(`
+      SELECT manifest_id, owner_kind, owner_id, format_version, item_count,
+             content_hash, raw_bytes, payload, created_at
+      FROM asset_manifests WHERE manifest_id = ?
+    `);
+    const stmtManifestInsert = db.prepare(`
+      INSERT OR IGNORE INTO asset_manifests
+        (manifest_id, owner_kind, owner_id, format_version, item_count,
+         content_hash, raw_bytes, payload, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const stmtLiveSet = db.prepare(`
+      INSERT INTO asset_manifest_live(owner_kind, owner_id, manifest_id, updated_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(owner_kind, owner_id) DO UPDATE SET
+        manifest_id = excluded.manifest_id,
+        updated_at = excluded.updated_at
+    `);
+    const stmtLiveGet = db.prepare(`
+      SELECT l.owner_kind, l.owner_id, l.manifest_id, l.updated_at,
+             m.format_version, m.item_count, m.content_hash, m.raw_bytes
+      FROM asset_manifest_live l
+      JOIN asset_manifests m ON m.manifest_id = l.manifest_id
+      WHERE l.owner_kind = ? AND l.owner_id = ?
+    `);
+    const stmtMigrationSet = db.prepare(`
+      INSERT INTO asset_manifest_migration
+        (owner_kind, owner_id, manifest_id, source_hash, item_count, status, error, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(owner_kind, owner_id) DO UPDATE SET
+        manifest_id = excluded.manifest_id,
+        source_hash = excluded.source_hash,
+        item_count = excluded.item_count,
+        status = excluded.status,
+        error = excluded.error,
+        updated_at = excluded.updated_at
+    `);
+    const stmtMigrationList = db.prepare(`
+      SELECT owner_kind, owner_id, manifest_id, source_hash, item_count, status, error, updated_at
+      FROM asset_manifest_migration ORDER BY owner_kind, owner_id
+    `);
+
+    const cache = new Map();
+    let cacheBytes = 0;
+
+    function cacheGet(manifestId) {
+        const found = cache.get(manifestId);
+        if (!found) return null;
+        cache.delete(manifestId);
+        cache.set(manifestId, found);
+        return found.items;
+    }
+
+    function cachePut(manifestId, items, rawBytes) {
+        if (maxCacheBytes <= 0 || rawBytes > maxCacheBytes) return;
+        const previous = cache.get(manifestId);
+        if (previous) cacheBytes -= previous.rawBytes;
+        cache.delete(manifestId);
+        cache.set(manifestId, { items, rawBytes });
+        cacheBytes += rawBytes;
+        while (cacheBytes > maxCacheBytes && cache.size > 0) {
+            const oldestId = cache.keys().next().value;
+            const oldest = cache.get(oldestId);
+            cache.delete(oldestId);
+            cacheBytes -= oldest.rawBytes;
+        }
+    }
+
+    function loadItems(manifestId) {
+        const cached = cacheGet(manifestId);
+        if (cached) return cached;
+        const row = stmtManifestGet.get(manifestId);
+        if (!row) return null;
+        const decoded = decodeAndValidateRow(row);
+        cachePut(manifestId, decoded.items, decoded.rawBytes);
+        return decoded.items;
+    }
+
+    function descriptorForRow(row) {
+        if (!row) return null;
+        return {
+            id: row.manifest_id,
+            version: row.format_version,
+            count: row.item_count,
+            sha256: row.content_hash,
+        };
+    }
+
+    const putTx = db.transaction((kind, ownerId, items, activate) => {
+        assertOwner(kind, ownerId);
+        const encoded = encodeItems(items);
+        const manifestId = manifestIdFor(kind, ownerId, encoded.hash);
+        const now = Date.now();
+        stmtManifestInsert.run(
+            manifestId, kind, ownerId, MANIFEST_FORMAT_VERSION, items.length,
+            encoded.hash, encoded.raw.length, encoded.payload, now,
+        );
+        // INSERT OR IGNORE makes repeated writes cheap, but the persisted row
+        // still has to pass integrity checks before it can become live. This
+        // prevents an existing damaged row from being re-activated while a
+        // warm cache temporarily hides its corrupt payload.
+        const stored = stmtManifestGet.get(manifestId);
+        const decoded = decodeAndValidateRow(stored);
+        if (stored.owner_kind !== kind || stored.owner_id !== ownerId || stored.content_hash !== encoded.hash) {
+            throw new Error(`Asset manifest owner mismatch: ${manifestId}`);
+        }
+        if (activate) stmtLiveSet.run(kind, ownerId, manifestId, now);
+        stmtMigrationSet.run(kind, ownerId, manifestId, encoded.hash, items.length, 'verified', null, now);
+        cachePut(manifestId, decoded.items, decoded.rawBytes);
+        return {
+            id: manifestId,
+            version: MANIFEST_FORMAT_VERSION,
+            count: items.length,
+            sha256: encoded.hash,
+        };
+    });
+
+    function putManifest(kind, ownerId, items, { activate = true } = {}) {
+        return putTx(kind, ownerId, items, activate);
+    }
+
+    function getLiveDescriptor(kind, ownerId) {
+        assertOwner(kind, ownerId);
+        const row = stmtLiveGet.get(kind, ownerId);
+        if (row && row.format_version !== MANIFEST_FORMAT_VERSION) {
+            throw new Error(`Unsupported asset manifest version: ${row.format_version}`);
+        }
+        return descriptorForRow(row);
+    }
+
+    function getItemsByOwner(kind, ownerId) {
+        const descriptor = getLiveDescriptor(kind, ownerId);
+        return descriptor ? loadItems(descriptor.id) : null;
+    }
+
+    function getPage(manifestId, { offset = 0, limit = 100, search = '' } = {}) {
+        const items = loadItems(manifestId);
+        if (!items) return null;
+        const safeOffset = Math.max(0, Math.trunc(Number(offset) || 0));
+        const safeLimit = Math.min(500, Math.max(1, Math.trunc(Number(limit) || 100)));
+        const query = String(search || '').toLocaleLowerCase();
+        const filtered = query
+            ? items.filter((item) => item[0].toLocaleLowerCase().includes(query))
+            : items;
+        return {
+            total: filtered.length,
+            offset: safeOffset,
+            limit: safeLimit,
+            items: filtered.slice(safeOffset, safeOffset + safeLimit),
+        };
+    }
+
+    function resolveNames(owners, names) {
+        const wanted = new Set((names || []).map((name) => String(name).toLocaleLowerCase()));
+        // Asset names are imported data. A null-prototype result keeps names
+        // such as "__proto__" and "constructor" as ordinary lookup keys.
+        const resolved = Object.create(null);
+        if (wanted.size === 0) return resolved;
+        const loadedOwners = [];
+        for (const owner of owners || []) {
+            if (!owner) continue;
+            const descriptor = owner.manifestId
+                ? { id: owner.manifestId }
+                : getLiveDescriptor(owner.kind, owner.ownerId);
+            if (!descriptor) continue;
+            const items = loadItems(descriptor.id);
+            if (!items) continue;
+            loadedOwners.push(items);
+            for (const item of items) {
+                const key = item[0].toLocaleLowerCase();
+                if (wanted.has(key) && !Object.hasOwn(resolved, key)) resolved[key] = item[1];
+            }
+            if (Object.keys(resolved).length >= wanted.size) break;
+        }
+        // Preserve the legacy fuzzy fallback without sending every manifest
+        // name to the browser. It is only evaluated for exact misses.
+        for (const name of wanted) {
+            if (Object.hasOwn(resolved, name) || name.length < 3) continue;
+            const dot = name.lastIndexOf('.');
+            const prefix = dot > 0 ? name.slice(0, dot) : '';
+            let bestDistance = Number.POSITIVE_INFINITY;
+            let bestPath = '';
+            for (const items of loadedOwners) {
+                for (const item of items) {
+                    const candidate = item[0].toLocaleLowerCase();
+                    if (!candidate.startsWith(prefix)) continue;
+                    const distance = stringDistance(name, candidate);
+                    if (distance < bestDistance) {
+                        bestDistance = distance;
+                        bestPath = item[1];
+                    }
+                }
+            }
+            // A nearest neighbour is not necessarily a useful match. Without
+            // a distance ceiling an unrelated missing name can silently turn
+            // into the first asset in a manifest.
+            const maxDistance = Math.max(1, Math.floor(name.length * 0.35));
+            if (bestPath && bestDistance <= maxDistance) resolved[name] = bestPath;
+        }
+        return resolved;
+    }
+
+    function applyOperations(kind, ownerId, expectedManifestId, operations) {
+        assertOwner(kind, ownerId);
+        if (!Array.isArray(operations) || operations.length === 0 || operations.length > 1000) {
+            throw new Error('Asset manifest operations must contain 1-1000 entries');
+        }
+        const current = getLiveDescriptor(kind, ownerId);
+        if (!current) throw new Error(`Asset manifest owner not found: ${kind}/${ownerId}`);
+        if (expectedManifestId && expectedManifestId !== current.id) {
+            const error = new Error('Asset manifest revision conflict');
+            error.code = 'MANIFEST_CONFLICT';
+            error.current = current;
+            throw error;
+        }
+        const source = loadItems(current.id);
+        const next = source.map((item) => item.slice());
+        for (const operation of operations) {
+            const type = operation?.type;
+            if (type === 'append') {
+                assertItems([operation.item]);
+                next.push(operation.item.slice());
+                continue;
+            }
+            const index = Math.trunc(Number(operation?.index));
+            if (!Number.isFinite(index) || index < 0 || index >= next.length + (type === 'insert' ? 1 : 0)) {
+                throw new Error(`Invalid asset manifest operation index: ${operation?.index}`);
+            }
+            if (type === 'insert') {
+                assertItems([operation.item]);
+                next.splice(index, 0, operation.item.slice());
+            } else if (type === 'remove') {
+                if (index >= next.length) throw new Error(`Invalid remove index: ${index}`);
+                next.splice(index, 1);
+            } else if (type === 'rename') {
+                if (index >= next.length || typeof operation.name !== 'string') {
+                    throw new Error(`Invalid rename operation at index: ${index}`);
+                }
+                next[index][0] = operation.name;
+            } else if (type === 'replace') {
+                if (index >= next.length) throw new Error(`Invalid replace index: ${index}`);
+                assertItems([operation.item]);
+                next[index] = operation.item.slice();
+            } else {
+                throw new Error(`Unsupported asset manifest operation: ${type}`);
+            }
+        }
+        return putManifest(kind, ownerId, next, { activate: true });
+    }
+
+    function verifyManifest(manifestId) {
+        const row = stmtManifestGet.get(manifestId);
+        if (!row) return { ok: false, error: 'not-found' };
+        try {
+            // Verification deliberately bypasses the LRU so it checks the bytes
+            // currently persisted in SQLite, not an earlier cached decode.
+            const decoded = decodeAndValidateRow(row);
+            return {
+                ok: true,
+                manifestId,
+                version: row.format_version,
+                ownerKind: row.owner_kind,
+                ownerId: row.owner_id,
+                count: decoded.items.length,
+                sha256: row.content_hash,
+                rawBytes: row.raw_bytes,
+            };
+        } catch (error) {
+            return { ok: false, manifestId, error: String(error?.message || error) };
+        }
+    }
+
+    function recordMigrationFailure(kind, ownerId, error) {
+        assertOwner(kind, ownerId);
+        stmtMigrationSet.run(kind, ownerId, null, null, 0, 'failed', String(error?.message || error), Date.now());
+    }
+
+    function listMigrationState() {
+        return stmtMigrationList.all();
+    }
+
+    function stats() {
+        const manifest = db.prepare(`
+          SELECT COUNT(*) AS count, COALESCE(SUM(item_count), 0) AS items,
+                 COALESCE(SUM(raw_bytes), 0) AS raw_bytes,
+                 COALESCE(SUM(LENGTH(payload)), 0) AS stored_bytes
+          FROM asset_manifests
+        `).get();
+        const live = db.prepare(`SELECT COUNT(*) AS count FROM asset_manifest_live`).get();
+        return {
+            manifests: manifest.count,
+            liveManifests: live.count,
+            items: manifest.items,
+            rawBytes: manifest.raw_bytes,
+            storedBytes: manifest.stored_bytes,
+            cacheEntries: cache.size,
+            cacheRawBytes: cacheBytes,
+        };
+    }
+
+    return {
+        putManifest,
+        getLiveDescriptor,
+        getItemsByOwner,
+        loadItems,
+        getPage,
+        resolveNames,
+        applyOperations,
+        verifyManifest,
+        recordMigrationFailure,
+        listMigrationState,
+        stats,
+    };
+}
+
+module.exports = {
+    MANIFEST_FORMAT_VERSION,
+    createAssetManifestStore,
+    encodeItems,
+    decodeItems,
+    manifestIdFor,
+    stringDistance,
+};
