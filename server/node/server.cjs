@@ -33,6 +33,7 @@ const {
 const { createRequestLogs } = require('./request-logs.cjs');
 const { applyPatch } = require('fast-json-patch');
 const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, normalizeForwardHeaders, hasRemoteBlocks } = require('./utils.cjs');
+const { createPatchHashCache } = require('./patch-hash-cache.cjs');
 const { spawn, execSync } = require('child_process');
 const os = require('os');
 const { Readable, Transform } = require('stream');
@@ -56,6 +57,7 @@ let dbCache = {};
 let saveTimers = {};
 const SAVE_INTERVAL = 5000;
 let fullChatStore = null; // Map<chaId, Map<chatId, chatObject>> — lazy-initialized
+const databasePatchHashCache = createPatchHashCache(calculateHash);
 
 // ETag for database.bin
 let dbEtag = null;
@@ -3784,7 +3786,9 @@ app.post('/api/patch', async (req, res, next) => {
             }
 
             patchStage = 'hash';
-            const serverHash = calculateHash(dbCache[filePath]).toString(16);
+            const serverHash = decodedKey === 'database/database.bin'
+                ? databasePatchHashCache.hash(dbCache[filePath]).toString(16)
+                : calculateHash(dbCache[filePath]).toString(16);
 
             if (expectedHash !== serverHash) {
                 console.log(`[Patch] Hash mismatch for ${decodedKey}: expected=${expectedHash}, server=${serverHash}`);
@@ -3819,6 +3823,9 @@ app.post('/api/patch', async (req, res, next) => {
                 // Invalidate corrupted cache entry to force reload on next request
                 delete dbCache[filePath];
                 throw patchErr;
+            }
+            if (decodedKey === 'database/database.bin') {
+                databasePatchHashCache.update(dbCache[filePath], snapshot, patch);
             }
             dbCache[filePath] = snapshot;
 
