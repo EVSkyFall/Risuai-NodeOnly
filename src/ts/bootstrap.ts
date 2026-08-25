@@ -177,7 +177,9 @@ export async function loadData() {
             // the canonical changeChar path so lazy chat hydration, toggles,
             // and chat UI initialization still run normally.
             try {
-                const lastChaId = localStorage.getItem('risu-last-active-character')
+                const lastChaId = db.nodeOnlyRestoreLastChat
+                    ? localStorage.getItem('risu-last-active-character')
+                    : null
                 const restoreIndex = lastChaId
                     ? DBState.db.characters.findIndex((char) => char?.chaId === lastChaId)
                     : -1

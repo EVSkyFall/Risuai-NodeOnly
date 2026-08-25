@@ -1699,6 +1699,7 @@ export const languageEnglish = {
     blockquoteStyling: "Blockquote Styling",
     dynamicModelRegistry: "Dynamic Model Registry",
     confirmInstallPluginViaPlugin: "You are trying to install a plugin via another plugin. This can be dangerous if the source plugin is not trustworthy. Do you want to continue?",
+    nodeOnlyRestoreLastChat: "Reopen Last Chat on Start",
     nodeOnlyScrollButtonType: "Scroll Button Type",
     scrollButtonTypeFour: "4 Buttons",
     scrollButtonTypeTwo: "2 Buttons",

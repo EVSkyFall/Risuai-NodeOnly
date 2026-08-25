@@ -766,6 +766,7 @@ export function setDatabase(data:Database){
     data.saveSignatures ??= false
     data.nodeOnlyScrollButtonType ??= 'four'
     data.nodeOnlyHideRecentChats ??= false
+    data.nodeOnlyRestoreLastChat ??= false
     data.nodeOnlyAutoCleanAssets ??= false
     data.keepSessionAlive ??= 'off'
     data.localNetworkMode ??= false
@@ -1560,6 +1561,10 @@ export interface Database{
     dynamicModelRegistry?:boolean
     nodeOnlyScrollButtonType?:'four'|'two'|'off'
     nodeOnlyHideRecentChats?:boolean
+    // Reopen the last active character on boot instead of landing on Home.
+    // Default OFF — an unexpected jump into a chat surprises users who open
+    // the app to browse. Toggled in accessibility settings (Others tab).
+    nodeOnlyRestoreLastChat?:boolean
     // Delete unreferenced assets/* on boot (cleanChunks). Default OFF: the
     // reference walker deleting an asset it simply didn't know about is
     // unrecoverable, so orphan removal is a deliberate act from the storage

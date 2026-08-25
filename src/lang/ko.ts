@@ -1960,6 +1960,7 @@ export const languageKorean = {
   nanoGPTSelectFromList: "목록에서 선택",
   nanoGPTManualInput: "수동 입력",
   nanoGPTManualModelSelect: "수동 모델 선택",
+  nodeOnlyRestoreLastChat: "시작 시 마지막 채팅 열기",
   nodeOnlyScrollButtonType: "스크롤 버튼 타입",
   scrollButtonTypeFour: "4버튼",
   scrollButtonTypeTwo: "2버튼",
