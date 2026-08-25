@@ -145,6 +145,7 @@ export const helpZhHant = {
         "hypaV3EmbeddingRequestsPerMinute": "用於相似性搜尋的每分鐘最大嵌入模型請求數。",
         "hypaV3EmbeddingMaxConcurrent": "用於相似性搜尋的最大同時嵌入模型請求數。",
         "allowV2Plugin": "警告：此選項將啟用已棄用的 V2.0 外掛執行功能。V2.0 外掛會繞過 V2.1 安全檢查機制，可能存在安全風險。除非您明確信任該外掛且尚無法將其遷移至 V3，否則請保持停用。",
+        "allowV21Plugin": "警告：由於 V2.1 API 已被棄用且將在未來版本中停止運作，預設會封鎖安裝新的 V2.1 外掛。已安裝的 V2.1 外掛仍可繼續運作。僅在需要安裝或更新您信任的 V2.1 外掛時才啟用；V2.1 安全檢查仍會套用。",
         "inlayImageLossless": "啟用後，嵌入內容將以無損 PNG 格式儲存，而非壓縮的 WebP。這可保留原始畫質，但會佔用較多儲存空間。",
         "inlayImagePriority": "啟用後，嵌入內容將優先以圖片形式渲染以加快載入速度，圖片載入失敗後才自動切換為影片／音訊。若您使用大量影片或音訊嵌入，請停用此選項。",
         "showModelInSidebar": "在側邊欄中顯示目前 AI 模型名稱，方便快速查看。",

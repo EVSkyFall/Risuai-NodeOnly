@@ -1284,6 +1284,7 @@ export const languageGerman = {
     "providerPermissionConsent": "Plugin {} fordert die Berechtigung an, auf den Provider zuzugreifen, was unautorisierte API-Aufrufe ermöglichen könnte. Möchten Sie dies zulassen?",
     "pluginPermissionDenyGuide": "Die Berechtigungsanfrage des Plugins \"{}\" wurde abgelehnt. Abgelehnte Berechtigungen werden nicht erneut abgefragt.\n\nFalls dies ein Versehen war, können Sie es unter [Einstellungen] > [Plugins] rückgängig machen, indem Sie die Berechtigungsantworten des Plugins zurücksetzen.",
     "sendChatConsent": "Plugin {} fordert die Berechtigung an, in Ihrem Namen Chat-Nachrichten zu senden, was KI-Antworten auslöst. Möchten Sie dies zulassen?",
+    "inlayPermissionConsent": "Plugin {} fordert die Berechtigung an, auf das Inlay zuzugreifen, wodurch es Inlay-Inhalte lesen, schreiben oder bearbeiten kann. Möchten Sie dies zulassen?",
     "pluginV2Warning": "Plugin V2 und V2.1 gelten als unsicher und werden in zukünftigen Versionen nicht mehr funktionieren. **Bitte verwenden Sie diese Versionen von Plugins nicht.** Wenn Sie der Entwickler dieses Plugins sind, aktualisieren Sie bitte so schnell wie möglich auf V3.",
     "enableScrollToActiveChar": "Scrollen zum aktiven Charakter aktivieren",
     "newMessageButtonRightCenter": "Mitte rechts",
