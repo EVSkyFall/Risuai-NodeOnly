@@ -198,7 +198,44 @@ function assetManifestSummary(dbObj) {
     };
 }
 
+/**
+ * Disk-protection guard partner of findStubFlagLossChats, for lazy asset
+ * manifests. An owner (module / character / persona embedded module) whose
+ * assets were split out carries only a descriptor on the client. If a writer
+ * hands back that owner with neither the descriptor nor an inline array —
+ * a plugin rebuilding characters from a field whitelist, `remove
+ * /characters/N/additionalAssetManifest`, a malformed full write — hydrate
+ * would pass it through and the asset list would be gone on disk while the
+ * manifest rows stay orphaned. Compare the previous document with the next
+ * one by owner id and report those owners so the caller can reject.
+ */
+function findAssetManifestLossOwners(prevDb, nextDb) {
+    if (!prevDb || !nextDb) return [];
+    const losses = [];
+    const check = (kind, prevList, nextList, ownerIdOf, hasDescriptor, hasInline) => {
+        if (!Array.isArray(prevList) || !Array.isArray(nextList)) return;
+        const prevIds = new Set();
+        prevList.forEach((owner, i) => { if (hasDescriptor(owner)) prevIds.add(ownerIdOf(owner, i)); });
+        if (prevIds.size === 0) return;
+        nextList.forEach((owner, i) => {
+            if (!owner || typeof owner !== 'object') return;
+            const id = ownerIdOf(owner, i);
+            if (prevIds.has(id) && !hasDescriptor(owner) && !hasInline(owner)) {
+                losses.push({ kind, ownerId: id, index: i });
+            }
+        });
+    };
+    check('module', prevDb.modules, nextDb.modules, moduleOwnerId,
+        (m) => !!m?.assetManifest, (m) => Array.isArray(m?.assets));
+    check('character', prevDb.characters, nextDb.characters, characterOwnerId,
+        (c) => !!c?.additionalAssetManifest, (c) => Array.isArray(c?.additionalAssets));
+    check('persona', prevDb.personas, nextDb.personas, personaOwnerId,
+        (p) => !!p?.embeddedModule?.assetManifest, (p) => Array.isArray(p?.embeddedModule?.assets));
+    return losses;
+}
+
 module.exports = {
+    findAssetManifestLossOwners,
     stripAssetManifests,
     hydrateAssetManifests,
     assetManifestSummary,

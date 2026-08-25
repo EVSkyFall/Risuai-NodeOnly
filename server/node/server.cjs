@@ -40,6 +40,7 @@ const { createAssetManifestStore } = require('./assetManifestStore.cjs');
 const {
     stripAssetManifests,
     hydrateAssetManifests,
+    findAssetManifestLossOwners,
     assetManifestSummary,
     moduleOwnerId,
     characterOwnerId,
@@ -1822,6 +1823,13 @@ const loginRouteLimiter = rateLimit({
     message: { error: 'Too many attempts. Please wait and try again later.' },
     validate: { xForwardedForHeader: false }
 });
+
+// Hex `file-path` headers are case-insensitive to decode but dbCache is keyed
+// by the raw string, so an upper-case header would get its own cache entry
+// and dodge every check that reads the canonical (lower-case) key.
+function normalizeFilePathHeader(value) {
+    return typeof value === 'string' ? value.trim().toLowerCase() : value;
+}
 
 function isHex(str) {
     return hexRegex.test(str.toUpperCase().trim()) || str === '__password';
@@ -3629,7 +3637,7 @@ app.get('/api/read', async (req, res, next) => {
     if(!await checkAuth(req, res)){
         return;
     }
-    const filePath = req.headers['file-path'];
+    const filePath = normalizeFilePathHeader(req.headers['file-path']);
     if (!filePath) {
         console.log('no path')
         res.status(400).send({ error:'File path required' });
@@ -3708,7 +3716,7 @@ app.get('/api/remove', async (req, res, next) => {
     if(!await checkAuth(req, res)){
         return;
     }
-    const filePath = req.headers['file-path'];
+    const filePath = normalizeFilePathHeader(req.headers['file-path']);
     if (!filePath) {
         res.status(400).send({ error:'File path required' });
         return;
@@ -3849,7 +3857,7 @@ app.post('/api/write', async (req, res, next) => {
         return;
     }
     if (!checkActiveSession(req, res)) return;
-    const filePath = req.headers['file-path'];
+    const filePath = normalizeFilePathHeader(req.headers['file-path']);
     const fileContent = req.body;
     if (!filePath || !fileContent) {
         res.status(400).send({ error:'File path required' });
@@ -3927,6 +3935,26 @@ app.post('/api/write', async (req, res, next) => {
                         recordPersistFailure(err, '/api/write:stub-flag-loss');
                         logger.error(`[Write] ${err.message}`);
                         res.status(500).json({ error: 'Write aborted: chat data integrity check failed' });
+                        return;
+                    }
+
+                    // Same boundary for lazy asset manifests (see
+                    // findAssetManifestLossOwners). Compared against the
+                    // stripped client view; load it from disk when the cache
+                    // is cold (restart, or a writer that never called
+                    // /api/read) so only a first-ever write is unguarded.
+                    const manifestLosses = (await loadDbCacheIfMissing())
+                        ? findAssetManifestLossOwners(dbCache[DB_HEX_KEY], incomingDb)
+                        : [];
+                    if (manifestLosses.length > 0) {
+                        const sample = manifestLosses.slice(0, 3).map(l => `${l.kind}:${l.ownerId}`).join(', ');
+                        const err = new Error(
+                            `write aborted: ${manifestLosses.length} owner(s) would lose their asset manifest `
+                            + `without an inline asset list. sample=[${sample}]`
+                        );
+                        recordPersistFailure(err, '/api/write:asset-manifest-loss');
+                        logger.error(`[Write] ${err.message}`);
+                        res.status(500).json({ error: 'Write aborted: asset manifest integrity check failed' });
                         return;
                     }
 
@@ -4019,7 +4047,7 @@ app.post('/api/patch', async (req, res, next) => {
         return;
     }
     if (!checkActiveSession(req, res)) return;
-    const filePath = req.headers['file-path'];
+    const filePath = normalizeFilePathHeader(req.headers['file-path']);
     let patch = req.body.patch;
     const expectedHash = req.body.expectedHash;
 
@@ -4202,6 +4230,30 @@ app.post('/api/patch', async (req, res, next) => {
             if (!validRoot) {
                 res.status(400).send({ error: 'Patch must leave the document as an object' });
                 return;
+            }
+            // Lazy asset manifest guard (partner of the chat guard above): an
+            // owner that had a descriptor must still have it or an inline
+            // array, otherwise hydrate would write it to disk without its
+            // assets. 409 so the client rebases; a full write with the same
+            // shape is stopped at /api/write.
+            if (decodedKey === 'database/database.bin') {
+                const manifestLosses = findAssetManifestLossOwners(dbCache[filePath], next);
+                if (manifestLosses.length > 0) {
+                    const sample = manifestLosses.slice(0, 5).map(l => `${l.kind}:${l.ownerId}`).join(', ');
+                    logger.warn(`[Patch] Rejected: ${manifestLosses.length} owner(s) would lose their asset manifest: ${sample}`);
+                    let currentEtag;
+                    try {
+                        currentEtag = computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(dbCache[filePath])));
+                        dbEtag = currentEtag;
+                    } catch {}
+                    res.status(409).send({
+                        error: 'Patch rejected: owner would lose its asset manifest without an inline asset list',
+                        code: 'ASSET_MANIFEST_GUARD_REJECTED',
+                        assetManifestGuardRejected: true,
+                        currentEtag,
+                    });
+                    return;
+                }
             }
             if (decodedKey === 'database/database.bin') {
                 databasePatchHashCache.update(dbCache[filePath], next, patch);
