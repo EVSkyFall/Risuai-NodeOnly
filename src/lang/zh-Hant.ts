@@ -1864,6 +1864,7 @@ export const languageChineseTraditional = {
     "pluginStorageRefresh": "重新整理",
     "pluginStorageEmpty": "沒有任何項目。",
     "pluginStorageLoadError": "無法載入儲存空間。",
+    "pluginStorageNotLoaded": "開啟時載入",
     "pluginStorageSave": "儲存",
     "pluginStorageFormatJson": "格式化 JSON",
     "pluginStorageMetaType": "類型",
