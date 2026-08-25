@@ -1607,7 +1607,7 @@ export async function getRisuHub(arg:{
         arg.search += ' __shared'
         const stringArg = `search==${arg.search}&&page==${arg.page}&&nsfw==${arg.nsfw}&&sort==${arg.sort}&&web==other`
 
-        const da = await fetch(hubURL + '/realm/' + encodeURIComponent(stringArg), {
+        const da = await fetch(hubURL + '/realm/' + encodeURIComponent(stringArg) + "?cache=30", {
             headers: {
                 "x-risuai-info": appVer + ';node'
             }
