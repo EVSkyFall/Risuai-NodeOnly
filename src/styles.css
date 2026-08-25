@@ -31,6 +31,9 @@
   --color-darkborderc: var(--risu-theme-darkborderc);
   --color-darkbutton: var(--risu-theme-darkbutton);
   --color-success: var(--risu-theme-success);
+  --color-warning: var(--risu-theme-warning);
+  --color-highlight: var(--risu-theme-highlight);
+  --color-accent: var(--risu-theme-accent);
   --color-primary: var(--risu-theme-primary);
 
   --color-primary-50: var(--risu-theme-primary-50);
@@ -272,6 +275,9 @@ body {
      of ColorScheme interface, so updateColorScheme() never overrides it.
      See .agent/guide/ui.md "시맨틱 토큰". */
   --risu-theme-success: #16a34a;
+  --risu-theme-highlight: #f59e0b;
+  --risu-theme-warning: #ffca1e;
+  --risu-theme-accent: #7581ff;
   /* Primary — dynamic accent for "active/on" fills (toggle track, primary CTA).
      Part of ColorScheme: updateColorScheme() overrides it per theme. The default
      here is a fallback for the brief boot window before updateColorScheme runs. */
@@ -490,6 +496,16 @@ html {
 
 .text-bordered {
   -webkit-text-stroke: 1px #000;
+}
+
+/* Shared border treatment for text fields and compound input frames. */
+.risu-field-border {
+  border: 1px solid var(--risu-theme-darkborderc);
+  transition: border-color 200ms ease;
+}
+
+.risu-field-border:focus-within {
+  border-color: var(--risu-theme-primary);
 }
 
 .x-risu-risu-file {
