@@ -787,6 +787,7 @@ export const languageKorean = {
   streamingDisplayOptimizationStrong: "완료 후 일괄 적용",
   streamingDisplayOptimizationStrongDesc: "스트리밍 중엔 원문만 표시하고, 완료되면 스크립트를 한 번에 적용합니다",
   allowV2Plugin: "비권장 V2.0 플러그인 허용",
+  allowV21Plugin: "비권장 V2.1 플러그인 설치 허용",
   altGreet: "추가 첫 메시지",
   scripts: "스크립트",
   settings: "설정",
@@ -1782,6 +1783,8 @@ export const languageKorean = {
     "플러그인 {} 이(가) 채팅 내용을 교체할 권한을 요청합니다. 대화 조작에 사용될 수 있습니다. 허용하시겠습니까?",
   providerPermissionConsent:
     "플러그인 {} 이(가) Provider 접근 권한을 요청합니다. 무단 API 호출이 발생할 수 있습니다. 허용하시겠습니까?",
+  inlayPermissionConsent:
+    "플러그인 {}이(가) 인레이에 접근할 권한을 요청하고 있습니다. 인레이 내용을 읽거나 쓰거나 수정할 수 있습니다. 허용하시겠습니까?",
   sendChatConsent:
     "플러그인 {} 이(가) 사용자 대신 채팅 메시지를 전송할 권한을 요청합니다. AI 응답이 트리거됩니다. 허용하시겠습니까?",
   pluginPermissionDenyGuide:

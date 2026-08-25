@@ -130,6 +130,10 @@ export const advancedSettingsItems: SettingItem[] = [
             void loadPlugins();
         }
     },
+    {
+        id: 'adv.allowV21Plugin', type: 'check', labelKey: 'allowV21Plugin', bindKey: 'allowV21Plugin',
+        helpKey: 'allowV21Plugin', helpUnrecommended: true, classes: 'mt-4',
+    },
     // Experimental Section (visible when useExperimental is true)
     {
         id: 'adv.exp.googleToken', type: 'check', labelKey: 'googleCloudTokenization', bindKey: 'googleClaudeTokenizing',

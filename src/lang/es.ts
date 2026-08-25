@@ -1286,6 +1286,7 @@ export const languageSpanish = {
     "providerPermissionConsent": "El plugin {} está solicitando permiso para acceder al proveedor, lo que podría permitirle realizar llamadas API no autorizadas. ¿Desea permitir esto?",
     "pluginPermissionDenyGuide": "Se ha denegado la solicitud de permiso del plugin \"{}\". Los permisos denegados no se volverán a preguntar.\n\nSi fue un error, puede deshacerlo en [Ajustes] > [Plugins] restableciendo las respuestas de permisos de ese plugin.",
     "sendChatConsent": "El plugin {} está solicitando permiso para enviar mensajes de chat en su nombre, lo que activará respuestas de IA. ¿Desea permitir esto?",
+    "inlayPermissionConsent": "El plugin {} está solicitando permiso para acceder al inlay, lo que le permitiría leer, escribir o editar el contenido del inlay. ¿Desea permitir esto?",
     "pluginV2Warning": "Los plugins V2 y V2.1 se consideran inseguros y dejarán de funcionar en futuras versiones. **Por favor, no use estas versiones de plugins.** Si usted es el desarrollador de este plugin, actualícelo a V3 lo antes posible.",
     "disableAbove": "Mensajes cortados para la IA",
     "hamburgerButtonBottom": "Mover el botón de menú a la parte inferior de la barra lateral",
