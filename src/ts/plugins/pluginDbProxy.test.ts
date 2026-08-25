@@ -98,21 +98,40 @@ describe('risuai.db.pluginCustomStorage', () => {
         expect(db.pluginCustomStorage).toEqual({})
     })
 
-    test('assigning a whole object replaces the store content', () => {
+    test('assigning a whole object merges into the store, keeping other keys', () => {
         store.setItemSync('old', 1)
         const risuaiDb = makeRisuaiDb(db)
         risuaiDb.pluginCustomStorage = { a: 1 }
-        expect(store.keys()).toEqual(['a'])
+        expect(store.keys().sort()).toEqual(['a', 'old'])
         expect(store.getItemSync('a')).toBe(1)
+        expect(store.getItemSync('old')).toBe(1)
         expect(db.pluginCustomStorage).toEqual({})
     })
 
-    test('setDatabase({pluginCustomStorage}) replaces store content, other keys hit the DB', () => {
+    test('setDatabase({pluginCustomStorage}) merges into the store, other keys hit the DB', () => {
         store.setItemSync('old', 1)
         bulkSet(db, { pluginCustomStorage: { a: 1 }, characters: ['c'], custom: 'v' })
-        expect(store.keys().sort()).toEqual(['a', 'custom'])
+        expect(store.keys().sort()).toEqual(['a', 'custom', 'old'])
         expect(store.getItemSync('a')).toBe(1)
         expect(db.characters).toEqual(['c'])
         expect(db.pluginCustomStorage).toEqual({})
+    })
+
+    // Regression: getDatabase() exposes pluginCustomStorage as {} (values live in
+    // the store), so a plugin round-tripping getDatabase() -> setDatabase() used
+    // to wipe every other plugin's data (module-manager / plugin-manager report).
+    test('round-tripping an empty pluginCustomStorage does not wipe the store', () => {
+        store.setItemSync('other-plugin', { keep: true })
+        bulkSet(db, { pluginCustomStorage: {}, characters: [] })
+        expect(store.keys()).toEqual(['other-plugin'])
+        expect(store.getItemSync('other-plugin')).toEqual({ keep: true })
+    })
+
+    test('partial pluginCustomStorage write updates its key only', () => {
+        store.setItemSync('other-plugin', 1)
+        store.setItemSync('__mm_disabledModules__', ['x'])
+        bulkSet(db, { pluginCustomStorage: { __mm_disabledModules__: [] } })
+        expect(store.getItemSync('__mm_disabledModules__')).toEqual([])
+        expect(store.getItemSync('other-plugin')).toBe(1)
     })
 })

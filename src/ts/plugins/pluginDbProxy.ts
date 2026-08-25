@@ -4,7 +4,7 @@
 // INVARIANT). V2 plugins historically read/wrote `risuai.db.pluginCustomStorage`
 // directly, so the safe DB proxy hands out this live object instead of the
 // real (always empty) DB field, and bulk writers (setDatabase/setDatabaseLite)
-// route the key through replacePluginCustomStorage.
+// route the key through mergePluginCustomStorage.
 
 import * as pluginStorageStore from "./pluginStorageStore";
 
@@ -42,9 +42,15 @@ export function pluginCustomStorageProxy(): Record<string, any> {
     });
 }
 
-// `db.pluginCustomStorage = obj` semantics: the store becomes exactly `obj`.
-export function replacePluginCustomStorage(obj: unknown): void {
-    pluginStorageStore.clearSync();
+// `db.pluginCustomStorage = obj` semantics: MERGE `obj` into the store.
+//
+// This is deliberately not a replace. `getDatabase()` hands plugins the real
+// DB field, which is always `{}` (values live in the store), so a plugin doing
+// the ordinary upstream round-trip `getDatabase() -> mutate -> setDatabase()`
+// would otherwise hand back an empty/partial object and wipe every other
+// plugin's data. Missing keys therefore never mean "delete"; a plugin that
+// wants a full wipe has `pluginStorage.clear()`.
+export function mergePluginCustomStorage(obj: unknown): void {
     if (!obj || typeof obj !== "object") return;
     for (const [k, v] of Object.entries(obj as Record<string, any>)) {
         pluginStorageStore.setItemSync(k, v);
@@ -55,6 +61,6 @@ export function replacePluginCustomStorage(obj: unknown): void {
 // was handled here (so callers must not write it into the real DB).
 export function applyPluginDbKey(key: string, value: unknown): boolean {
     if (key !== PLUGIN_CUSTOM_STORAGE_KEY) return false;
-    replacePluginCustomStorage(value);
+    mergePluginCustomStorage(value);
     return true;
 }
