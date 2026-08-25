@@ -3,7 +3,7 @@
     import { tokenizeAccurate } from "../../ts/tokenizer";
     import { saveImage as saveAsset, type character, getCurrentCharacter } from "../../ts/storage/database.svelte";
     import { convertCharacterToModule } from "src/ts/interchangeability";
-    import { notifySuccess } from "src/ts/alert";
+    import { alertError, notifySuccess } from "src/ts/alert";
     import { DBState } from 'src/ts/stores.svelte';
     import { CharConfigSubMenu, MobileGUI, selectedCharID, hypaV3ModalOpen } from "../../ts/stores.svelte";
     import { PlusIcon, SmileIcon, TrashIcon, UserIcon, ActivityIcon, BookIcon, Braces, Volume2Icon, DownloadIcon, HardDriveUploadIcon, Share2Icon, ImageIcon, ImageOffIcon, ArrowUp, ArrowDown, TriangleAlertIcon } from '@lucide/svelte'
@@ -12,7 +12,7 @@
     import LoreBook from "./LoreBook/LoreBookSetting.svelte";
     import { getAuthorNoteDefaultText, selectMultipleFile, selectSingleFile } from "../../ts/util";
     import Help from "../Others/Help.svelte";
-    import { exportChar } from "src/ts/characterCards";
+    import { exportChar, hydrateCharacterAssets } from "src/ts/characterCards";
     import { getElevenTTSVoices, getWebSpeechTTSVoices, getVOICEVOXVoices, oaiVoices, getNovelAIVoices } from "src/ts/process/tts";
     import { appendAssetManifestItems, editAssetManifest, forageStorage, getFileSrc, loadAssetManifestItems, recoverAssetManifestConflict } from "src/ts/globalApi.svelte";
 import { openAssetViewer, hasImageAssets } from "src/ts/assetViewer.svelte";
@@ -99,6 +99,7 @@ import ShButton from "../UI/GUI/ShButton.svelte";
     let manifestOffset = $state(0)
     let manifestTotal = $state(0)
     let manifestLoading = $state(false)
+    let converting = $state(false)
     const manifestPageSize = 100
 
     function currentChar(): character {
@@ -804,11 +805,24 @@ import ShButton from "../UI/GUI/ShButton.svelte";
         }} className="mt-2">{language.exportCharacter}</Button>
     {/if}
 
-    <Button size="md" className="mt-2" onclick={async () => {
-        const char = getCurrentCharacter()
-        const m = convertCharacterToModule(char)
-        DBState.db.modules.push(m)
-        notifySuccess(language.successfullyConverted)
+    <Button size="md" className="mt-2" disabled={converting} onclick={async () => {
+        if(converting){
+            return
+        }
+        converting = true
+        try {
+            const char = getCurrentCharacter() as character
+            // Hydrate first: copying the descriptor would make the new module
+            // share the character's manifest, so editing one would change the
+            // other until the next reload.
+            const m = convertCharacterToModule(await hydrateCharacterAssets(char))
+            DBState.db.modules.push(m)
+            notifySuccess(language.successfullyConverted)
+        } catch (error) {
+            alertError(`${error}`)
+        } finally {
+            converting = false
+        }
     }}>{language.convertToModule}</Button>
 
     <Button onclick={async () => {

@@ -78,10 +78,15 @@ export async function resolvePrioritizedAssetManifestNames(
     characterManifest: AssetManifestDescriptor | undefined,
     moduleManifests: AssetManifestDescriptor[],
     names: string[],
+    { fuzzy = true }: { fuzzy?: boolean } = {},
 ): Promise<{ character: Record<string, string>; modules: Record<string, string> }> {
     const uniqueNames = [...new Set(names.map((name) => name.toLocaleLowerCase()))]
     const character = characterManifest
-        ? await resolveAssetManifestNames([characterManifest], uniqueNames, new Set([characterManifest.id]))
+        ? await resolveAssetManifestNames(
+            [characterManifest],
+            uniqueNames,
+            fuzzy ? new Set([characterManifest.id]) : new Set(),
+        )
         : {}
     const remaining = uniqueNames.filter((name) => !Object.hasOwn(character, name))
     const modules = moduleManifests.length > 0 && remaining.length > 0

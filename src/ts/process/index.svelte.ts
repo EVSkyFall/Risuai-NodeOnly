@@ -1002,10 +1002,13 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     .filter((manifest) => !!manifest)
                 if (moduleManifests.length > 0 || currentChar.additionalAssetManifest || p1 === 'icon') {
                     assetPromises.push((async () => {
+                        // The legacy array path above matches asset_prompt names
+                        // exactly; keep the manifest path at the same strictness.
                         const resolved = await resolvePrioritizedAssetManifestNames(
                             currentChar.additionalAssetManifest,
                             moduleManifests,
                             [p1],
+                            { fuzzy: false },
                         )
                         const key = p1.toLocaleLowerCase()
                         const path = resolved.character[key] ?? resolved.modules[key]

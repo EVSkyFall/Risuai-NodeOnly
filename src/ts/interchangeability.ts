@@ -128,6 +128,10 @@ export function convertCharacterToModule(c: character): RisuModule {
     return safeStructuredClone(mod)
 }
 
+// The persona converters below have no UI caller today. When one is added,
+// hydrate lazy asset manifests first (hydrateModuleAssets /
+// hydrateCharacterAssets) like the module↔character buttons do — copying a
+// descriptor makes the copy edit the source owner's manifest.
 export function convertPersonaToCharacter(p: RisuPersona): character {
     let char = createBlankChar()
 

@@ -5,11 +5,11 @@
     import { DBState } from 'src/ts/stores.svelte';
     import Button from "src/lib/UI/GUI/Button.svelte";
     import ModuleMenu from "src/lib/Setting/Pages/Module/ModuleMenu.svelte";
-    import { exportModule, exportModuleLegacy, importModule, refreshModules, type RisuModule } from "src/ts/process/modules";
+    import { exportModule, exportModuleLegacy, hydrateModuleAssets, importModule, refreshModules, type RisuModule } from "src/ts/process/modules";
     import { SquarePen, TrashIcon, Globe, Share2Icon, PlusIcon, HardDriveUpload, Waypoints } from "@lucide/svelte";
     import { v4 } from "uuid";
     import { tooltip } from "src/ts/gui/tooltip";
-    import { alertConfirm, alertSelect, notifySuccess } from "src/ts/alert";
+    import { alertConfirm, alertError, alertSelect, notifySuccess } from "src/ts/alert";
     import TextInput from "src/lib/UI/GUI/TextInput.svelte";
     import { onDestroy } from "svelte";
     import { importMCPModule } from "src/ts/process/mcp/mcp";
@@ -23,6 +23,7 @@
     let mode = $state(0)
     let editModuleIndex = $state(-1)
     let moduleSearch = $state('')
+    let converting = $state(false)
 
     function sortModules(modules:RisuModule[], search:string){
         return modules.filter((v) => {
@@ -173,11 +174,24 @@
             notifySuccess(language.moduleUpdated)
             mode = 0
         }}>{language.editModule}</Button>
-        <Button className="mt-2" onclick={() => {
-            const char = convertModuleToCharacter(tempModule)
-            DBState.db.characters.push(char)
-            checkCharOrder()
-            notifySuccess(language.successfullyConverted)
+        <Button className="mt-2" disabled={converting} onclick={async () => {
+            if(converting){
+                return
+            }
+            converting = true
+            try {
+                // Hydrate first: copying the descriptor would make the new
+                // character share the module's manifest, so editing one would
+                // change the other until the next reload.
+                const char = convertModuleToCharacter(await hydrateModuleAssets(tempModule))
+                DBState.db.characters.push(char)
+                checkCharOrder()
+                notifySuccess(language.successfullyConverted)
+            } catch (error) {
+                alertError(`${error}`)
+            } finally {
+                converting = false
+            }
         }}>{language.convertToCharacter}</Button>
     {/if}
     </SettingPage>

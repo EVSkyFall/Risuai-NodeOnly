@@ -1158,17 +1158,22 @@ function createBaseV2(char:character) {
 }
 
 
+/** Replace a lazy asset manifest with a plain array copy (export/conversion). */
+export async function hydrateCharacterAssets(char:character): Promise<character> {
+    if (Array.isArray(char.additionalAssets) || !char.additionalAssetManifest) return char
+    const hydrated = safeStructuredClone(char)
+    hydrated.additionalAssets = await loadAssetManifestItems(char.additionalAssetManifest) as [string, string, string][]
+    delete hydrated.additionalAssetManifest
+    return hydrated
+}
+
 export async function exportCharacterCard(char:character, type:'png'|'json'|'charx'|'charxJpeg' = 'png', arg:{
     password?:string
     writer?:LocalWriter|VirtualWriter,
     spec?:'v2'|'v3'
     onProgress?:(msg:string, pct:number) => void
 } = {}) {
-    char = safeStructuredClone(char)
-    if (!Array.isArray(char.additionalAssets) && char.additionalAssetManifest) {
-        char.additionalAssets = await loadAssetManifestItems(char.additionalAssetManifest) as [string, string, string][]
-        delete char.additionalAssetManifest
-    }
+    char = await hydrateCharacterAssets(safeStructuredClone(char))
     let img = await readImage(char.image)
     const spec:'v2'|'v3' = arg.spec ?? 'v2' //backward compatibility
     const onProgress = arg.onProgress ?? ((msg:string, pct:number) => {
