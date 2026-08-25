@@ -54,7 +54,9 @@ export async function loadData() {
                 }
                 try {
                     const decoded = await decodeRisuSave(gotStorage)
-                    setPatchSyncBaseline(safeStructuredClone(decoded))
+                    // setPatchSyncBaseline owns its defensive clone. Cloning at
+                    // both call sites briefly held two full DB copies at boot.
+                    setPatchSyncBaseline(decoded)
                     console.log(decoded)
                     setDatabase(decoded)
                 } catch (error) {
@@ -66,7 +68,7 @@ export async function loadData() {
                             LoadingStatusState.text = `Reading Backup File ${backup}...`
                             const backupData: Uint8Array = await forageStorage.getItem(`database/dbbackup-${backup}.bin`) as unknown as Uint8Array
                             const backupDecoded = await decodeRisuSave(backupData)
-                            setPatchSyncBaseline(safeStructuredClone(backupDecoded))
+                            setPatchSyncBaseline(backupDecoded)
                             setDatabase(backupDecoded)
                             backupLoaded = true
                             break

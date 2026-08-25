@@ -1721,6 +1721,7 @@ export interface character{
     }
     supaMemory?:boolean
     additionalAssets?:[string, string, string][]
+    additionalAssetManifest?:import('./nodeStorage').AssetManifestDescriptor
     ttsReadOnlyQuoted?:boolean
     replaceGlobalNote:string
     backgroundHTML?:string

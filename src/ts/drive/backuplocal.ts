@@ -1,5 +1,5 @@
 import { alertError, alertStore, alertWait, alertMd, alertConfirm, alertConfirmMulti, alertClear, waitAlert, notifySuccess, notifyInfo, notifyError } from "../alert";
-import { downloadFile, LocalWriter, forageStorage } from "../globalApi.svelte";
+import { downloadFile, LocalWriter, forageStorage, loadAssetManifestItems } from "../globalApi.svelte";
 import { encodeRisuSaveLegacy } from "../storage/risuSave";
 import { getDatabase, type Chat } from "../storage/database.svelte";
 import { fetchChatFromServer } from "../storage/chatStorage";
@@ -258,6 +258,23 @@ export async function SavePartialLocalBackup(){
     // Reassemble full chats from server for placeholders (runtime lazy load)
     alertWait(`Saving partial local backup... (Assembling chat data)`)
     const dbCopy = structuredClone({ ...db, account: undefined })
+    for (const module of dbCopy.modules ?? []) {
+        if (!module?.assetManifest) continue
+        module.assets = await loadAssetManifestItems(module.assetManifest) as [string, string, string][]
+        delete module.assetManifest
+    }
+    for (const char of dbCopy.characters ?? []) {
+        if (char?.additionalAssetManifest) {
+            char.additionalAssets = await loadAssetManifestItems(char.additionalAssetManifest) as [string, string, string][]
+            delete char.additionalAssetManifest
+        }
+    }
+    for (const persona of dbCopy.personas ?? []) {
+        const embedded = persona?.embeddedModule
+        if (!embedded?.assetManifest) continue
+        embedded.assets = await loadAssetManifestItems(embedded.assetManifest) as [string, string, string][]
+        delete embedded.assetManifest
+    }
     for (const char of dbCopy.characters) {
         for (let i = 0; i < char.chats.length; i++) {
             const chat = char.chats[i]

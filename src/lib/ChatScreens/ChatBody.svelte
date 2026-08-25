@@ -6,9 +6,9 @@
     import { tick } from 'svelte'
     import { addMetadataToElement, getDistance, ParseMarkdown, postTranslationParse, resolveInlayPlaceholders, trimMarkdown, type CbsConditions, type simpleCharacterArgument } from "../../ts/parser/parser.svelte"
     import { getLLMCache, translateHTML } from "../../ts/translator/translator"
-    import { getModuleAssets } from "src/ts/process/modules";
+    import { getModuleAssets, getModules } from "src/ts/process/modules";
     import { getCurrentCharacter } from "src/ts/storage/database.svelte";
-    import { getFileSrc } from "src/ts/globalApi.svelte";
+    import { getFileSrc, resolvePrioritizedAssetManifestNames } from "src/ts/globalApi.svelte";
 
     interface Props {
         character?: simpleCharacterArgument|string|null
@@ -305,7 +305,7 @@
         }
     }
 
-    const checkImg = () => {
+    const checkImg = async () => {
         if(!DBState.db.newImageHandlingBeta || !bodyRoot){
             return
         }
@@ -315,6 +315,9 @@
             const currentCharacter = getCurrentCharacter()
             const styl = currentCharacter.prebuiltAssetStyle
             const assets = getModuleAssets().concat(currentCharacter.additionalAssets ?? [])
+            const moduleManifests = getModules()
+                .map((module) => module?.assetManifest)
+                .filter((manifest) => !!manifest)
             const normalizedAssets = assets.map((asset) => {
                 return {
                     name: asset[0].toLocaleLowerCase(),
@@ -322,10 +325,27 @@
                 }
             })
             const exactAssets = new Map(normalizedAssets.map((asset) => [asset.name, asset.path]))
+            const requestedNames = [...imgs]
+                .map((img) => img.getAttribute('src')?.toLocaleLowerCase() || '')
+                .filter((name) => name.length >= 3 && name.length <= 200 && !name.includes(':'))
+            let manifestResolved = { character: {}, modules: {} } as {
+                character: Record<string, string>
+                modules: Record<string, string>
+            }
+            if ((moduleManifests.length > 0 || currentCharacter.additionalAssetManifest) && requestedNames.length > 0) {
+                try {
+                    manifestResolved = await resolvePrioritizedAssetManifestNames(
+                        currentCharacter.additionalAssetManifest,
+                        moduleManifests,
+                        requestedNames,
+                    )
+                } catch (error) {
+                    console.warn('[Assets] Failed to resolve lazy asset manifests', error)
+                }
+            }
 
             imgs.forEach(async (img) => {
                 const name = img.getAttribute('src')?.toLocaleLowerCase() || ''
-                console.log(name)
 
                 if(
                     name.length > 200 ||
@@ -335,8 +355,7 @@
                     return
                 }
                 
-                const foundAsset = exactAssets.get(name)
-                console.log('Checking image:', name, 'Assets:', assets)
+                const foundAsset = manifestResolved.character[name] ?? exactAssets.get(name) ?? manifestResolved.modules[name]
                 if(foundAsset){
                     img.classList.add('root-loaded-image')
                     img.classList.add('root-loaded-image-' + styl)
@@ -362,6 +381,7 @@
                         currentFound = asset.path
                     }
                 }
+                if(!currentFound && manifestResolved.character[name]) currentFound = manifestResolved.character[name]
                 if(currentFound){
                     const got = await getFileSrc(currentFound)
                     const name2 = img.getAttribute('src')?.toLocaleLowerCase() || ''
@@ -389,9 +409,9 @@
             return
         }
         markParsingResult
-        checkImg()
+        void checkImg()
         markParsingResult.then(async () => {
-            checkImg()
+            await checkImg()
             await tick() // Wait for Svelte to re-render the {:then} block into DOM
             if (bodyRoot) resolveInlayPlaceholders(bodyRoot)
         })

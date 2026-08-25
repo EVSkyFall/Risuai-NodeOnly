@@ -14,7 +14,13 @@ import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from
 import { decodeRisuSave, encodeRisuSaveLegacy, findDangerousChatOps, RisuSaveEncoder, RisuSavePatcher, type toSaveType } from "./storage/risuSave";
 import { isHydrating, saveChatToServer, ensureChatHydrated, chatToStub, classifyChat } from "./storage/chatStorage";
 import { AutoStorage } from "./storage/autoStorage";
-import { ConflictError, type PersistWarning } from "./storage/nodeStorage";
+import {
+    ConflictError,
+    type PersistWarning,
+    type AssetManifestDescriptor,
+    type AssetManifestOperation,
+    type AssetManifestTuple,
+} from "./storage/nodeStorage";
 import { supportsPatchSync } from "./platform";
 import { updateAnimationSpeed } from "./gui/animation";
 import { updateColorScheme, updateTextThemeAndCSS } from "./gui/colorscheme";
@@ -31,6 +37,7 @@ import {
     createRequestLogScope, recordRequestLog, fetchRequestLogs,
     type RequestLogCategory, type RequestLogSource, type RequestLogRoute,
 } from "./requestLog";
+import { cacheFullAssetManifest } from './storage/assetManifestCache';
 
 export const forageStorage = new AutoStorage()
 
@@ -42,6 +49,109 @@ function errorMessage(error: unknown): string {
     } catch {
         return String(error)
     }
+}
+
+export async function loadAssetManifestItems(manifest?: AssetManifestDescriptor): Promise<AssetManifestTuple[]> {
+    if (!manifest) return []
+    const items = await forageStorage.getAllAssetManifestItems(manifest)
+    cacheFullAssetManifest(manifest.id, items)
+    return items
+}
+
+export async function resolveAssetManifestNames(
+    manifests: AssetManifestDescriptor[],
+    names: string[],
+    fuzzyManifestIds: ReadonlySet<string> = new Set(),
+): Promise<Record<string, string>> {
+    const owners = manifests
+        .filter((manifest) => manifest?.id)
+        .map((manifest) => ({
+            manifestId: manifest.id,
+            kind: manifest.ownerKind,
+            ownerId: manifest.ownerId,
+            fuzzy: fuzzyManifestIds.has(manifest.id),
+        }))
+    return forageStorage.resolveAssetManifestNames(owners, names, getDatabase().assetMaxDifference ?? 4)
+}
+
+export async function resolvePrioritizedAssetManifestNames(
+    characterManifest: AssetManifestDescriptor | undefined,
+    moduleManifests: AssetManifestDescriptor[],
+    names: string[],
+): Promise<{ character: Record<string, string>; modules: Record<string, string> }> {
+    const uniqueNames = [...new Set(names.map((name) => name.toLocaleLowerCase()))]
+    const character = characterManifest
+        ? await resolveAssetManifestNames([characterManifest], uniqueNames, new Set([characterManifest.id]))
+        : {}
+    const remaining = uniqueNames.filter((name) => !Object.hasOwn(character, name))
+    const modules = moduleManifests.length > 0 && remaining.length > 0
+        ? await resolveAssetManifestNames(moduleManifests, remaining)
+        : {}
+    return { character, modules }
+}
+
+export async function editAssetManifest(
+    manifest: AssetManifestDescriptor,
+    operations: AssetManifestOperation[],
+): Promise<AssetManifestDescriptor> {
+    if (!manifest.ownerKind || !manifest.ownerId) {
+        throw new Error('Asset manifest owner information is missing')
+    }
+    try {
+        const descriptor = await forageStorage.editAssetManifest(
+            manifest.ownerKind,
+            manifest.ownerId,
+            manifest.id,
+            operations,
+        )
+        activeSavePatcher?.updateAssetManifestBaseline(manifest.ownerKind, manifest.ownerId, descriptor)
+        return descriptor
+    } catch (error) {
+        if (!(error instanceof ConflictError)) throw error
+        const current = (error as ConflictError & { current?: AssetManifestDescriptor }).current
+            ?? await forageStorage.getAssetManifestOwner(manifest.ownerKind, manifest.ownerId)
+        if (current) {
+            const enriched = { ...current, ownerKind: manifest.ownerKind, ownerId: manifest.ownerId }
+            Object.assign(manifest, enriched)
+            activeSavePatcher?.updateAssetManifestBaseline(manifest.ownerKind, manifest.ownerId, enriched)
+        }
+        // Asset operations are positional and not generally idempotent. Do not
+        // replay automatically: a lost response followed by a 409 could append
+        // twice or remove the next tuple. The refreshed descriptor lets the UI
+        // reload safely before the user retries the edit.
+        throw error
+    }
+}
+
+export async function appendAssetManifestItems(
+    manifest: AssetManifestDescriptor,
+    items: AssetManifestTuple[],
+): Promise<AssetManifestDescriptor> {
+    let current = manifest
+    for (let offset = 0; offset < items.length; offset += 1000) {
+        current = await editAssetManifest(
+            current,
+            items.slice(offset, offset + 1000).map((item) => ({ type: 'append' as const, item })),
+        )
+    }
+    return current
+}
+
+export function isAssetManifestConflict(error: unknown): error is ConflictError {
+    return error instanceof ConflictError
+}
+
+export async function recoverAssetManifestConflict(
+    error: unknown,
+    reload: () => Promise<void>,
+): Promise<boolean> {
+    if (!isAssetManifestConflict(error)) return false
+    notifyError(language.errors.assetManifestConflictTitle, {
+        description: language.errors.assetManifestConflictDesc,
+        source: 'asset-manifest-conflict',
+    })
+    await reload()
+    return true
 }
 
 export async function downloadFile(name: string, dat: Uint8Array | ArrayBuffer | string) {
@@ -252,6 +362,7 @@ let requestImmediateSaveImpl: ((options?: {
     forceFullWrite?: boolean
 }) => Promise<void> | void) = () => {}
 let patchSyncBaseline: Database | null = null
+let activeSavePatcher: RisuSavePatcher | null = null
 
 // Surfaces server-side persist failures (Stage 1 visibility — see issues.md).
 // The same failure is re-attached on every patch response until cleared, so we
@@ -465,7 +576,10 @@ export async function saveDb() {
     let patcher = new RisuSavePatcher()
     if (supportsPatchSync) {
         await patcher.init(patchSyncBaseline ?? getDatabase())
+        activeSavePatcher = patcher
         patchSyncBaseline = null
+    } else {
+        activeSavePatcher = null
     }
 
     function hasTrackedChanges(toSave: toSaveType) {
@@ -802,6 +916,7 @@ export async function saveDb() {
             if (supportsPatchSync) {
                 patcher = new RisuSavePatcher()
                 await patcher.init(mergedBaseline)
+                activeSavePatcher = patcher
             }
         }
         requeueTrackedChanges(toSave)

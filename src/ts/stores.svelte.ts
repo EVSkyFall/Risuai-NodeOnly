@@ -141,6 +141,7 @@ export function createSimpleCharacter(char:character){
         customscript: char.customscript,
         chaId: char.chaId,
         additionalAssets: char.additionalAssets,
+        additionalAssetManifest: char.additionalAssetManifest,
         virtualscript: char.virtualscript,
         emotionImages: char.emotionImages,
         triggerscript: char.triggerscript,

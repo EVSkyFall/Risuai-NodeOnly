@@ -839,6 +839,34 @@ describe('fast-path — expectedHash stays protocol-consistent', () => {
     })
 })
 
+describe('out-of-band asset manifest baseline updates', () => {
+    test('accepted module manifest edit becomes the next patch pre-image without a replace op', async () => {
+        const before = {
+            characters: [],
+            botPresets: [],
+            modules: [{ id: 'm1', assetManifest: { id: 'old', version: 1, count: 1, sha256: 'a' } }],
+        }
+        const descriptor = {
+            id: 'new', version: 1, count: 2, sha256: 'b',
+            ownerKind: 'module', ownerId: 'm1',
+        }
+        const after = {
+            ...before,
+            modules: [{ ...before.modules[0], assetManifest: descriptor }],
+        }
+        const patcher = new RisuSavePatcher()
+        await patcher.init(before)
+        expect(patcher.updateAssetManifestBaseline('module', 'm1', descriptor)).toBe(true)
+
+        const result = await patcher.set(after, emptyToSave())
+        expect(result.patch).toEqual([])
+
+        const fresh = new RisuSavePatcher()
+        await fresh.init(after)
+        expect(result.expectedHash).toBe((await fresh.set(after, emptyToSave())).expectedHash)
+    })
+})
+
 // ──────────────────────────────────────────────────────────────────────────
 // Fast-path granularity — per-ROOT-KEY and per-MODULE pre-checks.
 //

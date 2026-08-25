@@ -4,6 +4,7 @@ import type { RisuModule } from './process/modules';
 import type { LLMModel } from './model/modellist';
 import { get } from 'svelte/store';
 import { CurrentTriggerIdStore } from './stores.svelte';
+import { getCachedFullAssetManifest } from './storage/assetManifestCache';
 
 export const defaultCBSRegisterArg: CBSRegisterArg = {
     registerFunction: () => { throw new Error('registerFunction not implemented') },
@@ -1331,7 +1332,8 @@ export function registerCBS(arg:CBSRegisterArg) {
             if(!selchar){
                 return ''
             }
-            return makeArray(selchar.additionalAssets?.map((f) => {
+            const assets = selchar.additionalAssets ?? getCachedFullAssetManifest(selchar.additionalAssetManifest?.id)
+            return makeArray(assets?.map((f) => {
                 return f[0]
             }))
         },
@@ -1481,7 +1483,8 @@ export function registerCBS(arg:CBSRegisterArg) {
             }
 
             const excludes = selchar.prebuiltAssetExclude ?? []
-            const arr = (selchar?.additionalAssets ?? []).filter((f) => {
+            const assets = selchar?.additionalAssets ?? getCachedFullAssetManifest(selchar?.additionalAssetManifest?.id) ?? []
+            const arr = assets.filter((f) => {
                 return !excludes.includes(f[1])
             })
 
@@ -1614,7 +1617,8 @@ export function registerCBS(arg:CBSRegisterArg) {
             if(!module){
                 return ''
             }
-            return makeArray(module.assets?.map((f) => {
+            const assets = module.assets ?? getCachedFullAssetManifest(module.assetManifest?.id)
+            return makeArray(assets?.map((f) => {
                 return f[0]
             }))
         },

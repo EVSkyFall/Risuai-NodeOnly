@@ -14,7 +14,7 @@
     import Help from "../Others/Help.svelte";
     import { exportChar } from "src/ts/characterCards";
     import { getElevenTTSVoices, getWebSpeechTTSVoices, getVOICEVOXVoices, oaiVoices, getNovelAIVoices } from "src/ts/process/tts";
-    import { getFileSrc } from "src/ts/globalApi.svelte";
+    import { appendAssetManifestItems, editAssetManifest, forageStorage, getFileSrc, loadAssetManifestItems, recoverAssetManifestConflict } from "src/ts/globalApi.svelte";
 import { openAssetViewer, hasImageAssets } from "src/ts/assetViewer.svelte";
     import TextInput from "../UI/GUI/TextInput.svelte";
     import ShInput from "../UI/GUI/ShInput.svelte";
@@ -95,6 +95,99 @@ import ShButton from "../UI/GUI/ShButton.svelte";
     // Starts empty and is filled by the effect below before first paint —
     // initializing from the character directly crashes when none is selected.
     let licensed = $state('')
+    let manifestItems:[string, string, string][] = $state([])
+    let manifestOffset = $state(0)
+    let manifestTotal = $state(0)
+    let manifestLoading = $state(false)
+    const manifestPageSize = 100
+
+    function currentChar(): character {
+        return DBState.db.characters[$selectedCharID] as character
+    }
+
+    async function loadCharacterManifestPage(offset = 0) {
+        const manifest = currentChar().additionalAssetManifest
+        if (!manifest) return
+        manifestLoading = true
+        try {
+            const page = await forageStorage.getAssetManifestPage(manifest, {
+                offset,
+                limit: manifestPageSize,
+            })
+            manifestItems = page.items as [string, string, string][]
+            manifestOffset = page.offset
+            manifestTotal = page.total
+            assetFileExtensions = []
+            assetFilePath = []
+        } finally {
+            manifestLoading = false
+        }
+    }
+
+    async function openCharacterAssetsTab() {
+        viewSubMenu = 2
+        if (currentChar().additionalAssetManifest) await loadCharacterManifestPage(0)
+        else currentChar().additionalAssets ??= []
+    }
+
+    async function addCharacterManifestAsset(item: [string, string, string]) {
+        const char = currentChar()
+        if (!char.additionalAssetManifest) {
+            char.additionalAssets ??= []
+            char.additionalAssets.push(item)
+            char.additionalAssets = char.additionalAssets
+            return
+        }
+        try {
+            char.additionalAssetManifest = await editAssetManifest(char.additionalAssetManifest, [
+                { type: 'append', item },
+            ])
+            const lastPageOffset = Math.floor((char.additionalAssetManifest.count - 1) / manifestPageSize) * manifestPageSize
+            await loadCharacterManifestPage(lastPageOffset)
+        } catch (error) {
+            if (!await recoverAssetManifestConflict(error, () => loadCharacterManifestPage(0))) throw error
+        }
+    }
+
+    async function renameCharacterManifestAsset(index: number, name: string) {
+        const char = currentChar()
+        if (!char.additionalAssetManifest) return
+        try {
+            char.additionalAssetManifest = await editAssetManifest(char.additionalAssetManifest, [
+                { type: 'rename', index: manifestOffset + index, name },
+            ])
+            await loadCharacterManifestPage(manifestOffset)
+        } catch (error) {
+            if (!await recoverAssetManifestConflict(error, () => loadCharacterManifestPage(0))) throw error
+        }
+    }
+
+    async function removeCharacterManifestAsset(index: number) {
+        const char = currentChar()
+        char.chats[char.chatPage].fmIndex = -1
+        if (!char.additionalAssetManifest) {
+            char.additionalAssets?.splice(index, 1)
+            char.additionalAssets = char.additionalAssets
+            return
+        }
+        try {
+            char.additionalAssetManifest = await editAssetManifest(char.additionalAssetManifest, [
+                { type: 'remove', index: manifestOffset + index },
+            ])
+            const nextOffset = Math.min(manifestOffset, Math.max(0, Math.floor((char.additionalAssetManifest.count - 1) / manifestPageSize) * manifestPageSize))
+            await loadCharacterManifestPage(nextOffset)
+        } catch (error) {
+            if (!await recoverAssetManifestConflict(error, () => loadCharacterManifestPage(0))) throw error
+        }
+    }
+
+    async function openCharacterAssetViewer() {
+        const char = currentChar()
+        const assets = char.additionalAssetManifest
+            ? await loadAssetManifestItems(char.additionalAssetManifest) as [string, string, string][]
+            : char.additionalAssets
+        openAssetViewer(char.name, assets)
+    }
 
     $effect.pre(() => {
         if (!currentCharacter) return
@@ -105,13 +198,14 @@ import ShButton from "../UI/GUI/ShButton.svelte";
     $effect.pre(() => {
         if (!currentCharacter) return
         if(DBState.db.characters[$selectedCharID].type ==='character' && DBState.db.useAdditionalAssetsPreview){
-            if((DBState.db.characters[$selectedCharID] as character).additionalAssets){
-                for(let i = 0; i < (DBState.db.characters[$selectedCharID] as character).additionalAssets.length; i++){
-                    if((DBState.db.characters[$selectedCharID] as character).additionalAssets[i].length > 2 && (DBState.db.characters[$selectedCharID] as character).additionalAssets[i][2]) {
-                        assetFileExtensions[i] = (DBState.db.characters[$selectedCharID] as character).additionalAssets[i][2]
+            const assets = currentChar().additionalAssetManifest ? manifestItems : currentChar().additionalAssets
+            if(assets){
+                for(let i = 0; i < assets.length; i++){
+                    if(assets[i].length > 2 && assets[i][2]) {
+                        assetFileExtensions[i] = assets[i][2]
                     } else
-                        assetFileExtensions[i] = (DBState.db.characters[$selectedCharID] as character).additionalAssets[i][1].split('.').pop()
-                    getFileSrc((DBState.db.characters[$selectedCharID] as character).additionalAssets[i][1]).then((filePath) => {
+                        assetFileExtensions[i] = assets[i][1].split('.').pop()
+                    getFileSrc(assets[i][1]).then((filePath) => {
                         assetFilePath[i] = filePath
                     })
                 }
@@ -275,10 +369,10 @@ import ShButton from "../UI/GUI/ShButton.svelte";
 
 
 {#snippet assetViewerButton()}
-    {#if DBState.db.characters[$selectedCharID].type === 'character' && hasImageAssets((DBState.db.characters[$selectedCharID] as character).additionalAssets)}
+    {#if DBState.db.characters[$selectedCharID].type === 'character' && (currentChar().additionalAssetManifest || hasImageAssets(currentChar().additionalAssets))}
         <ShButton
             className="w-full mb-3"
-            onclick={() => openAssetViewer(DBState.db.characters[$selectedCharID].name, (DBState.db.characters[$selectedCharID] as character).additionalAssets)}
+            onclick={openCharacterAssetViewer}
         >
             <ImageIcon size={16} />
             <span>{language.viewInAssetViewer}</span>
@@ -331,9 +425,7 @@ import ShButton from "../UI/GUI/ShButton.svelte";
         }} class="p2 flex-1 border-r border-l border-selected" class:bg-selected={viewSubMenu === 1}>
             <span>{language.viewScreen}</span>
         </button>
-        <button onclick={() => {
-            viewSubMenu = 2
-        }} class="p-2 flex-1" class:bg-selected={viewSubMenu === 2}>
+        <button onclick={openCharacterAssetsTab} class="p-2 flex-1" class:bg-selected={viewSubMenu === 2}>
             <span>{language.additionalAssets}</span>
         </button>
     </div>
@@ -488,9 +580,13 @@ import ShButton from "../UI/GUI/ShButton.svelte";
 
             <CheckInput bind:check={(DBState.db.characters[$selectedCharID] as character).inlayViewScreen} name={language.inlayViewScreen} onChange={() => {
                 if(DBState.db.characters[$selectedCharID].type === 'character'){
-                    if((DBState.db.characters[$selectedCharID] as character).inlayViewScreen && (DBState.db.characters[$selectedCharID] as character).additionalAssets === undefined){
+                    if((DBState.db.characters[$selectedCharID] as character).inlayViewScreen
+                        && (DBState.db.characters[$selectedCharID] as character).additionalAssets === undefined
+                        && !(DBState.db.characters[$selectedCharID] as character).additionalAssetManifest){
                         (DBState.db.characters[$selectedCharID] as character).additionalAssets = []
-                    }else if(!(DBState.db.characters[$selectedCharID] as character).inlayViewScreen && (DBState.db.characters[$selectedCharID] as character).additionalAssets.length === 0){
+                    }else if(!(DBState.db.characters[$selectedCharID] as character).inlayViewScreen
+                        && (DBState.db.characters[$selectedCharID] as character).additionalAssets?.length === 0
+                        && !(DBState.db.characters[$selectedCharID] as character).additionalAssetManifest){
                         (DBState.db.characters[$selectedCharID] as character).additionalAssets = undefined
                     }
                     
@@ -538,17 +634,27 @@ import ShButton from "../UI/GUI/ShButton.svelte";
                             <button class="hover:text-primary" onclick={async () => {
                                 if(DBState.db.characters[$selectedCharID].type === 'character'){
                                     const da = await selectMultipleFile(['png', 'webp', 'mp4', 'mp3', 'gif', 'jpeg', 'jpg', 'ttf', 'otf', 'css', 'webm', 'woff', 'woff2', 'svg', 'avif'])
-                                    DBState.db.characters[$selectedCharID].additionalAssets = DBState.db.characters[$selectedCharID].additionalAssets ?? []
                                     if(!da){
                                         return
                                     }
+                                    const appended: [string, string, string][] = []
                                     for(const f of da){
                                         const img = f.data
                                         const name = f.name
                                         const extension = name.split('.').pop().toLowerCase()
                                         const imgp = await saveAsset(img,'', extension)
-                                        DBState.db.characters[$selectedCharID].additionalAssets.push([name, imgp, extension])
-                                        DBState.db.characters[$selectedCharID].additionalAssets = DBState.db.characters[$selectedCharID].additionalAssets
+                                        if (currentChar().additionalAssetManifest) appended.push([name, imgp, extension])
+                                        else await addCharacterManifestAsset([name, imgp, extension])
+                                    }
+                                    const char = currentChar()
+                                    if (char.additionalAssetManifest && appended.length > 0) {
+                                        try {
+                                            char.additionalAssetManifest = await appendAssetManifestItems(char.additionalAssetManifest, appended)
+                                            const lastPageOffset = Math.floor((char.additionalAssetManifest.count - 1) / manifestPageSize) * manifestPageSize
+                                            await loadCharacterManifestPage(lastPageOffset)
+                                        } catch (error) {
+                                            if (!await recoverAssetManifestConflict(error, () => loadCharacterManifestPage(0))) throw error
+                                        }
                                     }
                                 }
                             }}>
@@ -556,12 +662,14 @@ import ShButton from "../UI/GUI/ShButton.svelte";
                             </button>
                         </th>
                     </tr>
-                    {#if (!DBState.db.characters[$selectedCharID].additionalAssets) || DBState.db.characters[$selectedCharID].additionalAssets.length === 0}
+                    {#if manifestLoading}
+                        <tr><td class="text-textcolor2">{language.storageLoading}</td></tr>
+                    {:else if currentChar().additionalAssetManifest ? manifestTotal === 0 : (!currentChar().additionalAssets || currentChar().additionalAssets.length === 0)}
                         <tr>
                             <td class="text-textcolor2"> No Assets</td>
                         </tr>
                     {:else}
-                        {#each DBState.db.characters[$selectedCharID].additionalAssets as assets, i}
+                        {#each (currentChar().additionalAssetManifest ? manifestItems : currentChar().additionalAssets) as assets, i}
                             <tr>
                                 <td class="font-medium truncate">
                                     {#if assetFilePath[i] && DBState.db.useAdditionalAssetsPreview}
@@ -574,18 +682,21 @@ import ShButton from "../UI/GUI/ShButton.svelte";
                                             <img src={assetFilePath[i]} class="w-16 h-16 m-1 rounded-md" alt={assets[0]}/>
                                         {/if}
                                     {/if}
-                                    <ShInput className="mb-4" autocomplete="off" bind:value={DBState.db.characters[$selectedCharID].additionalAssets[i][0]} placeholder="..." />
+                                    {#if currentChar().additionalAssetManifest}
+                                        <ShInput
+                                            className="mb-4"
+                                            autocomplete="off"
+                                            value={assets[0]}
+                                            onchange={(event) => renameCharacterManifestAsset(i, event.currentTarget.value)}
+                                            placeholder="..."
+                                        />
+                                    {:else}
+                                        <ShInput className="mb-4" autocomplete="off" bind:value={DBState.db.characters[$selectedCharID].additionalAssets[i][0]} placeholder="..." />
+                                    {/if}
                                 </td>
                                 
                                 <th class="font-medium cursor-pointer w-10">
-                                    <button class="hover:text-draculared" onclick={() => {
-                                        if(DBState.db.characters[$selectedCharID].type === 'character'){
-                                            DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].fmIndex = -1
-                                            let additionalAssets = DBState.db.characters[$selectedCharID].additionalAssets
-                                            additionalAssets.splice(i, 1)
-                                            DBState.db.characters[$selectedCharID].additionalAssets = additionalAssets
-                                        }
-                                    }}>
+                                    <button class="hover:text-draculared" onclick={() => removeCharacterManifestAsset(i)}>
                                         <TrashIcon />
                                     </button>
                                     {#if DBState.db.useAdditionalAssetsPreview}
@@ -611,6 +722,19 @@ import ShButton from "../UI/GUI/ShButton.svelte";
                     {/if}
                 </tbody>
                 </table>
+                {#if currentChar().additionalAssetManifest && manifestTotal > manifestPageSize}
+                    <div class="mt-2 flex items-center justify-between gap-2">
+                        <ShButton
+                            disabled={manifestOffset === 0 || manifestLoading}
+                            onclick={() => loadCharacterManifestPage(Math.max(0, manifestOffset - manifestPageSize))}
+                        >←</ShButton>
+                        <span>{manifestOffset + 1}–{Math.min(manifestOffset + manifestItems.length, manifestTotal)} / {manifestTotal}</span>
+                        <ShButton
+                            disabled={manifestOffset + manifestPageSize >= manifestTotal || manifestLoading}
+                            onclick={() => loadCharacterManifestPage(manifestOffset + manifestPageSize)}
+                        >→</ShButton>
+                    </div>
+                {/if}
             </div>
     {/if}
 {:else if $CharConfigSubMenu === 3}

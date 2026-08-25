@@ -25,23 +25,29 @@ function trimAssetName(str) {
     return str.trim().replace(/[_ -.]/g, '');
 }
 
+function validationError(message) {
+    const error = new Error(message);
+    error.code = 'MANIFEST_VALIDATION';
+    return error;
+}
+
 function assertOwner(kind, ownerId) {
-    if (!OWNER_KINDS.has(kind)) throw new Error(`Unsupported asset manifest owner kind: ${kind}`);
-    if (typeof ownerId !== 'string' || ownerId.length === 0) throw new Error('Asset manifest owner id is required');
+    if (!OWNER_KINDS.has(kind)) throw validationError(`Unsupported asset manifest owner kind: ${kind}`);
+    if (typeof ownerId !== 'string' || ownerId.length === 0) throw validationError('Asset manifest owner id is required');
 }
 
 function assertItems(items) {
-    if (!Array.isArray(items)) throw new Error('Asset manifest items must be an array');
+    if (!Array.isArray(items)) throw validationError('Asset manifest items must be an array');
     for (let i = 0; i < items.length; i++) {
         const item = items[i];
         if (!Array.isArray(item) || item.length < 2 || item.length > 3) {
-            throw new Error(`Invalid asset tuple at index ${i}`);
+            throw validationError(`Invalid asset tuple at index ${i}`);
         }
         if (typeof item[0] !== 'string' || typeof item[1] !== 'string') {
-            throw new Error(`Invalid asset tuple strings at index ${i}`);
+            throw validationError(`Invalid asset tuple strings at index ${i}`);
         }
         if (item.length === 3 && item[2] != null && typeof item[2] !== 'string') {
-            throw new Error(`Invalid asset tuple extension at index ${i}`);
+            throw validationError(`Invalid asset tuple extension at index ${i}`);
         }
     }
 }
@@ -357,13 +363,17 @@ function createAssetManifestStore(db, options = {}) {
         const loadedOwners = [];
         for (const owner of owners || []) {
             if (!owner) continue;
-            const descriptor = owner.manifestId
+            let descriptor = owner.manifestId
                 ? { id: owner.manifestId }
                 : getLiveDescriptor(owner.kind, owner.ownerId);
             if (!descriptor) continue;
-            const items = loadItemsShared(descriptor.id);
+            let items = loadItemsShared(descriptor.id);
+            if (!items && owner.kind && owner.ownerId) {
+                descriptor = getLiveDescriptor(owner.kind, owner.ownerId);
+                items = descriptor ? loadItemsShared(descriptor.id) : null;
+            }
             if (!items) continue;
-            loadedOwners.push(items);
+            loadedOwners.push({ items, fuzzy: owner.fuzzy !== false });
             for (const item of items) {
                 const key = item[0].toLocaleLowerCase();
                 if (wanted.has(key) && !Object.hasOwn(resolved, key)) resolved[key] = item[1];
@@ -380,7 +390,9 @@ function createAssetManifestStore(db, options = {}) {
             const trimmedName = trimAssetName(name);
             let bestDistance = Number.POSITIVE_INFINITY;
             let bestPath = '';
-            for (const items of loadedOwners) {
+            for (const loaded of loadedOwners) {
+                if (!loaded.fuzzy) continue;
+                const items = loaded.items;
                 for (const item of items) {
                     const candidate = trimAssetName(item[0].toLocaleLowerCase());
                     // Length difference is a lower bound on edit distance.
@@ -400,10 +412,10 @@ function createAssetManifestStore(db, options = {}) {
     function applyOperations(kind, ownerId, expectedManifestId, operations) {
         assertOwner(kind, ownerId);
         if (!Array.isArray(operations) || operations.length === 0 || operations.length > 1000) {
-            throw new Error('Asset manifest operations must contain 1-1000 entries');
+            throw validationError('Asset manifest operations must contain 1-1000 entries');
         }
         const current = getLiveDescriptor(kind, ownerId);
-        if (!current) throw new Error(`Asset manifest owner not found: ${kind}/${ownerId}`);
+        if (!current) throw validationError(`Asset manifest owner not found: ${kind}/${ownerId}`);
         if (expectedManifestId && expectedManifestId !== current.id) {
             const error = new Error('Asset manifest revision conflict');
             error.code = 'MANIFEST_CONFLICT';
@@ -421,25 +433,25 @@ function createAssetManifestStore(db, options = {}) {
             }
             const index = Math.trunc(Number(operation?.index));
             if (!Number.isFinite(index) || index < 0 || index >= next.length + (type === 'insert' ? 1 : 0)) {
-                throw new Error(`Invalid asset manifest operation index: ${operation?.index}`);
+                throw validationError(`Invalid asset manifest operation index: ${operation?.index}`);
             }
             if (type === 'insert') {
                 assertItems([operation.item]);
                 next.splice(index, 0, operation.item.slice());
             } else if (type === 'remove') {
-                if (index >= next.length) throw new Error(`Invalid remove index: ${index}`);
+                if (index >= next.length) throw validationError(`Invalid remove index: ${index}`);
                 next.splice(index, 1);
             } else if (type === 'rename') {
                 if (index >= next.length || typeof operation.name !== 'string') {
-                    throw new Error(`Invalid rename operation at index: ${index}`);
+                    throw validationError(`Invalid rename operation at index: ${index}`);
                 }
                 next[index][0] = operation.name;
             } else if (type === 'replace') {
-                if (index >= next.length) throw new Error(`Invalid replace index: ${index}`);
+                if (index >= next.length) throw validationError(`Invalid replace index: ${index}`);
                 assertItems([operation.item]);
                 next[index] = operation.item.slice();
             } else {
-                throw new Error(`Unsupported asset manifest operation: ${type}`);
+                throw validationError(`Unsupported asset manifest operation: ${type}`);
             }
         }
         return putManifest(kind, ownerId, next, { activate: true });
@@ -476,6 +488,22 @@ function createAssetManifestStore(db, options = {}) {
         return stmtMigrationList.all();
     }
 
+    function listLiveDescriptors() {
+        return db.prepare(`
+          SELECT m.manifest_id, m.owner_kind, m.owner_id, m.item_count, m.content_hash
+          FROM asset_manifest_live l
+          JOIN asset_manifests m ON m.manifest_id = l.manifest_id
+          ORDER BY m.owner_kind, m.owner_id
+        `).all().map((row) => ({
+            id: row.manifest_id,
+            version: MANIFEST_FORMAT_VERSION,
+            count: row.item_count,
+            sha256: row.content_hash,
+            ownerKind: row.owner_kind,
+            ownerId: row.owner_id,
+        }));
+    }
+
     function stats() {
         const manifest = db.prepare(`
           SELECT COUNT(*) AS count, COALESCE(SUM(item_count), 0) AS items,
@@ -506,6 +534,7 @@ function createAssetManifestStore(db, options = {}) {
         verifyManifest,
         recordMigrationFailure,
         listMigrationState,
+        listLiveDescriptors,
         stats,
     };
 }

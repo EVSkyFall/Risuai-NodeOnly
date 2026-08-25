@@ -106,6 +106,18 @@ async function writeKey(key: string, value: Uint8Array | Buffer | string) {
     expect(res.status).toBe(200)
 }
 
+async function readKey(key: string) {
+    const res = await fetch(`${base}/api/read`, {
+        method: 'GET',
+        headers: {
+            ...authHeaders(),
+            'file-path': hexKey(key),
+        },
+    })
+    expect(res.status).toBe(200)
+    return new Uint8Array(await res.arrayBuffer())
+}
+
 async function removeKey(key: string) {
     return fetch(`${base}/api/remove`, {
         method: 'GET',
@@ -235,6 +247,82 @@ describe('/api/db/assets/auto-sweep', () => {
         const body = await res.json()
         expect(body.error).toContain('Reference scan produced no references')
         expect(hasKey('assets/old.png')).toBe(true)
+    })
+
+    it('preserves paths referenced only by a live asset manifest', async () => {
+        await seedDb({
+            characters: [{ chaId: 'keep', image: 'assets/avatar.png', chats: [] }],
+            modules: [{ id: 'module-a', name: 'pack', assets: [['only-manifest', 'assets/manifest.png', 'png']] }],
+        })
+        // Reading the database builds the lazy client view and activates the
+        // module manifest. Then emulate a future slim on-disk blob containing
+        // only its descriptor so the sweep must consult the manifest table.
+        await readKey('database/database.bin')
+        const descriptor = withDb((db) => db.prepare(`
+            SELECT m.manifest_id AS id, m.item_count AS count, m.content_hash AS sha256
+            FROM asset_manifest_live l
+            JOIN asset_manifests m ON m.manifest_id = l.manifest_id
+            WHERE m.owner_kind = 'module' AND m.owner_id = 'module-a'
+        `).get())
+        expect(descriptor?.id).toBeTruthy()
+        withDb((db) => {
+            const stripped = encodeRisuSaveLegacy({
+                characters: [{ chaId: 'keep', image: 'assets/avatar.png', chats: [] }],
+                modules: [{
+                    id: 'module-a',
+                    name: 'pack',
+                    assetManifest: {
+                        ...descriptor,
+                        version: 1,
+                        ownerKind: 'module',
+                        ownerId: 'module-a',
+                    },
+                }],
+            })
+            db.prepare('UPDATE kv SET value = ?, updated_at = ? WHERE key = ?')
+                .run(Buffer.from(stripped), Date.now(), 'database/database.bin')
+        })
+        await writeKey('assets/avatar.png', 'avatar')
+        await writeKey('assets/manifest.png', 'manifest')
+        await writeKey('assets/orphan.png', 'orphan')
+        for (const key of ['assets/avatar.png', 'assets/manifest.png', 'assets/orphan.png']) {
+            setUpdatedAt(key, Date.now() - 8 * DAY)
+        }
+
+        const res = await autoSweep(true)
+        expect(res.status).toBe(200)
+        expect(hasKey('assets/avatar.png')).toBe(true)
+        expect(hasKey('assets/manifest.png')).toBe(true)
+        expect(hasKey('assets/orphan.png')).toBe(false)
+    })
+
+    it('fails closed without deleting assets when a live manifest is corrupt', async () => {
+        await seedDb({
+            characters: [{ chaId: 'keep', image: 'assets/avatar.png', chats: [] }],
+            modules: [{ id: 'module-a', name: 'pack', assets: [['live', 'assets/live.png', 'png']] }],
+        })
+        await readKey('database/database.bin')
+        withDb((db) => {
+            db.prepare(`
+                UPDATE asset_manifests SET payload = ?
+                WHERE manifest_id = (
+                    SELECT manifest_id FROM asset_manifest_live
+                    WHERE owner_kind = 'module' AND owner_id = 'module-a'
+                )
+            `).run(Buffer.from('corrupt'))
+        })
+        await writeKey('assets/avatar.png', 'avatar')
+        await writeKey('assets/live.png', 'live')
+        await writeKey('assets/would-be-orphan.png', 'orphan')
+        for (const key of ['assets/avatar.png', 'assets/live.png', 'assets/would-be-orphan.png']) {
+            setUpdatedAt(key, Date.now() - 8 * DAY)
+        }
+
+        const res = await autoSweep(true)
+        expect(res.status).toBe(400)
+        expect(hasKey('assets/avatar.png')).toBe(true)
+        expect(hasKey('assets/live.png')).toBe(true)
+        expect(hasKey('assets/would-be-orphan.png')).toBe(true)
     })
 
     it('sweeps stale remote caches, preserves recent ones, creates missing meta, and removes orphan meta', async () => {

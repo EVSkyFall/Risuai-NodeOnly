@@ -5,7 +5,7 @@ import { checkNullish, decryptBuffer, isKnownUri, selectFileByDom, sleep } from 
 import { language } from "src/lang"
 import { v4 as uuidv4, v4 } from 'uuid';
 import { characterFormatUpdate } from "./characters"
-import { AppendableBuffer, BlankWriter, checkCharOrder, downloadFile, forageStorage, loadAsset, LocalWriter, readImage, saveAsset, VirtualWriter } from "./globalApi.svelte"
+import { AppendableBuffer, BlankWriter, checkCharOrder, downloadFile, forageStorage, loadAsset, loadAssetManifestItems, LocalWriter, readImage, saveAsset, VirtualWriter } from "./globalApi.svelte"
 import { compressImage, getImageType } from "./media"
 import { selectedCharID } from "./stores.svelte"
 import { openSettings, SettingsRoute } from "./routing"
@@ -1164,6 +1164,11 @@ export async function exportCharacterCard(char:character, type:'png'|'json'|'cha
     spec?:'v2'|'v3'
     onProgress?:(msg:string, pct:number) => void
 } = {}) {
+    char = safeStructuredClone(char)
+    if (!Array.isArray(char.additionalAssets) && char.additionalAssetManifest) {
+        char.additionalAssets = await loadAssetManifestItems(char.additionalAssetManifest) as [string, string, string][]
+        delete char.additionalAssetManifest
+    }
     let img = await readImage(char.image)
     const spec:'v2'|'v3' = arg.spec ?? 'v2' //backward compatibility
     const onProgress = arg.onProgress ?? ((msg:string, pct:number) => {
@@ -1725,6 +1730,10 @@ export async function getHubResources(id:string) {
 }
 
 export function isCharacterHasAssets(char:character){
+    if(char.additionalAssetManifest && char.additionalAssetManifest.count > 0){
+        return true
+    }
+
     if(char.additionalAssets && char.additionalAssets.length > 0){
         return true
     }

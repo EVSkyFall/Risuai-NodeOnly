@@ -25,8 +25,8 @@ import { runLuaEditTrigger } from "./scriptings";
 import { getModelInfo, LLMFlags } from "../model/modellist";
 import { resolveChatModelBinding, resolvePresetMaxOutputTokens, presetSupportsVision } from "./request/modelPresetBinding";
 import { hypaMemoryV3 } from "./memory/hypav3";
-import { getModuleAssets, getModuleToggles } from "./modules";
-import { forageStorage, readImage } from "../globalApi.svelte";
+import { getModuleAssets, getModules, getModuleToggles } from "./modules";
+import { forageStorage, readImage, resolvePrioritizedAssetManifestNames } from "../globalApi.svelte";
 import { pluginV2 } from "../plugins/plugins.svelte";
 import { chatGenKey, chatProcessStage, endGeneration, isChatGenerating, setGenerationStage, startGeneration } from "./generationState";
 import { clearPendingSend, registerPendingSend } from "./request/pendingSends";
@@ -996,14 +996,28 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     })
                 })())
             }
-            else if(p1 === 'icon'){
-                assetPromises.push((async () => {
-                    const assetDataBuf = await readImage(currentChar.image ?? '')
-                    multimodal.push({
-                        type: "image",
-                        base64: `data:image/png;base64,${Buffer.from(assetDataBuf).toString('base64')}`
-                    })
-                })())
+            else {
+                const moduleManifests = getModules()
+                    .map((module) => module?.assetManifest)
+                    .filter((manifest) => !!manifest)
+                if (moduleManifests.length > 0 || currentChar.additionalAssetManifest || p1 === 'icon') {
+                    assetPromises.push((async () => {
+                        const resolved = await resolvePrioritizedAssetManifestNames(
+                            currentChar.additionalAssetManifest,
+                            moduleManifests,
+                            [p1],
+                        )
+                        const key = p1.toLocaleLowerCase()
+                        const path = resolved.character[key] ?? resolved.modules[key]
+                        const source = path || (p1 === 'icon' ? currentChar.image ?? '' : '')
+                        if (!source) return
+                        const assetDataBuf = await readImage(source)
+                        multimodal.push({
+                            type: "image",
+                            base64: `data:image/png;base64,${Buffer.from(assetDataBuf).toString('base64')}`
+                        })
+                    })())
+                }
             }
             return ''          
         })

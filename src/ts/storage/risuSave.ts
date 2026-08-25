@@ -932,6 +932,72 @@ export class RisuSavePatcher {
         }
     }
 
+    /**
+     * Advance the patch baseline after the server accepts an out-of-band asset
+     * manifest edit. The reactive DB is updated by the caller; this method keeps
+     * the next /api/patch expectedHash and diff pre-image on the same revision.
+     */
+    updateAssetManifestBaseline(
+        kind: 'module' | 'character' | 'persona-module',
+        ownerId: string,
+        descriptor: any,
+    ): boolean {
+        const nextDescriptor = normalizeJSON(descriptor)
+        if (kind === 'module') {
+            const modules = Array.isArray(this.lastSyncedDb.modules) ? this.lastSyncedDb.modules : []
+            const index = modules.findIndex((owner: any) => owner?.id === ownerId || owner?.assetManifest?.ownerId === ownerId)
+            if (index < 0) return false
+            const nextOwner = { ...modules[index], assetManifest: nextDescriptor }
+            const nextModules = modules.slice()
+            nextModules[index] = nextOwner
+            this.lastSyncedDb = { ...this.lastSyncedDb, modules: nextModules }
+            if (typeof nextOwner?.id === 'string' && nextOwner.id) {
+                this.lastModuleJsons.set(nextOwner.id, JSON.stringify(nextOwner))
+                this.moduleItemHashes.set(nextOwner.id, calculateHash(nextOwner))
+            }
+            let modulesHash = SEED_ARRAY
+            for (const module of nextModules) {
+                const cached = typeof module?.id === 'string' ? this.moduleItemHashes.get(module.id) : undefined
+                modulesHash = (Math.imul(modulesHash, PRIME_MULTIPLIER) + (cached ?? calculateHash(module))) >>> 0
+            }
+            this.hashBlocks.modules = modulesHash
+            return true
+        }
+
+        if (kind === 'character') {
+            const characters = Array.isArray(this.lastSyncedDb.characters) ? this.lastSyncedDb.characters : []
+            const index = characters.findIndex((owner: any) => owner?.chaId === ownerId || owner?.additionalAssetManifest?.ownerId === ownerId)
+            if (index < 0) return false
+            const nextOwner = { ...characters[index], additionalAssetManifest: nextDescriptor }
+            const nextCharacters = characters.slice()
+            nextCharacters[index] = nextOwner
+            this.lastSyncedDb = { ...this.lastSyncedDb, characters: nextCharacters }
+            if (nextOwner?.chaId) {
+                this.hashBlocks[nextOwner.chaId] = calculateHash(nextOwner)
+                this.lastCharJsons.set(nextOwner.chaId, JSON.stringify(nextOwner))
+            }
+            return true
+        }
+
+        const personas = Array.isArray(this.lastSyncedDb.personas) ? this.lastSyncedDb.personas : []
+        const index = personas.findIndex((owner: any) =>
+            owner?.id === ownerId || owner?.personaId === ownerId || owner?.embeddedModule?.assetManifest?.ownerId === ownerId)
+        if (index < 0) return false
+        const nextOwner = {
+            ...personas[index],
+            embeddedModule: {
+                ...personas[index]?.embeddedModule,
+                assetManifest: nextDescriptor,
+            },
+        }
+        const nextPersonas = personas.slice()
+        nextPersonas[index] = nextOwner
+        this.lastSyncedDb = { ...this.lastSyncedDb, personas: nextPersonas }
+        this.hashBlocks.personas = calculateHash(nextPersonas)
+        this.lastRootKeyJsons.set('personas', JSON.stringify(nextPersonas))
+        return true
+    }
+
     async set(data: any, toSave: toSaveType): Promise<{ patch: any[]; expectedHash: string }> {
         const { compare } = await import('fast-json-patch')
         const expectedHash: string = this.hash();

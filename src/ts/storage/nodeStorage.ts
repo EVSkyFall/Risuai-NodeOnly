@@ -119,6 +119,31 @@ export interface SettingsBackupEstimate {
     moduleAssets: { count: number, bytes: number, moduleCount: number }
 }
 
+export type AssetManifestTuple = [string, string] | [string, string, string]
+
+export interface AssetManifestDescriptor {
+    id: string
+    version: number
+    count: number
+    sha256: string
+    ownerKind?: 'module' | 'character' | 'persona-module'
+    ownerId?: string
+}
+
+export interface AssetManifestPage {
+    total: number
+    offset: number
+    limit: number
+    items: AssetManifestTuple[]
+}
+
+export type AssetManifestOperation =
+    | { type: 'append'; item: AssetManifestTuple }
+    | { type: 'insert'; index: number; item: AssetManifestTuple }
+    | { type: 'remove'; index: number }
+    | { type: 'rename'; index: number; name: string }
+    | { type: 'replace'; index: number; item: AssetManifestTuple }
+
 export class NodeStorage{
     private static readonly BULK_WRITE_CLIENT_BATCH = 20
 
@@ -631,6 +656,107 @@ export class NodeStorage{
             })
             if (da.status < 200 || da.status >= 300) throw await this.storageRequestError('setItems', da)
         }
+    }
+
+    // ── Lazy asset-reference manifests ────────────────────────────────────────
+    async getAssetManifestPage(
+        manifest: string | AssetManifestDescriptor,
+        options: { offset?: number; limit?: number; search?: string } = {},
+    ): Promise<AssetManifestPage> {
+        const descriptor = typeof manifest === 'string' ? null : manifest
+        let manifestId = typeof manifest === 'string' ? manifest : manifest.id
+        const params = new URLSearchParams()
+        if (options.offset != null) params.set('offset', String(options.offset))
+        if (options.limit != null) params.set('limit', String(options.limit))
+        if (options.search) params.set('search', options.search)
+        const query = params.toString()
+        for (let attempt = 0; attempt < 2; attempt++) {
+            const da = await this.authFetch(`/api/asset-manifests/${encodeURIComponent(manifestId)}${query ? `?${query}` : ''}`)
+            if (da.ok) return await da.json()
+            if (da.status !== 404 || !descriptor?.ownerKind || !descriptor.ownerId || attempt > 0) {
+                throw new Error(`asset manifest read error: ${da.status}`)
+            }
+
+            // Superseded manifest rows are pruned on activation. A 404 for a
+            // descriptor that carries owner information means the client must
+            // refresh the owner's live descriptor and retry once.
+            const live = await this.getAssetManifestOwner(descriptor.ownerKind, descriptor.ownerId)
+            if (!live) throw new Error('asset manifest owner is no longer live')
+            Object.assign(descriptor, live)
+            manifestId = live.id
+        }
+        throw new Error('asset manifest read retry exhausted')
+    }
+
+    async getAssetManifestOwner(ownerKind: string, ownerId: string): Promise<AssetManifestDescriptor | null> {
+        const da = await this.authFetch(
+            `/api/asset-manifests/owner/${encodeURIComponent(ownerKind)}/${encodeURIComponent(ownerId)}`,
+        )
+        if (da.status === 404) return null
+        if (!da.ok) throw new Error(`asset manifest owner read error: ${da.status}`)
+        return await da.json()
+    }
+
+    async getAllAssetManifestItems(manifest: AssetManifestDescriptor): Promise<AssetManifestTuple[]> {
+        const pageSize = 500
+        const items: AssetManifestTuple[] = []
+        while (items.length < manifest.count) {
+            const requestedManifestId = manifest.id
+            const page = await this.getAssetManifestPage(manifest, { offset: items.length, limit: pageSize })
+            if (manifest.id !== requestedManifestId) {
+                // The old revision disappeared between pages. Restart from the
+                // beginning so tuples from two revisions are never mixed.
+                items.length = 0
+                continue
+            }
+            items.push(...page.items)
+            if (page.items.length === 0 || items.length >= page.total) break
+        }
+        if (items.length !== manifest.count) {
+            throw new Error(`asset manifest count mismatch: expected ${manifest.count}, got ${items.length}`)
+        }
+        return items
+    }
+
+    async resolveAssetManifestNames(
+        owners: Array<{ kind?: string; ownerId?: string; manifestId?: string; fuzzy?: boolean }>,
+        names: string[],
+        maxDistance: number,
+    ): Promise<Record<string, string>> {
+        const da = await this.authFetch('/api/asset-manifests/resolve', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ owners, names, maxDistance }),
+        })
+        if (!da.ok) throw new Error(`asset manifest resolve error: ${da.status}`)
+        const body = await da.json()
+        return body.resolved ?? {}
+    }
+
+    async editAssetManifest(
+        ownerKind: string,
+        ownerId: string,
+        expectedManifestId: string,
+        operations: AssetManifestOperation[],
+    ): Promise<AssetManifestDescriptor> {
+        const da = await this.authFetch(
+            `/api/asset-manifests/owner/${encodeURIComponent(ownerKind)}/${encodeURIComponent(ownerId)}`,
+            {
+                method: 'PATCH',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ expectedManifestId, operations }),
+            },
+        )
+        if (da.status === 409) {
+            const body = await da.json().catch(() => ({}))
+            const error = new ConflictError('Asset manifest revision conflict', '') as ConflictError & {
+                current?: AssetManifestDescriptor
+            }
+            error.current = body?.current
+            throw error
+        }
+        if (!da.ok) throw new Error(`asset manifest edit error: ${da.status}`)
+        return await da.json()
     }
 
     async exportBackup(opts?: ExportBackupOptions): Promise<Response> {

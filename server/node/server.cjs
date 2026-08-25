@@ -36,6 +36,15 @@ const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, norm
 const { createPatchHashCache, decodePointerSegment } = require('./patch-hash-cache.cjs');
 const { clonePatchSnapshot } = require('./patch-selective-clone.cjs');
 const pluginStorage = require('./plugin-storage-store.cjs');
+const { createAssetManifestStore } = require('./assetManifestStore.cjs');
+const {
+    stripAssetManifests,
+    hydrateAssetManifests,
+    assetManifestSummary,
+    moduleOwnerId,
+    characterOwnerId,
+    personaOwnerId,
+} = require('./assetManifestMigration.cjs');
 const { spawn, execSync } = require('child_process');
 const os = require('os');
 const { Readable, Transform } = require('stream');
@@ -86,6 +95,11 @@ function queueStorageOperation(operation) {
 }
 
 const DB_HEX_KEY = Buffer.from('database/database.bin', 'utf-8').toString('hex');
+const assetManifestStore = createAssetManifestStore(sqliteDb, {
+    maxCacheBytes: process.env.POCKETRISU_ASSET_MANIFEST_CACHE_BYTES
+        ? Number(process.env.POCKETRISU_ASSET_MANIFEST_CACHE_BYTES)
+        : undefined,
+});
 
 // ─── Persist failure tracking (Stage 1 visibility) ───────────────────────────
 // Debounced persist runs in setTimeout, so failures cannot be returned in the
@@ -281,7 +295,7 @@ async function flushPendingDb() {
             const raw = kvGet('database/database.bin');
             if (raw) {
                 const dbObj = normalizeJSON(await decodeRisuSave(raw));
-                const fullDb = reassembleFullDb(stripChatsFromDb(dbObj));
+                const fullDb = hydrateDatabaseForDisk(stripDatabaseForClient(dbObj, { reconcileManifests: true }));
                 kvSet('database/database.bin', Buffer.from(encodeRisuSaveLegacy(fullDb)));
             }
         }
@@ -336,7 +350,7 @@ async function loadDbCacheIfMissing({ createBackup = false } = {}) {
     if (!raw) return false;
     const dbObj = await decodeDatabaseWithPersistentChatIds(raw, { createBackup });
     initChatStore(dbObj);
-    dbCache[DB_HEX_KEY] = normalizeJSON(stripChatsFromDb(dbObj));
+    dbCache[DB_HEX_KEY] = normalizeJSON(stripDatabaseForClient(dbObj, { reconcileManifests: true }));
     return true;
 }
 
@@ -543,6 +557,24 @@ function stripChatsFromDb(dbObj) {
         return { ...char, chats: char.chats.map(chatToStub) };
     });
     return stripped;
+}
+
+/**
+ * Browser runtime view: chat bodies and large asset-reference arrays are kept
+ * server-side. The on-disk database remains legacy-compatible until the
+ * explicit slim-database cutover is implemented and verified.
+ */
+function stripDatabaseForClient(dbObj, { reconcileManifests = false } = {}) {
+    const chatStripped = stripChatsFromDb(dbObj);
+    return stripAssetManifests(chatStripped, assetManifestStore, {
+        activate: reconcileManifests ? 'reconcile' : true,
+    }).db;
+}
+
+/** Rebuild the exact legacy shape before any database.bin disk write. */
+function hydrateDatabaseForDisk(clientDb) {
+    const chatsHydrated = reassembleFullDb(clientDb);
+    return hydrateAssetManifests(chatsHydrated, assetManifestStore);
 }
 
 /**
@@ -821,7 +853,7 @@ async function persistDbCacheWithChats(filePath, decodedKey) {
     const strippedDb = dbCache[filePath];
     if (!strippedDb) return;
     await ensureChatStore();
-    const fullDb = reassembleFullDb(strippedDb);
+    const fullDb = hydrateDatabaseForDisk(strippedDb);
 
     // Disk protection guard: abort persist when reassemble produced metadata-only
     // chats. Writing them would lock the loss in (next /api/read returns the
@@ -861,6 +893,80 @@ async function persistDbCacheWithChats(filePath, decodedKey) {
     if (decodedKey === 'database/database.bin') {
         initChatStore(fullDb);
     }
+}
+
+function scheduleDatabasePersist(source = 'database') {
+    if (saveTimers[DB_HEX_KEY]) clearTimeout(saveTimers[DB_HEX_KEY]);
+    const timer = setTimeout(() => {
+        queueStorageOperation(async () => {
+            if (saveTimers[DB_HEX_KEY] !== timer) return;
+            try {
+                await persistDbCacheWithChats(DB_HEX_KEY, 'database/database.bin');
+                clearPersistFailure();
+                try { createBackupAndRotate(); }
+                catch (backupError) { logger.warn(`[${source}] Backup rotation failed:`, backupError); }
+            } catch (error) {
+                logger.error(`[${source}] Error saving database.bin:`, error);
+                recordPersistFailure(error, source);
+            } finally {
+                if (saveTimers[DB_HEX_KEY] === timer) delete saveTimers[DB_HEX_KEY];
+            }
+        }).catch((error) => logger.error(`[${source}] Storage queue failed:`, error));
+    }, SAVE_INTERVAL);
+    saveTimers[DB_HEX_KEY] = timer;
+}
+
+// Manifest edits need the canonical client-view cache. Reuses the shared cold
+// loader so the decode/strip path stays identical to /api/read and /api/patch;
+// callers must already hold the storage queue.
+async function ensureDatabaseCache() {
+    if (!(await loadDbCacheIfMissing())) throw new Error('Database not found');
+    return dbCache[DB_HEX_KEY];
+}
+
+function locateAssetManifestOwner(database, kind, ownerId) {
+    if (kind === 'module') {
+        const index = (database.modules || []).findIndex((owner, i) => moduleOwnerId(owner, i) === ownerId);
+        return { collectionKey: 'modules', index, descriptorKey: 'assetManifest', nested: false };
+    }
+    if (kind === 'character') {
+        const index = (database.characters || []).findIndex((owner, i) => characterOwnerId(owner, i) === ownerId);
+        return { collectionKey: 'characters', index, descriptorKey: 'additionalAssetManifest', nested: false };
+    }
+    if (kind === 'persona-module') {
+        const index = (database.personas || []).findIndex((owner, i) => personaOwnerId(owner, i) === ownerId);
+        return { collectionKey: 'personas', index, descriptorKey: 'assetManifest', nested: true };
+    }
+    return null;
+}
+
+function replaceCachedAssetManifestDescriptor(database, kind, ownerId, descriptor) {
+    const location = locateAssetManifestOwner(database, kind, ownerId);
+    if (!location || location.index < 0) {
+        const error = new Error(`Asset manifest owner not found in database cache: ${kind}/${ownerId}`);
+        error.code = 'MANIFEST_VALIDATION';
+        throw error;
+    }
+    const currentList = database[location.collectionKey];
+    const currentOwner = currentList[location.index];
+    let nextOwner;
+    if (location.nested) {
+        nextOwner = {
+            ...currentOwner,
+            embeddedModule: {
+                ...currentOwner.embeddedModule,
+                [location.descriptorKey]: descriptor,
+            },
+        };
+    } else {
+        nextOwner = { ...currentOwner, [location.descriptorKey]: descriptor };
+    }
+    const nextList = currentList.slice();
+    nextList[location.index] = nextOwner;
+    return {
+        nextDatabase: { ...database, [location.collectionKey]: nextList },
+        collectionKey: location.collectionKey,
+    };
 }
 
 function shouldCompress(req, res) {
@@ -3548,15 +3654,17 @@ app.get('/api/read', async (req, res, next) => {
         if (value === null) {
             value = kvGet(key);
         }
-        if(value === null){
+        if (value === null) {
             res.send();
         } else {
-            // Strip chat payloads from database.bin — client gets stubs only
+            // Strip chat payloads and asset manifests from database.bin — the
+            // client gets stubs and descriptors only.
             if (key === 'database/database.bin') {
                 try {
                     // Cold load runs under the storage queue so it cannot
                     // race a cold /api/patch (see loadDbCacheIfMissing). A
-                    // warm cache is served directly without queueing.
+                    // warm cache is served directly without queueing, so a
+                    // read can never re-activate a superseded manifest.
                     if (!dbCache[filePath]) {
                         await queueStorageOperation(() => loadDbCacheIfMissing({ createBackup: true }));
                     }
@@ -3577,6 +3685,7 @@ app.get('/api/read', async (req, res, next) => {
             res.send(value);
         }
     } catch (error) {
+        logger.error('[Read] Failed to read stored data', error);
         next(error);
     }
 });
@@ -3796,7 +3905,7 @@ app.post('/api/write', async (req, res, next) => {
                     var persistedEtag;
                     const incomingDb = await decodeRisuSave(fileContent);
                     await ensureChatStore();
-                    const fullDb = reassembleFullDb(incomingDb);
+                    const fullDb = hydrateDatabaseForDisk(incomingDb);
 
                     // Mirror the patch-persist guard (persistDbCacheWithChats):
                     // a malformed full-write payload could carry chats with
@@ -3847,7 +3956,9 @@ app.post('/api/write', async (req, res, next) => {
                     // PERSISTED DB, stripped. Not the request bytes — the
                     // split above may have emptied pluginCustomStorage, so
                     // the client's copy and the served copy differ.
-                    persistedEtag = computeDatabaseEtagFromObject(normalizeJSON(stripChatsFromDb(fullDb)));
+                    persistedEtag = computeDatabaseEtagFromObject(
+                        normalizeJSON(stripDatabaseForClient(fullDb, { reconcileManifests: true })),
+                    );
                 } catch (e) {
                     logger.error('[Write] Failed to merge chats into database.bin:', e.message);
                     // Do NOT write stubs-only to disk — that would permanently
@@ -4163,6 +4274,118 @@ app.post('/api/patch', async (req, res, next) => {
         res.status(500).send({
             error: 'Patch application failed: ' + (error && error.message ? error.message : error)
         });
+    }
+});
+
+// ─── Asset manifest endpoints ─────────────────────────────────────────────────
+// Large module/character asset-reference arrays live here instead of in the
+// browser's reactive database. Binary assets remain untouched in assets/*.
+app.get('/api/asset-manifests/stats', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    try {
+        res.json({
+            ...assetManifestStore.stats(),
+            migration: assetManifestStore.listMigrationState(),
+            runtime: dbCache[DB_HEX_KEY] ? assetManifestSummary(dbCache[DB_HEX_KEY]) : null,
+        });
+    } catch (error) { next(error); }
+});
+
+app.get('/api/asset-manifests/owner/:kind/:ownerId', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    try {
+        const descriptor = assetManifestStore.getLiveDescriptor(req.params.kind, req.params.ownerId);
+        if (!descriptor) return res.status(404).json({ error: 'Asset manifest owner not found' });
+        res.json({ ...descriptor, ownerKind: req.params.kind, ownerId: req.params.ownerId });
+    } catch (error) { next(error); }
+});
+
+app.get('/api/asset-manifests/:manifestId', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    try {
+        const page = assetManifestStore.getPage(req.params.manifestId, {
+            offset: req.query.offset,
+            limit: req.query.limit,
+            search: req.query.search,
+        });
+        if (!page) return res.status(404).json({ error: 'Asset manifest not found' });
+        res.json(page);
+    } catch (error) { next(error); }
+});
+
+app.post('/api/asset-manifests/resolve', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    try {
+        const owners = Array.isArray(req.body?.owners) ? req.body.owners : [];
+        const names = Array.isArray(req.body?.names) ? req.body.names : [];
+        if (owners.length > 200 || names.length > 1000) {
+            return res.status(413).json({ error: 'Too many asset manifest owners or names' });
+        }
+        res.json({
+            resolved: assetManifestStore.resolveNames(owners, names, {
+                maxDistance: req.body?.maxDistance,
+            }),
+        });
+    } catch (error) { next(error); }
+});
+
+app.patch('/api/asset-manifests/owner/:kind/:ownerId', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    if (!checkActiveSession(req, res)) return;
+    try {
+        const descriptor = await queueStorageOperation(async () => {
+            const currentDb = await ensureDatabaseCache();
+            // Validate that the owner exists in the canonical cache before the
+            // SQLite live pointer advances. This keeps a malformed request from
+            // creating a manifest revision the database cannot reference.
+            const location = locateAssetManifestOwner(currentDb, req.params.kind, req.params.ownerId);
+            if (!location || location.index < 0) {
+                const error = new Error(`Asset manifest owner not found: ${req.params.kind}/${req.params.ownerId}`);
+                error.code = 'MANIFEST_VALIDATION';
+                throw error;
+            }
+            const nextDescriptor = assetManifestStore.applyOperations(
+                req.params.kind,
+                req.params.ownerId,
+                req.body?.expectedManifestId,
+                req.body?.operations,
+            );
+            const enriched = {
+                ...nextDescriptor,
+                ownerKind: req.params.kind,
+                ownerId: req.params.ownerId,
+            };
+            const { nextDatabase, collectionKey } = replaceCachedAssetManifestDescriptor(
+                currentDb,
+                req.params.kind,
+                req.params.ownerId,
+                enriched,
+            );
+            databasePatchHashCache.update(currentDb, nextDatabase, [{
+                op: 'replace',
+                path: `/${collectionKey}`,
+                value: nextDatabase[collectionKey],
+            }]);
+            dbCache[DB_HEX_KEY] = nextDatabase;
+            scheduleDatabasePersist('asset-manifest');
+            return enriched;
+        });
+        res.json({ ...descriptor, ownerKind: req.params.kind, ownerId: req.params.ownerId });
+    } catch (error) {
+        if (error?.code === 'MANIFEST_CONFLICT') {
+            return res.status(409).json({
+                error: error.message,
+                current: error.current ? {
+                    ...error.current,
+                    ownerKind: req.params.kind,
+                    ownerId: req.params.ownerId,
+                } : null,
+            });
+        }
+        if (error?.code === 'MANIFEST_VALIDATION') {
+            return res.status(400).json({ error: error.message });
+        }
+        next(error);
     }
 });
 
@@ -5176,7 +5399,7 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
                         const raw = kvGet('database/database.bin');
                         if (raw) {
                             const dbObj = normalizeJSON(await decodeRisuSave(raw));
-                            const fullDb = reassembleFullDb(stripChatsFromDb(dbObj));
+                            const fullDb = hydrateDatabaseForDisk(stripDatabaseForClient(dbObj, { reconcileManifests: true }));
                             const encoded = Buffer.from(encodeRisuSaveLegacy(fullDb));
                             try {
                                 kvSet('database/database.bin', encoded);
@@ -5636,6 +5859,26 @@ async function computeAssetSweep({ includeAssets, assetGraceMs = 0, includeRemot
 
     const uncleanable = buildUncleanableSet(dbObj);
     const assets = includeAssets ? kvListWithSizesAndUpdatedAt('assets/') : [];
+
+    // The persisted blob is currently hydrated for upstream compatibility, but
+    // manifests are authoritative for the lazy client view and will remain so
+    // after a future slim-database cutover. Union live manifest paths now so a
+    // partial/stripped blob can never make referenced assets look orphaned.
+    try {
+        for (const descriptor of assetManifestStore.listLiveDescriptors()) {
+            const verified = assetManifestStore.verifyManifest(descriptor.id);
+            if (!verified.ok) {
+                throw new Error(`Asset manifest verification failed: ${descriptor.id} (${verified.error})`);
+            }
+            for (const item of assetManifestStore.loadItems(descriptor.id) || []) {
+                const basename = statsBasename(item?.[1]);
+                if (basename) uncleanable.add(basename);
+            }
+        }
+    } catch (error) {
+        return { error: `Manifest reference scan failed — refusing to purge: ${error?.message || error}` };
+    }
+
     // A walker that returns nothing while assets exist means the decode
     // produced a shape we do not understand — every asset would look orphaned.
     // Refuse rather than delete the library. Checked before plugin-storage refs
