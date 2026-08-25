@@ -698,12 +698,35 @@ function trimmer(str:string){
     return str.trim().replace(/[_ -.]/g, '')
 }
 
-const blobUrlCache = new Map<string, { url: string; type: string }>()
+type InlayCacheEntry = { url: string; type: string; width?: number; height?: number }
+type InlayDimensions = { width: number; height: number }
+
+const blobUrlCache = new Map<string, InlayCacheEntry>()
 const inlayImageExts = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'avif']
 
 /** Build a direct-serve URL for a KV key via /api/asset/ */
 function assetUrl(kvKey: string): string {
     return `/api/asset/${Buffer.from(kvKey, 'utf-8').toString('hex')}`
+}
+
+function getInlayDimensions(source: { width?: number; height?: number } | undefined): InlayDimensions | undefined {
+    const width = Math.round(source?.width ?? 0)
+    const height = Math.round(source?.height ?? 0)
+    if(width <= 0 || height <= 0) return undefined
+    return { width, height }
+}
+
+function getInlayDimensionAttributes(source: { width?: number; height?: number } | undefined): string {
+    const dimensions = getInlayDimensions(source)
+    if(!dimensions) return ''
+    return ` width="${dimensions.width}" height="${dimensions.height}"`
+}
+
+function applyInlayDimensions(img: HTMLImageElement, source: { width?: number; height?: number } | undefined) {
+    const dimensions = getInlayDimensions(source)
+    if(!dimensions) return
+    img.setAttribute('width', String(dimensions.width))
+    img.setAttribute('height', String(dimensions.height))
 }
 
 function createMissingInlayPlaceholder(id: string): HTMLDivElement {
@@ -749,7 +772,7 @@ export function parseInlayAssets(data:string){
                         data = data.replace(inlay, '')
                         break
                     }
-                    data = data.replace(inlay, `${prefix}<img src="${url}"/>${postfix}`)
+                    data = data.replace(inlay, `${prefix}<img src="${url}"${getInlayDimensionAttributes(cached)}/>${postfix}`)
                     break
                 case 'video':
                     data = data.replace(inlay, `${prefix}<video controls><source src="${url}" type="video/mp4"></video>${postfix}`)
@@ -773,6 +796,9 @@ async function processInlayQueue() {
 
     while (resolveQueue.length > 0) {
         const batch = resolveQueue.splice(0, 20)
+        // <img> elements inserted below, so late-arriving dimensions can still
+        // reserve their box before the image finishes decoding.
+        const insertedImages = new Map<string, HTMLImageElement[]>()
 
         const unknownIds = batch
             .filter(({ id }) => !blobUrlCache.has(id))
@@ -784,13 +810,31 @@ async function processInlayQueue() {
                 for (const id of unknownIds) {
                     blobUrlCache.set(id, { url: assetUrl(`inlay/${id}`), type: 'image' })
                 }
+                // Dimensions are fetched without blocking the image load; when
+                // they arrive, size the already-inserted <img> so it doesn't
+                // jump from 0 height once decoded.
+                getInlayInfosBatch(unknownIds).then((infos) => {
+                    for (const id of unknownIds) {
+                        const cached = blobUrlCache.get(id)
+                        if(!cached) continue
+                        const dimensions = getInlayDimensions(infos[id])
+                        if(!dimensions) continue
+                        cached.width = dimensions.width
+                        cached.height = dimensions.height
+                        for (const img of insertedImages.get(id) ?? []) {
+                            if (img.isConnected) applyInlayDimensions(img, dimensions)
+                        }
+                    }
+                }).catch(() => {})
             } else {
                 // Accurate path: fetch type info first
                 try {
                     const infos = await getInlayInfosBatch(unknownIds)
                     for (const id of unknownIds) {
-                        const type = infos[id]?.type ?? 'image'
-                        blobUrlCache.set(id, { url: assetUrl(`inlay/${id}`), type })
+                        const info = infos[id]
+                        const type = info?.type ?? 'image'
+                        const dimensions = getInlayDimensions(info)
+                        blobUrlCache.set(id, { url: assetUrl(`inlay/${id}`), type, width: dimensions?.width, height: dimensions?.height })
                     }
                 } catch {
                     for (const id of unknownIds) {
@@ -814,6 +858,8 @@ async function processInlayQueue() {
                         if (DBState.db.hideAllImages) { el.remove(); break }
                         const img = document.createElement('img')
                         img.src = url
+                        applyInlayDimensions(img, cached)
+                        insertedImages.set(id, [...(insertedImages.get(id) ?? []), img])
                         img.style.animation = 'risu-fade-in 0.3s ease-out'
                         // Fallback for legacy inlays without inlay_info:
                         // if <img> fails, probe Content-Type and swap to video/audio
