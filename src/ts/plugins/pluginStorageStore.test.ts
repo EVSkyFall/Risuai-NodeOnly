@@ -455,3 +455,24 @@ describe('preloadAll + sync ops (V2 mode)', () => {
         }
     })
 })
+
+describe('snapshotAll', () => {
+    test('returns every key as a plain object without flipping preloaded', async () => {
+        kv.set('plugin-storage/' + Buffer.from('a').toString('base64url'), new TextEncoder().encode('1'))
+        kv.set('plugin-storage/' + Buffer.from('b').toString('base64url'), new TextEncoder().encode('{"x":true}'))
+        const snap = await store.snapshotAll()
+        expect(snap).toEqual({ a: 1, b: { x: true } })
+        expect(store.isPreloaded()).toBe(false)
+        // the copy is detached from the store
+        snap.a = 99
+        expect(await store.getItem('a')).toBe(1)
+    })
+
+    test('keeps a "__proto__" key as an own property', async () => {
+        kv.set('plugin-storage/' + Buffer.from('__proto__').toString('base64url'), new TextEncoder().encode('{"p":1}'))
+        const snap = await store.snapshotAll()
+        expect(Object.prototype.hasOwnProperty.call(snap, '__proto__')).toBe(true)
+        expect(Object.getPrototypeOf(snap)).toBe(Object.prototype)
+        expect(JSON.parse(JSON.stringify(snap))['__proto__']).toEqual({ p: 1 })
+    })
+})

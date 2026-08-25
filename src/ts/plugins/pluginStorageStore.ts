@@ -368,6 +368,30 @@ export function preloadAll(): Promise<void> {
     return preloadPromise;
 }
 
+// One-off full copy of the store as a plain object, for writers that must
+// embed every plugin value (client-assembled backups). Does not touch
+// `preloaded` or the LRU cap — values are read through the normal path and
+// may be evicted again afterwards.
+export async function snapshotAll(): Promise<Record<string, any>> {
+    await refreshIndex();
+    const out: Record<string, any> = {};
+    const all = [...index.keys()];
+    const CONCURRENCY = 8;
+    for (let i = 0; i < all.length; i += CONCURRENCY) {
+        const chunk = all.slice(i, i + CONCURRENCY);
+        const values = await Promise.all(chunk.map((k) => getItem(k)));
+        chunk.forEach((k, j) => {
+            if (values[j] === null || values[j] === undefined) return;
+            // defineProperty so a stored "__proto__" key stays an own property
+            // (same as the server's readAll).
+            Object.defineProperty(out, k, {
+                value: values[j], enumerable: true, writable: true, configurable: true,
+            });
+        });
+    }
+    return out;
+}
+
 // ── sync API (V2 plugins; valid only after preloadAll) ─────────────────────
 
 export function getItemSync(key: string): any | null {

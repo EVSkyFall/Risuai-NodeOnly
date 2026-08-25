@@ -3,6 +3,7 @@ import { downloadFile, LocalWriter, forageStorage, loadAssetManifestItems } from
 import { encodeRisuSaveLegacy } from "../storage/risuSave";
 import { getDatabase, type Chat } from "../storage/database.svelte";
 import { fetchChatFromServer } from "../storage/chatStorage";
+import * as pluginStorageStore from "../plugins/pluginStorageStore";
 import { language } from "src/lang";
 
 function formatBytes(bytes: number): string {
@@ -288,6 +289,11 @@ export async function SavePartialLocalBackup(){
             }
         }
     }
+    // Plugin values live in the server kv, never in the client DB (the field
+    // is always {}). Importing a .bin replaces plugin storage wholesale, so
+    // the backup must carry every key or a restore wipes them.
+    alertWait(`Saving partial local backup... (Assembling plugin data)`)
+    dbCopy.pluginCustomStorage = await pluginStorageStore.snapshotAll()
     const dbData = encodeRisuSaveLegacy(dbCopy, 'compression')
 
     alertWait(`Saving partial local backup... (Saving database)`) 
