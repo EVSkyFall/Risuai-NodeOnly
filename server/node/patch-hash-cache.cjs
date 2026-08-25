@@ -123,4 +123,5 @@ function createPatchHashCache(calculateHash) {
 module.exports = {
     createPatchHashCache,
     collectTouchedTopLevelKeys,
+    decodePointerSegment,
 };

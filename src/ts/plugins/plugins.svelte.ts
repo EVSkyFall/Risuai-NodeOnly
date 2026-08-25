@@ -11,6 +11,8 @@ import { checkCodeSafety } from "./pluginSafety";
 import { SafeDocument, SafeIdbFactory, SafeLocalStorage } from "./pluginSafeClass";
 import { loadV3Plugins, reloadV3Plugin } from "./apiV3/v3.svelte";
 import { pluginCodeTranspiler } from "./apiV3/transpiler";
+import * as pluginStorageStore from "./pluginStorageStore";
+import { PLUGIN_CUSTOM_STORAGE_KEY, applyPluginDbKey, pluginCustomStorageProxy } from "./pluginDbProxy";
 
 export const customProviderStore = writable([] as string[])
 
@@ -454,6 +456,16 @@ export async function loadPlugins() {
     const pluginV2 = enabledPlugins.filter((a: RisuPlugin) => a.version === 2 || a.version === '2.1')
     const pluginV3 = enabledPlugins.filter((a: RisuPlugin) => a.version === '3.0')
 
+    // Plugin values live on the server, never in db.pluginCustomStorage. V3
+    // reads on demand; the V2 API is synchronous, so any enabled V2 plugin
+    // forces a full preload into the store's cache.
+    try {
+        await pluginStorageStore.init()
+        if (pluginV2.length > 0) await pluginStorageStore.preloadAll()
+    } catch (e) {
+        console.error('[pluginStorage] init failed', e)
+    }
+
     await loadV2Plugin(pluginV2)
     await loadV3Plugins(pluginV3)
 }
@@ -703,32 +715,34 @@ export const getV2PluginAPIs = () => {
             }
             return new Proxy(db, {
                 get(target, prop) {
+                    // Live store view; the real DB field is always {} (see pluginDbProxy).
+                    if (prop === PLUGIN_CUSTOM_STORAGE_KEY) {
+                        return pluginCustomStorageProxy();
+                    }
                     if (typeof prop === 'string' && allowedDbKeys.includes(prop)) {
                         return (target as any)[prop];
                     }
-                    else if(target.pluginCustomStorage){
-                        console.log('Getting custom db property', prop.toString());
-                        return target.pluginCustomStorage[prop.toString()];
-                    }
-                    return undefined;
+                    // Custom props map to plugin storage (server-backed, not the DB).
+                    console.log('Getting custom db property', prop.toString());
+                    return pluginStorageStore.getItemSync(prop.toString()) ?? undefined;
                 },
                 set(target, prop, value) {
+                    if (typeof prop === 'string' && applyPluginDbKey(prop, value)) {
+                        return true;
+                    }
                     if (typeof prop === 'string' && allowedDbKeys.includes(prop)) {
                         (target as any)[prop] = value;
                         return true;
                     }
                     else{
                         console.log('Setting custom db property', prop.toString(), value);
-                        target.pluginCustomStorage ??= {}
-                        target.pluginCustomStorage[prop.toString()] = value;
+                        pluginStorageStore.setItemSync(prop.toString(), value);
                         return true;
                     }
                 },
                 ownKeys(target) {
                     const keys = Reflect.ownKeys(target).filter(key => typeof key === 'string' && allowedDbKeys.includes(key));
-                    if(target.pluginCustomStorage){
-                        keys.push(...Object.keys(target.pluginCustomStorage));
-                    }
+                    keys.push(...pluginStorageStore.keys());
                     return keys;
                 },
                 deleteProperty(target, prop) {
@@ -740,70 +754,62 @@ export const getV2PluginAPIs = () => {
                 },
             })
         },
+        // Sync API over the store's cache; loadPlugins() preloads every key
+        // when a V2 plugin is enabled. Values never touch db.pluginCustomStorage.
         pluginStorage: {
             getItem: (key: string) => {
-                const db = getDatabase({ snapshot: true });
-                db.pluginCustomStorage ??= {}
-                return db.pluginCustomStorage[key] || null;
+                return pluginStorageStore.getItemSync(key) || null;
             },
             setItem: (key: string, value: string) => {
-                const db = getDatabase();
-                db.pluginCustomStorage ??= {}
-                db.pluginCustomStorage[key] = value;
+                pluginStorageStore.setItemSync(key, value);
             },
             removeItem: (key: string) => {
-                const db = getDatabase();
-                db.pluginCustomStorage ??= {}
-                delete db.pluginCustomStorage[key];
+                pluginStorageStore.removeItemSync(key);
             },
             clear: () => {
-                const db = getDatabase();
-                db.pluginCustomStorage = {};
+                pluginStorageStore.clearSync();
             },
             key: (index: number) => {
-                const db = getDatabase();
-                db.pluginCustomStorage ??= {}
-                const keys = Object.keys(db.pluginCustomStorage);
-                return keys[index] || null;
+                return pluginStorageStore.key(index);
             },
             keys: () => {
-                const db = getDatabase();
-                db.pluginCustomStorage ??= {}
-                return Object.keys(db.pluginCustomStorage);
+                return pluginStorageStore.keys();
             },
             length: () => {
-                const db = getDatabase();
-                db.pluginCustomStorage ??= {}
-                return Object.keys(db.pluginCustomStorage).length;
+                return pluginStorageStore.length();
             }
         },
         setDatabaseLite: (newDb: any) => {
             const db = getDatabase();
-            db.pluginCustomStorage ??= {}
             for (const key of Object.keys(newDb)) {
+                if (applyPluginDbKey(key, newDb[key])) {
+                    continue;
+                }
                 if (allowedDbKeys.includes(key)) {
                     (db as any)[key] = newDb[key];
                 }
                 else{
-                    db.pluginCustomStorage[key] = newDb[key];
+                    pluginStorageStore.setItemSync(key, newDb[key]);
                 }
             }
             DBState.db = db;
         },
         setDatabase: async (newDb: any) => {
             const db = getDatabase();
-            db.pluginCustomStorage ??= {}
             for (const key of Object.keys(newDb)) {
                 if (key === 'plugins') {
                     console.warn('[WARN] Plugin attempted to access plugin directly. this would be blocked in future versions. Instead, use the provided APIs to manage plugins. Attempting to handle plugin installation via plugin for new plugins in the provided database object.')
                     newDb[key] = await handlePluginInstallViaPlugin(newDb.plugins)
                 }
                 
+                if (applyPluginDbKey(key, newDb[key])) {
+                    continue;
+                }
                 if (allowedDbKeys.includes(key)) {
                     (db as any)[key] = newDb[key];
                 }
                 else{
-                    db.pluginCustomStorage[key] = newDb[key];
+                    pluginStorageStore.setItemSync(key, newDb[key]);
                 }
             }
             setDatabase(db);

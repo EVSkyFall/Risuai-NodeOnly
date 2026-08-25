@@ -453,6 +453,7 @@ export async function saveDb() {
         botPreset: false,
         modules: false,
         plugins: false,
+        // Always false: plugin values are in the server kv, not the DB.
         pluginCustomStorage: false
     }
 
@@ -472,7 +473,6 @@ export async function saveDb() {
             toSave.botPreset ||
             toSave.modules ||
             toSave.plugins ||
-            toSave.pluginCustomStorage ||
             toSave.root ||
             toSave.character.length > 0 ||
             toSave.chat.length > 0
@@ -487,7 +487,6 @@ export async function saveDb() {
         changeTracker.botPreset = false
         changeTracker.modules = false
         changeTracker.plugins = false
-        changeTracker.pluginCustomStorage = false
         return toSave
     }
 
@@ -511,7 +510,6 @@ export async function saveDb() {
         let didInitBotPresetEffect = false
         let didInitModulesEffect = false
         let didInitPluginsEffect = false
-        let didInitPluginStorageEffect = false
         let didInitGeneralEffect = false
         let trackedActiveChatKey = ''
 
@@ -598,15 +596,9 @@ export async function saveDb() {
             changeTracker.plugins = true
             saveTimeoutExecute()
         })
-        $effect(() => {
-            deepTouch(DBState.db.pluginCustomStorage)
-            if (!didInitPluginStorageEffect) {
-                didInitPluginStorageEffect = true
-                return
-            }
-            changeTracker.pluginCustomStorage = true
-            saveTimeoutExecute()
-        })
+        // No effect for db.pluginCustomStorage: plugin values live in the
+        // server kv (pluginStorageStore) and the DB field stays {} forever, so
+        // toSave.pluginCustomStorage is always false.
         $effect(() => {
             const currentCharacterIds = (DBState?.db?.characters ?? []).map((character) => character?.chaId).filter(Boolean)
             deepTouch(currentCharacterIds)
@@ -695,7 +687,6 @@ export async function saveDb() {
         changeTracker.botPreset = changeTracker.botPreset || toSave.botPreset
         changeTracker.modules = changeTracker.modules || toSave.modules
         changeTracker.plugins = changeTracker.plugins || toSave.plugins
-        changeTracker.pluginCustomStorage = changeTracker.pluginCustomStorage || toSave.pluginCustomStorage
         changeTracker.root = changeTracker.root || toSave.root
     }
 

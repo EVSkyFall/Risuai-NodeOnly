@@ -1122,3 +1122,38 @@ describe('fast-path — per-module granularity', () => {
         expect(liveHash).toBe(freshHash)
     })
 })
+
+// ──────────────────────────────────────────────────────────────────────────
+// pluginCustomStorage is excluded from the patch protocol: plugin values live
+// in the server kv (pluginStorageStore) and the DB field is always {} on the
+// server. The client must neither diff the key nor hash anything but {}.
+// ──────────────────────────────────────────────────────────────────────────
+
+const { calculateHash } = await import('./risuSave')
+
+describe('RisuSavePatcher — pluginCustomStorage excluded', () => {
+    test('non-empty pluginCustomStorage emits no ops and hashes as {}', async () => {
+        const base = { characters: [], botPresets: [], modules: [], foo: 1, pluginCustomStorage: { big: 'x'.repeat(1000) } }
+        const patcher = new RisuSavePatcher()
+        await patcher.init(base)
+
+        const serverDb = { ...base, pluginCustomStorage: {} }
+        expect(patcher.hash()).toBe((calculateHash(serverDb) >>> 0).toString(16))
+
+        const changed = { ...base, pluginCustomStorage: { other: 'y', big: 'z' } }
+        const { patch, expectedHash } = await patcher.set(changed, { ...emptyToSave(), root: true })
+        expect(patch.filter((p: any) => p.path.startsWith('/pluginCustomStorage'))).toEqual([])
+        expect(expectedHash).toBe((calculateHash(serverDb) >>> 0).toString(16))
+        // Baseline still pinned to {} for the next save.
+        expect(patcher.hash()).toBe((calculateHash(serverDb) >>> 0).toString(16))
+    })
+
+    test('deleting the key from the live db emits no remove op', async () => {
+        const base = { characters: [], botPresets: [], modules: [], pluginCustomStorage: {} }
+        const patcher = new RisuSavePatcher()
+        await patcher.init(base)
+        const { characters, botPresets, modules } = base
+        const { patch } = await patcher.set({ characters, botPresets, modules }, { ...emptyToSave(), root: true })
+        expect(patch).toEqual([])
+    })
+})

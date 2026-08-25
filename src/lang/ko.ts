@@ -2035,6 +2035,7 @@ export const languageKorean = {
   pluginStorageRefresh: "새로고침",
   pluginStorageEmpty: "항목이 없습니다.",
   pluginStorageLoadError: "저장소를 불러올 수 없습니다.",
+  pluginStorageNotLoaded: "열면 로드",
   pluginStorageSave: "저장",
   pluginStorageFormatJson: "JSON 정렬",
   pluginStorageMetaType: "타입",

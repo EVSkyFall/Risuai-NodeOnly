@@ -887,6 +887,14 @@ export class RisuSavePatcher {
                 this.hashBlocks[key] = calculateHash(this.lastSyncedDb[key]);
             }
         }
+        // Plugin values live in the server kv (pluginStorageStore); the DB
+        // field is always {} on the server after its boot migration. Pin the
+        // baseline to {} so hash() matches the server's calculateHash(db) and
+        // set() never diffs (or copies) whatever a stale client object holds.
+        if (Object.hasOwn(this.lastSyncedDb, 'pluginCustomStorage')) {
+            this.lastSyncedDb.pluginCustomStorage = {};
+            this.hashBlocks['pluginCustomStorage'] = calculateHash({});
+        }
 
         for (let i = 0; i < this.lastSyncedDb.characters.length; i++) {
             const character = this.lastSyncedDb.characters[i];
@@ -955,7 +963,13 @@ export class RisuSavePatcher {
         // (see init()) so normalize-affected data always falls to the full path.
         const nextRoot: any = {}
         const removedRootKeys = new Set(Object.keys(lastRoot))
+        // Excluded from the diff entirely (see init()): never emit ops for it.
+        if (Object.hasOwn(lastRoot, 'pluginCustomStorage')) {
+            removedRootKeys.delete('pluginCustomStorage')
+            nextRoot.pluginCustomStorage = lastRoot.pluginCustomStorage
+        }
         for (const key of Object.keys(curRoot)) {
+            if (key === 'pluginCustomStorage') continue
             // An own '__proto__' key can't round-trip through JSON Patch — the
             // server's applyPatch rejects any op touching it (prototype-pollution
             // guard), failing every save. The old whole-root normalizeJSON

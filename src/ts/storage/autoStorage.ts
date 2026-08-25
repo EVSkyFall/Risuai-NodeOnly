@@ -84,6 +84,9 @@ export class AutoStorage{
     async getItems(keys: string[]) { return this.realStorage.getItems(keys) }
     async setItems(entries: {key: string, value: Uint8Array}[]) { return this.realStorage.setItems(entries) }
 
+    // ── Plugin storage (server kv, per key) ───────────────────────────────────
+    async getPluginStorageIndex() { await this.Init(); return this.realStorage.getPluginStorageIndex() }
+
     // ── Server-side backup ─────────────────────────────────────────────────────
     async saveServerBackup(onProgress?: (current: number, total: number, bytes: number, totalBytes: number) => void) { await this.Init(); return this.realStorage.saveServerBackup(onProgress) }
     async listServerBackups() { await this.Init(); return this.realStorage.listServerBackups() }

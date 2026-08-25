@@ -1874,6 +1874,7 @@ export const languageEnglish = {
     pluginStorageRefresh: "Refresh",
     pluginStorageEmpty: "No entries.",
     pluginStorageLoadError: "Failed to load storage.",
+    pluginStorageNotLoaded: "loads on open",
     pluginStorageSave: "Save",
     pluginStorageFormatJson: "Format JSON",
     pluginStorageMetaType: "Type",

@@ -108,6 +108,11 @@ export interface ExportBackupOptions {
 }
 
 /** Size breakdown backing the settings-only confirm dialog. */
+export interface PluginStorageIndex {
+    entries: { key: string, size: number }[]
+    migrated: boolean
+}
+
 export interface SettingsBackupEstimate {
     dbBytes: number
     baseAssets: { count: number, bytes: number }
@@ -638,6 +643,13 @@ export class NodeStorage{
         const da = await this.authFetch(url)
         if (da.status < 200 || da.status >= 300) throw `backup export error: ${da.status}`
         return da
+    }
+
+    // Key names + sizes only; values stay on the server until read per key.
+    async getPluginStorageIndex(): Promise<PluginStorageIndex> {
+        const da = await this.authFetch('/api/plugin-storage/index', { method: 'GET' })
+        if (da.status < 200 || da.status >= 300) throw await this.storageRequestError('pluginStorageIndex', da)
+        return await da.json()
     }
 
     async settingsBackupEstimate(): Promise<SettingsBackupEstimate> {

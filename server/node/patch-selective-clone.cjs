@@ -1,8 +1,6 @@
 'use strict';
 
-function decodePointerSegment(segment) {
-    return segment.replace(/~1/g, '/').replace(/~0/g, '~');
-}
+const { decodePointerSegment } = require('./patch-hash-cache.cjs');
 
 function collectPatchTopLevelKeys(patch) {
     const keys = new Set();

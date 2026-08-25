@@ -3,6 +3,7 @@ import { SandboxHost } from "./factory";
 import { getDatabase, normalizeChat } from "src/ts/storage/database.svelte";
 import { SafeLocalPluginStorage, tagWhitelist } from "../pluginSafeClass";
 import { recordOwner, removeOwner, clearOwners } from "../pluginStorageMeta";
+import * as pluginStorageStore from "../pluginStorageStore";
 import DOMPurify from 'dompurify';
 import { additionalChatMenu, additionalFloatingActionButtons, additionalHamburgerMenu, additionalSettingsMenu, bodyIntercepterStore, chatPanelStore, DBState, selectedCharID, type MenuDef } from "src/ts/stores.svelte";
 import { v4 } from "uuid";
@@ -1372,24 +1373,34 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             
             return v;
         },
-        _getPluginStorage: oldApis.pluginStorage.getItem,
-        // Wrapped (not aliased) so we can record the originating plugin into the
-        // sidecar meta map. The value write is unchanged; reads stay aliased.
-        _setPluginStorage: (key: string, value: any) => {
-            oldApis.pluginStorage.setItem(key, value)
+        // Plugin storage is server-backed and read on demand (see
+        // pluginStorageStore). V3 calls are already async over postMessage, so
+        // awaiting here keeps the plugin-facing contract unchanged. Writes also
+        // record the originating plugin into the sidecar meta map.
+        _getPluginStorage: async (key: string) => {
+            return (await pluginStorageStore.getItem(key)) || null
+        },
+        _setPluginStorage: async (key: string, value: any) => {
+            try {
+                await pluginStorageStore.setItem(key, value)
+            } catch (e) {
+                // Plugins already handle `written === false` (LIBRA/Flashback).
+                console.error(`[RisuAI Plugin: ${plugin.name}] pluginStorage.setItem("${key}") failed`, e)
+                return false
+            }
             recordOwner('save', key, plugin.name)
         },
-        _removePluginStorage: (key: string) => {
-            oldApis.pluginStorage.removeItem(key)
+        _removePluginStorage: async (key: string) => {
+            await pluginStorageStore.removeItem(key)
             removeOwner('save', key)
         },
-        _clearPluginStorage: () => {
-            oldApis.pluginStorage.clear()
+        _clearPluginStorage: async () => {
+            await pluginStorageStore.clear()
             clearOwners('save')
         },
-        _keyPluginStorage: oldApis.pluginStorage.key,
-        _keysPluginStorage: oldApis.pluginStorage.keys,
-        _lengthPluginStorage: oldApis.pluginStorage.length,
+        _keyPluginStorage: pluginStorageStore.key,
+        _keysPluginStorage: pluginStorageStore.keys,
+        _lengthPluginStorage: pluginStorageStore.length,
         _getSafeLocalStorage: oldApis.safeLocalStorage.getItem,
         _setSafeLocalStorage: (key: string, value: string) => {
             oldApis.safeLocalStorage.setItem(key, value)

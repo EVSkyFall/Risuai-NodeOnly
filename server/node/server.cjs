@@ -33,8 +33,9 @@ const {
 const { createRequestLogs } = require('./request-logs.cjs');
 const { applyPatch } = require('fast-json-patch');
 const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, normalizeForwardHeaders, hasRemoteBlocks } = require('./utils.cjs');
-const { createPatchHashCache } = require('./patch-hash-cache.cjs');
+const { createPatchHashCache, decodePointerSegment } = require('./patch-hash-cache.cjs');
 const { clonePatchSnapshot } = require('./patch-selective-clone.cjs');
+const pluginStorage = require('./plugin-storage-store.cjs');
 const { spawn, execSync } = require('child_process');
 const os = require('os');
 const { Readable, Transform } = require('stream');
@@ -170,10 +171,12 @@ function trimSnapshotsToLimits() {
     // Size each snapshot by its marginal disk cost (chunks not shared with the
     // live blob), not its logical size — chunked snapshots share chunks, so a
     // logical measure would over-trim ones that cost almost nothing on disk.
-    const entries = kvList(DB_BACKUP_PREFIX)
+    const entries = listSnapshotKeys()
         .map((key) => {
             const tsRaw = parseInt(key.slice(DB_BACKUP_PREFIX.length, -4), 10);
-            return { key, size: snapshotFootprint(key), ts: Number.isFinite(tsRaw) ? tsRaw : 0 };
+            // Plugin bytes are marginal too: blobs only this snapshot references
+            // (see plugin-storage-store.cjs snapshotBytes).
+            return { key, size: snapshotFootprint(key) + snapshotPluginBytes(key), ts: Number.isFinite(tsRaw) ? tsRaw : 0 };
         })
         .sort((a, b) => b.ts - a.ts);
 
@@ -190,8 +193,39 @@ function trimSnapshotsToLimits() {
             toDelete.push(e.key);
         }
     }
-    for (const key of toDelete) kvDel(key);
+    for (const key of toDelete) deleteSnapshot(key);
     return { kept: entries.length - toDelete.length, removed: toDelete.length };
+}
+
+// ── Snapshot ↔ plugin storage ───────────────────────────────────────────────
+// The blob under database/dbbackup-* holds an empty pluginCustomStorage once
+// the split has run, so every snapshot also carries a content-addressed map
+// of the plugin-storage/ rows (see plugin-storage-store.cjs snapshotTo).
+// These helpers keep the two halves created, sized, deleted and restored
+// together. snapshotPluginBytes is the marginal cost (blobs only that
+// snapshot references + its map row); dropping a snapshot GCs its unique
+// blobs in the same transaction.
+// Only the exact `database/dbbackup-<digits>.bin` shape names a snapshot. A
+// looser check (prefix + strip 4 chars) let `dbbackup-1234xxxx` map to plugin
+// id `1234` and GC another snapshot's blobs while its DB blob stayed behind.
+function isSnapshotKey(key) {
+    return typeof key === 'string' && DB_BACKUP_KEY_RE.test(key);
+}
+
+function snapshotPluginId(key) {
+    const m = typeof key === 'string' ? DB_BACKUP_KEY_RE.exec(key) : null;
+    if (!m) throw new Error(`Not a snapshot key: ${key}`);
+    return m[1];
+}
+
+function snapshotPluginBytes(key) {
+    return pluginStorage.snapshotBytes(snapshotPluginId(key));
+}
+
+function deleteSnapshot(key) {
+    const id = snapshotPluginId(key);
+    kvDel(key);
+    pluginStorage.dropSnapshot(id);
 }
 
 // Current snapshot count + two totals:
@@ -201,25 +235,38 @@ function trimSnapshotsToLimits() {
 //   logicalBytes — sum of each snapshot's full logical size (kvSize), i.e. what
 //                  the snapshots would cost WITHOUT dedup. Drives the "saved by
 //                  deduplication" figure; never used for trimming.
+function listSnapshotKeys() {
+    return kvList(DB_BACKUP_PREFIX).filter(isSnapshotKey);
+}
+
 function snapshotUsage() {
-    const keys = kvList(DB_BACKUP_PREFIX);
+    const keys = listSnapshotKeys();
     let bytes = 0, logicalBytes = 0;
     for (const k of keys) {
-        bytes += snapshotFootprint(k);
-        logicalBytes += (kvSize(k) || 0);
+        const id = snapshotPluginId(k);
+        bytes += snapshotFootprint(k) + pluginStorage.snapshotBytes(id);
+        logicalBytes += (kvSize(k) || 0) + pluginStorage.snapshotLogicalBytes(id);
     }
     return { count: keys.length, bytes, logicalBytes };
 }
 
-function createBackupAndRotate() {
+// `force` skips the cooldown — used before one-way migrations, where a
+// snapshot of the pre-migration blob is the only rollback path.
+function createBackupAndRotate({ force = false } = {}) {
     const now = Date.now();
-    if (lastBackupTime && now - lastBackupTime < BACKUP_INTERVAL_MS) {
+    if (!force && lastBackupTime && now - lastBackupTime < BACKUP_INTERVAL_MS) {
         return;
     }
-    lastBackupTime = now;
 
     const backupKey = `${DB_BACKUP_PREFIX}${(now / 100).toFixed()}.bin`;
-    kvCopyValue('database/database.bin', backupKey);
+    // Blob + plugin rows land atomically so a snapshot never exists half-made.
+    sqliteDb.transaction(() => {
+        kvCopyValue('database/database.bin', backupKey);
+        pluginStorage.snapshotTo(snapshotPluginId(backupKey));
+    })();
+    // Advance the cooldown only once the snapshot is committed: a throw above
+    // must not suppress the next attempt for the whole interval.
+    lastBackupTime = now;
     trimSnapshotsToLimits();
 }
 
@@ -240,6 +287,57 @@ async function flushPendingDb() {
         }
         createBackupAndRotate();
     }
+}
+
+// ── /api/patch × plugin storage ─────────────────────────────────────────────
+// During the mixed old/new client window, an older client still patches
+// `/pluginCustomStorage/<key>` in database.bin. Applying those to dbCache
+// would land them in the blob, where the next cold decode discards them
+// (kv-wins re-migration). So direct-child add/replace/remove ops are routed
+// to the kv store and stripped from the DB patch; anything else touching the
+// subtree (deeper paths, the field itself, move/copy/test) is rejected so
+// the client falls back to a full write, which splits DB-wins.
+const PLUGIN_STORAGE_POINTER = '/pluginCustomStorage';
+const PLUGIN_STORAGE_KV_OPS = new Set(['add', 'replace', 'remove']);
+
+function partitionPluginStorageOps(patch) {
+    const kvOps = [];
+    const rejected = [];
+    const rest = [];
+    for (const op of Array.isArray(patch) ? patch : []) {
+        const path = typeof op?.path === 'string' ? op.path : '';
+        const from = typeof op?.from === 'string' ? op.from : '';
+        const inSubtree = (p) => p === PLUGIN_STORAGE_POINTER || p.startsWith(`${PLUGIN_STORAGE_POINTER}/`);
+        if (!inSubtree(path) && !inSubtree(from)) {
+            rest.push(op);
+            continue;
+        }
+        const tail = path.slice(PLUGIN_STORAGE_POINTER.length + 1);
+        const directChild = path.startsWith(`${PLUGIN_STORAGE_POINTER}/`) && !tail.includes('/');
+        if (directChild && PLUGIN_STORAGE_KV_OPS.has(op.op) && !from) {
+            kvOps.push({ op: op.op, key: decodePointerSegment(tail), value: op.value });
+        } else {
+            rejected.push(op);
+        }
+    }
+    return { kvOps, rejected, rest };
+}
+
+// Cold-load database.bin into dbCache (stripped) + fullChatStore. Every
+// caller must run this inside queueStorageOperation: /api/read used to decode
+// outside the queue, so a concurrent /api/patch could cold-load, apply and
+// cache first, then be overwritten by the read's older snapshot — losing an
+// acknowledged patch on the next persist. Re-checks the cache inside the
+// queue so a load that already happened while waiting is not repeated.
+// Returns false when there is no blob on disk.
+async function loadDbCacheIfMissing({ createBackup = false } = {}) {
+    if (dbCache[DB_HEX_KEY]) return true;
+    const raw = kvGet('database/database.bin');
+    if (!raw) return false;
+    const dbObj = await decodeDatabaseWithPersistentChatIds(raw, { createBackup });
+    initChatStore(dbObj);
+    dbCache[DB_HEX_KEY] = normalizeJSON(stripChatsFromDb(dbObj));
+    return true;
 }
 
 function invalidateDbCache() {
@@ -323,8 +421,44 @@ async function decodeDatabaseWithPersistentChatIds(raw, options = {}) {
         }
     }
 
+    // One-time move of pluginCustomStorage into kv (plugin-storage/*). Runs on
+    // every cold decode (boot, /api/read, /api/patch, import, snapshot restore)
+    // so a blob written by an older build or upstream is split on first load.
+    // Throws leave dbObj and the blob untouched; the next load retries.
+    // Not on the migrationResult failure path: a failed migration keeps the
+    // data in the blob, which is still a fully working state.
+    // kvWinsOnRemigration: if the marker already exists, the blob still
+    // holding data means the emptied blob never persisted; kv has since been
+    // the live copy, so it must not be clobbered (see store comment).
+    let pluginSplit = false;
+    try {
+        const pluginMigration = pluginStorage.migrateFromDb(dbObj, {
+            createSnapshot: () => createBackupAndRotate({ force: true }),
+            kvWinsOnRemigration: true,
+        });
+        if (pluginMigration.migrated) {
+            dbObj.pluginCustomStorage = {};
+            needsPersist = true;
+            pluginSplit = true;
+            logger.info(`[PluginStorage] Migrated ${pluginMigration.keys} key(s), ${(pluginMigration.bytes / 1024 / 1024).toFixed(1)}MB from database.bin to kv`);
+        }
+    } catch (e) {
+        logger.error('[PluginStorage] Migration failed; plugin data stays in database.bin', e);
+    }
+
     if (needsPersist) {
-        kvSet('database/database.bin', Buffer.from(encodeRisuSaveLegacy(dbObj)));
+        try {
+            kvSet('database/database.bin', Buffer.from(encodeRisuSaveLegacy(dbObj)));
+        } catch (e) {
+            // The split already committed to kv, so the decoded (emptied) DB is
+            // the correct live state even if the blob could not be rewritten
+            // (e.g. size limit). Serve it rather than failing the request;
+            // the next cold decode re-splits the stale blob kv-wins.
+            if (!pluginSplit) throw e;
+            logger.error('[PluginStorage] Blob persist after split failed; serving from kv', e);
+            recordPersistFailure(e, 'decode:plugin-split');
+            return dbObj;
+        }
         if (createBackup) {
             createBackupAndRotate();
         }
@@ -2311,6 +2445,7 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
     kvDelPrefix('inlay_meta/');
     kvDelPrefix('inlay_info/');
     kvDelPrefix('coldstorage/');
+    // NOTE: plugin-storage/ is NOT cleared here — see the final COMMIT below.
     // Composer drafts are session/device-local and not carried in the backup;
     // wipe stale ones so an old snapshot's chats don't resurrect later drafts.
     kvDelPrefix('drafts/');
@@ -2465,6 +2600,16 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
                 writeStagingSidecarSync(id, info);
             }
         }
+        // Backup = full replace, same as assets/. The .bin carries plugin
+        // storage inside database.risudat (export reassembles it there, never
+        // as kv entries), so decodeDatabaseWithPersistentChatIds below
+        // re-splits it. Cleared only in the FINAL transaction, after the
+        // stream validated: entries are committed in BATCH_SIZE batches, so a
+        // delete in the first batch would survive a later truncation failure
+        // and leave the old database.bin with its plugin rows gone. Dropping
+        // the marker with the prefix makes the re-split a first migration
+        // (DB-wins), which is what a full replace means.
+        kvDelPrefix(pluginStorage.PREFIX);
         sqliteDb.exec('COMMIT');
     } catch (error) {
         try { sqliteDb.exec('ROLLBACK'); } catch (_) {}
@@ -3409,14 +3554,13 @@ app.get('/api/read', async (req, res, next) => {
             // Strip chat payloads from database.bin — client gets stubs only
             if (key === 'database/database.bin') {
                 try {
-                    const dbObj = await decodeDatabaseWithPersistentChatIds(value, {
-                        createBackup: true,
-                    });
-                    initChatStore(dbObj);
-                    const stripped = normalizeJSON(stripChatsFromDb(dbObj));
-                    // Populate dbCache so patch endpoint uses the same data
-                    dbCache[filePath] = stripped;
-                    value = Buffer.from(encodeRisuSaveLegacy(stripped));
+                    // Cold load runs under the storage queue so it cannot
+                    // race a cold /api/patch (see loadDbCacheIfMissing). A
+                    // warm cache is served directly without queueing.
+                    if (!dbCache[filePath]) {
+                        await queueStorageOperation(() => loadDbCacheIfMissing({ createBackup: true }));
+                    }
+                    value = Buffer.from(encodeRisuSaveLegacy(dbCache[filePath]));
                 } catch (e) {
                     // Log the Error itself (not just e.message) so logger.*
                     // tags it and the Express middleware won't re-log after next().
@@ -3432,6 +3576,20 @@ app.get('/api/read', async (req, res, next) => {
             res.setHeader('Content-Type', 'application/octet-stream');
             res.send(value);
         }
+    } catch (error) {
+        next(error);
+    }
+});
+
+// Names + sizes of every plugin-storage key, no values. Backs the client's
+// synchronous keys()/length and the storage viewer. `migrated` is whether the
+// DB→kv split has ever run on this instance (marker present).
+app.get('/api/plugin-storage/index', async (req, res, next) => {
+    if(!await checkAuth(req, res)){
+        return;
+    }
+    try {
+        res.json({ entries: pluginStorage.list(), migrated: pluginStorage.isMigrated() });
     } catch (error) {
         next(error);
     }
@@ -3465,6 +3623,12 @@ app.get('/api/remove', async (req, res, next) => {
         }
         if (key.startsWith('inlay_info/')) {
             await fs.unlink(getInlaySidecarPath(key.slice('inlay_info/'.length))).catch(() => {});
+        }
+        // A DB snapshot owns a plugin-storage map row + blobs; a raw kvDel
+        // would orphan them (never GC'd, never counted).
+        if (isSnapshotKey(key)) {
+            deleteSnapshot(key);
+            return res.send({ success: true });
         }
         kvDel(key);
         res.send({ success: true });
@@ -3628,6 +3792,8 @@ app.post('/api/write', async (req, res, next) => {
             } else if (key === 'database/database.bin') {
                 // Client sends stubs-only DB — merge full chats from server before persisting
                 try {
+                    // eslint-disable-next-line no-var
+                    var persistedEtag;
                     const incomingDb = await decodeRisuSave(fileContent);
                     await ensureChatStore();
                     const fullDb = reassembleFullDb(incomingDb);
@@ -3655,10 +3821,33 @@ app.post('/api/write', async (req, res, next) => {
                         return;
                     }
 
+                    // A client that still ships a populated pluginCustomStorage
+                    // (older build, or one that never reloaded after the
+                    // split) is the only writer of that data — split it into
+                    // kv now, DB-wins, so the blob on disk never carries
+                    // plugin data. Without this the next cold decode would
+                    // re-migrate it over kv values written by newer clients.
+                    // A throw here rolls the kv rows back and aborts the
+                    // write below, leaving disk untouched.
+                    const pluginMigration = pluginStorage.migrateFromDb(fullDb, {
+                        createSnapshot: () => createBackupAndRotate({ force: true }),
+                    });
+                    if (pluginMigration.migrated) {
+                        // fullDb is a fresh decode, not the dbCache root — no
+                        // hash-cache aliasing concern; dbCache is dropped below.
+                        fullDb.pluginCustomStorage = {};
+                        logger.info(`[PluginStorage] Split ${pluginMigration.keys} key(s) from a full database.bin write into kv`);
+                    }
+
                     const mergedContent = Buffer.from(encodeRisuSaveLegacy(fullDb));
                     // Re-init chat store from merged result
                     initChatStore(fullDb);
                     kvSet(key, mergedContent);
+                    // ETag of what the next /api/read will serve: the
+                    // PERSISTED DB, stripped. Not the request bytes — the
+                    // split above may have emptied pluginCustomStorage, so
+                    // the client's copy and the served copy differ.
+                    persistedEtag = computeDatabaseEtagFromObject(normalizeJSON(stripChatsFromDb(fullDb)));
                 } catch (e) {
                     logger.error('[Write] Failed to merge chats into database.bin:', e.message);
                     // Do NOT write stubs-only to disk — that would permanently
@@ -3677,8 +3866,7 @@ app.post('/api/write', async (req, res, next) => {
                     clearTimeout(saveTimers[DB_HEX_KEY]);
                     delete saveTimers[DB_HEX_KEY];
                 }
-                // ETag based on stripped version (what client sees)
-                dbEtag = computeBufferEtag(fileContent);
+                dbEtag = persistedEtag;
                 createBackupAndRotate();
             }
 
@@ -3721,7 +3909,7 @@ app.post('/api/patch', async (req, res, next) => {
     }
     if (!checkActiveSession(req, res)) return;
     const filePath = req.headers['file-path'];
-    const patch = req.body.patch;
+    let patch = req.body.patch;
     const expectedHash = req.body.expectedHash;
 
     if (!filePath || !patch || !expectedHash) {
@@ -3743,19 +3931,13 @@ app.post('/api/patch', async (req, res, next) => {
             // Load database into memory if not already cached
             // For database.bin, cache holds the STRIPPED version (stubs only)
             if (!dbCache[filePath]) {
-                const fileContent = kvGet(decodedKey);
-                if (fileContent) {
-                    const decoded = decodedKey === 'database/database.bin'
-                        ? await decodeDatabaseWithPersistentChatIds(fileContent)
-                        : normalizeJSON(await decodeRisuSave(fileContent));
-                    if (decodedKey === 'database/database.bin') {
-                        initChatStore(decoded);
-                        dbCache[filePath] = normalizeJSON(stripChatsFromDb(decoded));
-                    } else {
-                        dbCache[filePath] = decoded;
-                    }
+                if (decodedKey === 'database/database.bin') {
+                    if (!(await loadDbCacheIfMissing())) dbCache[filePath] = {};
                 } else {
-                    dbCache[filePath] = {};
+                    const fileContent = kvGet(decodedKey);
+                    dbCache[filePath] = fileContent
+                        ? normalizeJSON(await decodeRisuSave(fileContent))
+                        : {};
                 }
             }
 
@@ -3792,6 +3974,29 @@ app.post('/api/patch', async (req, res, next) => {
                 return;
             }
 
+            // Plugin-storage ops (old clients): see partitionPluginStorageOps.
+            let pluginKvOps = [];
+            if (decodedKey === 'database/database.bin') {
+                const partition = partitionPluginStorageOps(patch);
+                if (partition.rejected.length > 0) {
+                    const sample = partition.rejected.slice(0, 5).map(v => `${v.op} ${v.path}`).join(', ');
+                    logger.warn(`[Patch] Rejected ${partition.rejected.length} plugin-storage op(s) (client must full-write): ${sample}`);
+                    let currentEtag;
+                    try {
+                        currentEtag = computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(dbCache[filePath])));
+                        dbEtag = currentEtag;
+                    } catch {}
+                    res.status(409).send({
+                        error: 'Patch rejected: unsupported op on pluginCustomStorage',
+                        code: 'PLUGIN_STORAGE_OPS_REJECTED',
+                        currentEtag,
+                    });
+                    return;
+                }
+                pluginKvOps = partition.kvOps;
+                patch = partition.rest;
+            }
+
             patchStage = 'hash';
             const serverHash = decodedKey === 'database/database.bin'
                 ? databasePatchHashCache.hash(dbCache[filePath]).toString(16)
@@ -3814,12 +4019,41 @@ app.post('/api/patch', async (req, res, next) => {
                 return;
             }
 
+            // Ordering with the plugin kv ops (old clients): the DB patch is
+            // cloned/applied/validated FIRST and the kv ops are written only
+            // after it succeeded, so a patch whose DB part fails (bad op,
+            // non-object root) leaves kv untouched. The kv writes are single
+            // rows and not transactional with dbCache; a kv failure after the
+            // DB patch landed is the remaining non-atomic window — it is
+            // logged + recorded as a persist warning and the client's next
+            // full write re-splits.
+            const applyPluginKvOps = () => {
+                if (pluginKvOps.length === 0) return;
+                patchStage = 'plugin-storage';
+                try {
+                    for (const kvOp of pluginKvOps) {
+                        if (kvOp.op === 'remove') pluginStorage.remove(kvOp.key);
+                        else pluginStorage.set(kvOp.key, kvOp.value);
+                    }
+                } catch (kvErr) {
+                    logger.error('[Patch] Plugin-storage op failed after the DB patch was applied:', kvErr);
+                    recordPersistFailure(kvErr, 'patch:plugin-storage');
+                    throw kvErr;
+                }
+            };
+
             // Nothing to apply: the client already matches the server. Skip the
             // clone/apply/persist work and hand back the current revision.
+            // (Also the case when every op was a plugin-storage op — the DB
+            // root is unchanged, so hash cache and etag stay valid.)
             if (Array.isArray(patch) && patch.length === 0) {
+                applyPluginKvOps();
+                if (pluginKvOps.length > 0 && decodedKey === 'database/database.bin') {
+                    dbEtag = computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(dbCache[filePath])));
+                }
                 const emptyPayload = {
                     success: true,
-                    appliedOperations: 0,
+                    appliedOperations: pluginKvOps.length,
                     etag: decodedKey === 'database/database.bin' ? dbEtag : undefined,
                 };
                 const emptyWarning = currentPersistWarning();
@@ -3862,6 +4096,8 @@ app.post('/api/patch', async (req, res, next) => {
                 databasePatchHashCache.update(dbCache[filePath], next, patch);
             }
             dbCache[filePath] = next;
+            // DB patch is in; now the kv half (see ordering note above).
+            applyPluginKvOps();
 
             // Schedule save to KV (debounced) — merge full chats back for database.bin
             if (saveTimers[filePath]) {
@@ -3908,7 +4144,7 @@ app.post('/api/patch', async (req, res, next) => {
 
             const responsePayload = {
                 success: true,
-                appliedOperations: result.length,
+                appliedOperations: result.length + pluginKvOps.length,
                 etag: decodedKey === 'database/database.bin' ? dbEtag : undefined,
             };
             const persistWarning = currentPersistWarning();
@@ -4102,6 +4338,38 @@ async function buildSettingsOnlyPlan({ includeModuleAssets = true } = {}) {
     };
 }
 
+/**
+ * database.risudat bytes for a full export: the live blob with
+ * pluginCustomStorage re-embedded from plugin-storage/ kv so the .bin decodes
+ * to a complete DB in upstream RisuAI and in older NodeOnly builds.
+ *
+ * The blob is one msgpack document (encodeRisuSaveLegacy), not block-based,
+ * so there is no "replace one block" path: this decodes and re-encodes the
+ * whole DB and materializes every plugin value. Memory cost is roughly the
+ * decoded DB plus plugin storage twice (object + encoded buffer). Skipped
+ * entirely when kv holds no plugin keys, which keeps the raw-blob fast path
+ * for everyone else. Blob values win over kv on overlap — same rule as the
+ * migration, since a still-populated blob means a newer write.
+ */
+async function buildFullExportDbValue() {
+    const raw = kvGet('database/database.bin');
+    if (!raw) return null;
+    if (pluginStorage.list().length === 0) return raw;
+    const dbObj = await decodeRisuSave(raw);
+    const fromDb = dbObj.pluginCustomStorage;
+    const merged = pluginStorage.readAll();
+    if (fromDb && typeof fromDb === 'object') {
+        for (const key of Object.keys(fromDb)) {
+            Object.defineProperty(merged, key, {
+                value: Object.getOwnPropertyDescriptor(fromDb, key).value,
+                enumerable: true, writable: true, configurable: true,
+            });
+        }
+    }
+    dbObj.pluginCustomStorage = merged;
+    return Buffer.from(encodeRisuSaveLegacy(dbObj));
+}
+
 // Size breakdown for the settings-only confirm dialog. Kept separate from
 // /api/db/stats because it has to decode and re-encode the DB, which that
 // dashboard poll should not pay for on every load.
@@ -4152,6 +4420,11 @@ app.get('/api/backup/export', async (req, res, next) => {
             settingsDbValue = plan.dbValue;
             settingsAssetNames = plan.keepNames;
         }
+        // Full export ships plugin storage inside database.risudat (see
+        // buildFullExportDbValue) — never as plugin-storage/ kv entries, which
+        // would duplicate it. Settings-only keeps the trimmed blob's empty
+        // field: plugin data is chat-scoped and does not travel with settings.
+        const exportDbValue = settingsOnly ? settingsDbValue : await buildFullExportDbValue();
 
         // Inlay images only ever attach to chat messages, so a settings-only
         // export skips those namespaces for the same reason upstream does.
@@ -4210,7 +4483,7 @@ app.get('/api/backup/export', async (req, res, next) => {
             ...inlayEntries,
             ...sidecarEntries.filter(Boolean),
         ].sort((a, b) => a.sortKey.localeCompare(b.sortKey));
-        const dbSize = settingsOnly ? settingsDbValue.length : kvSize('database/database.bin');
+        const dbSize = exportDbValue ? exportDbValue.length : 0;
         const totalBytes = namespacedEntries.reduce((sum, entry) => {
             return sum + 8 + Buffer.byteLength(entry.backupName, 'utf-8') + entry.size;
         }, 0) + (dbSize ? 8 + Buffer.byteLength('database.risudat', 'utf-8') + dbSize : 0);
@@ -4259,7 +4532,7 @@ app.get('/api/backup/export', async (req, res, next) => {
         }
 
         if (!closed && dbSize) {
-            const dbValue = settingsOnly ? settingsDbValue : kvGet('database/database.bin');
+            const dbValue = exportDbValue;
             if (dbValue) {
                 const ok = res.write(encodeBackupEntry('database.risudat', dbValue));
                 if (!ok) {
@@ -4494,7 +4767,9 @@ app.post('/api/backup/server/save', async (req, res, next) => {
                         }
                     }
                     if (closed) throw new Error('Client disconnected during backup save');
-                    const dbValue = kvGet('database/database.bin');
+                    // Same reassembly as /api/backup/export — plugin storage
+                    // rides inside database.risudat, not as kv entries.
+                    const dbValue = await buildFullExportDbValue();
                     if (dbValue) {
                         const ok = writeStream.write(encodeBackupEntry('database.risudat', dbValue));
                         if (!ok) await new Promise(r => writeStream.once('drain', r));
@@ -4980,6 +5255,12 @@ function clearExistingData() {
     // (importBackupFromSource) already clears these; the save-folder path did not,
     // leaving orphans that no dashboard or Optimize pass ever reclaims.
     kvDelPrefix('coldstorage/');
+    // Plugin storage is a full replace too: the incoming save folder either
+    // carries its own plugin-storage/ rows (INSERT OR REPLACE lands them
+    // after this delete, inside the same transaction) or has the data inside
+    // its database.bin, which the next cold decode re-splits. Runs inside the
+    // importer's transaction, so a failed import rolls this back with the DB.
+    kvDelPrefix(pluginStorage.PREFIX);
     // Clear remote-block migration marker — newly imported database.bin may
     // contain REMOTE blocks (it usually does, since save-folder imports
     // preserve upstream's split-character format) and we want the migration
@@ -5210,6 +5491,9 @@ app.post('/api/migrate/save-folder/cleanup/execute', async (req, res, next) => {
 
 const DB_BLOB_KEY = 'database/database.bin';
 const DB_BACKUP_PREFIX = 'database/dbbackup-';
+// createBackupAndRotate names snapshots `${DB_BACKUP_PREFIX}${digits}.bin`;
+// the digits double as the plugin-storage snapshot id.
+const DB_BACKUP_KEY_RE = /^database\/dbbackup-(\d+)\.bin$/;
 const ASSET_PREFIXES = ['assets/', 'remotes/', 'inlay/', 'inlay_thumb/', 'inlay_meta/', 'inlay_info/', 'coldstorage/'];
 const AUTO_SWEEP_GRACE_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -5235,7 +5519,9 @@ function extractAssetRefsFromText(value) {
 // can union it with buildUncleanableSet before deciding what is orphaned.
 function collectPluginStorageAssetRefs() {
     const set = new Set();
-    for (const key of kvList('cache/plugin-storage/')) {
+    // plugin-storage/ is the former db.pluginCustomStorage; the DB blob's
+    // field is now always empty, so it must be scanned here instead.
+    for (const key of [...kvList('cache/plugin-storage/'), ...kvList(pluginStorage.PREFIX)]) {
         try {
             const raw = kvGet(key);
             if (!raw) continue;
@@ -5470,6 +5756,8 @@ async function sumInlayFsBytes() {
 async function estimateServerBackupSize() {
     let total = 0;
     total += kvSize(DB_BLOB_KEY) || 0;
+    // Plugin storage is re-embedded into database.risudat on export.
+    for (const it of pluginStorage.list()) total += it.size;
     for (const it of kvListWithSizes('assets/')) total += it.size;
     for (const it of kvListWithSizes('inlay_meta/')) total += it.size;
     for (const e of listColdStorageBackupEntries()) total += e.size;
@@ -5537,7 +5825,7 @@ app.get('/api/db/stats', async (req, res, next) => {
         let backupTotal = 0;
         let backupOldest = null, backupNewest = null;
         for (const k of backupKeys) {
-            const sz = kvSize(k) || 0;
+            const sz = (kvSize(k) || 0) + snapshotPluginBytes(k);
             backupTotal += sz;
             const tsRaw = parseInt(k.slice(DB_BACKUP_PREFIX.length, -4), 10);
             if (Number.isFinite(tsRaw)) {
@@ -5960,7 +6248,7 @@ app.put('/api/db/snapshots/limits', async (req, res, next) => {
 app.get('/api/db/snapshots', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     try {
-        const out = kvList(DB_BACKUP_PREFIX).map((key) => {
+        const out = listSnapshotKeys().map((key) => {
             const tsRaw = parseInt(key.slice(DB_BACKUP_PREFIX.length, -4), 10);
             const ts = Number.isFinite(tsRaw) ? tsRaw * 100 : null;
             // Logical size — the full data this snapshot represents (the whole DB),
@@ -5969,7 +6257,7 @@ app.get('/api/db/snapshots', async (req, res, next) => {
             // (kvSize reassembles via the manifest; the marker's 13 bytes are not
             // what a user wants to see for a full backup.) Trimming still sizes by
             // snapshotFootprint in db.cjs, so this display change can't over-trim.
-            return { key, size: kvSize(key) || 0, timestamp: ts };
+            return { key, size: (kvSize(key) || 0) + snapshotPluginBytes(key), timestamp: ts };
         }).sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
         res.json({ snapshots: out });
     } catch (err) { next(err); }
@@ -5980,11 +6268,12 @@ app.delete('/api/db/snapshots', async (req, res, next) => {
     if (!checkActiveSession(req, res)) return;
     try {
         const key = typeof req.query?.key === 'string' ? req.query.key : '';
-        // Restrict to snapshot prefix — never let this endpoint touch other kv keys.
-        if (!key.startsWith(DB_BACKUP_PREFIX)) {
+        // Exact snapshot shape only — never let this endpoint touch other kv
+        // keys, nor derive a plugin snapshot id from a malformed name.
+        if (!isSnapshotKey(key)) {
             return res.status(400).json({ error: 'Invalid snapshot key' });
         }
-        kvDel(key);
+        deleteSnapshot(key);
         res.json({ ok: true });
     } catch (err) { next(err); }
 });
@@ -5998,7 +6287,7 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
     if (!checkActiveSession(req, res)) return;
     try {
         const key = typeof req.body?.key === 'string' ? req.body.key : '';
-        if (!key.startsWith(DB_BACKUP_PREFIX)) {
+        if (!isSnapshotKey(key)) {
             return res.status(400).json({ error: 'Invalid snapshot key' });
         }
         const blob = kvGet(key);
@@ -6010,7 +6299,13 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
             // /api/db/optimize. Without this, an in-flight save could land
             // after kvCopyValue and overwrite the restored snapshot.
             await flushPendingDb();
-            kvCopyValue(key, DB_BLOB_KEY);
+            // Blob and plugin rows come back together: the live plugin set is
+            // replaced by exactly the snapshot's (empty for a pre-split
+            // snapshot, whose data the decode below re-splits from the blob).
+            sqliteDb.transaction(() => {
+                kvCopyValue(key, DB_BLOB_KEY);
+                pluginStorage.restoreFrom(snapshotPluginId(key));
+            })();
             invalidateDbCache();
             // Snapshot may pre-date the remote-block migration. Clear the marker
             // so migrateRemoteBlocksIfNeeded re-evaluates against the restored
