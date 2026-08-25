@@ -20,7 +20,6 @@ import {
     type AssetManifestDescriptor,
     type AssetManifestOperation,
     type AssetManifestTuple,
-    type PluginStorageManifestDescriptor,
 } from "./storage/nodeStorage";
 import { supportsPatchSync } from "./platform";
 import { updateAnimationSpeed } from "./gui/animation";
@@ -52,120 +51,6 @@ function errorMessage(error: unknown): string {
     }
 }
 
-const loadedPluginStorageKeys = new Set<string>()
-const loadedPluginStorageOwners = new Set<string>()
-let knownPluginStorageKeys = new Set<string>()
-let pluginStorageIndexSnapshotId = ''
-let clearAllPluginStorageOnNextSync = false
-let pluginStorageDirtyBeforeSaveLoop = false
-
-/**
- * Load only save-bound state owned by plugins that are about to run. Disabled
- * plugin history remains in the immutable server snapshot and consumes no
- * browser heap. Legacy unowned keys are tiny and are loaded once for backwards
- * compatibility.
- */
-export async function hydratePluginStorageForOwners(owners: string[]): Promise<void> {
-    const db = getDatabase()
-    const manifest = db.pluginStorageManifest
-    if (!manifest?.id) return
-
-    if (pluginStorageIndexSnapshotId !== manifest.id) {
-        const index = await forageStorage.getPluginStorageManifestIndex(manifest)
-        knownPluginStorageKeys = new Set(index.map((entry) => entry.key))
-        pluginStorageIndexSnapshotId = manifest.id
-    }
-
-    const wantedOwners = [...new Set(owners.filter(Boolean))]
-        .filter((owner) => !loadedPluginStorageOwners.has(owner))
-    const includeUnowned = !loadedPluginStorageOwners.has('(legacy/unowned)')
-    if (wantedOwners.length === 0 && !includeUnowned) return
-
-    const loaded = await forageStorage.loadPluginStorageManifest(manifest, {
-        owners: wantedOwners,
-        includeUnowned,
-    })
-    db.pluginCustomStorage ??= {}
-    Object.assign(db.pluginCustomStorage, loaded.values)
-    for (const key of loaded.loadedKeys) loadedPluginStorageKeys.add(key)
-    for (const owner of wantedOwners) loadedPluginStorageOwners.add(owner)
-    if (includeUnowned) loadedPluginStorageOwners.add('(legacy/unowned)')
-}
-
-/** Load selected manifest keys for the storage viewer without hydrating peers. */
-export async function hydratePluginStorageKeys(keys: string[]): Promise<void> {
-    const db = getDatabase()
-    const manifest = db.pluginStorageManifest
-    if (!manifest?.id || keys.length === 0) return
-    const missing = [...new Set(keys)].filter((key) => !loadedPluginStorageKeys.has(key))
-    if (missing.length === 0) return
-    const loaded = await forageStorage.loadPluginStorageManifest(manifest, { keys: missing })
-    db.pluginCustomStorage ??= {}
-    Object.assign(db.pluginCustomStorage, loaded.values)
-    for (const key of loaded.loadedKeys) loadedPluginStorageKeys.add(key)
-}
-
-export async function listPluginStorageManifestEntries() {
-    const manifest = getDatabase().pluginStorageManifest
-    if (!manifest?.id) return []
-    return forageStorage.getPluginStorageManifestIndex(manifest)
-}
-
-export function markPluginStorageClearAll() {
-    clearAllPluginStorageOnNextSync = true
-}
-
-export function markPluginStorageKeysForSync(keys: string[]) {
-    for (const key of keys) loadedPluginStorageKeys.add(key)
-}
-
-/** Records writes made while plugins are booting, before saveDb installs effects. */
-export function markPluginStorageDirty() {
-    pluginStorageDirtyBeforeSaveLoop = true
-}
-
-async function syncLoadedPluginStorage(db: Database): Promise<PluginStorageManifestDescriptor | null> {
-    const manifest = db.pluginStorageManifest
-    if (!manifest?.id) return null
-    const current = db.pluginCustomStorage ?? {}
-    for (const key of Object.keys(current)) loadedPluginStorageKeys.add(key)
-    const keysToSync = clearAllPluginStorageOnNextSync
-        ? [...knownPluginStorageKeys]
-        : [...loadedPluginStorageKeys]
-    const values: Record<string, unknown> = {}
-    for (const key of keysToSync) {
-        if (Object.hasOwn(current, key)) values[key] = current[key]
-    }
-    let descriptor: PluginStorageManifestDescriptor
-    try {
-        descriptor = await forageStorage.syncPluginStorageManifest(manifest.id, values, keysToSync)
-    } catch (error) {
-        if (!(error instanceof ConflictError)) throw error
-        const current = (error as ConflictError & { current?: PluginStorageManifestDescriptor }).current
-            ?? await forageStorage.getLivePluginStorageManifest()
-        if (!current) throw error
-        Object.assign(manifest, current)
-        descriptor = await forageStorage.syncPluginStorageManifest(manifest.id, values, keysToSync)
-    }
-    db.pluginStorageManifest = descriptor
-    pluginStorageIndexSnapshotId = descriptor.id
-    for (const key of keysToSync) {
-        if (!Object.hasOwn(current, key)) {
-            loadedPluginStorageKeys.delete(key)
-            knownPluginStorageKeys.delete(key)
-        }
-    }
-    for (const key of Object.keys(values)) knownPluginStorageKeys.add(key)
-    clearAllPluginStorageOnNextSync = false
-    return descriptor
-}
-
-/** Shallow projection used by the Node sync encoder/patcher. */
-function databaseForServerSync(db: Database): Database {
-    if (!db.pluginStorageManifest) return db
-    return { ...db, pluginCustomStorage: {} }
-}
-
 export async function loadAssetManifestItems(manifest?: AssetManifestDescriptor): Promise<AssetManifestTuple[]> {
     if (!manifest) return []
     const items = await forageStorage.getAllAssetManifestItems(manifest)
@@ -176,6 +61,7 @@ export async function loadAssetManifestItems(manifest?: AssetManifestDescriptor)
 export async function resolveAssetManifestNames(
     manifests: AssetManifestDescriptor[],
     names: string[],
+    fuzzyManifestIds: ReadonlySet<string> = new Set(),
 ): Promise<Record<string, string>> {
     const owners = manifests
         .filter((manifest) => manifest?.id)
@@ -183,8 +69,25 @@ export async function resolveAssetManifestNames(
             manifestId: manifest.id,
             kind: manifest.ownerKind,
             ownerId: manifest.ownerId,
+            fuzzy: fuzzyManifestIds.has(manifest.id),
         }))
     return forageStorage.resolveAssetManifestNames(owners, names, getDatabase().assetMaxDifference ?? 4)
+}
+
+export async function resolvePrioritizedAssetManifestNames(
+    characterManifest: AssetManifestDescriptor | undefined,
+    moduleManifests: AssetManifestDescriptor[],
+    names: string[],
+): Promise<{ character: Record<string, string>; modules: Record<string, string> }> {
+    const uniqueNames = [...new Set(names.map((name) => name.toLocaleLowerCase()))]
+    const character = characterManifest
+        ? await resolveAssetManifestNames([characterManifest], uniqueNames, new Set([characterManifest.id]))
+        : {}
+    const remaining = uniqueNames.filter((name) => !Object.hasOwn(character, name))
+    const modules = moduleManifests.length > 0 && remaining.length > 0
+        ? await resolveAssetManifestNames(moduleManifests, remaining)
+        : {}
+    return { character, modules }
 }
 
 export async function editAssetManifest(
@@ -195,23 +98,60 @@ export async function editAssetManifest(
         throw new Error('Asset manifest owner information is missing')
     }
     try {
-        return await forageStorage.editAssetManifest(
+        const descriptor = await forageStorage.editAssetManifest(
             manifest.ownerKind,
             manifest.ownerId,
             manifest.id,
             operations,
         )
+        activeSavePatcher?.updateAssetManifestBaseline(manifest.ownerKind, manifest.ownerId, descriptor)
+        return descriptor
     } catch (error) {
         if (!(error instanceof ConflictError)) throw error
         const current = (error as ConflictError & { current?: AssetManifestDescriptor }).current
             ?? await forageStorage.getAssetManifestOwner(manifest.ownerKind, manifest.ownerId)
-        if (current) Object.assign(manifest, current)
+        if (current) {
+            const enriched = { ...current, ownerKind: manifest.ownerKind, ownerId: manifest.ownerId }
+            Object.assign(manifest, enriched)
+            activeSavePatcher?.updateAssetManifestBaseline(manifest.ownerKind, manifest.ownerId, enriched)
+        }
         // Asset operations are positional and not generally idempotent. Do not
         // replay automatically: a lost response followed by a 409 could append
         // twice or remove the next tuple. The refreshed descriptor lets the UI
         // reload safely before the user retries the edit.
         throw error
     }
+}
+
+export async function appendAssetManifestItems(
+    manifest: AssetManifestDescriptor,
+    items: AssetManifestTuple[],
+): Promise<AssetManifestDescriptor> {
+    let current = manifest
+    for (let offset = 0; offset < items.length; offset += 1000) {
+        current = await editAssetManifest(
+            current,
+            items.slice(offset, offset + 1000).map((item) => ({ type: 'append' as const, item })),
+        )
+    }
+    return current
+}
+
+export function isAssetManifestConflict(error: unknown): error is ConflictError {
+    return error instanceof ConflictError
+}
+
+export async function recoverAssetManifestConflict(
+    error: unknown,
+    reload: () => Promise<void>,
+): Promise<boolean> {
+    if (!isAssetManifestConflict(error)) return false
+    notifyError(language.errors.assetManifestConflictTitle, {
+        description: language.errors.assetManifestConflictDesc,
+        source: 'asset-manifest-conflict',
+    })
+    await reload()
+    return true
 }
 
 export async function downloadFile(name: string, dat: Uint8Array | ArrayBuffer | string) {
@@ -422,6 +362,7 @@ let requestImmediateSaveImpl: ((options?: {
     forceFullWrite?: boolean
 }) => Promise<void> | void) = () => {}
 let patchSyncBaseline: Database | null = null
+let activeSavePatcher: RisuSavePatcher | null = null
 
 // Surfaces server-side persist failures (Stage 1 visibility — see issues.md).
 // The same failure is re-attached on every patch response until cleared, so we
@@ -535,8 +476,7 @@ export function setPatchSyncBaseline(data: Database | null) {
 }
 
 export async function saveDb() {
-    let changed = pluginStorageDirtyBeforeSaveLoop
-    pluginStorageDirtyBeforeSaveLoop = false
+    let changed = false
     let gotChannel = false
     const sessionID = v4()
     let saveInFlight: Promise<void> | null = null
@@ -624,18 +564,21 @@ export async function saveDb() {
         botPreset: false,
         modules: false,
         plugins: false,
-        pluginCustomStorage: changed
+        pluginCustomStorage: false
     }
 
     let encoder = new RisuSaveEncoder()
-    await encoder.init(databaseForServerSync(getDatabase()), {
+    await encoder.init(getDatabase(), {
         compression: false
     })
 
     let patcher = new RisuSavePatcher()
     if (supportsPatchSync) {
-        await patcher.init(databaseForServerSync(patchSyncBaseline ?? getDatabase()))
+        await patcher.init(patchSyncBaseline ?? getDatabase())
+        activeSavePatcher = patcher
         patchSyncBaseline = null
+    } else {
+        activeSavePatcher = null
     }
 
     function hasTrackedChanges(toSave: toSaveType) {
@@ -972,21 +915,17 @@ export async function saveDb() {
                 }
             }
             mergedDb.characters = mergedCharacters
-            // The server database contains only the plugin-storage descriptor.
-            // Preserve the browser's already-hydrated working set across a
-            // conflict rebase; it is synced through its dedicated endpoint.
-            mergedDb.pluginCustomStorage = localDb.pluginCustomStorage
-            mergedDb.pluginStorageManifest = localDb.pluginStorageManifest
             const mergedBaseline = safeStructuredClone(mergedDb) as Database
             setDatabase(mergedDb)
 
             encoder = new RisuSaveEncoder()
-            await encoder.init(databaseForServerSync(getDatabase()), {
+            await encoder.init(getDatabase(), {
                 compression: false
             })
             if (supportsPatchSync) {
                 patcher = new RisuSavePatcher()
-                await patcher.init(databaseForServerSync(mergedBaseline))
+                await patcher.init(mergedBaseline)
+                activeSavePatcher = patcher
             }
         }
         requeueTrackedChanges(toSave)
@@ -1038,15 +977,8 @@ export async function saveDb() {
             )
         }
 
-        if (toSave.pluginCustomStorage && db.pluginStorageManifest) {
-            await syncLoadedPluginStorage(db)
-            // The new immutable snapshot descriptor lives in the ROOT block.
-            toSave.root = true
-        }
-
         // ── database.bin: exclude chat payload (stubs only via encoder) ──
-        const syncDb = databaseForServerSync(db)
-        await encoder.set(syncDb, safeStructuredClone(toSave))
+        await encoder.set(db, safeStructuredClone(toSave))
         const encoded = encoder.encode()
         if (!encoded) {
             await sleep(1000)
@@ -1058,7 +990,7 @@ export async function saveDb() {
         let newEtag: string | undefined
 
         if (supportsPatchSync && !options?.forceFullWrite) {
-            const patchData = await patcher.set(syncDb, safeStructuredClone(toSave))
+            const patchData = await patcher.set(db, safeStructuredClone(toSave))
             // Refuse to send patches that would corrupt server-side lazy chats.
             // chatToStub strips chats to metadata before diffing, so the only
             // way these ops appear is a baseline desync. Falling through to a
@@ -1258,7 +1190,7 @@ export async function saveDb() {
             // share the same baseline (including setDatabase defaults).
             if (supportsPatchSync) {
                 const decodedDb = await decodeRisuSave(dbData)
-                await patcher.init(databaseForServerSync(decodedDb))
+                await patcher.init(decodedDb)
             }
         }
 
@@ -1333,7 +1265,7 @@ export async function saveDb() {
         changed = false
         if (requiresFullEncoderReload.state) {
             encoder = new RisuSaveEncoder()
-            await encoder.init(databaseForServerSync(getDatabase()), {
+            await encoder.init(getDatabase(), {
                 compression: false,
                 skipRemoteSavingOnCharacters: false
             })

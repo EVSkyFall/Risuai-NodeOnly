@@ -11,11 +11,6 @@ const {
     hydrateAssetManifests,
     assetManifestSummary,
 } = require('../server/node/assetManifestMigration.cjs');
-const { createPluginStorageManifestStore } = require('../server/node/pluginStorageManifestStore.cjs');
-const {
-    stripPluginStorageManifest,
-    hydratePluginStorageManifest,
-} = require('../server/node/pluginStorageManifestMigration.cjs');
 
 function parseArgs(argv) {
     const args = {};
@@ -114,30 +109,6 @@ function aggregateFieldBytes(items) {
         .slice(0, 20);
 }
 
-function objectEntrySummary(value, meta = {}) {
-    return Object.entries(value || {})
-        .map(([key, entry]) => ({
-            key,
-            type: Array.isArray(entry) ? 'array' : entry === null ? 'null' : typeof entry,
-            bytes: jsonBytes(entry),
-            owner: meta?.[key]?.plugin || null,
-        }))
-        .sort((a, b) => b.bytes - a.bytes)
-        .slice(0, 30);
-}
-
-function pluginOwnerSummary(storage, meta = {}) {
-    const totals = new Map();
-    for (const [key, entry] of Object.entries(storage || {})) {
-        const owner = meta?.[key]?.plugin || '(legacy/unowned)';
-        const current = totals.get(owner) || { owner, keys: 0, bytes: 0 };
-        current.keys += 1;
-        current.bytes += Math.max(0, jsonBytes(entry));
-        totals.set(owner, current);
-    }
-    return [...totals.values()].sort((a, b) => b.bytes - a.bytes);
-}
-
 async function main() {
     const args = parseArgs(process.argv);
     const sourcePath = path.resolve(args.db);
@@ -156,11 +127,8 @@ async function main() {
 
     const manifestDb = new Database(':memory:');
     const store = createAssetManifestStore(manifestDb, { maxCacheBytes: 0 });
-    const pluginStore = createPluginStorageManifestStore(manifestDb, { maxCacheBytes: 0 });
     const chatStrippedDb = stripChatsForClient(dbObj);
-    const assetStrippedResult = stripAssetManifests(chatStrippedDb, store);
-    const pluginStrippedResult = stripPluginStorageManifest(assetStrippedResult.db, pluginStore);
-    const strippedResult = { ...assetStrippedResult, db: pluginStrippedResult.db };
+    const strippedResult = stripAssetManifests(chatStrippedDb, store);
     const summary = assetManifestSummary(strippedResult.db);
     if (summary.manifests !== legacyOwners.length || summary.items !== originalItems) {
         throw new Error(`Migration count mismatch: manifests ${summary.manifests}/${legacyOwners.length}, items ${summary.items}/${originalItems}`);
@@ -175,8 +143,7 @@ async function main() {
     }
 
     console.log('[verify] rebuilding legacy arrays and comparing owner hashes');
-    const assetHydrated = hydrateAssetManifests(strippedResult.db, store);
-    const hydrated = hydratePluginStorageManifest(assetHydrated, pluginStore);
+    const hydrated = hydrateAssetManifests(strippedResult.db, store);
     for (const owner of legacyOwners) {
         const beforeHash = hashJson(owner.items);
         const after = hydratedItems(hydrated, owner);
@@ -184,9 +151,6 @@ async function main() {
         if (owner.items.length !== after.length || beforeHash !== afterHash) {
             throw new Error(`Round-trip mismatch: ${owner.kind}[${owner.index}]`);
         }
-    }
-    if (hashJson(dbObj.pluginCustomStorage || {}) !== hashJson(hydrated.pluginCustomStorage || {})) {
-        throw new Error('Plugin storage round-trip mismatch');
     }
 
     console.log('[verify] checking referenced assets against kv keys');
@@ -212,7 +176,6 @@ async function main() {
 
     const strippedBytes = Buffer.from(encodeRisuSaveLegacy(strippedResult.db)).length;
     const storeStats = store.stats();
-    const pluginStoreStats = pluginStore.stats();
     const topLevelBytes = Object.entries(strippedResult.db)
         .map(([key, value]) => ({ key, bytes: jsonBytes(value) }))
         .sort((a, b) => b.bytes - a.bytes)
@@ -231,20 +194,9 @@ async function main() {
         missingSamples,
         manifestStoredBytes: storeStats.storedBytes,
         manifestRawBytes: storeStats.rawBytes,
-        pluginStorageSnapshot: strippedResult.db.pluginStorageManifest || null,
-        pluginStorageStoredBytes: pluginStoreStats.valueStoredBytes,
-        pluginStorageRawBytes: pluginStoreStats.valueRawBytes,
         topLevelBytes,
         characterFieldBytes: aggregateFieldBytes(strippedResult.db.characters),
         moduleFieldBytes: aggregateFieldBytes(strippedResult.db.modules),
-        pluginCustomStorageEntries: objectEntrySummary(
-            strippedResult.db.pluginCustomStorage,
-            strippedResult.db.pluginStorageMeta,
-        ),
-        pluginCustomStorageOwners: pluginOwnerSummary(
-            strippedResult.db.pluginCustomStorage,
-            strippedResult.db.pluginStorageMeta,
-        ),
         pluginEntries: aggregateFieldBytes(strippedResult.db.plugins),
         plugins: (strippedResult.db.plugins || []).map((plugin) => ({
             name: plugin?.name || plugin?.displayName || '(unnamed)',

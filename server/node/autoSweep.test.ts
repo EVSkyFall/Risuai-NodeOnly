@@ -296,6 +296,35 @@ describe('/api/db/assets/auto-sweep', () => {
         expect(hasKey('assets/orphan.png')).toBe(false)
     })
 
+    it('fails closed without deleting assets when a live manifest is corrupt', async () => {
+        await seedDb({
+            characters: [{ chaId: 'keep', image: 'assets/avatar.png', chats: [] }],
+            modules: [{ id: 'module-a', name: 'pack', assets: [['live', 'assets/live.png', 'png']] }],
+        })
+        await readKey('database/database.bin')
+        withDb((db) => {
+            db.prepare(`
+                UPDATE asset_manifests SET payload = ?
+                WHERE manifest_id = (
+                    SELECT manifest_id FROM asset_manifest_live
+                    WHERE owner_kind = 'module' AND owner_id = 'module-a'
+                )
+            `).run(Buffer.from('corrupt'))
+        })
+        await writeKey('assets/avatar.png', 'avatar')
+        await writeKey('assets/live.png', 'live')
+        await writeKey('assets/would-be-orphan.png', 'orphan')
+        for (const key of ['assets/avatar.png', 'assets/live.png', 'assets/would-be-orphan.png']) {
+            setUpdatedAt(key, Date.now() - 8 * DAY)
+        }
+
+        const res = await autoSweep(true)
+        expect(res.status).toBe(400)
+        expect(hasKey('assets/avatar.png')).toBe(true)
+        expect(hasKey('assets/live.png')).toBe(true)
+        expect(hasKey('assets/would-be-orphan.png')).toBe(true)
+    })
+
     it('sweeps stale remote caches, preserves recent ones, creates missing meta, and removes orphan meta', async () => {
         await seedReferencedDb()
         await writeKey('remotes/keep.local.bin', 'remote-live')

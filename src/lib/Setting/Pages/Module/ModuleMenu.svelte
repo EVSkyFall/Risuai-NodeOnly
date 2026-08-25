@@ -11,7 +11,7 @@
     import Check from "src/lib/UI/GUI/CheckInput.svelte";
     import Help from "src/lib/Others/Help.svelte";
     import TextAreaInput from "src/lib/UI/GUI/TextAreaInput.svelte";
-    import { editAssetManifest, forageStorage, getFileSrc, loadAssetManifestItems, saveAsset, downloadFile } from "src/ts/globalApi.svelte";
+    import { appendAssetManifestItems, editAssetManifest, forageStorage, getFileSrc, loadAssetManifestItems, recoverAssetManifestConflict, saveAsset, downloadFile } from "src/ts/globalApi.svelte";
     import { alertError, notifySuccess } from "src/ts/alert";
     import { exportRegex, importRegex } from "src/ts/process/scripts";
     import { selectMultipleFile } from "src/ts/util";
@@ -66,19 +66,27 @@
             currentModule.assets = currentModule.assets
             return
         }
-        currentModule.assetManifest = await editAssetManifest(currentModule.assetManifest, [
-            { type: 'append', item },
-        ])
-        const lastPageOffset = Math.floor((currentModule.assetManifest.count - 1) / manifestPageSize) * manifestPageSize
-        await loadManifestPage(lastPageOffset)
+        try {
+            currentModule.assetManifest = await editAssetManifest(currentModule.assetManifest, [
+                { type: 'append', item },
+            ])
+            const lastPageOffset = Math.floor((currentModule.assetManifest.count - 1) / manifestPageSize) * manifestPageSize
+            await loadManifestPage(lastPageOffset)
+        } catch (error) {
+            if (!await recoverAssetManifestConflict(error, () => loadManifestPage(0))) throw error
+        }
     }
 
     async function renameManifestAsset(index: number, name: string) {
         if (!currentModule.assetManifest) return
-        currentModule.assetManifest = await editAssetManifest(currentModule.assetManifest, [
-            { type: 'rename', index: manifestOffset + index, name },
-        ])
-        await loadManifestPage(manifestOffset)
+        try {
+            currentModule.assetManifest = await editAssetManifest(currentModule.assetManifest, [
+                { type: 'rename', index: manifestOffset + index, name },
+            ])
+            await loadManifestPage(manifestOffset)
+        } catch (error) {
+            if (!await recoverAssetManifestConflict(error, () => loadManifestPage(0))) throw error
+        }
     }
 
     async function removeManifestAsset(index: number) {
@@ -87,11 +95,15 @@
             currentModule.assets = currentModule.assets
             return
         }
-        currentModule.assetManifest = await editAssetManifest(currentModule.assetManifest, [
-            { type: 'remove', index: manifestOffset + index },
-        ])
-        const nextOffset = Math.min(manifestOffset, Math.max(0, Math.floor((currentModule.assetManifest.count - 1) / manifestPageSize) * manifestPageSize))
-        await loadManifestPage(nextOffset)
+        try {
+            currentModule.assetManifest = await editAssetManifest(currentModule.assetManifest, [
+                { type: 'remove', index: manifestOffset + index },
+            ])
+            const nextOffset = Math.min(manifestOffset, Math.max(0, Math.floor((currentModule.assetManifest.count - 1) / manifestPageSize) * manifestPageSize))
+            await loadManifestPage(nextOffset)
+        } catch (error) {
+            if (!await recoverAssetManifestConflict(error, () => loadManifestPage(0))) throw error
+        }
     }
 
     async function openCurrentAssetViewer() {
@@ -339,12 +351,23 @@
                         if(!da){
                             return
                         }
+                        const appended: [string, string, string][] = []
                         for(const f of da){
                             const img = f.data
                             const name = f.name
                             const extension = name.split('.').pop().toLowerCase()
                             const imgp = await saveAsset(img,'', extension)
-                            await addManifestAsset([name, imgp, extension])
+                            if (currentModule.assetManifest) appended.push([name, imgp, extension])
+                            else await addManifestAsset([name, imgp, extension])
+                        }
+                        if (currentModule.assetManifest && appended.length > 0) {
+                            try {
+                                currentModule.assetManifest = await appendAssetManifestItems(currentModule.assetManifest, appended)
+                                const lastPageOffset = Math.floor((currentModule.assetManifest.count - 1) / manifestPageSize) * manifestPageSize
+                                await loadManifestPage(lastPageOffset)
+                            } catch (error) {
+                                if (!await recoverAssetManifestConflict(error, () => loadManifestPage(0))) throw error
+                            }
                         }
                     }}>
                         <PlusIcon />
@@ -352,7 +375,7 @@
                 </th>
             </tr>
             {#if manifestLoading}
-                <tr><td colspan="3">Loading...</td></tr>
+                <tr><td colspan="3">{language.storageLoading}</td></tr>
             {:else if currentModule.assetManifest ? manifestTotal === 0 : (!currentModule.assets || currentModule.assets.length === 0)}
                 <tr>
                     <td colspan="3">{language.noData}</td>

@@ -1726,6 +1726,10 @@ export async function getHubResources(id:string) {
 }
 
 export function isCharacterHasAssets(char:character){
+    if(char.additionalAssetManifest && char.additionalAssetManifest.count > 0){
+        return true
+    }
+
     if(char.additionalAssets && char.additionalAssets.length > 0){
         return true
     }

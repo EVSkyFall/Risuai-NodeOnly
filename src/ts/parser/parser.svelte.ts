@@ -2,7 +2,7 @@ import DOMPurify from 'dompurify';
 import markdownit from 'markdown-it'
 import { appVer, getCurrentCharacter, getDatabase, type Database, type character, type customscript, type triggerscript } from '../storage/database.svelte';
 import { DBState, selIdState } from '../stores.svelte';
-import { aiWatermarkingLawApplies, getFileSrc, loadAssetManifestItems, resolveAssetManifestNames } from '../globalApi.svelte';
+import { aiWatermarkingLawApplies, getFileSrc, loadAssetManifestItems, resolvePrioritizedAssetManifestNames } from '../globalApi.svelte';
 import { isNodeServer } from "src/ts/platform"
 import { getChatVar, setChatVar, getGlobalChatVar } from './chatVar.svelte';
 import { processScriptFull } from '../process/scripts';
@@ -500,18 +500,24 @@ async function parseAdditionalAssets(data:string, char:simpleCharacterArgument|c
     const assetPaths = assetsCache ?? {}
     const emoPaths = emoAssetsCache ?? {}
 
-    const manifests = getModules()
+    const moduleManifests = getModules()
         .map((module) => module?.assetManifest)
         .filter((manifest) => !!manifest)
-    if (char.additionalAssetManifest) manifests.push(char.additionalAssetManifest)
-    if (manifests.length > 0) {
+    if (moduleManifests.length > 0 || char.additionalAssetManifest) {
         const names = [...data.matchAll(assetRegex)]
             .map((match) => String(match[2] ?? '').toLocaleLowerCase())
             .filter((name) => name.length > 0)
         if (names.length > 0) {
             try {
-                const resolved = await resolveAssetManifestNames(manifests, names)
-                for (const [name, path] of Object.entries(resolved)) {
+                const resolved = await resolvePrioritizedAssetManifestNames(
+                    char.additionalAssetManifest,
+                    moduleManifests,
+                    names,
+                )
+                for (const [name, path] of Object.entries(resolved.modules)) {
+                    assetPaths[name] ??= { srcPaths: [path] }
+                }
+                for (const [name, path] of Object.entries(resolved.character)) {
                     assetPaths[name] = { srcPaths: [path] }
                 }
             } catch (error) {

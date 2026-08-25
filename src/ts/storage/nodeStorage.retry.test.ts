@@ -162,15 +162,4 @@ describe('NodeStorage manifest revision recovery', () => {
         expect(JSON.parse(String(init.body))).toMatchObject({ maxDistance: 9 })
     })
 
-    test('refreshes a pruned plugin snapshot before loading its index', async () => {
-        const fetchMock = vi.fn()
-            .mockResolvedValueOnce(jsonResponse(404, { error: 'not found' }))
-            .mockResolvedValueOnce(jsonResponse(200, { id: 'live', version: 1, count: 0, sha256: 'live' }))
-            .mockResolvedValueOnce(jsonResponse(200, { entries: [] }))
-        const { storage } = setUpStorage(fetchMock)
-        const descriptor = { id: 'stale', version: 1, count: 1, sha256: 'stale' }
-
-        await expect(storage.getPluginStorageManifestIndex(descriptor)).resolves.toEqual([])
-        expect(descriptor.id).toBe('live')
-    })
 })

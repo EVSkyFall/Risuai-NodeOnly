@@ -14,7 +14,7 @@
     import Help from "../Others/Help.svelte";
     import { exportChar } from "src/ts/characterCards";
     import { getElevenTTSVoices, getWebSpeechTTSVoices, getVOICEVOXVoices, oaiVoices, getNovelAIVoices } from "src/ts/process/tts";
-    import { editAssetManifest, forageStorage, getFileSrc, loadAssetManifestItems } from "src/ts/globalApi.svelte";
+    import { appendAssetManifestItems, editAssetManifest, forageStorage, getFileSrc, loadAssetManifestItems, recoverAssetManifestConflict } from "src/ts/globalApi.svelte";
 import { openAssetViewer, hasImageAssets } from "src/ts/assetViewer.svelte";
     import TextInput from "../UI/GUI/TextInput.svelte";
     import ShInput from "../UI/GUI/ShInput.svelte";
@@ -138,20 +138,28 @@ import ShButton from "../UI/GUI/ShButton.svelte";
             char.additionalAssets = char.additionalAssets
             return
         }
-        char.additionalAssetManifest = await editAssetManifest(char.additionalAssetManifest, [
-            { type: 'append', item },
-        ])
-        const lastPageOffset = Math.floor((char.additionalAssetManifest.count - 1) / manifestPageSize) * manifestPageSize
-        await loadCharacterManifestPage(lastPageOffset)
+        try {
+            char.additionalAssetManifest = await editAssetManifest(char.additionalAssetManifest, [
+                { type: 'append', item },
+            ])
+            const lastPageOffset = Math.floor((char.additionalAssetManifest.count - 1) / manifestPageSize) * manifestPageSize
+            await loadCharacterManifestPage(lastPageOffset)
+        } catch (error) {
+            if (!await recoverAssetManifestConflict(error, () => loadCharacterManifestPage(0))) throw error
+        }
     }
 
     async function renameCharacterManifestAsset(index: number, name: string) {
         const char = currentChar()
         if (!char.additionalAssetManifest) return
-        char.additionalAssetManifest = await editAssetManifest(char.additionalAssetManifest, [
-            { type: 'rename', index: manifestOffset + index, name },
-        ])
-        await loadCharacterManifestPage(manifestOffset)
+        try {
+            char.additionalAssetManifest = await editAssetManifest(char.additionalAssetManifest, [
+                { type: 'rename', index: manifestOffset + index, name },
+            ])
+            await loadCharacterManifestPage(manifestOffset)
+        } catch (error) {
+            if (!await recoverAssetManifestConflict(error, () => loadCharacterManifestPage(0))) throw error
+        }
     }
 
     async function removeCharacterManifestAsset(index: number) {
@@ -162,11 +170,15 @@ import ShButton from "../UI/GUI/ShButton.svelte";
             char.additionalAssets = char.additionalAssets
             return
         }
-        char.additionalAssetManifest = await editAssetManifest(char.additionalAssetManifest, [
-            { type: 'remove', index: manifestOffset + index },
-        ])
-        const nextOffset = Math.min(manifestOffset, Math.max(0, Math.floor((char.additionalAssetManifest.count - 1) / manifestPageSize) * manifestPageSize))
-        await loadCharacterManifestPage(nextOffset)
+        try {
+            char.additionalAssetManifest = await editAssetManifest(char.additionalAssetManifest, [
+                { type: 'remove', index: manifestOffset + index },
+            ])
+            const nextOffset = Math.min(manifestOffset, Math.max(0, Math.floor((char.additionalAssetManifest.count - 1) / manifestPageSize) * manifestPageSize))
+            await loadCharacterManifestPage(nextOffset)
+        } catch (error) {
+            if (!await recoverAssetManifestConflict(error, () => loadCharacterManifestPage(0))) throw error
+        }
     }
 
     async function openCharacterAssetViewer() {
@@ -625,12 +637,24 @@ import ShButton from "../UI/GUI/ShButton.svelte";
                                     if(!da){
                                         return
                                     }
+                                    const appended: [string, string, string][] = []
                                     for(const f of da){
                                         const img = f.data
                                         const name = f.name
                                         const extension = name.split('.').pop().toLowerCase()
                                         const imgp = await saveAsset(img,'', extension)
-                                        await addCharacterManifestAsset([name, imgp, extension])
+                                        if (currentChar().additionalAssetManifest) appended.push([name, imgp, extension])
+                                        else await addCharacterManifestAsset([name, imgp, extension])
+                                    }
+                                    const char = currentChar()
+                                    if (char.additionalAssetManifest && appended.length > 0) {
+                                        try {
+                                            char.additionalAssetManifest = await appendAssetManifestItems(char.additionalAssetManifest, appended)
+                                            const lastPageOffset = Math.floor((char.additionalAssetManifest.count - 1) / manifestPageSize) * manifestPageSize
+                                            await loadCharacterManifestPage(lastPageOffset)
+                                        } catch (error) {
+                                            if (!await recoverAssetManifestConflict(error, () => loadCharacterManifestPage(0))) throw error
+                                        }
                                     }
                                 }
                             }}>
@@ -639,7 +663,7 @@ import ShButton from "../UI/GUI/ShButton.svelte";
                         </th>
                     </tr>
                     {#if manifestLoading}
-                        <tr><td class="text-textcolor2">Loading...</td></tr>
+                        <tr><td class="text-textcolor2">{language.storageLoading}</td></tr>
                     {:else if currentChar().additionalAssetManifest ? manifestTotal === 0 : (!currentChar().additionalAssets || currentChar().additionalAssets.length === 0)}
                         <tr>
                             <td class="text-textcolor2"> No Assets</td>

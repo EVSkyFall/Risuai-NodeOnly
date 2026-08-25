@@ -40,12 +40,10 @@ const {
     stripAssetManifests,
     hydrateAssetManifests,
     assetManifestSummary,
+    moduleOwnerId,
+    characterOwnerId,
+    personaOwnerId,
 } = require('./assetManifestMigration.cjs');
-const { createPluginStorageManifestStore } = require('./pluginStorageManifestStore.cjs');
-const {
-    stripPluginStorageManifest,
-    hydratePluginStorageManifest,
-} = require('./pluginStorageManifestMigration.cjs');
 const { spawn, execSync } = require('child_process');
 const os = require('os');
 const { Readable, Transform } = require('stream');
@@ -99,11 +97,6 @@ const DB_HEX_KEY = Buffer.from('database/database.bin', 'utf-8').toString('hex')
 const assetManifestStore = createAssetManifestStore(sqliteDb, {
     maxCacheBytes: process.env.POCKETRISU_ASSET_MANIFEST_CACHE_BYTES
         ? Number(process.env.POCKETRISU_ASSET_MANIFEST_CACHE_BYTES)
-        : undefined,
-});
-const pluginStorageManifestStore = createPluginStorageManifestStore(sqliteDb, {
-    maxCacheBytes: process.env.POCKETRISU_PLUGIN_STORAGE_CACHE_BYTES
-        ? Number(process.env.POCKETRISU_PLUGIN_STORAGE_CACHE_BYTES)
         : undefined,
 });
 
@@ -255,7 +248,7 @@ async function flushPendingDb() {
             const raw = kvGet('database/database.bin');
             if (raw) {
                 const dbObj = normalizeJSON(await decodeRisuSave(raw));
-                const fullDb = reassembleFullDb(stripChatsFromDb(dbObj));
+                const fullDb = hydrateDatabaseForDisk(stripDatabaseForClient(dbObj, { reconcileManifests: true }));
                 kvSet('database/database.bin', Buffer.from(encodeRisuSaveLegacy(fullDb)));
             }
         }
@@ -437,17 +430,17 @@ function stripChatsFromDb(dbObj) {
  * server-side. The on-disk database remains legacy-compatible until the
  * explicit slim-database cutover is implemented and verified.
  */
-function stripDatabaseForClient(dbObj) {
+function stripDatabaseForClient(dbObj, { reconcileManifests = false } = {}) {
     const chatStripped = stripChatsFromDb(dbObj);
-    const assetStripped = stripAssetManifests(chatStripped, assetManifestStore).db;
-    return stripPluginStorageManifest(assetStripped, pluginStorageManifestStore).db;
+    return stripAssetManifests(chatStripped, assetManifestStore, {
+        activate: reconcileManifests ? 'reconcile' : true,
+    }).db;
 }
 
 /** Rebuild the exact legacy shape before any database.bin disk write. */
 function hydrateDatabaseForDisk(clientDb) {
     const chatsHydrated = reassembleFullDb(clientDb);
-    const assetsHydrated = hydrateAssetManifests(chatsHydrated, assetManifestStore);
-    return hydratePluginStorageManifest(assetsHydrated, pluginStorageManifestStore);
+    return hydrateAssetManifests(chatsHydrated, assetManifestStore);
 }
 
 /**
@@ -766,6 +759,82 @@ async function persistDbCacheWithChats(filePath, decodedKey) {
     if (decodedKey === 'database/database.bin') {
         initChatStore(fullDb);
     }
+}
+
+function scheduleDatabasePersist(source = 'database') {
+    if (saveTimers[DB_HEX_KEY]) clearTimeout(saveTimers[DB_HEX_KEY]);
+    const timer = setTimeout(() => {
+        queueStorageOperation(async () => {
+            if (saveTimers[DB_HEX_KEY] !== timer) return;
+            try {
+                await persistDbCacheWithChats(DB_HEX_KEY, 'database/database.bin');
+                clearPersistFailure();
+                try { createBackupAndRotate(); }
+                catch (backupError) { logger.warn(`[${source}] Backup rotation failed:`, backupError); }
+            } catch (error) {
+                logger.error(`[${source}] Error saving database.bin:`, error);
+                recordPersistFailure(error, source);
+            } finally {
+                if (saveTimers[DB_HEX_KEY] === timer) delete saveTimers[DB_HEX_KEY];
+            }
+        }).catch((error) => logger.error(`[${source}] Storage queue failed:`, error));
+    }, SAVE_INTERVAL);
+    saveTimers[DB_HEX_KEY] = timer;
+}
+
+async function ensureDatabaseCache() {
+    if (dbCache[DB_HEX_KEY]) return dbCache[DB_HEX_KEY];
+    const raw = kvGet('database/database.bin');
+    if (!raw) throw new Error('Database not found');
+    const decoded = await decodeDatabaseWithPersistentChatIds(raw);
+    initChatStore(decoded);
+    dbCache[DB_HEX_KEY] = normalizeJSON(stripDatabaseForClient(decoded, { reconcileManifests: true }));
+    return dbCache[DB_HEX_KEY];
+}
+
+function locateAssetManifestOwner(database, kind, ownerId) {
+    if (kind === 'module') {
+        const index = (database.modules || []).findIndex((owner, i) => moduleOwnerId(owner, i) === ownerId);
+        return { collectionKey: 'modules', index, descriptorKey: 'assetManifest', nested: false };
+    }
+    if (kind === 'character') {
+        const index = (database.characters || []).findIndex((owner, i) => characterOwnerId(owner, i) === ownerId);
+        return { collectionKey: 'characters', index, descriptorKey: 'additionalAssetManifest', nested: false };
+    }
+    if (kind === 'persona-module') {
+        const index = (database.personas || []).findIndex((owner, i) => personaOwnerId(owner, i) === ownerId);
+        return { collectionKey: 'personas', index, descriptorKey: 'assetManifest', nested: true };
+    }
+    return null;
+}
+
+function replaceCachedAssetManifestDescriptor(database, kind, ownerId, descriptor) {
+    const location = locateAssetManifestOwner(database, kind, ownerId);
+    if (!location || location.index < 0) {
+        const error = new Error(`Asset manifest owner not found in database cache: ${kind}/${ownerId}`);
+        error.code = 'MANIFEST_VALIDATION';
+        throw error;
+    }
+    const currentList = database[location.collectionKey];
+    const currentOwner = currentList[location.index];
+    let nextOwner;
+    if (location.nested) {
+        nextOwner = {
+            ...currentOwner,
+            embeddedModule: {
+                ...currentOwner.embeddedModule,
+                [location.descriptorKey]: descriptor,
+            },
+        };
+    } else {
+        nextOwner = { ...currentOwner, [location.descriptorKey]: descriptor };
+    }
+    const nextList = currentList.slice();
+    nextList[location.index] = nextOwner;
+    return {
+        nextDatabase: { ...database, [location.collectionKey]: nextList },
+        collectionKey: location.collectionKey,
+    };
 }
 
 function shouldCompress(req, res) {
@@ -3429,49 +3498,42 @@ app.get('/api/read', async (req, res, next) => {
     }
     try {
         const key = Buffer.from(filePath, 'hex').toString('utf-8');
-        // Flush pending patches before reading database.bin
-        if (key === 'database/database.bin') {
-            await flushPendingDb();
-        }
-        let value = null;
-        if (key.startsWith('inlay/')) {
-            value = await readInlayAssetPayload(key.slice('inlay/'.length));
-        } else if (key.startsWith('inlay_info/')) {
-            value = await readInlayInfoPayload(key.slice('inlay_info/'.length));
-        }
-        if (value === null) {
-            value = kvGet(key);
-        }
-        if(value === null){
-            res.send();
-        } else {
-            // Strip chat payloads from database.bin — client gets stubs only
+        const performRead = async () => {
+            // database.bin reads share the same serialization boundary as
+            // manifest edits and patch writes. A stale tab can no longer
+            // reactivate an old manifest while another write is in flight.
             if (key === 'database/database.bin') {
-                try {
-                    const dbObj = await decodeDatabaseWithPersistentChatIds(value, {
-                        createBackup: true,
-                    });
-                    initChatStore(dbObj);
-                    const stripped = normalizeJSON(stripDatabaseForClient(dbObj));
-                    // Populate dbCache so patch endpoint uses the same data
-                    dbCache[filePath] = stripped;
-                    value = Buffer.from(encodeRisuSaveLegacy(stripped));
-                } catch (e) {
-                    // Log the Error itself (not just e.message) so logger.*
-                    // tags it and the Express middleware won't re-log after next().
-                    logger.error('[Read] Failed to strip chats from database.bin', e);
-                    return next(e);
-                }
+                await flushPendingDb();
+            }
+            let value = null;
+            if (key.startsWith('inlay/')) {
+                value = await readInlayAssetPayload(key.slice('inlay/'.length));
+            } else if (key.startsWith('inlay_info/')) {
+                value = await readInlayInfoPayload(key.slice('inlay_info/'.length));
+            }
+            if (value === null) value = kvGet(key);
+            if (value === null) return res.send();
+
+            if (key === 'database/database.bin') {
+                const dbObj = await decodeDatabaseWithPersistentChatIds(value, { createBackup: true });
+                initChatStore(dbObj);
+                const stripped = normalizeJSON(stripDatabaseForClient(dbObj, { reconcileManifests: true }));
+                dbCache[filePath] = stripped;
+                value = Buffer.from(encodeRisuSaveLegacy(stripped));
                 dbEtag = computeBufferEtag(value);
-                if (req.headers['if-none-match'] === dbEtag) {
-                    return res.status(304).end();
-                }
+                if (req.headers['if-none-match'] === dbEtag) return res.status(304).end();
                 res.setHeader('x-db-etag', dbEtag);
             }
             res.setHeader('Content-Type', 'application/octet-stream');
-            res.send(value);
+            return res.send(value);
+        };
+        if (key === 'database/database.bin') {
+            await queueStorageOperation(performRead);
+        } else {
+            await performRead();
         }
     } catch (error) {
+        logger.error('[Read] Failed to read stored data', error);
         next(error);
     }
 });
@@ -3789,7 +3851,7 @@ app.post('/api/patch', async (req, res, next) => {
                         : normalizeJSON(await decodeRisuSave(fileContent));
                     if (decodedKey === 'database/database.bin') {
                         initChatStore(decoded);
-                        dbCache[filePath] = normalizeJSON(stripDatabaseForClient(decoded));
+                        dbCache[filePath] = normalizeJSON(stripDatabaseForClient(decoded, { reconcileManifests: true }));
                     } else {
                         dbCache[filePath] = decoded;
                     }
@@ -4025,106 +4087,57 @@ app.patch('/api/asset-manifests/owner/:kind/:ownerId', async (req, res, next) =>
     if (!await checkAuth(req, res)) return;
     if (!checkActiveSession(req, res)) return;
     try {
-        const descriptor = await queueStorageOperation(async () => assetManifestStore.applyOperations(
-            req.params.kind,
-            req.params.ownerId,
-            req.body?.expectedManifestId,
-            req.body?.operations,
-        ));
+        const descriptor = await queueStorageOperation(async () => {
+            const currentDb = await ensureDatabaseCache();
+            // Validate that the owner exists in the canonical cache before the
+            // SQLite live pointer advances. This keeps a malformed request from
+            // creating a manifest revision the database cannot reference.
+            const location = locateAssetManifestOwner(currentDb, req.params.kind, req.params.ownerId);
+            if (!location || location.index < 0) {
+                const error = new Error(`Asset manifest owner not found: ${req.params.kind}/${req.params.ownerId}`);
+                error.code = 'MANIFEST_VALIDATION';
+                throw error;
+            }
+            const nextDescriptor = assetManifestStore.applyOperations(
+                req.params.kind,
+                req.params.ownerId,
+                req.body?.expectedManifestId,
+                req.body?.operations,
+            );
+            const enriched = {
+                ...nextDescriptor,
+                ownerKind: req.params.kind,
+                ownerId: req.params.ownerId,
+            };
+            const { nextDatabase, collectionKey } = replaceCachedAssetManifestDescriptor(
+                currentDb,
+                req.params.kind,
+                req.params.ownerId,
+                enriched,
+            );
+            databasePatchHashCache.update(currentDb, nextDatabase, [{
+                op: 'replace',
+                path: `/${collectionKey}`,
+                value: nextDatabase[collectionKey],
+            }]);
+            dbCache[DB_HEX_KEY] = nextDatabase;
+            scheduleDatabasePersist('asset-manifest');
+            return enriched;
+        });
         res.json({ ...descriptor, ownerKind: req.params.kind, ownerId: req.params.ownerId });
     } catch (error) {
         if (error?.code === 'MANIFEST_CONFLICT') {
-            return res.status(409).json({ error: error.message, current: error.current });
-        }
-        next(error);
-    }
-});
-
-// ─── Plugin storage manifest endpoints ───────────────────────────────────────
-// Save-bound plugin state is kept as immutable, per-key compressed values.
-// The browser initially receives only a descriptor and loads state for enabled
-// plugins; disabled-plugin history remains intact on disk and in the manifest.
-app.get('/api/plugin-storage-manifests/stats', async (req, res, next) => {
-    if (!await checkAuth(req, res)) return;
-    try { res.json(pluginStorageManifestStore.stats()); }
-    catch (error) { next(error); }
-});
-
-app.get('/api/plugin-storage-manifests/live', async (req, res, next) => {
-    if (!await checkAuth(req, res)) return;
-    try {
-        const descriptor = pluginStorageManifestStore.getLiveDescriptor();
-        if (!descriptor) return res.status(404).json({ error: 'Plugin storage snapshot not found' });
-        res.json(descriptor);
-    } catch (error) { next(error); }
-});
-
-app.get('/api/plugin-storage-manifests/:snapshotId/index', async (req, res, next) => {
-    if (!await checkAuth(req, res)) return;
-    try {
-        const meta = dbCache[DB_HEX_KEY]?.pluginStorageMeta || {};
-        const entries = pluginStorageManifestStore.getIndex(req.params.snapshotId).map((entry) => ({
-            ...entry,
-            owner: meta?.[entry.key]?.plugin || null,
-        }));
-        res.json({ entries });
-    } catch (error) {
-        if (/snapshot is missing/.test(String(error?.message || error))) {
-            return res.status(404).json({ error: 'Plugin storage snapshot not found' });
-        }
-        next(error);
-    }
-});
-
-app.post('/api/plugin-storage-manifests/:snapshotId/load', async (req, res, next) => {
-    if (!await checkAuth(req, res)) return;
-    try {
-        const requestedOwners = new Set((Array.isArray(req.body?.owners) ? req.body.owners : []).map(String));
-        const requestedKeys = new Set((Array.isArray(req.body?.keys) ? req.body.keys : []).map(String));
-        const includeUnowned = req.body?.includeUnowned === true;
-        if (requestedOwners.size > 200 || requestedKeys.size > 10000) {
-            return res.status(413).json({ error: 'Too many plugin storage owners or keys' });
-        }
-        const meta = dbCache[DB_HEX_KEY]?.pluginStorageMeta || {};
-        const keys = pluginStorageManifestStore.getIndex(req.params.snapshotId)
-            .map((entry) => entry.key)
-            .filter((key) => {
-                if (requestedKeys.has(key)) return true;
-                const owner = meta?.[key]?.plugin;
-                return owner ? requestedOwners.has(String(owner)) : includeUnowned;
+            return res.status(409).json({
+                error: error.message,
+                current: error.current ? {
+                    ...error.current,
+                    ownerKind: req.params.kind,
+                    ownerId: req.params.ownerId,
+                } : null,
             });
-        res.json({ values: pluginStorageManifestStore.loadSubset(req.params.snapshotId, keys), loadedKeys: keys });
-    } catch (error) {
-        if (/snapshot is missing/.test(String(error?.message || error))) {
-            return res.status(404).json({ error: 'Plugin storage snapshot not found' });
         }
-        next(error);
-    }
-});
-
-app.patch('/api/plugin-storage-manifests/:snapshotId', async (req, res, next) => {
-    if (!await checkAuth(req, res)) return;
-    if (!checkActiveSession(req, res)) return;
-    try {
-        const values = req.body?.values;
-        const loadedKeys = req.body?.loadedKeys;
-        if (!values || typeof values !== 'object' || Array.isArray(values) || !Array.isArray(loadedKeys)) {
-            return res.status(400).json({ error: 'values object and loadedKeys array are required' });
-        }
-        if (Object.keys(values).length > 10000 || loadedKeys.length > 10000) {
-            return res.status(413).json({ error: 'Too many plugin storage entries' });
-        }
-        const descriptor = await queueStorageOperation(async () =>
-            pluginStorageManifestStore.applyLoadedValues(
-                req.params.snapshotId,
-                values,
-                loadedKeys,
-                { activate: true },
-            ));
-        res.json(descriptor);
-    } catch (error) {
-        if (error?.code === 'PLUGIN_STORAGE_CONFLICT') {
-            return res.status(409).json({ error: error.message, current: error.current });
+        if (error?.code === 'MANIFEST_VALIDATION') {
+            return res.status(400).json({ error: error.message });
         }
         next(error);
     }
@@ -5101,7 +5114,7 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
                         const raw = kvGet('database/database.bin');
                         if (raw) {
                             const dbObj = normalizeJSON(await decodeRisuSave(raw));
-                            const fullDb = reassembleFullDb(stripChatsFromDb(dbObj));
+                            const fullDb = hydrateDatabaseForDisk(stripDatabaseForClient(dbObj, { reconcileManifests: true }));
                             const encoded = Buffer.from(encodeRisuSaveLegacy(fullDb));
                             try {
                                 kvSet('database/database.bin', encoded);
@@ -5557,19 +5570,13 @@ async function computeAssetSweep({ includeAssets, assetGraceMs = 0, includeRemot
     // partial/stripped blob can never make referenced assets look orphaned.
     try {
         for (const descriptor of assetManifestStore.listLiveDescriptors()) {
+            const verified = assetManifestStore.verifyManifest(descriptor.id);
+            if (!verified.ok) {
+                throw new Error(`Asset manifest verification failed: ${descriptor.id} (${verified.error})`);
+            }
             for (const item of assetManifestStore.loadItems(descriptor.id) || []) {
                 const basename = statsBasename(item?.[1]);
                 if (basename) uncleanable.add(basename);
-            }
-        }
-        const pluginSnapshot = pluginStorageManifestStore.getLiveDescriptor();
-        if (pluginSnapshot) {
-            const pluginStorage = pluginStorageManifestStore.loadSnapshot(pluginSnapshot.id);
-            for (const value of Object.values(pluginStorage)) {
-                for (const ref of extractAssetRefsFromText(value)) {
-                    const basename = statsBasename(ref);
-                    if (basename) uncleanable.add(basename);
-                }
             }
         }
     } catch (error) {

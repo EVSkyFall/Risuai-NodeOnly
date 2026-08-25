@@ -1,7 +1,7 @@
 <script lang="ts">
     import { FileMusicIcon, PlusIcon } from "@lucide/svelte";
     import { type character } from "src/ts/storage/database.svelte";
-    import { editAssetManifest, forageStorage, getFileSrc, saveAsset } from "src/ts/globalApi.svelte";
+    import { appendAssetManifestItems, forageStorage, getFileSrc, recoverAssetManifestConflict, saveAsset } from "src/ts/globalApi.svelte";
     import { selectMultipleFile } from "src/ts/util";
     interface Props {
         currentCharacter: character;
@@ -61,6 +61,7 @@
             if(!da){
                 return
             }
+            const appended: [string, string, string][] = []
             for(const f of da){
                 console.log(f)
                 const img = f.data
@@ -68,14 +69,21 @@
                 const extension = name.split('.').pop().toLowerCase()
                 const imgp = await saveAsset(img,'',extension)
                 if (currentCharacter.additionalAssetManifest) {
-                    currentCharacter.additionalAssetManifest = await editAssetManifest(
-                        currentCharacter.additionalAssetManifest,
-                        [{ type: 'append', item: [name, imgp, extension] }],
-                    )
-                    await loadManifestPage(Math.floor((currentCharacter.additionalAssetManifest.count - 1) / manifestPageSize) * manifestPageSize)
+                    appended.push([name, imgp, extension])
                 } else {
                     currentCharacter.additionalAssets ??= []
                     currentCharacter.additionalAssets.push([name, imgp, extension])
+                }
+            }
+            if (currentCharacter.additionalAssetManifest && appended.length > 0) {
+                try {
+                    currentCharacter.additionalAssetManifest = await appendAssetManifestItems(
+                        currentCharacter.additionalAssetManifest,
+                        appended,
+                    )
+                    await loadManifestPage(Math.floor((currentCharacter.additionalAssetManifest.count - 1) / manifestPageSize) * manifestPageSize)
+                } catch (error) {
+                    if (!await recoverAssetManifestConflict(error, () => loadManifestPage(0))) throw error
                 }
             }
         }

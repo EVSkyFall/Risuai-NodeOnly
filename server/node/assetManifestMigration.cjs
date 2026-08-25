@@ -40,13 +40,28 @@ function stripAssetManifests(dbObj, store, { activate = true } = {}) {
     const migrated = [];
     const out = { ...dbObj };
 
+    // `reconcile` is used when reading the canonical database.bin. Creating the
+    // content-addressed row is side-effect free; the live pointer only moves
+    // when disk content genuinely differs (initial migration or crash recovery).
+    // A normal read of already-live content therefore cannot prune/re-activate
+    // revisions behind an accepted manifest edit.
+    function putCanonical(kind, ownerId, items) {
+        if (activate !== 'reconcile') {
+            return store.putManifest(kind, ownerId, items, { activate });
+        }
+        const candidate = store.putManifest(kind, ownerId, items, { activate: false });
+        const live = store.getLiveDescriptor(kind, ownerId);
+        if (live?.id === candidate.id) return live;
+        return store.putManifest(kind, ownerId, items, { activate: true });
+    }
+
     if (Array.isArray(dbObj.modules)) {
         out.modules = dbObj.modules.map((module, index) => {
             if (!module || !Array.isArray(module.assets) || module.assets.length === 0) return module;
             const ownerId = moduleOwnerId(module, index);
             try {
                 const descriptor = enrichDescriptor(
-                    store.putManifest('module', ownerId, module.assets, { activate }),
+                    putCanonical('module', ownerId, module.assets),
                     'module', ownerId,
                 );
                 const next = { ...module, assetManifest: descriptor };
@@ -68,7 +83,7 @@ function stripAssetManifests(dbObj, store, { activate = true } = {}) {
             const ownerId = characterOwnerId(character, index);
             try {
                 const descriptor = enrichDescriptor(
-                    store.putManifest('character', ownerId, character.additionalAssets, { activate }),
+                    putCanonical('character', ownerId, character.additionalAssets),
                     'character', ownerId,
                 );
                 const next = { ...character, additionalAssetManifest: descriptor };
@@ -89,7 +104,7 @@ function stripAssetManifests(dbObj, store, { activate = true } = {}) {
             const ownerId = personaOwnerId(persona, index);
             try {
                 const descriptor = enrichDescriptor(
-                    store.putManifest('persona-module', ownerId, embedded.assets, { activate }),
+                    putCanonical('persona-module', ownerId, embedded.assets),
                     'persona-module', ownerId,
                 );
                 const nextEmbedded = { ...embedded, assetManifest: descriptor };

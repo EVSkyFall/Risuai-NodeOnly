@@ -4,7 +4,6 @@ import {
     type ExportBackupOptions,
     type AssetManifestDescriptor,
     type AssetManifestOperation,
-    type PluginStorageManifestDescriptor,
 } from "./nodeStorage"
 
 export class AutoStorage{
@@ -105,7 +104,7 @@ export class AutoStorage{
         return this.realStorage.getAllAssetManifestItems(manifest)
     }
     async resolveAssetManifestNames(
-        owners: Array<{ kind?: string; ownerId?: string; manifestId?: string }>,
+        owners: Array<{ kind?: string; ownerId?: string; manifestId?: string; fuzzy?: boolean }>,
         names: string[],
         maxDistance: number,
     ) {
@@ -120,30 +119,6 @@ export class AutoStorage{
     ) {
         await this.Init()
         return this.realStorage.editAssetManifest(ownerKind, ownerId, expectedManifestId, operations)
-    }
-
-    async getLivePluginStorageManifest() {
-        await this.Init()
-        return this.realStorage.getLivePluginStorageManifest()
-    }
-    async getPluginStorageManifestIndex(snapshot: string | PluginStorageManifestDescriptor) {
-        await this.Init()
-        return this.realStorage.getPluginStorageManifestIndex(snapshot)
-    }
-    async loadPluginStorageManifest(
-        snapshot: string | PluginStorageManifestDescriptor,
-        options?: { owners?: string[]; keys?: string[]; includeUnowned?: boolean },
-    ) {
-        await this.Init()
-        return this.realStorage.loadPluginStorageManifest(snapshot, options)
-    }
-    async syncPluginStorageManifest(
-        snapshotId: string,
-        values: Record<string, unknown>,
-        loadedKeys: string[],
-    ): Promise<PluginStorageManifestDescriptor> {
-        await this.Init()
-        return this.realStorage.syncPluginStorageManifest(snapshotId, values, loadedKeys)
     }
 
     // ── Server-side backup ─────────────────────────────────────────────────────

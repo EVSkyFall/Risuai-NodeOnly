@@ -44,6 +44,8 @@ export const languageEnglish = {
         modelJobBusy: "This chat is still generating on the server. It will fill in automatically when it finishes — please wait a moment.",
         modelJobConnectionLost: "The connection dropped, but the server is still generating. It will resume automatically when you come back — no need to send again.",
         chatGuardPersistDesc: "Server detected corrupted chat structure mid-persist and refused to write to disk. Your latest changes may NOT be on disk yet — re-verify before refreshing. Existing data is safe.",
+        assetManifestConflictTitle: "Asset list changed in another session",
+        assetManifestConflictDesc: "The latest asset page has been reloaded. Please review it and retry your edit.",
     },
     showHelp: "Show Help",
     help: helpEn,

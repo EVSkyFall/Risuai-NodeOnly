@@ -125,20 +125,6 @@ export interface AssetManifestDescriptor {
     ownerId?: string
 }
 
-export interface PluginStorageManifestDescriptor {
-    id: string
-    version: number
-    count: number
-    sha256: string
-}
-
-export interface PluginStorageManifestIndexEntry {
-    key: string
-    sha256: string
-    bytes: number
-    owner: string | null
-}
-
 export interface AssetManifestPage {
     total: number
     offset: number
@@ -728,7 +714,7 @@ export class NodeStorage{
     }
 
     async resolveAssetManifestNames(
-        owners: Array<{ kind?: string; ownerId?: string; manifestId?: string }>,
+        owners: Array<{ kind?: string; ownerId?: string; manifestId?: string; fuzzy?: boolean }>,
         names: string[],
         maxDistance: number,
     ): Promise<Record<string, string>> {
@@ -765,90 +751,6 @@ export class NodeStorage{
             throw error
         }
         if (!da.ok) throw new Error(`asset manifest edit error: ${da.status}`)
-        return await da.json()
-    }
-
-    // ── Lazy save-bound plugin storage ───────────────────────────────────────
-    async getLivePluginStorageManifest(): Promise<PluginStorageManifestDescriptor | null> {
-        const da = await this.authFetch('/api/plugin-storage-manifests/live')
-        if (da.status === 404) return null
-        if (!da.ok) throw new Error(`plugin storage live descriptor error: ${da.status}`)
-        return await da.json()
-    }
-
-    async getPluginStorageManifestIndex(
-        snapshot: string | PluginStorageManifestDescriptor,
-    ): Promise<PluginStorageManifestIndexEntry[]> {
-        const descriptor = typeof snapshot === 'string' ? null : snapshot
-        let snapshotId = typeof snapshot === 'string' ? snapshot : snapshot.id
-        for (let attempt = 0; attempt < 2; attempt++) {
-            const da = await this.authFetch(
-                `/api/plugin-storage-manifests/${encodeURIComponent(snapshotId)}/index`,
-            )
-            if (da.ok) {
-                const body = await da.json()
-                return body.entries ?? []
-            }
-            if (da.status !== 404 || !descriptor || attempt > 0) {
-                throw new Error(`plugin storage index error: ${da.status}`)
-            }
-            const live = await this.getLivePluginStorageManifest()
-            if (!live) throw new Error('plugin storage snapshot is no longer live')
-            Object.assign(descriptor, live)
-            snapshotId = live.id
-        }
-        throw new Error('plugin storage index retry exhausted')
-    }
-
-    async loadPluginStorageManifest(
-        snapshot: string | PluginStorageManifestDescriptor,
-        options: { owners?: string[]; keys?: string[]; includeUnowned?: boolean } = {},
-    ): Promise<{ values: Record<string, unknown>; loadedKeys: string[] }> {
-        const descriptor = typeof snapshot === 'string' ? null : snapshot
-        let snapshotId = typeof snapshot === 'string' ? snapshot : snapshot.id
-        for (let attempt = 0; attempt < 2; attempt++) {
-            const da = await this.authFetch(
-                `/api/plugin-storage-manifests/${encodeURIComponent(snapshotId)}/load`,
-                {
-                    method: 'POST',
-                    headers: { 'content-type': 'application/json' },
-                    body: JSON.stringify(options),
-                },
-            )
-            if (da.ok) return await da.json()
-            if (da.status !== 404 || !descriptor || attempt > 0) {
-                throw new Error(`plugin storage load error: ${da.status}`)
-            }
-            const live = await this.getLivePluginStorageManifest()
-            if (!live) throw new Error('plugin storage snapshot is no longer live')
-            Object.assign(descriptor, live)
-            snapshotId = live.id
-        }
-        throw new Error('plugin storage load retry exhausted')
-    }
-
-    async syncPluginStorageManifest(
-        snapshotId: string,
-        values: Record<string, unknown>,
-        loadedKeys: string[],
-    ): Promise<PluginStorageManifestDescriptor> {
-        const da = await this.authFetch(
-            `/api/plugin-storage-manifests/${encodeURIComponent(snapshotId)}`,
-            {
-                method: 'PATCH',
-                headers: { 'content-type': 'application/json' },
-                body: JSON.stringify({ values, loadedKeys }),
-            },
-        )
-        if (da.status === 409) {
-            const body = await da.json().catch(() => ({}))
-            const error = new ConflictError('Plugin storage snapshot conflict', '') as ConflictError & {
-                current?: PluginStorageManifestDescriptor
-            }
-            error.current = body?.current
-            throw error
-        }
-        if (!da.ok) throw new Error(`plugin storage sync error: ${da.status}`)
         return await da.json()
     }
 

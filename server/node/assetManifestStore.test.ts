@@ -202,6 +202,8 @@ describe('asset manifest store', () => {
         expect(store.resolveNames(owners, ['smiles.png'], { maxDistance: 0 })).toEqual({})
         expect(store.resolveNames(owners, ['sm.png'], { maxDistance: 3 })).toEqual({ 'sm.png': 'assets/smile' })
         expect(store.resolveNames(owners, ['smile.webp'], { maxDistance: 0 })).toEqual({ 'smile.webp': 'assets/smile' })
+        expect(store.resolveNames([{ ...owners[0], fuzzy: false }], ['smiles.png'])).toEqual({})
+        expect(store.resolveNames([{ ...owners[0], fuzzy: false }], ['smile.png'])).toEqual({ 'smile.png': 'assets/smile' })
     })
 
     it('falls back to the live owner when a supplied manifest revision was pruned', () => {
