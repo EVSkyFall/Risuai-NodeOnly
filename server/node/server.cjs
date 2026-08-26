@@ -6810,6 +6810,25 @@ app.get('/api/public-stats', async (req, res) => {
     }
 });
 
+// ── Supporters proxy (Patreon list via update worker) ───────────────────────
+const SUPPORTERS_URL = UPDATE_CHECK_URL.replace(/\/check$/, '/supporters');
+const SUPPORTER_NAME_URL = UPDATE_CHECK_URL.replace(/\/check$/, '/patreon/name');
+let supportersCache = { at: 0, data: null };
+app.get('/api/supporters', async (req, res) => {
+    if (UPDATE_CHECK_DISABLED) { res.json({ disabled: true, supporters: [], tiers: [] }); return; }
+    if (supportersCache.data && Date.now() - supportersCache.at < 60_000) { res.json(supportersCache.data); return; }
+    try {
+        const r = await fetch(SUPPORTERS_URL);
+        if (!r.ok) { res.status(r.status).json({ error: 'upstream error' }); return; }
+        const data = await r.json();
+        data.nameUrl = SUPPORTER_NAME_URL;
+        supportersCache = { at: Date.now(), data };
+        res.json(data);
+    } catch {
+        res.status(502).json({ error: 'fetch failed' });
+    }
+});
+
 // ── Update check endpoint ────────────────────────────────────────────────────
 app.get('/api/update-check', async (req, res) => {
     const currentVersion = getCurrentVersion();

@@ -1,6 +1,7 @@
 <script lang="ts">
-    import { AccessibilityIcon, ActivityIcon, PackageIcon, BotIcon, CodeIcon, CogIcon, ContactIcon, FlaskConicalIcon, ImageIcon, LanguagesIcon, MonitorIcon, MonitorSmartphoneIcon, Sailboat, ScrollTextIcon, SearchIcon, UserIcon, CircleXIcon, KeyboardIcon, TruckIcon, FileBoxIcon, Volume2Icon } from "@lucide/svelte";
+    import { AccessibilityIcon, ActivityIcon, PackageIcon, BotIcon, CodeIcon, CogIcon, ContactIcon, FlaskConicalIcon, ImageIcon, LanguagesIcon, MonitorIcon, MonitorSmartphoneIcon, Sailboat, ScrollTextIcon, SearchIcon, UserIcon, CircleXIcon, KeyboardIcon, TruckIcon, FileBoxIcon, Volume2Icon, HeartIcon } from "@lucide/svelte";
     import { language } from "src/lang";
+    import { supportDialogOpen } from "src/ts/support";
     import DisplaySettings from "./Pages/DisplaySettings.svelte";
     import NotificationSoundSettings from "./Pages/NotificationSoundSettings.svelte";
     import MigrationSettings from "./Pages/MigrationSettings.svelte";
@@ -236,6 +237,13 @@
                     }}>
                         <CogIcon />
                         <span>{language.system}</span>
+                    </button>
+                    <button class="flex gap-2 items-center hover:text-textcolor text-textcolor2"
+                        onclick={() => {
+                        supportDialogOpen.set(true)
+                    }}>
+                        <HeartIcon />
+                        <span>{language.support}</span>
                     </button>
                     {#if devPanelEnabled}
                         <button class="flex gap-2 items-center hover:text-textcolor"

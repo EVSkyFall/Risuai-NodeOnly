@@ -34,6 +34,7 @@
     User2Icon,
     ChevronsLeft,
     ArrowRight,
+    HeartIcon,
   } from "@lucide/svelte";
     import {
   addCharacter,
@@ -52,6 +53,7 @@
     import { checkCharOrder, getFileSrc, saveAsset } from "src/ts/globalApi.svelte";
     import { alertInput, alertSelect } from "src/ts/alert";
     import SideChatList from "./SideChatList.svelte";
+  import { supportDialogOpen } from "src/ts/support";
 
   import { sideBarSize } from "src/ts/gui/guisize";
   import DevTool from "./DevTool.svelte";
@@ -1142,6 +1144,14 @@
   {/if}
   {#if sideBarMode === 0}
     {#if $selectedCharID < 0 || $settingsOpen}
+      <button
+        type="button"
+        class="mt-2 flex w-full items-center gap-2 rounded-md border border-borderc/10 bg-darkbg px-2.5 py-1.5 text-left text-sm text-textcolor2 transition-colors hover:border-borderc/30 hover:bg-selected/50 hover:text-textcolor"
+        onclick={() => supportDialogOpen.set(true)}
+      >
+        <HeartIcon size={14} class="shrink-0 text-primary" />
+        <span class="truncate">{language.supportBanner}</span>
+      </button>
       <span class="block text-base font-semibold text-textcolor mt-2">{language.recentChatsTitle}</span>
       <div class="flex items-center justify-between gap-2 mt-2">
         <span class="text-sm text-textcolor2">{language.hideRecentChats}</span>
