@@ -1149,11 +1149,11 @@
         <!-- Same card rhythm as the recent-chat rows below (p-2.5, round leading badge). -->
         <button
           type="button"
-          class="mt-3 mb-1 flex w-full items-center gap-2.5 rounded-md border border-borderc/10 bg-darkbg p-2.5 text-left transition-colors hover:border-borderc/30 hover:bg-selected/50"
+          class="mt-1 mb-1 flex w-full items-center gap-2 rounded-md border border-borderc/10 bg-darkbg px-2 py-1.5 text-left transition-colors hover:border-borderc/30 hover:bg-selected/50"
           onclick={() => supportDialogOpen.set(true)}
         >
-          <span class="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-primary/15 text-primary">
-            <HeartIcon size={16} />
+          <span class="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-primary/15 text-primary">
+            <HeartIcon size={13} />
           </span>
           <span class="truncate text-sm font-medium text-textcolor">{language.supportBanner}</span>
         </button>
