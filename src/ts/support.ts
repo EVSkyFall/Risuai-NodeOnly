@@ -1,6 +1,7 @@
 import { writable } from "svelte/store"
 
-export const PATREON_URL = 'https://www.patreon.com/PocketRisu'
+// Lands on the tier picker rather than the (empty) page front.
+export const PATREON_URL = 'https://www.patreon.com/PocketRisu/membership'
 export const UPSTREAM_PATREON_URL = 'https://www.patreon.com/RisuAI'
 
 export interface SupporterTier {
