@@ -1,7 +1,7 @@
 <script lang="ts">
     import { AccessibilityIcon, ActivityIcon, PackageIcon, BotIcon, CodeIcon, CogIcon, ContactIcon, FlaskConicalIcon, ImageIcon, LanguagesIcon, MonitorIcon, MonitorSmartphoneIcon, Sailboat, ScrollTextIcon, SearchIcon, UserIcon, CircleXIcon, KeyboardIcon, TruckIcon, FileBoxIcon, Volume2Icon, HeartIcon } from "@lucide/svelte";
     import { language } from "src/lang";
-    import { supportDialogOpen } from "src/ts/support";
+    import { supportDialogOpen, supportEnabled } from "src/ts/support";
     import DisplaySettings from "./Pages/DisplaySettings.svelte";
     import NotificationSoundSettings from "./Pages/NotificationSoundSettings.svelte";
     import MigrationSettings from "./Pages/MigrationSettings.svelte";
@@ -238,13 +238,15 @@
                         <CogIcon />
                         <span>{language.system}</span>
                     </button>
-                    <button class="flex gap-2 items-center hover:text-textcolor text-textcolor2"
-                        onclick={() => {
-                        supportDialogOpen.set(true)
-                    }}>
-                        <HeartIcon />
-                        <span>{language.support}</span>
-                    </button>
+                    {#if $supportEnabled}
+                        <button class="flex gap-2 items-center hover:text-textcolor text-textcolor2"
+                            onclick={() => {
+                            supportDialogOpen.set(true)
+                        }}>
+                            <HeartIcon />
+                            <span>{language.support}</span>
+                        </button>
+                    {/if}
                     {#if devPanelEnabled}
                         <button class="flex gap-2 items-center hover:text-textcolor"
                             class:text-textcolor={$SettingsMenuIndex === 99}

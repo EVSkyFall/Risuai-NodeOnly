@@ -91,7 +91,7 @@
             onCloseAutoFocus={handleDialogCloseAutoFocus}
         >
             {#if title || description || closable}
-                <div class="flex flex-col gap-1 pr-8 relative">
+                <div class="flex flex-col gap-1 pr-8 relative z-10">
                     {#if title}
                         <Dialog.Title class="text-lg font-semibold text-textcolor leading-tight">
                             {@render title()}
