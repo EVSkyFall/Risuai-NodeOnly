@@ -1339,4 +1339,21 @@ export const languageVietnamese = {
     httpInsecureOpenRemoteAccess: "Mở cài đặt",
 
     selectBotHint: "Chọn một bot để bắt đầu trò chuyện",
+
+    support: "Ủng hộ",
+    supportBanner: "Ủng hộ PocketRisu",
+    supportTitle: "Ủng hộ PocketRisu",
+    supportThanks: "Cảm ơn bạn đã ủng hộ",
+    supportButton: "Ủng hộ trên Patreon",
+    supportSetName: "Đăng tên người ủng hộ",
+    supportStatActive: "Người ủng hộ hiện tại",
+    supportStatLifetime: "Tổng số người ủng hộ",
+    supportCaptionActive: "Những người đồng hành cùng chúng tôi mỗi tháng",
+    supportCaptionLifetime: "Tất cả những người đã ủng hộ chúng tôi đến nay",
+    supportPerMonth: "tháng",
+    supportEmpty: "Hãy là người ủng hộ đầu tiên",
+    supportLoadFailed: "Không tải được danh sách người ủng hộ",
+    supportRetry: "Thử lại",
+    supportDisabled: "Máy chủ này đã tắt kiểm tra cập nhật nên không hiển thị danh sách người ủng hộ",
+    supportUpstream: "Ủng hộ RisuAI gốc",
 } satisfies DeepPartial<typeof import('./en').languageEnglish>;

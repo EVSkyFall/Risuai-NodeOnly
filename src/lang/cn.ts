@@ -1339,4 +1339,21 @@ export const languageChinese = {
     httpInsecureOpenRemoteAccess: "打开设置",
 
     selectBotHint: "选择一个机器人开始聊天",
+
+    support: "赞助",
+    supportBanner: "支持 PocketRisu",
+    supportTitle: "支持 PocketRisu",
+    supportThanks: "感谢您的支持",
+    supportButton: "在 Patreon 上赞助",
+    supportSetName: "登记赞助者名称",
+    supportStatActive: "当前定期赞助者",
+    supportStatLifetime: "累计赞助者",
+    supportCaptionActive: "每个月都与我们同行的人",
+    supportCaptionLifetime: "迄今为止支持过我们的所有人",
+    supportPerMonth: "月",
+    supportEmpty: "成为第一位赞助者吧",
+    supportLoadFailed: "无法加载赞助者列表",
+    supportRetry: "重试",
+    supportDisabled: "此服务器已关闭更新检查，无法显示赞助者列表",
+    supportUpstream: "赞助原版 RisuAI",
 } satisfies DeepPartial<typeof import('./en').languageEnglish>;

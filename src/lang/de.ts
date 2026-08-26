@@ -1339,4 +1339,21 @@ export const languageGerman = {
     httpInsecureOpenRemoteAccess: "Einstellungen öffnen",
 
     selectBotHint: "Wählen Sie einen Bot zum Chatten",
+
+    support: "Unterstützen",
+    supportBanner: "PocketRisu unterstützen",
+    supportTitle: "PocketRisu unterstützen",
+    supportThanks: "Vielen Dank für deine Unterstützung",
+    supportButton: "Auf Patreon unterstützen",
+    supportSetName: "Unterstützernamen veröffentlichen",
+    supportStatActive: "Aktuelle Unterstützer",
+    supportStatLifetime: "Unterstützer insgesamt",
+    supportCaptionActive: "Die Menschen, die jeden Monat dabei sind",
+    supportCaptionLifetime: "Alle, die uns bisher unterstützt haben",
+    supportPerMonth: "Monat",
+    supportEmpty: "Sei der erste Unterstützer",
+    supportLoadFailed: "Unterstützerliste konnte nicht geladen werden",
+    supportRetry: "Erneut versuchen",
+    supportDisabled: "Update-Prüfungen sind auf diesem Server deaktiviert, daher ist die Unterstützerliste nicht verfügbar",
+    supportUpstream: "Das originale RisuAI unterstützen",
 } satisfies DeepPartial<typeof import('./en').languageEnglish>;

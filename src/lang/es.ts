@@ -1339,4 +1339,21 @@ export const languageSpanish = {
     httpInsecureOpenRemoteAccess: "Abrir configuración",
 
     selectBotHint: "Selecciona un bot para empezar a chatear",
+
+    support: "Apoyar",
+    supportBanner: "Apoya a PocketRisu",
+    supportTitle: "Apoya a PocketRisu",
+    supportThanks: "Gracias por tu apoyo",
+    supportButton: "Apoyar en Patreon",
+    supportSetName: "Publicar tu nombre de colaborador",
+    supportStatActive: "Colaboradores actuales",
+    supportStatLifetime: "Colaboradores en total",
+    supportCaptionActive: "Las personas que nos acompañan cada mes",
+    supportCaptionLifetime: "Todas las personas que nos han apoyado hasta ahora",
+    supportPerMonth: "mes",
+    supportEmpty: "Sé el primer colaborador",
+    supportLoadFailed: "No se pudo cargar la lista de colaboradores",
+    supportRetry: "Reintentar",
+    supportDisabled: "La comprobación de actualizaciones está desactivada en este servidor, así que la lista de colaboradores no está disponible",
+    supportUpstream: "Apoyar al RisuAI original",
 } satisfies DeepPartial<typeof import('./en').languageEnglish>;
