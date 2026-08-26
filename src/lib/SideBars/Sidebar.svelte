@@ -1146,13 +1146,16 @@
   {#if sideBarMode === 0}
     {#if $selectedCharID < 0 || $settingsOpen}
       {#if $supportEnabled}
+        <!-- Same card rhythm as the recent-chat rows below (p-2.5, round leading badge). -->
         <button
           type="button"
-          class="mt-2 flex w-full items-center gap-2 rounded-md border border-borderc/10 bg-darkbg px-2.5 py-1.5 text-left text-sm text-textcolor2 transition-colors hover:border-borderc/30 hover:bg-selected/50 hover:text-textcolor"
+          class="mt-3 mb-1 flex w-full items-center gap-2.5 rounded-md border border-borderc/10 bg-darkbg p-2.5 text-left transition-colors hover:border-borderc/30 hover:bg-selected/50"
           onclick={() => supportDialogOpen.set(true)}
         >
-          <HeartIcon size={14} class="shrink-0 text-primary" />
-          <span class="truncate">{language.supportBanner}</span>
+          <span class="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-primary/15 text-primary">
+            <HeartIcon size={16} />
+          </span>
+          <span class="truncate text-sm font-medium text-textcolor">{language.supportBanner}</span>
         </button>
       {/if}
       <span class="block text-base font-semibold text-textcolor mt-2">{language.recentChatsTitle}</span>
