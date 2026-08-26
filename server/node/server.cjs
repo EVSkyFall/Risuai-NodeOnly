@@ -3874,6 +3874,13 @@ app.post('/api/write', async (req, res, next) => {
             // ETag conflict detection for database.bin
             if (key === 'database/database.bin') {
                 const ifMatch = req.headers['x-if-match'];
+                // dbEtag is null after a restart or cache invalidation until
+                // a /api/read recomputes it; a stale client's full write must
+                // not slip through that window, so derive it from the current
+                // client view when the writer sent a precondition.
+                if (ifMatch && !dbEtag && (await loadDbCacheIfMissing())) {
+                    dbEtag = computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(dbCache[DB_HEX_KEY])));
+                }
                 if (ifMatch && dbEtag && ifMatch !== dbEtag) {
                     res.status(409).send({
                         error: 'ETag mismatch - concurrent modification detected',
@@ -4419,6 +4426,10 @@ app.patch('/api/asset-manifests/owner/:kind/:ownerId', async (req, res, next) =>
                 value: nextDatabase[collectionKey],
             }]);
             dbCache[DB_HEX_KEY] = nextDatabase;
+            // The client view changed, so a full write carrying the
+            // pre-edit etag must conflict instead of reconciling its stale
+            // inline asset list over this manifest revision.
+            dbEtag = computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(nextDatabase)));
             scheduleDatabasePersist('asset-manifest');
             return enriched;
         });

@@ -316,6 +316,16 @@ export async function importModule(){
                 return
             }
             importData.id = v4()
+            // A hand-edited export may still carry a lazy manifest descriptor;
+            // keeping it would make the copy edit the source module's manifest.
+            if(importData.assetManifest){
+                try {
+                    Object.assign(importData, await hydrateModuleAssets(importData))
+                } catch {
+                    importData.assets = []
+                }
+                delete importData.assetManifest
+            }
 
             if(importData.lowLevelAccess){
                 const conf = await alertConfirm(language.lowLevelAccessConfirm)

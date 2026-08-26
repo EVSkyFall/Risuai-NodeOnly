@@ -103,6 +103,40 @@ describe('lazy asset manifest guard', () => {
         expect((await readDb()).characters[0].additionalAssetManifest).toBeTruthy()
     })
 
+    test('a manifest edit bumps the db etag so a pre-edit full write conflicts', async () => {
+        const before = await client.fetch('/api/read', { headers: { 'file-path': DB_KEY_HEX } })
+        const staleEtag = before.headers.get('x-db-etag')
+        expect(staleEtag).toBeTruthy()
+        const db = utils.normalizeJSON(await utils.decodeRisuSave(Buffer.from(await before.arrayBuffer()))) as any
+        const edit = await client.fetch('/api/asset-manifests/owner/character/c1', {
+            method: 'PATCH',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+                expectedManifestId: db.characters[0].additionalAssetManifest.id,
+                operations: [{ type: 'append', item: ['y.png', 'assets/y', 'png'] }],
+            }),
+        })
+        expect(edit.status).toBe(200)
+        const res = await client.fetch('/api/write', {
+            method: 'POST',
+            headers: { 'content-type': 'application/octet-stream', 'file-path': DB_KEY_HEX, 'x-if-match': staleEtag! },
+            body: Buffer.from(utils.encodeRisuSaveLegacy(db)),
+        })
+        expect(res.status).toBe(409)
+    })
+
+    test('a stale etag still conflicts right after the cache was invalidated', async () => {
+        const before = await client.fetch('/api/read', { headers: { 'file-path': DB_KEY_HEX } })
+        const db = utils.normalizeJSON(await utils.decodeRisuSave(Buffer.from(await before.arrayBuffer()))) as any
+        expect((await client.importBackup(seedBin)).ok).toBe(true) // dbEtag is null now
+        const res = await client.fetch('/api/write', {
+            method: 'POST',
+            headers: { 'content-type': 'application/octet-stream', 'file-path': DB_KEY_HEX, 'x-if-match': 'stale' },
+            body: Buffer.from(utils.encodeRisuSaveLegacy(db)),
+        })
+        expect(res.status).toBe(409)
+    })
+
     test('the full-write guard also holds on a cold cache', async () => {
         const db = await readDb()
         const { additionalAssetManifest, ...stripped } = db.characters[0]
