@@ -833,6 +833,66 @@ describe('Comfy custom template orchestration', () => {
     })
   })
 
+  it('attributes a non-retryable upload rejection to the timeline item', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'comfy-timeline-upload-'))
+    dirs.push(root)
+    const inlayDir = path.join(root, 'inlays')
+    await writeMedia(inlayDir, 'reel', 'mp4', 'video', Buffer.from('000000186674797069736F6D', 'hex'))
+    const fetchImpl = (async (urlValue: string | URL | Request) => {
+      const url = new URL(String(urlValue))
+      if (url.pathname === '/system_stats') return Response.json({ system: {} })
+      if (url.pathname === '/queue') return Response.json({ queue_running: [], queue_pending: [] })
+      if (url.pathname === '/history') return Response.json({})
+      if (url.pathname === '/upload/image') return new Response('video/* not accepted', { status: 400 })
+      throw new Error(`Unexpected request ${url.pathname}`)
+    }) as typeof fetch
+
+    const db = new Database(':memory:')
+    dbs.push(db)
+    const store = createComfyStore(db, { defaultTemplateDir: templateDir })
+    const registry = createTemplateRegistry({ templateDir, store })
+    const registered = await registry.registerTemplate({
+      name: 'V16 timeline upload',
+      kind: 'video',
+      mode: 'ref2v',
+      graphJson: {
+        director: {
+          class_type: 'MiniMaxH3Director',
+          inputs: { prompt: '{{positive}}', timeline_data: '{{timeline}}' },
+        },
+        sampler: { class_type: 'RandomNoise', inputs: { noise_seed: 1 } },
+      },
+      outputDescriptor: {
+        nodeId: 'director', classType: 'MiniMaxH3Director', historyKey: 'gifs', mediaType: 'video/mp4',
+      },
+      promptProfile: 'h3-structured',
+    })
+    const orchestrator = createComfyOrchestrator({
+      store,
+      registry,
+      assets: createComfyAssetStore({ inlayDir, stagingDir: path.join(root, 'staging'), fetchImpl }),
+      fetchImpl,
+    })
+    await orchestrator.updateEndpoint('http://127.0.0.1:8188')
+    const submitted = await orchestrator.submit({
+      operationKey: 'timeline-upload-op',
+      template: registered.template.id,
+      slots: {
+        positive: 'a director document',
+        seed: 7,
+        timeline: { items: [{ slot: 9, type: 'video', assetId: 'reel' }] },
+      },
+    })
+    const raw = store.getJob(submitted.jobId)
+    store.updateJob(raw.jobId, raw.revision, 'queued', { state: 'submitting' })
+    await orchestrator.runOnce()
+    await orchestrator.runOnce()
+
+    const polled = await orchestrator.poll(submitted.jobId)
+    expect(polled.state).toBe('failed')
+    expect(polled.error.message.startsWith('timeline video slot 9 (reel): ')).toBe(true)
+  })
+
   it('refuses to submit a timeline naming an asset of the wrong media kind', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'comfy-timeline-kind-'))
     dirs.push(root)

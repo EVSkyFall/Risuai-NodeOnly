@@ -734,8 +734,9 @@ function createComfyOrchestrator(options) {
                     );
                 } catch (error) {
                     if (generation !== localGeneration) return;
-                    if (isRetryableUploadError(error)) return queueDispatchRetry(current, error);
-                    throw error;
+                    const attributed = timelineItem ? attributeTimelineError(error, timelineItem) : error;
+                    if (isRetryableUploadError(error)) return queueDispatchRetry(current, attributed);
+                    throw attributed;
                 }
                 if (generation !== localGeneration) return;
                 current = store.updateJob(current.jobId, current.revision, 'submitting', {
