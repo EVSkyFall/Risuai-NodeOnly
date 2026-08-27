@@ -3,11 +3,30 @@ import { forageStorage } from '../../globalApi.svelte'
 const ENDPOINT = '/api/comfy/orchestrator'
 const PROTOCOL_VERSION = 1
 
+export interface ComfyTimelineItem {
+    slot: number
+    type: 'image' | 'video' | 'audio'
+    /** An inlay asset id the core can read; it uploads and resolves it. */
+    assetId: string
+    start?: number
+    duration?: number
+    trim_start?: number
+    trim_end?: number
+    source_duration?: number
+    media_mode?: 'video_audio'
+}
+
+export interface ComfyTimelineSpec {
+    items: ComfyTimelineItem[]
+}
+
 export interface ComfySlots {
     positive: string
-    input_image: string
+    /** Absent on templates that address their media through {{timeline}}. */
+    input_image?: string
     seed: number
     duration?: number
+    timeline?: ComfyTimelineSpec
 }
 
 export interface ComfySubmitInput {
@@ -93,6 +112,7 @@ export interface ComfyTemplateAnalysis {
         negative: ComfyTemplateNodeRef | ComfyTemplateNodeRef[]
         inputImages: Array<ComfyTemplateNodeRef & { name?: string }>
         seeds: ComfyTemplateNodeRef[]
+        timeline?: ComfyTemplateNodeRef | null
     }
     embeddedSlots?: ComfyTemplateEmbeddedSlot[]
     embeddedImageLiterals?: ComfyTemplateEmbeddedImageLiteral[]
@@ -129,7 +149,7 @@ export interface ComfyTemplateRegistrationInput {
 
 export interface ComfyTemplateRequiredManifestSlot {
     name: string
-    type: 'string' | 'imageAsset' | 'integer'
+    type: 'string' | 'imageAsset' | 'integer' | 'timeline'
     required: true
     minimum?: number
     maximum?: number
@@ -153,6 +173,7 @@ export interface ComfyTemplateSlotBindings {
     inputImages: Array<ComfyTemplateNodeRef & { name: string }>
     seeds: ComfyTemplateNodeRef[]
     duration?: ComfyTemplateNodeRef & { defaultValue: number }
+    timeline?: ComfyTemplateNodeRef
     embedded?: {
         slots: Array<ComfyTemplateEmbeddedSlot & { name: string }>
         inputImages: Array<ComfyTemplateEmbeddedImageLiteral & { name: string }>

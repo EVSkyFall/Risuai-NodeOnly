@@ -165,6 +165,46 @@ describe('plugin Comfy orchestrator relay', () => {
     }])
   })
 
+  it('relays a timeline slot spec opaquely for the core to validate', async () => {
+    const requests: any[] = []
+    const api = createComfySandboxApi({
+      transport: async body => {
+        requests.push(body)
+        return {
+          status: 200,
+          json: async () => ({ ok: true, jobId: 'timeline-job' }),
+        }
+      },
+    })
+    const timeline = {
+      items: [
+        { slot: 0, type: 'image' as const, assetId: 'plugin-inlay-anchor' },
+        {
+          slot: 0,
+          type: 'video' as const,
+          assetId: 'comfy-reel',
+          trim_start: 1,
+          trim_end: 4,
+          media_mode: 'video_audio' as const,
+        },
+        { slot: 0, type: 'audio' as const, assetId: 'plugin-inlay-voice', source_duration: 6 },
+      ],
+    }
+
+    await expect(api.submit({
+      operationKey: 'timeline-submit',
+      template: 'v16-ref2va',
+      slots: { positive: 'a director document', seed: 5, timeline },
+    })).resolves.toEqual({ ok: true, jobId: 'timeline-job' })
+    expect(requests).toEqual([{
+      protocolVersion: 1,
+      op: 'submit',
+      operationKey: 'timeline-submit',
+      template: 'v16-ref2va',
+      slots: { positive: 'a director document', seed: 5, timeline },
+    }])
+  })
+
   it('round-trips template registration operations and forwards the optional kind filter', async () => {
     const requests: any[] = []
     const graphJson = {

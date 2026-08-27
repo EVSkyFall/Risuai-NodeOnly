@@ -1,6 +1,7 @@
 // @vitest-environment node
 
 import Database from 'better-sqlite3'
+import { createHash } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -29,11 +30,19 @@ afterEach(async () => {
   })))
 })
 
-async function writeImage(inlayDir: string, id: string) {
+async function writeImage(inlayDir: string, id: string, dimensions: { width?: number, height?: number } = {}) {
   await mkdir(inlayDir, { recursive: true })
   await writeFile(path.join(inlayDir, `${id}.png`), Buffer.from('89504E470D0A1A0A0000000D49484452', 'hex'))
   await writeFile(path.join(inlayDir, `${id}.meta.json`), JSON.stringify({
-    ext: 'png', name: `${id}.png`, type: 'image',
+    ext: 'png', name: `${id}.png`, type: 'image', ...dimensions,
+  }))
+}
+
+async function writeMedia(inlayDir: string, id: string, ext: string, type: string, bytes: Buffer) {
+  await mkdir(inlayDir, { recursive: true })
+  await writeFile(path.join(inlayDir, `${id}.${ext}`), bytes)
+  await writeFile(path.join(inlayDir, `${id}.meta.json`), JSON.stringify({
+    ext, name: `${id}.${ext}`, type,
   }))
 }
 
@@ -545,5 +554,323 @@ describe('Comfy custom template orchestration', () => {
       name: '204924_00001-audio.webm',
       type: 'video',
     })
+  })
+
+  it('uploads every timeline asset once and injects the assembled document', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'comfy-timeline-'))
+    dirs.push(root)
+    const inlayDir = path.join(root, 'inlays')
+    const media = {
+      anchor: { ext: 'png', bytes: Buffer.from('89504E470D0A1A0A0000000D49484452', 'hex') },
+      reference: { ext: 'png', bytes: Buffer.from('89504E470D0A1A0A0000000D4948445222', 'hex') },
+      reel: { ext: 'mp4', bytes: Buffer.from('000000186674797069736F6D', 'hex') },
+      voice: { ext: 'mp3', bytes: Buffer.concat([Buffer.from('ID3'), Buffer.alloc(16)]) },
+    }
+    await writeImage(inlayDir, 'anchor', { width: 768, height: 1120 })
+    await writeMedia(inlayDir, 'reference', 'png', 'image', media.reference.bytes)
+    await writeMedia(inlayDir, 'reel', 'mp4', 'video', media.reel.bytes)
+    await writeMedia(inlayDir, 'voice', 'mp3', 'audio', media.voice.bytes)
+    const uploads: string[] = []
+    let submittedPrompt: any
+    const mp4 = Buffer.from('000000186674797069736F6D0000000069736F6D', 'hex')
+    const fetchImpl = (async (urlValue: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(urlValue))
+      if (url.pathname === '/system_stats') return Response.json({ system: {} })
+      if (url.pathname === '/upload/image') {
+        const uploaded = await new Request(url, {
+          method: 'POST',
+          headers: init?.headers,
+          body: init?.body,
+          duplex: 'half',
+        } as RequestInit).formData()
+        const file = uploaded.get('image') as File
+        uploads.push(file.name)
+        return Response.json({ name: file.name, subfolder: 'risu-comfy', type: 'input' })
+      }
+      if (url.pathname === '/queue') return Response.json({ queue_running: [], queue_pending: [] })
+      if (url.pathname === '/history') return Response.json({})
+      if (url.pathname === '/prompt') {
+        submittedPrompt = JSON.parse(String(init?.body)).prompt
+        return Response.json({ prompt_id: 'timeline-prompt' })
+      }
+      if (url.pathname === '/history/timeline-prompt') {
+        return Response.json({
+          'timeline-prompt': {
+            outputs: { director: { gifs: [{ filename: 'reel.mp4', subfolder: '', type: 'output' }] } },
+            status: { status_str: 'success', completed: true, messages: [] },
+          },
+        })
+      }
+      if (url.pathname === '/view') return new Response(mp4, { headers: { 'content-type': 'video/mp4' } })
+      throw new Error(`Unexpected request ${url.pathname}`)
+    }) as typeof fetch
+
+    const db = new Database(':memory:')
+    dbs.push(db)
+    const store = createComfyStore(db, { defaultTemplateDir: templateDir })
+    const registry = createTemplateRegistry({ templateDir, store })
+    const registered = await registry.registerTemplate({
+      name: 'V16 timeline',
+      kind: 'video',
+      mode: 'ref2v',
+      graphJson: {
+        director: {
+          class_type: 'MiniMaxH3Director',
+          inputs: { prompt: '{{positive}}', timeline_data: '{{timeline}}', builder_state: '{}' },
+        },
+        sampler: { class_type: 'RandomNoise', inputs: { noise_seed: 1 } },
+      },
+      outputDescriptor: {
+        nodeId: 'director', classType: 'MiniMaxH3Director', historyKey: 'gifs', mediaType: 'video/mp4',
+      },
+      promptProfile: 'h3-structured',
+    })
+
+    const orchestrator = createComfyOrchestrator({
+      store,
+      registry,
+      assets: createComfyAssetStore({ inlayDir, stagingDir: path.join(root, 'staging'), fetchImpl }),
+      fetchImpl,
+    })
+    await orchestrator.updateEndpoint('http://127.0.0.1:8188')
+    const slots = {
+      positive: 'a director document',
+      seed: 7,
+      timeline: {
+        items: [
+          { slot: 0, type: 'image', assetId: 'anchor' },
+          { slot: 1, type: 'image', assetId: 'reference' },
+          // The same asset twice: one upload, two slots.
+          { slot: 2, type: 'image', assetId: 'reference', start: 5 },
+          { slot: 0, type: 'video', assetId: 'reel', trim_start: 1, trim_end: 3, media_mode: 'video_audio' },
+          { slot: 0, type: 'audio', assetId: 'voice', source_duration: 6 },
+        ],
+      },
+    }
+    const submitted = await orchestrator.submit({
+      operationKey: 'timeline-op',
+      template: registered.template.id,
+      slots,
+    })
+    const raw = store.getJob(submitted.jobId)
+    expect(Object.keys(raw.inputAssets).sort()).toEqual([
+      'timeline#anchor',
+      'timeline#reel',
+      'timeline#reference',
+      'timeline#voice',
+    ])
+    expect(raw.inputAssets['timeline#anchor']).toMatchObject({ type: 'image', width: 768, height: 1120 })
+    expect(raw.inputAssets['timeline#voice']).toMatchObject({ type: 'audio' })
+    expect(raw.inputAssets['timeline#voice'].width).toBeUndefined()
+
+    store.updateJob(raw.jobId, raw.revision, 'queued', { state: 'submitting' })
+    await orchestrator.runOnce()
+    await orchestrator.runOnce()
+
+    expect(uploads).toHaveLength(4)
+    const uploadedName = (id: keyof typeof media) => 'risu-comfy/risu-' + submitted.jobId + '-'
+      + createHash('sha256').update(media[id].bytes).digest('hex').toUpperCase() + '.' + media[id].ext
+    expect(new Set(uploads)).toEqual(new Set(Object.keys(media).map(
+      id => uploadedName(id as keyof typeof media).slice('risu-comfy/'.length),
+    )))
+    expect(JSON.parse(submittedPrompt.director.inputs.timeline_data)).toEqual({
+      version: 1,
+      items: [
+        {
+          id: 'risu-image-0',
+          enabled: true,
+          order: 0,
+          slot: 0,
+          start: 0,
+          duration: 1,
+          type: 'image',
+          value: uploadedName(`anchor`),
+          thumbnail: null,
+          source_width: 768,
+          source_height: 1120,
+        },
+        {
+          id: 'risu-image-1',
+          enabled: true,
+          order: 1,
+          slot: 1,
+          start: 1,
+          duration: 1,
+          type: 'image',
+          value: uploadedName(`reference`),
+          thumbnail: null,
+        },
+        {
+          id: 'risu-image-2',
+          enabled: true,
+          order: 2,
+          slot: 2,
+          start: 5,
+          duration: 1,
+          type: 'image',
+          value: uploadedName(`reference`),
+          thumbnail: null,
+        },
+        {
+          id: 'risu-video-0',
+          enabled: true,
+          order: 3,
+          slot: 0,
+          start: 0,
+          duration: 2,
+          type: 'video',
+          value: uploadedName(`reel`),
+          thumbnail: null,
+          trim_start: 1,
+          trim_end: 3,
+          media_mode: 'video_audio',
+        },
+        {
+          id: 'risu-audio-0',
+          enabled: true,
+          order: 4,
+          slot: 0,
+          start: 0,
+          duration: 6,
+          type: 'audio',
+          value: uploadedName(`voice`),
+          thumbnail: null,
+          source_duration: 6,
+        },
+      ],
+    })
+    expect(submittedPrompt.director.inputs.prompt).toBe('a director document')
+    expect(submittedPrompt.sampler.inputs.noise_seed).toBe(7)
+
+    await expect(orchestrator.submit({
+      operationKey: 'timeline-op',
+      template: registered.template.id,
+      slots,
+    })).resolves.toMatchObject({ jobId: submitted.jobId })
+    await expect(orchestrator.submit({
+      operationKey: 'timeline-op',
+      template: registered.template.id,
+      slots: {
+        ...slots,
+        timeline: { items: [{ slot: 0, type: 'image', assetId: 'anchor' }] },
+      },
+    })).rejects.toMatchObject({ code: 'COMFY_OPERATION_KEY_CONFLICT' })
+  })
+
+  it('fails a timeline job whose asset changed after submission', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'comfy-timeline-changed-'))
+    dirs.push(root)
+    const inlayDir = path.join(root, 'inlays')
+    await writeImage(inlayDir, 'anchor')
+    const fetchImpl = (async (urlValue: string | URL | Request) => {
+      const url = new URL(String(urlValue))
+      if (url.pathname === '/system_stats') return Response.json({ system: {} })
+      if (url.pathname === '/queue') return Response.json({ queue_running: [], queue_pending: [] })
+      if (url.pathname === '/history') return Response.json({})
+      if (url.pathname === '/upload/image') throw new Error('the changed input must never upload')
+      throw new Error(`Unexpected request ${url.pathname}`)
+    }) as typeof fetch
+
+    const db = new Database(':memory:')
+    dbs.push(db)
+    const store = createComfyStore(db, { defaultTemplateDir: templateDir })
+    const registry = createTemplateRegistry({ templateDir, store })
+    const registered = await registry.registerTemplate({
+      name: 'V16 timeline pinning',
+      kind: 'video',
+      mode: 'ref2v',
+      graphJson: {
+        director: {
+          class_type: 'MiniMaxH3Director',
+          inputs: { prompt: '{{positive}}', timeline_data: '{{timeline}}' },
+        },
+        sampler: { class_type: 'RandomNoise', inputs: { noise_seed: 1 } },
+      },
+      outputDescriptor: {
+        nodeId: 'director', classType: 'MiniMaxH3Director', historyKey: 'gifs', mediaType: 'video/mp4',
+      },
+      promptProfile: 'h3-structured',
+    })
+    const orchestrator = createComfyOrchestrator({
+      store,
+      registry,
+      assets: createComfyAssetStore({ inlayDir, stagingDir: path.join(root, 'staging'), fetchImpl }),
+      fetchImpl,
+    })
+    await orchestrator.updateEndpoint('http://127.0.0.1:8188')
+    const submitted = await orchestrator.submit({
+      operationKey: 'timeline-changed-op',
+      template: registered.template.id,
+      slots: {
+        positive: 'a director document',
+        seed: 7,
+        timeline: { items: [{ slot: 0, type: 'image', assetId: 'anchor' }] },
+      },
+    })
+
+    await writeFile(
+      path.join(inlayDir, 'anchor.png'),
+      Buffer.from('89504E470D0A1A0A0000000D4948445200', 'hex'),
+    )
+    const raw = store.getJob(submitted.jobId)
+    store.updateJob(raw.jobId, raw.revision, 'queued', { state: 'submitting' })
+    await orchestrator.runOnce()
+    await orchestrator.runOnce()
+
+    expect(await orchestrator.poll(submitted.jobId)).toMatchObject({
+      state: 'failed',
+      error: { code: 'COMFY_INPUT_CHANGED' },
+    })
+  })
+
+  it('refuses to submit a timeline naming an asset of the wrong media kind', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'comfy-timeline-kind-'))
+    dirs.push(root)
+    const inlayDir = path.join(root, 'inlays')
+    await writeImage(inlayDir, 'anchor')
+    const fetchImpl = (async (urlValue: string | URL | Request) => {
+      const url = new URL(String(urlValue))
+      if (url.pathname === '/system_stats') return Response.json({ system: {} })
+      throw new Error(`Unexpected request ${url.pathname}`)
+    }) as typeof fetch
+
+    const db = new Database(':memory:')
+    dbs.push(db)
+    const store = createComfyStore(db, { defaultTemplateDir: templateDir })
+    const registry = createTemplateRegistry({ templateDir, store })
+    const registered = await registry.registerTemplate({
+      name: 'V16 timeline kinds',
+      kind: 'video',
+      mode: 'ref2v',
+      graphJson: {
+        director: {
+          class_type: 'MiniMaxH3Director',
+          inputs: { prompt: '{{positive}}', timeline_data: '{{timeline}}' },
+        },
+        sampler: { class_type: 'RandomNoise', inputs: { noise_seed: 1 } },
+      },
+      outputDescriptor: {
+        nodeId: 'director', classType: 'MiniMaxH3Director', historyKey: 'gifs', mediaType: 'video/mp4',
+      },
+      promptProfile: 'h3-structured',
+    })
+    const orchestrator = createComfyOrchestrator({
+      store,
+      registry,
+      assets: createComfyAssetStore({ inlayDir, stagingDir: path.join(root, 'staging'), fetchImpl }),
+      fetchImpl,
+    })
+    await orchestrator.updateEndpoint('http://127.0.0.1:8188')
+
+    await expect(orchestrator.submit({
+      operationKey: 'timeline-kind-op',
+      template: registered.template.id,
+      slots: {
+        positive: 'a director document',
+        seed: 7,
+        timeline: { items: [{ slot: 0, type: 'video', assetId: 'anchor' }] },
+      },
+    })).rejects.toMatchObject({ code: 'COMFY_INPUT_NOT_VIDEO' })
+    expect(store.findByOperationKey('timeline-kind-op')).toBeNull()
   })
 })

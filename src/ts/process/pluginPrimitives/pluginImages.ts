@@ -153,11 +153,17 @@ export interface PluginInlayPutImageInput {
     dataUrl: string
 }
 
+export type PluginInlayMediaKind = 'image' | 'video' | 'audio'
+
+export type PluginInlayPutMediaInput = PluginInlayPutImageInput
+
 export type PluginInlayPutImageResult =
     | { status: 'succeeded'; result: { assetId: string } }
     | { status: 'precondition_failed'; code: string; error: string }
     | { status: 'definite_failure'; code: string; error: string }
     | { status: 'ambiguous'; code: string; error: string }
+
+export type PluginInlayPutMediaResult = PluginInlayPutImageResult
 
 export class PluginImageError extends Error {
     readonly code: string
@@ -314,6 +320,7 @@ export interface PluginImagesDependencies {
             ext: string
             mimeType: string
             name: string
+            type: PluginInlayMediaKind
         }): Promise<string>
     }
 }
@@ -325,6 +332,7 @@ export interface PluginImagesApi {
 
 export interface PluginInlaysApi {
     putImage(input: PluginInlayPutImageInput): Promise<PluginInlayPutImageResult>
+    putMedia(input: PluginInlayPutMediaInput): Promise<PluginInlayPutMediaResult>
     remove(input: PluginInlayRemoveInput): Promise<PluginInlayRemoveResult>
     read(input: PluginInlayReadInput): Promise<PluginInlayReadResult>
 }
@@ -336,12 +344,36 @@ const PUT_IMAGE_EXT_BY_MIME: Readonly<Record<string, string>> = Object.freeze({
     'image/webp': 'webp',
     'image/gif': 'gif',
 })
+// putMedia's superset. Aliases normalize onto the canonical MIME the inlay
+// storage and the Comfy input sidecar both speak.
+const PUT_MEDIA_EXT_BY_MIME: Readonly<Record<string, string>> = Object.freeze({
+    ...PUT_IMAGE_EXT_BY_MIME,
+    'video/mp4': 'mp4',
+    'video/webm': 'webm',
+    'audio/mpeg': 'mp3',
+    'audio/mp3': 'mp3',
+    'audio/ogg': 'ogg',
+    'audio/wav': 'wav',
+    'audio/x-wav': 'wav',
+    'audio/wave': 'wav',
+})
+const PUT_MEDIA_CANONICAL_MIME: Readonly<Record<string, string>> = Object.freeze({
+    'image/jpg': 'image/jpeg',
+    'audio/mp3': 'audio/mpeg',
+    'audio/x-wav': 'audio/wav',
+    'audio/wave': 'audio/wav',
+})
 const PUT_IMAGE_RECEIPT_VERSION = 1 as const
+// putImage and putMedia share one claim record, so a single operationKey can
+// only ever name one payload no matter which method wrote it first. The legacy
+// path segment is load-bearing: receipts already live under it.
+const PUT_CLAIM_KEY_PREFIX = '__risu_internal__/pluginInlays/putImage/'
 
 type DecodedPluginImage = {
     bytes: Uint8Array
     ext: string
     mimeType: string
+    mediaType: PluginInlayMediaKind
 }
 
 type PluginInlayPutClaim = {
@@ -351,6 +383,11 @@ type PluginInlayPutClaim = {
     assetId: string
     ext: string
     mimeType: string
+    /**
+     * Absent means image. putImage keeps writing receipts without the field, so
+     * a receipt written before putMedia existed still reads back as its own.
+     */
+    type?: 'video' | 'audio'
 }
 
 type PutClaimResolution =
@@ -410,7 +447,10 @@ function decodePercentImagePayload(payload: string): Uint8Array {
     return Uint8Array.from(bytes)
 }
 
-function decodePluginImageDataUrl(dataUrl: unknown): DecodedPluginImage {
+function decodePluginImageDataUrl(
+    dataUrl: unknown,
+    extByMime: Readonly<Record<string, string>> = PUT_IMAGE_EXT_BY_MIME,
+): DecodedPluginImage {
     if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:')) {
         throw new PluginImageError('inlay_data_url_invalid', 'dataUrl must be an image data URL')
     }
@@ -420,14 +460,17 @@ function decodePluginImageDataUrl(dataUrl: unknown): DecodedPluginImage {
     }
     const fields = dataUrl.slice(5, comma).split(';')
     const declaredMime = String(fields.shift() ?? '').trim().toLowerCase()
-    const ext = PUT_IMAGE_EXT_BY_MIME[declaredMime]
+    const ext = extByMime[declaredMime]
     if (!ext) {
         throw new PluginImageError(
             'inlay_image_mime_unsupported',
-            'dataUrl must declare a canonical image MIME type',
+            `dataUrl must declare a canonical ${
+                extByMime === PUT_IMAGE_EXT_BY_MIME ? 'image' : 'image, video, or audio'
+            } MIME type`,
         )
     }
-    const mimeType = declaredMime === 'image/jpg' ? 'image/jpeg' : declaredMime
+    const mimeType = PUT_MEDIA_CANONICAL_MIME[declaredMime] ?? declaredMime
+    const mediaType = mimeType.slice(0, mimeType.indexOf('/')) as PluginInlayMediaKind
     const base64 = fields.some(field => field.trim().toLowerCase() === 'base64')
     const payload = dataUrl.slice(comma + 1)
     const bytes = base64
@@ -436,7 +479,7 @@ function decodePluginImageDataUrl(dataUrl: unknown): DecodedPluginImage {
     if (bytes.length === 0) {
         throw new PluginImageError('inlay_image_data_empty', 'image data URL decodes to no bytes')
     }
-    return { bytes, ext, mimeType }
+    return { bytes, ext, mimeType, mediaType }
 }
 
 function preconditionFailure(code: string, error: string): PluginInlayPutImageResult {
@@ -445,6 +488,10 @@ function preconditionFailure(code: string, error: string): PluginInlayPutImageRe
 
 function ambiguousFailure(code: string, error: string): PluginInlayPutImageResult {
     return { status: 'ambiguous', code, error }
+}
+
+function claimMediaType(claim: { type?: unknown }): PluginInlayMediaKind {
+    return claim.type === 'video' || claim.type === 'audio' ? claim.type : 'image'
 }
 
 function resolveStoredPutClaim(value: unknown, expected: PluginInlayPutClaim): PutClaimResolution {
@@ -464,7 +511,8 @@ function resolveStoredPutClaim(value: unknown, expected: PluginInlayPutClaim): P
         || typeof stored.assetId !== 'string'
         || typeof stored.byteHash !== 'string'
         || typeof stored.ext !== 'string'
-        || typeof stored.mimeType !== 'string') {
+        || typeof stored.mimeType !== 'string'
+        || (stored.type !== undefined && stored.type !== 'video' && stored.type !== 'audio')) {
         return {
             ok: false,
             result: {
@@ -486,7 +534,8 @@ function resolveStoredPutClaim(value: unknown, expected: PluginInlayPutClaim): P
     }
     if (stored.byteHash !== expected.byteHash
         || stored.ext !== expected.ext
-        || stored.mimeType !== expected.mimeType) {
+        || stored.mimeType !== expected.mimeType
+        || claimMediaType(stored) !== claimMediaType(expected)) {
         return {
             ok: false,
             result: preconditionFailure(
@@ -619,12 +668,13 @@ async function isCompleteClaimedInlay(
     const state = await put.inspectInlay(claim.assetId)
     const asset = state.asset
     const info = state.info
+    const mediaType = claimMediaType(claim)
     if (!asset || !info || !(asset.data instanceof Blob)) return false
-    if (asset.type !== 'image'
+    if (asset.type !== mediaType
         || asset.ext !== claim.ext
         || asset.name !== claim.assetId
         || asset.data.type !== claim.mimeType
-        || info.type !== 'image'
+        || info.type !== mediaType
         || info.ext !== claim.ext
         || info.name !== claim.assetId) {
         return false
@@ -653,6 +703,7 @@ async function materializeClaimedInlay(
             ext: claim.ext,
             mimeType: claim.mimeType,
             name: claim.assetId,
+            type: claimMediaType(claim),
         })
     } catch (error) {
         writeError = error
@@ -671,6 +722,86 @@ async function materializeClaimedInlay(
             writeError instanceof Error ? writeError.message : String(writeError ?? 'incomplete payload or sidecar')
         }`,
     )
+}
+
+async function runPluginInlayPut(
+    deps: PluginImagesDependencies,
+    method: 'putImage' | 'putMedia',
+    input: PluginInlayPutImageInput,
+): Promise<PluginInlayPutImageResult> {
+    let operationKey: string
+    let decoded: DecodedPluginImage
+    try {
+        operationKey = typeof input?.operationKey === 'string' ? input.operationKey : ''
+        if (!operationKey) {
+            throw new PluginImageError(
+                'inlay_operation_key_invalid',
+                'operationKey must be a non-empty string',
+            )
+        }
+        decoded = decodePluginImageDataUrl(
+            input?.dataUrl,
+            method === 'putMedia' ? PUT_MEDIA_EXT_BY_MIME : PUT_IMAGE_EXT_BY_MIME,
+        )
+    } catch (error) {
+        return {
+            status: 'definite_failure',
+            code: error instanceof PluginImageError ? error.code : 'inlay_data_url_invalid',
+            error: error instanceof Error ? error.message : String(error),
+        }
+    }
+
+    const put = deps.putImage
+    const installId = put?.installId
+    if (!put || !put.atomic
+        || typeof installId !== 'string'
+        || !INSTALL_ID_PATTERN.test(installId)) {
+        return preconditionFailure(
+            'inlay_install_id_unavailable',
+            'plugin installation identity or durable receipt storage is unavailable',
+        )
+    }
+
+    let operationHash: string
+    let byteHash: string
+    let assetId: string
+    try {
+        [operationHash, byteHash, assetId] = await Promise.all([
+            sha256Hex(operationKey),
+            sha256BytesHex(decoded.bytes),
+            sha256Hex(`${installId}\u0000${operationKey}`).then(hash => `plugin-inlay-${hash}`),
+        ])
+    } catch (error) {
+        return preconditionFailure(
+            'inlay_digest_unavailable',
+            error instanceof Error ? error.message : String(error),
+        )
+    }
+
+    const expected: PluginInlayPutClaim = {
+        schemaVersion: PUT_IMAGE_RECEIPT_VERSION,
+        operationHash,
+        byteHash,
+        assetId,
+        ext: decoded.ext,
+        mimeType: decoded.mimeType,
+        ...(decoded.mediaType === 'image' ? {} : { type: decoded.mediaType }),
+    }
+    const recordKey = `${PUT_CLAIM_KEY_PREFIX}${operationHash}`
+    const atomicOperationKey = `risu:pluginInlays.${method}:${installId}:${operationHash}`
+
+    try {
+        const resolution = await claimPluginInlayPut(put, expected, recordKey, atomicOperationKey)
+        if (resolution.ok !== true) {
+            return (resolution as Extract<PutClaimResolution, { ok: false }>).result
+        }
+        return await materializeClaimedInlay(put, resolution.claim, decoded)
+    } catch (error) {
+        return ambiguousFailure(
+            'inlay_put_uncertain',
+            error instanceof Error ? error.message : String(error),
+        )
+    }
 }
 
 export function createPluginImagesApi(deps: PluginImagesDependencies): PluginImagesApi & PluginInlaysApi {
@@ -872,75 +1003,11 @@ export function createPluginImagesApi(deps: PluginImagesDependencies): PluginIma
         },
 
         async putImage(input) {
-            let operationKey: string
-            let decoded: DecodedPluginImage
-            try {
-                operationKey = typeof input?.operationKey === 'string' ? input.operationKey : ''
-                if (!operationKey) {
-                    throw new PluginImageError(
-                        'inlay_operation_key_invalid',
-                        'operationKey must be a non-empty string',
-                    )
-                }
-                decoded = decodePluginImageDataUrl(input?.dataUrl)
-            } catch (error) {
-                return {
-                    status: 'definite_failure',
-                    code: error instanceof PluginImageError ? error.code : 'inlay_data_url_invalid',
-                    error: error instanceof Error ? error.message : String(error),
-                }
-            }
+            return await runPluginInlayPut(deps, 'putImage', input)
+        },
 
-            const put = deps.putImage
-            const installId = put?.installId
-            if (!put || !put.atomic
-                || typeof installId !== 'string'
-                || !INSTALL_ID_PATTERN.test(installId)) {
-                return preconditionFailure(
-                    'inlay_install_id_unavailable',
-                    'plugin installation identity or durable receipt storage is unavailable',
-                )
-            }
-
-            let operationHash: string
-            let byteHash: string
-            let assetId: string
-            try {
-                [operationHash, byteHash, assetId] = await Promise.all([
-                    sha256Hex(operationKey),
-                    sha256BytesHex(decoded.bytes),
-                    sha256Hex(`${installId}\u0000${operationKey}`).then(hash => `plugin-inlay-${hash}`),
-                ])
-            } catch (error) {
-                return preconditionFailure(
-                    'inlay_digest_unavailable',
-                    error instanceof Error ? error.message : String(error),
-                )
-            }
-
-            const expected: PluginInlayPutClaim = {
-                schemaVersion: PUT_IMAGE_RECEIPT_VERSION,
-                operationHash,
-                byteHash,
-                assetId,
-                ext: decoded.ext,
-                mimeType: decoded.mimeType,
-            }
-            const recordKey = `__risu_internal__/pluginInlays/putImage/${operationHash}`
-            const atomicOperationKey = `risu:pluginInlays.putImage:${installId}:${operationHash}`
-
-            try {
-                const resolution = await claimPluginInlayPut(put, expected, recordKey, atomicOperationKey)
-                if (resolution.ok !== true) {
-                    return (resolution as Extract<PutClaimResolution, { ok: false }>).result
-                }
-                return await materializeClaimedInlay(put, resolution.claim, decoded)
-            } catch (error) {
-                return ambiguousFailure(
-                    'inlay_put_uncertain',
-                    error instanceof Error ? error.message : String(error),
-                )
-            }
+        async putMedia(input) {
+            return await runPluginInlayPut(deps, 'putMedia', input)
         },
 
         async remove(input) {
@@ -1066,6 +1133,7 @@ export function createDefaultPluginImagesApi(
                 ext: input.ext,
                 mimeType: input.mimeType,
                 name: input.name,
+                type: input.type,
             }),
         },
     })

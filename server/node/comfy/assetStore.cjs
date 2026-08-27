@@ -20,6 +20,25 @@ const IMAGE_MIME_BY_EXT = Object.freeze({
     avif: 'image/avif',
     bmp: 'image/bmp',
 });
+const VIDEO_MIME_BY_EXT = Object.freeze({
+    mp4: 'video/mp4',
+    webm: 'video/webm',
+});
+const AUDIO_MIME_BY_EXT = Object.freeze({
+    mp3: 'audio/mpeg',
+    ogg: 'audio/ogg',
+    wav: 'audio/wav',
+});
+const INPUT_MIME_BY_MEDIA_TYPE = Object.freeze({
+    image: IMAGE_MIME_BY_EXT,
+    video: VIDEO_MIME_BY_EXT,
+    audio: AUDIO_MIME_BY_EXT,
+});
+const INPUT_MISMATCH_CODE_BY_MEDIA_TYPE = Object.freeze({
+    image: 'COMFY_INPUT_NOT_IMAGE',
+    video: 'COMFY_INPUT_NOT_VIDEO',
+    audio: 'COMFY_INPUT_NOT_AUDIO',
+});
 const OUTPUT_MEDIA_TYPES = Object.freeze({
     'video/mp4': Object.freeze({ extensions: new Set(['mp4']), defaultExt: 'mp4', assetType: 'video' }),
     'video/webm': Object.freeze({ extensions: new Set(['webm']), defaultExt: 'webm', assetType: 'video' }),
@@ -111,6 +130,21 @@ function hasImageMagic(ext, bytes) {
     if (ext === 'gif') return bytes.length >= 6 && ['GIF87a', 'GIF89a'].includes(bytes.toString('ascii', 0, 6));
     if (ext === 'bmp') return bytes.length >= 2 && bytes.toString('ascii', 0, 2) === 'BM';
     if (ext === 'avif') return bytes.length >= 12 && bytes.toString('ascii', 4, 8) === 'ftyp' && bytes.toString('ascii', 8, 12).includes('avif');
+    return false;
+}
+
+function hasAudioMagic(ext, bytes) {
+    if (ext === 'mp3') {
+        // Either an ID3 tag or a raw frame sync (11 set bits).
+        return (bytes.length >= 3 && bytes.toString('ascii', 0, 3) === 'ID3')
+            || (bytes.length >= 2 && bytes[0] === 0xFF && (bytes[1] & 0xE0) === 0xE0);
+    }
+    if (ext === 'ogg') return bytes.length >= 4 && bytes.toString('ascii', 0, 4) === 'OggS';
+    if (ext === 'wav') {
+        return bytes.length >= 12
+            && bytes.toString('ascii', 0, 4) === 'RIFF'
+            && bytes.toString('ascii', 8, 12) === 'WAVE';
+    }
     return false;
 }
 
@@ -240,8 +274,8 @@ function escapeMultipartQuoted(value) {
         .replace(/"/g, '%22');
 }
 
-function encodeMultipart(input, filename, boundaryFactory) {
-    const rawValues = [filename, input.mimeType, 'input', 'risu-comfy', 'true'];
+function encodeMultipart(input, filename, boundaryFactory, fieldName = 'image') {
+    const rawValues = [filename, input.mimeType, fieldName, 'input', 'risu-comfy', 'true'];
     let boundary;
     while (!boundary) {
         const candidate = boundaryFactory();
@@ -259,7 +293,7 @@ function encodeMultipart(input, filename, boundaryFactory) {
     const escapedFilename = escapeMultipartQuoted(filename);
     const head = Buffer.from(
         `--${boundary}\r\n`
-        + `Content-Disposition: form-data; name="image"; filename="${escapedFilename}"\r\n`
+        + `Content-Disposition: form-data; name="${escapeMultipartQuoted(fieldName)}"; filename="${escapedFilename}"\r\n`
         + `Content-Type: ${input.mimeType}\r\n\r\n`,
     );
     const tail = Buffer.from(
@@ -368,7 +402,15 @@ function createComfyAssetStore(options) {
     const now = options.now ?? Date.now;
     const rename = options.rename ?? fs.promises.rename.bind(fs.promises);
 
-    async function readInputAsset(assetId) {
+    // `mediaType` selects which sidecar kind is admissible. It defaults to
+    // image so every existing caller — and the image gates they rely on — is
+    // untouched; video and audio go through the same five gates with their own
+    // extension, MIME, and magic tables.
+    async function readInputAsset(assetId, mediaType = 'image') {
+        const mimeByExt = INPUT_MIME_BY_MEDIA_TYPE[mediaType];
+        if (!mimeByExt) {
+            throw comfyError('COMFY_INPUT_MEDIA_TYPE_INVALID', 'Comfy input media type is unsupported');
+        }
         if (!isSafeAssetId(assetId)) {
             throw comfyError('COMFY_INPUT_ID_INVALID', 'Input asset ID is invalid');
         }
@@ -387,9 +429,12 @@ function createComfyAssetStore(options) {
             throw comfyError('COMFY_INPUT_SIDECAR_INVALID', 'Input asset sidecar is invalid JSON', { cause });
         }
         const ext = normalizeExt(sidecar?.ext);
-        const mimeType = IMAGE_MIME_BY_EXT[ext];
-        if (sidecar?.type !== 'image' || !mimeType) {
-            throw comfyError('COMFY_INPUT_NOT_IMAGE', 'Comfy input asset must be a supported image');
+        const mimeType = mimeByExt[ext];
+        if (sidecar?.type !== mediaType || !mimeType) {
+            throw comfyError(
+                INPUT_MISMATCH_CODE_BY_MEDIA_TYPE[mediaType],
+                `Comfy input asset must be a supported ${mediaType}`,
+            );
         }
 
         const payloadPath = path.join(root, `${assetId}.${ext}`);
@@ -398,13 +443,22 @@ function createComfyAssetStore(options) {
             missing: 'COMFY_INPUT_NOT_FOUND',
             tooLarge: 'COMFY_INPUT_TOO_LARGE',
         });
-        if (!hasImageMagic(ext, bytes)) {
-            throw comfyError('COMFY_INPUT_MAGIC_INVALID', 'Input asset bytes do not match the declared image type');
+        const magicMatches = mediaType === 'image'
+            ? hasImageMagic(ext, bytes)
+            : mediaType === 'video'
+                ? hasOutputMagic(mimeType, bytes)
+                : hasAudioMagic(ext, bytes);
+        if (!magicMatches) {
+            throw comfyError(
+                'COMFY_INPUT_MAGIC_INVALID',
+                `Input asset bytes do not match the declared ${mediaType} type`,
+            );
         }
 
         return {
             assetId,
             ext,
+            mediaType,
             mimeType,
             name: typeof sidecar.name === 'string' && sidecar.name ? sidecar.name : `${assetId}.${ext}`,
             width: Number.isFinite(sidecar.width) ? sidecar.width : undefined,
@@ -426,7 +480,16 @@ function createComfyAssetStore(options) {
 
         let multipart;
         try {
-            multipart = encodeMultipart(input, filename, multipartBoundaryFactory);
+            // ComfyUI's /upload/image handler is type-agnostic about the bytes,
+            // but whether it keys off the multipart field name for video/audio
+            // is only answerable on a live instance — so the name is a knob that
+            // defaults to today's wire shape.
+            multipart = encodeMultipart(
+                input,
+                filename,
+                multipartBoundaryFactory,
+                requestOptions.fieldName ?? 'image',
+            );
         } catch (error) {
             if (isComfyError(error)) throw error;
             throw comfyError('COMFY_UPLOAD_FAILED', 'Could not encode the Comfy input upload', { cause: error });
@@ -913,6 +976,7 @@ function createComfyAssetStore(options) {
 
 module.exports = {
     createComfyAssetStore,
+    isSafeAssetId,
     validateOutputDescriptor,
     DEFAULT_MAX_INPUT_BYTES,
     DEFAULT_MAX_OUTPUT_BYTES,

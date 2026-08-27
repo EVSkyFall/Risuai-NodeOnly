@@ -23,7 +23,7 @@ const { createComfyAssetStore, validateOutputDescriptor } = pkg as {
     rename?: typeof rename
     now?: () => number
   }) => {
-    readInputAsset: (assetId: string) => Promise<any>
+    readInputAsset: (assetId: string, mediaType?: string) => Promise<any>
     uploadInput: (endpointUrl: string, jobId: string, input: any, options?: any) => Promise<string>
     materializeOutput: (endpointUrl: string, jobId: string, output: any, options?: any) => Promise<any>
     recoverMaterialization: (jobId: string, options?: any) => Promise<any>
@@ -82,6 +82,73 @@ describe('Comfy input asset admission', () => {
       size: bytes.length,
       hash: createHash('sha256').update(bytes).digest('hex').toUpperCase(),
       bytes,
+    })
+  })
+
+  it.each([
+    ['video', 'mp4', 'video/mp4', Buffer.from('000000186674797069736F6D0000000069736F6D', 'hex')],
+    ['video', 'webm', 'video/webm', Buffer.from('1A45DFA30000000000000000', 'hex')],
+    ['audio', 'mp3', 'audio/mpeg', Buffer.concat([Buffer.from('ID3'), Buffer.alloc(16)])],
+    ['audio', 'mp3', 'audio/mpeg', Buffer.from('FFFB90640000000000000000', 'hex')],
+    ['audio', 'ogg', 'audio/ogg', Buffer.concat([Buffer.from('OggS'), Buffer.alloc(16)])],
+    ['audio', 'wav', 'audio/wav', Buffer.concat([
+      Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WAVEfmt '),
+    ])],
+  ])('admits a %s inlay stored as .%s through the same five gates', async (mediaType, ext, mimeType, bytes) => {
+    const root = await mkdtemp(path.join(tmpdir(), 'comfy-media-input-'))
+    dirs.push(root)
+    const inlayDir = path.join(root, 'inlays')
+    await mkdir(inlayDir, { recursive: true })
+    await writeFile(path.join(inlayDir, `media-1.${ext}`), bytes)
+    await writeFile(path.join(inlayDir, 'media-1.meta.json'), JSON.stringify({
+      ext, name: `source.${ext}`, type: mediaType,
+    }))
+
+    const assets = createComfyAssetStore({ inlayDir, stagingDir: path.join(root, 'staging') })
+    await expect(assets.readInputAsset('media-1', mediaType)).resolves.toMatchObject({
+      assetId: 'media-1',
+      ext,
+      mediaType,
+      mimeType,
+      name: `source.${ext}`,
+      size: bytes.length,
+      hash: createHash('sha256').update(bytes).digest('hex').toUpperCase(),
+      bytes,
+    })
+  })
+
+  it('keeps the media gates type-honest in both directions', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'comfy-media-gates-'))
+    dirs.push(root)
+    const inlayDir = path.join(root, 'inlays')
+    await mkdir(inlayDir, { recursive: true })
+    const png = Buffer.from('89504E470D0A1A0A0000000D49484452', 'hex')
+    await writeFile(path.join(inlayDir, 'still.png'), png)
+    await writeFile(path.join(inlayDir, 'still.meta.json'), JSON.stringify({
+      ext: 'png', name: 'still.png', type: 'image',
+    }))
+    await writeFile(path.join(inlayDir, 'reel.mp4'), png)
+    await writeFile(path.join(inlayDir, 'reel.meta.json'), JSON.stringify({
+      ext: 'mp4', name: 'reel.mp4', type: 'video',
+    }))
+
+    const assets = createComfyAssetStore({ inlayDir, stagingDir: path.join(root, 'staging') })
+    // An image asked for as video, and the legacy code for an image slot.
+    await expect(assets.readInputAsset('still', 'video')).rejects.toMatchObject({
+      code: 'COMFY_INPUT_NOT_VIDEO',
+    })
+    await expect(assets.readInputAsset('reel')).rejects.toMatchObject({
+      code: 'COMFY_INPUT_NOT_IMAGE',
+    })
+    await expect(assets.readInputAsset('reel', 'audio')).rejects.toMatchObject({
+      code: 'COMFY_INPUT_NOT_AUDIO',
+    })
+    // Declared video, PNG bytes.
+    await expect(assets.readInputAsset('reel', 'video')).rejects.toMatchObject({
+      code: 'COMFY_INPUT_MAGIC_INVALID',
+    })
+    await expect(assets.readInputAsset('still', 'signature')).rejects.toMatchObject({
+      code: 'COMFY_INPUT_MEDIA_TYPE_INVALID',
     })
   })
 

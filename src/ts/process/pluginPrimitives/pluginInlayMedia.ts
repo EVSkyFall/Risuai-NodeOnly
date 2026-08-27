@@ -10,7 +10,7 @@ export type PluginInlayMediaReadResult =
         result: {
             assetId: string
             data: Blob
-            mediaType: 'image' | 'video'
+            mediaType: 'image' | 'video' | 'audio'
             mimeType: string
             ext: string
             name: string
@@ -41,6 +41,9 @@ const MIME_BY_EXT: Record<string, string> = {
     webm: 'video/webm',
     mp4: 'video/mp4',
     mkv: 'video/x-matroska',
+    mp3: 'audio/mpeg',
+    ogg: 'audio/ogg',
+    wav: 'audio/wav',
 }
 
 export function createPluginInlayMediaApi(deps: PluginInlayMediaDependencies) {
@@ -72,10 +75,10 @@ export function createPluginInlayMediaApi(deps: PluginInlayMediaDependencies) {
                     code: 'inlay_not_found',
                 }
             }
-            if (asset.type !== 'image' && asset.type !== 'video') {
+            if (asset.type !== 'image' && asset.type !== 'video' && asset.type !== 'audio') {
                 return {
                     status: 'definite_failure',
-                    error: `the inlay is ${asset.type}, not image or video media`,
+                    error: `the inlay is ${asset.type}, not image, video, or audio media`,
                     code: 'inlay_media_unsupported',
                 }
             }

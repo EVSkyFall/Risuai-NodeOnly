@@ -1,6 +1,12 @@
 'use strict';
 
 const { comfyError, isComfyError } = require('./errors.cjs');
+const {
+    collectTimelineAssets,
+    isTimelineAssetKey,
+    resolveTimelineSpec,
+    timelineAssetKey,
+} = require('./timeline.cjs');
 
 const MAX_JSON_BYTES = 16 * 1024 * 1024;
 const DEFAULT_POLL_INTERVAL_MS = 1_000;
@@ -386,6 +392,22 @@ function createComfyOrchestrator(options) {
             const inputAsset = await assets.readInputAsset(assetId);
             inputAssets[imageSlot.name] = { assetId, hash: inputAsset.hash };
         }
+        if (template.templateSlots.timeline) {
+            for (const { assetId, type } of collectTimelineAssets(resolvedSlots.timeline)) {
+                const inputAsset = await assets.readInputAsset(assetId, type);
+                // The sidecar dimensions are pinned here rather than re-read at
+                // dispatch: a resumed dispatch skips the read for anything it
+                // already uploaded, and the assembled document must not depend
+                // on how far a previous attempt got.
+                inputAssets[timelineAssetKey(assetId)] = {
+                    assetId,
+                    hash: inputAsset.hash,
+                    type,
+                    ...(Number.isSafeInteger(inputAsset.width) ? { width: inputAsset.width } : {}),
+                    ...(Number.isSafeInteger(inputAsset.height) ? { height: inputAsset.height } : {}),
+                };
+            }
+        }
         const config = store.getConfig();
         const endpointGeneration = config.endpointGeneration;
         const binding = {
@@ -661,7 +683,7 @@ function createComfyOrchestrator(options) {
             const remoteInputs = { ...(current.remoteInputs ?? {}) };
             for (const [slotName, snapshot] of Object.entries(current.inputAssets ?? {})) {
                 if (remoteInputs[slotName]) continue;
-                const input = await assets.readInputAsset(snapshot.assetId);
+                const input = await assets.readInputAsset(snapshot.assetId, snapshot.type ?? 'image');
                 if (generation !== localGeneration) return;
                 if (input.hash !== snapshot.hash) {
                     return failJob(current, 'COMFY_INPUT_CHANGED', 'Input asset changed after submission');
@@ -688,7 +710,16 @@ function createComfyOrchestrator(options) {
             }
 
             const compiledSlots = { ...current.slots };
-            for (const [slotName, remoteName] of Object.entries(remoteInputs)) compiledSlots[slotName] = remoteName;
+            for (const [slotName, remoteName] of Object.entries(remoteInputs)) {
+                if (!isTimelineAssetKey(slotName)) compiledSlots[slotName] = remoteName;
+            }
+            if (current.templateSlots?.timeline) {
+                compiledSlots.timeline = resolveTimelineSpec(
+                    current.slots.timeline,
+                    current.inputAssets,
+                    remoteInputs,
+                );
+            }
             const compiled = registry.instantiateSnapshot(
                 current.templateJson,
                 current.templateHash,

@@ -4,6 +4,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const { comfyError } = require('./errors.cjs');
+const { assembleTimelineDocument, validateTimelineSpec } = require('./timeline.cjs');
 
 const TEMPLATE_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const CUSTOM_TEMPLATE_ID_PATTERN = /^[a-f0-9]{64}$/;
@@ -25,8 +26,9 @@ const IMAGE_ROLE_PATTERN = /^(?:input_image|keyframe|start_image|end_image|refer
 const EMBEDDED_IMAGE_LITERAL_PATTERN = /\.(?:png|jpe?g|webp)$/i;
 const CUSTOM_SLOT_TOKEN_PATTERN = /\{\{([a-z_][a-z0-9_]*)\}\}/g;
 const FIXED_CUSTOM_SLOT_NAMES = Object.freeze([
-    'positive', 'negative', 'seed', 'input_image', 'keyframe', 'start_image', 'end_image',
+    'positive', 'negative', 'seed', 'input_image', 'keyframe', 'start_image', 'end_image', 'timeline',
 ]);
+const DIRECT_ONLY_SLOT_NAMES = new Set(['timeline']);
 const SAFE_HISTORY_KEY_PATTERN = /^[A-Za-z0-9_:-]{1,128}$/;
 const DANGEROUS_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
 const BUILTIN_META = Object.freeze({
@@ -76,7 +78,16 @@ function errorEntry(error) {
 }
 
 function isKnownCustomSlotName(name) {
-    return name === 'positive' || name === 'negative' || name === 'seed' || IMAGE_ROLE_PATTERN.test(name);
+    return name === 'positive' || name === 'negative' || name === 'seed'
+        || DIRECT_ONLY_SLOT_NAMES.has(name)
+        || IMAGE_ROLE_PATTERN.test(name);
+}
+
+// A direct-only token is replaced by a whole assembled document, so it can only
+// ever be the exact value of an input — never a token nested inside embedded
+// JSON, where the embedded machinery would substitute it as a scalar.
+function isEmbeddableCustomSlotName(name) {
+    return isKnownCustomSlotName(name) && !DIRECT_ONLY_SLOT_NAMES.has(name);
 }
 
 function getExactCustomSlotName(value) {
@@ -224,11 +235,16 @@ function inspectEmbeddedJsonInput(value) {
     const imagesByLiteral = new Map();
     const unrecognizedByToken = new Map();
     let knownTokenInKey = false;
+    let directOnlyToken = false;
     visitJsonStringValues(parsed, (leaf, pathHint) => {
         for (const match of leaf.matchAll(CUSTOM_SLOT_TOKEN_PATTERN)) {
             const token = match[0];
             const name = match[1];
             if (isKnownCustomSlotName(name)) {
+                if (!isEmbeddableCustomSlotName(name)) {
+                    directOnlyToken = true;
+                    continue;
+                }
                 const current = slotsByToken.get(token);
                 if (current) current.occurrences += 1;
                 else slotsByToken.set(token, { token, occurrences: 1 });
@@ -269,6 +285,7 @@ function inspectEmbeddedJsonInput(value) {
         imageLiterals: [...imagesByLiteral.values()],
         unrecognized: [...unrecognizedByToken.values()],
         knownTokenInKey,
+        directOnlyToken,
     };
 }
 
@@ -367,7 +384,7 @@ function inspectGraph(graphJson, maxBytes) {
                 ok: false,
                 errors,
                 warnings,
-                slots: { positive: [], negative: [], inputImages: [], seeds: [] },
+                slots: { positive: [], negative: [], inputImages: [], seeds: [], timeline: null },
                 output: null,
                 stats: { bytes: parsed.inputBytes, nodeCount: Object.keys(document).length },
             },
@@ -387,6 +404,7 @@ function inspectGraph(graphJson, maxBytes) {
     const negativeRefs = [];
     const loadImages = [];
     const seeds = [];
+    const timelineRefs = [];
     const outputCandidates = [];
     const embeddedSlots = [];
     const embeddedImageLiterals = [];
@@ -444,8 +462,18 @@ function inspectGraph(graphJson, maxBytes) {
                 }
                 continue;
             }
+            if (exactSlotName === 'timeline') {
+                if (isImageInput || isSeedInput) {
+                    errors.push(errorEntry(comfyError(
+                        'COMFY_TEMPLATE_SLOT_OVERLAP',
+                        `Timeline slot overlaps a structural slot at ${nodeId}.inputs.${inputName}`,
+                    )));
+                } else timelineRefs.push(ref);
+                continue;
+            }
             if (
                 embeddedJson?.knownTokenInKey
+                || embeddedJson?.directOnlyToken
                 || (findKnownCustomSlotToken(value) && (!embeddedJson || embeddedJson.slots.length === 0))
             ) {
                 errors.push(errorEntry(comfyError(
@@ -480,6 +508,12 @@ function inspectGraph(graphJson, maxBytes) {
             'Template contains more than one {{negative}} literal',
         )));
     }
+    if (timelineRefs.length > 1) {
+        errors.push(errorEntry(comfyError(
+            'COMFY_TEMPLATE_TIMELINE_AMBIGUOUS',
+            'Template contains more than one {{timeline}} literal',
+        )));
+    }
     const declaredImageNames = new Set();
     for (const image of loadImages) {
         if (!image.name) continue;
@@ -504,6 +538,7 @@ function inspectGraph(graphJson, maxBytes) {
             negative: negativeRefs.length === 1 ? negativeRefs[0] : textInputs,
             inputImages,
             seeds,
+            timeline: timelineRefs.length === 1 ? timelineRefs[0] : null,
         },
         ...(embeddedSlots.length > 0 ? { embeddedSlots } : {}),
         ...(embeddedImageLiterals.length > 0 ? { embeddedImageLiterals } : {}),
@@ -527,6 +562,7 @@ function inspectGraph(graphJson, maxBytes) {
         positiveRefs,
         negativeRefs,
         loadImages,
+        timelineRefs,
         outputCandidates,
         embeddedSlots,
         embeddedImageLiterals,
@@ -608,6 +644,7 @@ function expectedRuntimeSlots(templateSlots) {
     if (templateSlots.negative) expected.push(['negative', 'string']);
     if ((templateSlots.seeds ?? []).length > 0) expected.push(['seed', 'integer']);
     if (templateSlots.duration) expected.push(['duration', 'positiveNumber', false]);
+    if (templateSlots.timeline) expected.push(['timeline', 'timeline']);
     return expected;
 }
 
@@ -635,6 +672,7 @@ function validateRuntimeSlots(templateSlots, slots) {
         if (type === 'positiveNumber' && (typeof value !== 'number' || !Number.isFinite(value) || value <= 0)) {
             throw comfyError('COMFY_SLOT_INVALID', `${name} must be a positive finite number`);
         }
+        if (type === 'timeline') validateTimelineSpec(value);
         if (
             type === 'imageAsset'
             && (
@@ -854,6 +892,9 @@ function instantiateDocument(document, templateSlots, slots, outputDescriptor) {
         if (!seed.embedded) setInput(prompt, seed, resolvedSlots.seed);
     }
     if (templateSlots.duration) setInput(prompt, templateSlots.duration, resolvedSlots.duration);
+    if (templateSlots.timeline) {
+        setInput(prompt, templateSlots.timeline, assembleTimelineDocument(resolvedSlots.timeline));
+    }
     applyEmbeddedInputs(prompt, templateSlots, resolvedSlots);
     return {
         prompt,
@@ -1083,7 +1124,21 @@ function resolveTemplateSlots(inspected, slotResolution) {
         }
     }
     const duration = resolveDurationSlot(inspected.document, resolution.duration);
+    // The timeline binds itself from its exact literal — there is nothing for an
+    // operator to resolve, and inspectGraph already rejected a second one.
+    const timeline = (inspected.timelineRefs ?? []).length === 1
+        ? { nodeId: inspected.timelineRefs[0].nodeId, inputName: inspected.timelineRefs[0].inputName }
+        : undefined;
     const structuralRefs = [positive, negative, ...inputImages, ...seeds].filter(Boolean);
+    if (timeline && structuralRefs.some(ref => (
+        ref.nodeId === timeline.nodeId && ref.inputName === timeline.inputName
+    ))) {
+        throw comfyError(
+            'COMFY_TEMPLATE_SLOT_RESOLUTION_INVALID',
+            'Timeline cannot overwrite another template slot',
+        );
+    }
+    if (timeline) structuralRefs.push(timeline);
     if (duration && (
         structuralRefs.some(ref => ref.nodeId === duration.nodeId && ref.inputName === duration.inputName)
         || isEmbeddedInputRef(embedded, duration)
@@ -1107,6 +1162,7 @@ function resolveTemplateSlots(inspected, slotResolution) {
         inputImages,
         seeds,
         ...(duration ? { duration } : {}),
+        ...(timeline ? { timeline } : {}),
         ...((embedded.slots.length > 0 || embedded.inputImages.length > 0) ? { embedded } : {}),
     };
 }
@@ -1150,6 +1206,10 @@ function assertRegistrationShape(input, templateSlots, outputDescriptor) {
     if (mediaKind !== input.kind) {
         throw comfyError('COMFY_TEMPLATE_KIND_OUTPUT_MISMATCH', 'Template kind does not match its output media type');
     }
+    // A timeline template addresses its images through the assembled document —
+    // the count is chosen per run, not declared by LoadImage nodes — so
+    // LoadImage cardinality no longer describes what the mode receives.
+    if (templateSlots.timeline) return;
     // Cardinality counts DISTINCT image roles, not bindings: execution uploads
     // one image per role name and substitutes it into every binding that
     // carries it, so a direct LoadImage plus an embedded literal sharing
@@ -1190,6 +1250,9 @@ function buildManifest(templateSlots) {
             name: 'duration', type: 'number', required: false,
             exclusiveMinimum: 0, defaultValue: templateSlots.duration.defaultValue,
         });
+    }
+    if (templateSlots.timeline) {
+        manifest.push({ name: 'timeline', type: 'timeline', required: true });
     }
     return manifest;
 }
@@ -1358,7 +1421,7 @@ function createTemplateRegistry(options = {}) {
                 ok: false,
                 errors: [errorEntry(error)],
                 warnings: [],
-                slots: { positive: [], negative: [], inputImages: [], seeds: [] },
+                slots: { positive: [], negative: [], inputImages: [], seeds: [], timeline: null },
                 output: null,
                 stats: {},
             };

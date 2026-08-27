@@ -1369,7 +1369,7 @@ type PluginInlayMediaReadResult =
         result: {
             assetId: string;
             data: Blob;
-            mediaType: 'image' | 'video';
+            mediaType: 'image' | 'video' | 'audio';
             mimeType: string;
             ext: string;
             name: string;
@@ -1460,12 +1460,29 @@ type PluginInlayPutImageResult =
     | { status: 'definite_failure'; code: string; error: string }
     | { status: 'ambiguous'; code: string; error: string };
 
+interface PluginInlayPutMediaInput {
+    operationKey: string;
+    /**
+     * An image (png/jpeg/webp/gif), video (mp4/webm), or audio (mp3/ogg/wav)
+     * data URL. The declared MIME decides the stored inlay kind.
+     */
+    dataUrl: string;
+}
+
+type PluginInlayPutMediaResult = PluginInlayPutImageResult;
+
 interface PluginInlaysAPI {
     /** Optional V1 extension that stores caller-supplied image bytes as a canonical inlay. */
     putImage?(input: PluginInlayPutImageInput): Promise<PluginInlayPutImageResult>;
+    /**
+     * Optional V1 extension that stores caller-supplied image, video, or audio
+     * bytes as a canonical inlay. Shares putImage's claim record, so one
+     * operationKey names one payload whichever method wrote it.
+     */
+    putMedia?(input: PluginInlayPutMediaInput): Promise<PluginInlayPutMediaResult>;
     remove(input: { operationKey: string; assetId: string }): Promise<any>;
     read(input: { assetId: string }): Promise<any>;
-    /** Optional V1 extension that returns image or video bytes as a Blob. */
+    /** Optional V1 extension that returns image, video, or audio bytes as a Blob. */
     readMedia?(input: { assetId: string }): Promise<PluginInlayMediaReadResult>;
 }
 
@@ -1568,6 +1585,7 @@ interface ComfyTemplateAnalysis {
         negative: ComfyTemplateNodeRef | ComfyTemplateNodeRef[];
         inputImages: Array<ComfyTemplateNodeRef & { name?: string }>;
         seeds: ComfyTemplateNodeRef[];
+        timeline?: ComfyTemplateNodeRef | null;
     };
     embeddedSlots?: ComfyTemplateEmbeddedSlot[];
     embeddedImageLiterals?: ComfyTemplateEmbeddedImageLiteral[];
@@ -1604,7 +1622,7 @@ interface ComfyTemplateRegistrationInput {
 
 interface ComfyTemplateRequiredManifestSlot {
     name: string;
-    type: 'string' | 'imageAsset' | 'integer';
+    type: 'string' | 'imageAsset' | 'integer' | 'timeline';
     required: true;
     minimum?: number;
     maximum?: number;
@@ -1628,6 +1646,7 @@ interface ComfyTemplateSlotBindings {
     inputImages: Array<ComfyTemplateNodeRef & { name: string }>;
     seeds: ComfyTemplateNodeRef[];
     duration?: ComfyTemplateNodeRef & { defaultValue: number };
+    timeline?: ComfyTemplateNodeRef;
     embedded?: {
         slots: Array<ComfyTemplateEmbeddedSlot & { name: string }>;
         inputImages: Array<ComfyTemplateEmbeddedImageLiteral & { name: string }>;
@@ -1671,11 +1690,36 @@ type ComfyTemplateSummary =
     | ComfyCustomTemplateSummary
     | ComfyBuiltinTemplateFailure;
 
+interface ComfyTimelineItem {
+    /** Type-scoped 0-based address: image 0..8, video 0..2, audio 0..2. */
+    slot: number;
+    type: 'image' | 'video' | 'audio';
+    /** An inlay asset id the core can read; it uploads and resolves it. */
+    assetId: string;
+    start?: number;
+    duration?: number;
+    trim_start?: number;
+    trim_end?: number;
+    source_duration?: number;
+    media_mode?: 'video_audio';
+}
+
+interface ComfyTimelineSpec {
+    items: ComfyTimelineItem[];
+}
+
 interface ComfyOrchestratorAPI {
     submit(input: {
         operationKey: string;
         template: string;
-        slots: { positive: string; input_image: string; seed: number; duration?: number };
+        slots: {
+            positive: string;
+            /** Absent on templates that address their media through {{timeline}}. */
+            input_image?: string;
+            seed: number;
+            duration?: number;
+            timeline?: ComfyTimelineSpec;
+        };
         target?: { charId?: string; chatId?: string };
     }): Promise<ComfyResult<{ jobId: string }>>;
     poll(input: { jobId: string }): Promise<ComfyResult<{ job: ComfyJobSnapshot }>>;

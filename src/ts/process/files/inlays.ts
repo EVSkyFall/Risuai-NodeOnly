@@ -75,6 +75,8 @@ export type InlayImageBytesWriteOptions = {
     ext: string
     mimeType: string
     name?: string
+    /** Defaults to 'image' so existing exact-byte image writes are unchanged. */
+    type?: 'image' | 'video' | 'audio'
     target?: InlayTarget
 }
 
@@ -677,7 +679,7 @@ export async function writeInlayImageBytes(
             name: arg.name ?? arg.id,
             data,
             ext: arg.ext,
-            type: 'image',
+            type: arg.type ?? 'image',
         },
         arg.target,
     )

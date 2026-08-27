@@ -1353,6 +1353,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
         _measurePluginImagePrompt: (input: any) => pluginImagesApi.measurePrompt(input),
         _generatePluginImageToInlay: (input: any) => pluginImagesApi.generateToInlay(input),
         _putPluginInlayImage: (input: any) => pluginImagesApi.putImage(input),
+        _putPluginInlayMedia: (input: any) => pluginImagesApi.putMedia(input),
         _removePluginInlay: (input: any) => pluginImagesApi.remove(input),
         _readPluginInlay: (input: any) => pluginImagesApi.read(input),
         _readPluginInlayMedia: (input: any) => pluginInlayMediaApi.readMedia(input),
@@ -1379,6 +1380,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
                 pluginInlaysV1: 1,
                 pluginInlaysMediaV1: 1,
                 pluginInlaysPutImageV1: 1,
+                pluginInlaysPutMediaV1: 1,
                 comfyOrchestratorV1: 1,
                 // Aggregate readiness marker: every primitive advertised in
                 // this handshake is wired and usable.
@@ -1432,6 +1434,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
                 },
                 'pluginInlays':{
                     'putImage': '_putPluginInlayImage',
+                    'putMedia': '_putPluginInlayMedia',
                     'remove': '_removePluginInlay',
                     'read': '_readPluginInlay',
                     'readMedia': '_readPluginInlayMedia',

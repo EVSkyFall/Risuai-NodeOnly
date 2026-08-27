@@ -11,6 +11,7 @@ const { createTemplateRegistry } = registryPkg as any
 const { createComfyStore } = storePkg as any
 const templateDir = fileURLToPath(new URL('./templates/', import.meta.url))
 const fl2vaFixturePath = fileURLToPath(new URL('./fixtures/DasiwaMinimaxH3WorkflowsT2VA_cMMH3V11_FL2VA.min.json', import.meta.url))
+const v16FixturePath = fileURLToPath(new URL('./fixtures/DasiwaMinimaxH3WorkflowsT2VA_cMMH3V16_REF2VA.min.json', import.meta.url))
 const dbs: any[] = []
 
 afterEach(() => {
@@ -1156,5 +1157,218 @@ describe('Comfy custom template analysis and registration', () => {
     expect(await registry.listTemplates('image')).toEqual([
       expect.objectContaining({ source: 'custom', kind: 'image', name: 'Still' }),
     ])
+  })
+})
+
+describe('Comfy {{timeline}} slot registration', () => {
+  async function registerV16(registry: any, overrides: Record<string, any> = {}) {
+    const graphJson = await readFile(v16FixturePath, 'utf8')
+    return await registry.registerTemplate({
+      name: 'V16 REF2VA',
+      kind: 'video',
+      mode: 'ref2v',
+      graphJson,
+      promptProfile: 'h3-structured',
+      outputDescriptor: {
+        nodeId: '2568',
+        classType: 'DaSiWa_EnhancedVideoCombine',
+        historyKey: 'gifs',
+        mediaType: 'video/mp4',
+      },
+      ...overrides,
+    })
+  }
+
+  it('analyzes the sanitized V16 REF2VA graph without an unknown-placeholder warning', async () => {
+    const { registry } = createRegistry()
+    const graphJson = await readFile(v16FixturePath, 'utf8')
+
+    expect(registry.analyzeTemplate(graphJson)).toMatchObject({
+      ok: true,
+      errors: [],
+      warnings: [],
+      slots: {
+        positive: { nodeId: '2730', inputName: 'prompt' },
+        inputImages: [],
+        seeds: [{ nodeId: '1512:2600', inputName: 'noise_seed' }],
+        timeline: { nodeId: '2730', inputName: 'timeline_data' },
+      },
+    })
+  })
+
+  it('binds the timeline directly and publishes it in the manifest', async () => {
+    const { registry } = createRegistry()
+    const registered = await registerV16(registry)
+
+    expect(registered.template).toMatchObject({
+      slots: expect.arrayContaining([{ name: 'timeline', type: 'timeline', required: true }]),
+      slotBindings: { timeline: { nodeId: '2730', inputName: 'timeline_data' } },
+    })
+    expect(await registry.listTemplates('video')).toContainEqual(expect.objectContaining({
+      id: registered.template.id,
+      slotBindings: expect.objectContaining({ timeline: { nodeId: '2730', inputName: 'timeline_data' } }),
+    }))
+  })
+
+  it('lets the timeline stand in for LoadImage cardinality on a ref2v mode', async () => {
+    const { registry } = createRegistry()
+    await expect(registerV16(registry)).resolves.toMatchObject({ created: true })
+  })
+
+  it('injects the assembled document at the bound input and leaves other slots alone', async () => {
+    const { registry } = createRegistry()
+    const registered = await registerV16(registry)
+
+    const compiled = await registry.instantiate(registered.template.id, {
+      positive: 'a director document',
+      seed: 41,
+      timeline: {
+        items: [
+          { slot: 0, type: 'image', assetId: 'plugin-inlay-anchor' },
+          { slot: 0, type: 'audio', assetId: 'plugin-inlay-voice', source_duration: 4 },
+        ],
+      },
+    })
+
+    expect(JSON.parse(compiled.prompt['2730'].inputs.timeline_data)).toEqual({
+      version: 1,
+      items: [
+        {
+          id: 'risu-image-0',
+          enabled: true,
+          order: 0,
+          slot: 0,
+          start: 0,
+          duration: 1,
+          type: 'image',
+          value: 'plugin-inlay-anchor',
+          thumbnail: null,
+        },
+        {
+          id: 'risu-audio-0',
+          enabled: true,
+          order: 1,
+          slot: 0,
+          start: 0,
+          duration: 4,
+          type: 'audio',
+          value: 'plugin-inlay-voice',
+          thumbnail: null,
+          source_duration: 4,
+        },
+      ],
+    })
+    expect(compiled.prompt['2730'].inputs.prompt).toBe('a director document')
+    expect(compiled.prompt['2730'].inputs.builder_state).toBe('{}')
+    expect(compiled.prompt['1512:2600'].inputs.noise_seed).toBe(41)
+  })
+
+  it('rejects a missing or malformed timeline at instantiation', async () => {
+    const { registry } = createRegistry()
+    const registered = await registerV16(registry)
+
+    await expect(registry.instantiate(registered.template.id, {
+      positive: 'no timeline', seed: 1,
+    })).rejects.toMatchObject({ code: 'COMFY_SLOT_MISSING' })
+    await expect(registry.instantiate(registered.template.id, {
+      positive: 'bad timeline', seed: 1, timeline: { items: [] },
+    })).rejects.toMatchObject({ code: 'COMFY_SLOT_INVALID' })
+    await expect(registry.instantiate(registered.template.id, {
+      positive: 'wire string is not a spec', seed: 1, timeline: '{"version":1,"items":[]}',
+    })).rejects.toMatchObject({ code: 'COMFY_SLOT_INVALID' })
+  })
+
+  it('rejects a second {{timeline}} literal and a nested one', () => {
+    const { registry } = createRegistry()
+    const twice = graph({ images: [] })
+    twice.directorA = { class_type: 'Director', inputs: { timeline_data: '{{timeline}}' } }
+    twice.directorB = { class_type: 'Director', inputs: { timeline_data: '{{timeline}}' } }
+    expect(registry.analyzeTemplate(twice)).toMatchObject({
+      ok: false,
+      errors: expect.arrayContaining([{
+        code: 'COMFY_TEMPLATE_TIMELINE_AMBIGUOUS',
+        message: expect.stringContaining('{{timeline}}'),
+      }]),
+    })
+
+    const nested = graph({ images: [] })
+    nested.director = {
+      class_type: 'Director',
+      inputs: { timeline_data: JSON.stringify({ items: [{ value: '{{timeline}}' }] }) },
+    }
+    expect(registry.analyzeTemplate(nested)).toMatchObject({
+      ok: false,
+      errors: expect.arrayContaining([{
+        code: 'COMFY_TEMPLATE_PLACEHOLDER_INVALID',
+        message: expect.stringContaining('director.inputs.timeline_data'),
+      }]),
+    })
+  })
+
+  it('rejects a {{timeline}} that lands on a structural input', () => {
+    const { registry } = createRegistry()
+    const onSeed = graph({ images: [], seeds: [['sampler', 'seed', '{{timeline}}']] })
+    expect(registry.analyzeTemplate(onSeed)).toMatchObject({
+      ok: false,
+      errors: expect.arrayContaining([{
+        code: 'COMFY_TEMPLATE_SLOT_OVERLAP',
+        message: expect.stringContaining('sampler.inputs.seed'),
+      }]),
+    })
+
+    const onImage = graph({ images: [] })
+    onImage.picture = { class_type: 'LoadImage', inputs: { image: '{{timeline}}' } }
+    expect(registry.analyzeTemplate(onImage)).toMatchObject({
+      ok: false,
+      errors: expect.arrayContaining([expect.objectContaining({ code: 'COMFY_TEMPLATE_SLOT_OVERLAP' })]),
+    })
+  })
+
+  it('rejects a positive resolution that would overwrite the timeline input', async () => {
+    const { registry } = createRegistry()
+    const custom = graph({ images: [], positive: null })
+    custom.director = {
+      class_type: 'Director',
+      inputs: { prompt: 'a document', timeline_data: '{{timeline}}' },
+    }
+    await expect(registry.registerTemplate({
+      name: 'Overlapping timeline',
+      kind: 'video',
+      mode: 't2v',
+      graphJson: custom,
+      slotResolution: { positive: { nodeId: 'director', inputName: 'timeline_data' } },
+      promptProfile: 'h3-structured',
+    })).rejects.toMatchObject({ code: 'COMFY_TEMPLATE_SLOT_RESOLUTION_INVALID' })
+  })
+
+  it('leaves a graph without {{timeline}} byte-identical in slots, manifest, and prompt', async () => {
+    const { registry } = createRegistry()
+    const plain = graph({ images: ['picture'] })
+    const registered = await registry.registerTemplate({
+      name: 'Untouched i2v',
+      kind: 'video',
+      mode: 'i2v',
+      graphJson: plain,
+      promptProfile: 'wan-motion',
+    })
+
+    expect(registered.template.slots).toEqual([
+      { name: 'input_image', type: 'imageAsset', required: true },
+      { name: 'positive', type: 'string', required: true },
+      { name: 'seed', type: 'integer', required: true, minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+    ])
+    expect(registered.template.slotBindings.timeline).toBeUndefined()
+    const compiled = await registry.instantiate(registered.template.id, {
+      positive: 'move', input_image: 'risu/input.png', seed: 3,
+    })
+    expect(JSON.stringify(compiled.prompt)).toBe(JSON.stringify({
+      output: { class_type: 'VHS_VideoCombine', inputs: { source: ['sampler', 0] } },
+      picture: { class_type: 'LoadImage', inputs: { image: 'risu/input.png' } },
+      sampler: { class_type: 'SamplerCustom', inputs: { seed: 3 } },
+      text: { class_type: 'CLIPTextEncode', inputs: { text: 'move' } },
+    }))
+    await expect(registry.instantiate(registered.template.id, {
+      positive: 'move', input_image: 'risu/input.png', seed: 3, timeline: { items: [] },
+    })).rejects.toMatchObject({ code: 'COMFY_SLOT_UNKNOWN' })
   })
 })
