@@ -648,7 +648,7 @@ function expectedRuntimeSlots(templateSlots) {
     return expected;
 }
 
-function validateRuntimeSlots(templateSlots, slots) {
+function validateRuntimeSlots(templateSlots, slots, { timelineResolved = false } = {}) {
     if (!isPlainObject(slots)) throw comfyError('COMFY_SLOTS_INVALID', 'Template slots must be an object');
     const expected = expectedRuntimeSlots(templateSlots);
     const names = new Set(expected.map(([name]) => name));
@@ -672,7 +672,7 @@ function validateRuntimeSlots(templateSlots, slots) {
         if (type === 'positiveNumber' && (typeof value !== 'number' || !Number.isFinite(value) || value <= 0)) {
             throw comfyError('COMFY_SLOT_INVALID', `${name} must be a positive finite number`);
         }
-        if (type === 'timeline') validateTimelineSpec(value);
+        if (type === 'timeline') validateTimelineSpec(value, { resolved: timelineResolved });
         if (
             type === 'imageAsset'
             && (
@@ -689,13 +689,17 @@ function validateRuntimeSlots(templateSlots, slots) {
     }
 }
 
-function resolveRuntimeSlots(templateSlots, slots) {
+// `timelineResolved` says which side of dispatch the caller is on: submit hands
+// in a plugin spec, the dispatch loop hands back the same spec once every asset
+// carries its uploaded name. It is a parameter rather than a shape sniff so a
+// caller cannot elect itself into the wider field set.
+function resolveRuntimeSlots(templateSlots, slots, options = {}) {
     if (!isPlainObject(slots)) throw comfyError('COMFY_SLOTS_INVALID', 'Template slots must be an object');
     const resolved = { ...slots };
     if (templateSlots.duration && !Object.prototype.hasOwnProperty.call(resolved, 'duration')) {
         resolved.duration = templateSlots.duration.defaultValue;
     }
-    validateRuntimeSlots(templateSlots, resolved);
+    validateRuntimeSlots(templateSlots, resolved, options);
     return resolved;
 }
 
@@ -879,9 +883,9 @@ function applyEmbeddedInputs(document, templateSlots, slots) {
     }
 }
 
-function instantiateDocument(document, templateSlots, slots, outputDescriptor) {
+function instantiateDocument(document, templateSlots, slots, outputDescriptor, options = {}) {
     assertEmbeddedSnapshotBindings(document, templateSlots);
-    const resolvedSlots = resolveRuntimeSlots(templateSlots, slots);
+    const resolvedSlots = resolveRuntimeSlots(templateSlots, slots, options);
     const prompt = structuredClone(document);
     if (templateSlots.positive && !templateSlots.positive.embedded) setInput(prompt, templateSlots.positive, resolvedSlots.positive);
     if (templateSlots.negative && !templateSlots.negative.embedded) setInput(prompt, templateSlots.negative, resolvedSlots.negative);
@@ -1206,10 +1210,6 @@ function assertRegistrationShape(input, templateSlots, outputDescriptor) {
     if (mediaKind !== input.kind) {
         throw comfyError('COMFY_TEMPLATE_KIND_OUTPUT_MISMATCH', 'Template kind does not match its output media type');
     }
-    // A timeline template addresses its images through the assembled document —
-    // the count is chosen per run, not declared by LoadImage nodes — so
-    // LoadImage cardinality no longer describes what the mode receives.
-    if (templateSlots.timeline) return;
     // Cardinality counts DISTINCT image roles, not bindings: execution uploads
     // one image per role name and substitutes it into every binding that
     // carries it, so a direct LoadImage plus an embedded literal sharing
@@ -1220,6 +1220,11 @@ function assertRegistrationShape(input, templateSlots, outputDescriptor) {
         if (IMAGE_ROLE_PATTERN.test(slot.name)) imageRoles.add(slot.name);
     }
     for (const binding of templateSlots.embedded?.inputImages ?? []) imageRoles.add(binding.name);
+    // A timeline template with no image role at all addresses its images through
+    // the assembled document — the count is chosen per run, not declared by
+    // LoadImage nodes — so cardinality has nothing to describe. A template that
+    // still carries image roles keeps the mode↔shape invariant.
+    if (templateSlots.timeline && imageRoles.size === 0) return;
     const imageCount = imageRoles.size;
     const validCardinality = input.mode === 't2v' || input.mode === 't2i'
         ? imageCount === 0
@@ -1511,7 +1516,7 @@ function createTemplateRegistry(options = {}) {
         return { ...compiled, templateHash: template.hash };
     }
 
-    function instantiateSnapshot(sourceText, expectedHash, slots, templateId = 'stored snapshot', snapshot = {}) {
+    function instantiateSnapshot(sourceText, expectedHash, slots, templateId = 'stored snapshot', snapshot = {}, options = {}) {
         if (typeof sourceText !== 'string' || sha256(Buffer.from(sourceText, 'utf8')) !== expectedHash) {
             throw comfyError('COMFY_TEMPLATE_SNAPSHOT_INVALID', 'Stored template snapshot hash does not match');
         }
@@ -1528,7 +1533,7 @@ function createTemplateRegistry(options = {}) {
             }
             : compileWithContext(document, templateId);
         return {
-            ...instantiateDocument(document, compiled.templateSlots, slots, compiled.outputDescriptor),
+            ...instantiateDocument(document, compiled.templateSlots, slots, compiled.outputDescriptor, options),
             templateHash: expectedHash,
         };
     }

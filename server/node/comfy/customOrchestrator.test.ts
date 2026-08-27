@@ -642,7 +642,8 @@ describe('Comfy custom template orchestration', () => {
           { slot: 1, type: 'image', assetId: 'reference' },
           // The same asset twice: one upload, two slots.
           { slot: 2, type: 'image', assetId: 'reference', start: 5 },
-          { slot: 0, type: 'video', assetId: 'reel', trim_start: 1, trim_end: 3, media_mode: 'video_audio' },
+          // Videos live at the top of the SHARED visual track, not at 0.
+          { slot: 9, type: 'video', assetId: 'reel', trim_start: 1, trim_end: 3, media_mode: 'video_audio' },
           { slot: 0, type: 'audio', assetId: 'voice', source_duration: 6 },
         ],
       },
@@ -659,8 +660,9 @@ describe('Comfy custom template orchestration', () => {
       'timeline#reference',
       'timeline#voice',
     ])
-    expect(raw.inputAssets['timeline#anchor']).toMatchObject({ type: 'image', width: 768, height: 1120 })
-    expect(raw.inputAssets['timeline#voice']).toMatchObject({ type: 'audio' })
+    expect(raw.inputAssets['timeline#anchor']).toMatchObject({ type: 'image', slot: 0, width: 768, height: 1120 })
+    expect(raw.inputAssets['timeline#reel']).toMatchObject({ type: 'video', slot: 9 })
+    expect(raw.inputAssets['timeline#voice']).toMatchObject({ type: 'audio', slot: 0 })
     expect(raw.inputAssets['timeline#voice'].width).toBeUndefined()
 
     store.updateJob(raw.jobId, raw.revision, 'queued', { state: 'submitting' })
@@ -673,11 +675,15 @@ describe('Comfy custom template orchestration', () => {
     expect(new Set(uploads)).toEqual(new Set(Object.keys(media).map(
       id => uploadedName(id as keyof typeof media).slice('risu-comfy/'.length),
     )))
+    // The id timestamp is the job's own creation time, so the document a resumed
+    // dispatch rebuilds is identical to the one the first attempt sent.
+    const stamp = raw.createdAt
+    expect(Number.isSafeInteger(stamp)).toBe(true)
     expect(JSON.parse(submittedPrompt.director.inputs.timeline_data)).toEqual({
       version: 1,
       items: [
         {
-          id: 'risu-image-0',
+          id: `image-${stamp}-0`,
           enabled: true,
           order: 0,
           slot: 0,
@@ -690,7 +696,7 @@ describe('Comfy custom template orchestration', () => {
           source_height: 1120,
         },
         {
-          id: 'risu-image-1',
+          id: `image-${stamp}-1`,
           enabled: true,
           order: 1,
           slot: 1,
@@ -701,7 +707,7 @@ describe('Comfy custom template orchestration', () => {
           thumbnail: null,
         },
         {
-          id: 'risu-image-2',
+          id: `image-${stamp}-2`,
           enabled: true,
           order: 2,
           slot: 2,
@@ -712,11 +718,11 @@ describe('Comfy custom template orchestration', () => {
           thumbnail: null,
         },
         {
-          id: 'risu-video-0',
+          id: `video-${stamp}-3`,
           enabled: true,
           order: 3,
-          slot: 0,
-          start: 0,
+          slot: 9,
+          start: 9,
           duration: 2,
           type: 'video',
           value: uploadedName(`reel`),
@@ -726,7 +732,7 @@ describe('Comfy custom template orchestration', () => {
           media_mode: 'video_audio',
         },
         {
-          id: 'risu-audio-0',
+          id: `audio-${stamp}-4`,
           enabled: true,
           order: 4,
           slot: 0,
@@ -738,6 +744,7 @@ describe('Comfy custom template orchestration', () => {
           source_duration: 6,
         },
       ],
+      prompt_blocks: [],
     })
     expect(submittedPrompt.director.inputs.prompt).toBe('a director document')
     expect(submittedPrompt.sampler.inputs.noise_seed).toBe(7)
@@ -819,7 +826,10 @@ describe('Comfy custom template orchestration', () => {
 
     expect(await orchestrator.poll(submitted.jobId)).toMatchObject({
       state: 'failed',
-      error: { code: 'COMFY_INPUT_CHANGED' },
+      error: {
+        code: 'COMFY_INPUT_CHANGED',
+        message: 'timeline image slot 0 (anchor): Input asset changed after submission',
+      },
     })
   })
 
@@ -828,6 +838,7 @@ describe('Comfy custom template orchestration', () => {
     dirs.push(root)
     const inlayDir = path.join(root, 'inlays')
     await writeImage(inlayDir, 'anchor')
+    await writeImage(inlayDir, 'anchor-reel')
     const fetchImpl = (async (urlValue: string | URL | Request) => {
       const url = new URL(String(urlValue))
       if (url.pathname === '/system_stats') return Response.json({ system: {} })
@@ -862,15 +873,24 @@ describe('Comfy custom template orchestration', () => {
     })
     await orchestrator.updateEndpoint('http://127.0.0.1:8188')
 
+    // Twelve references can share one job; the refusal has to name the bad one.
     await expect(orchestrator.submit({
       operationKey: 'timeline-kind-op',
       template: registered.template.id,
       slots: {
         positive: 'a director document',
         seed: 7,
-        timeline: { items: [{ slot: 0, type: 'video', assetId: 'anchor' }] },
+        timeline: {
+          items: [
+            { slot: 0, type: 'image', assetId: 'anchor' },
+            { slot: 10, type: 'video', assetId: 'anchor-reel' },
+          ],
+        },
       },
-    })).rejects.toMatchObject({ code: 'COMFY_INPUT_NOT_VIDEO' })
+    })).rejects.toMatchObject({
+      code: 'COMFY_INPUT_NOT_VIDEO',
+      message: expect.stringContaining('timeline video slot 10 (anchor-reel):'),
+    })
     expect(store.findByOperationKey('timeline-kind-op')).toBeNull()
   })
 })

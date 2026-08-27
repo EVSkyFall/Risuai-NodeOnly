@@ -180,12 +180,15 @@ describe('plugin Comfy orchestrator relay', () => {
       items: [
         { slot: 0, type: 'image' as const, assetId: 'plugin-inlay-anchor' },
         {
-          slot: 0,
+          // Videos address the top of the shared visual track, not slot 0.
+          slot: 9,
           type: 'video' as const,
           assetId: 'comfy-reel',
           trim_start: 1,
           trim_end: 4,
           media_mode: 'video_audio' as const,
+          source_width: 1152,
+          source_height: 784,
         },
         { slot: 0, type: 'audio' as const, assetId: 'plugin-inlay-voice', source_duration: 6 },
       ],

@@ -1215,6 +1215,25 @@ describe('Comfy {{timeline}} slot registration', () => {
     await expect(registerV16(registry)).resolves.toMatchObject({ created: true })
   })
 
+  // The bypass is only for a graph that has NO image role at all: the sanitized
+  // V16 graphs carry zero LoadImage nodes, so cardinality has nothing to
+  // describe. A mixed timeline+image template still has to match its mode.
+  it('keeps the mode invariant alive when a timeline template still carries image roles', async () => {
+    const { registry } = createRegistry()
+    const mixed = graph({ images: ['picture'] })
+    mixed.director = { class_type: 'Director', inputs: { timeline_data: '{{timeline}}' } }
+    const register = (mode: string) => registry.registerTemplate({
+      name: `Mixed ${mode}`,
+      kind: 'video',
+      mode,
+      graphJson: mixed,
+      promptProfile: 'h3-structured',
+    })
+
+    await expect(register('t2v')).rejects.toMatchObject({ code: 'COMFY_TEMPLATE_IMAGE_CARDINALITY' })
+    await expect(register('i2v')).resolves.toMatchObject({ created: true })
+  })
+
   it('injects the assembled document at the bound input and leaves other slots alone', async () => {
     const { registry } = createRegistry()
     const registered = await registerV16(registry)
@@ -1230,11 +1249,12 @@ describe('Comfy {{timeline}} slot registration', () => {
       },
     })
 
+    // No job exists yet on this path, so the ids stamp zero rather than a clock.
     expect(JSON.parse(compiled.prompt['2730'].inputs.timeline_data)).toEqual({
       version: 1,
       items: [
         {
-          id: 'risu-image-0',
+          id: 'image-0-0',
           enabled: true,
           order: 0,
           slot: 0,
@@ -1245,7 +1265,7 @@ describe('Comfy {{timeline}} slot registration', () => {
           thumbnail: null,
         },
         {
-          id: 'risu-audio-0',
+          id: 'audio-0-1',
           enabled: true,
           order: 1,
           slot: 0,
@@ -1257,6 +1277,7 @@ describe('Comfy {{timeline}} slot registration', () => {
           source_duration: 4,
         },
       ],
+      prompt_blocks: [],
     })
     expect(compiled.prompt['2730'].inputs.prompt).toBe('a director document')
     expect(compiled.prompt['2730'].inputs.builder_state).toBe('{}')

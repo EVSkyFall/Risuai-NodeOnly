@@ -1464,7 +1464,10 @@ interface PluginInlayPutMediaInput {
     operationKey: string;
     /**
      * An image (png/jpeg/webp/gif), video (mp4/webm), or audio (mp3/ogg/wav)
-     * data URL. The declared MIME decides the stored inlay kind.
+     * data URL. The declared MIME decides the stored inlay kind. Common aliases
+     * are accepted and normalized to their canonical type — `audio/mp3` to
+     * `audio/mpeg`, `audio/x-wav` and `audio/wave` to `audio/wav`, `image/jpg`
+     * to `image/jpeg` — so the stored inlay never carries the alias.
      */
     dataUrl: string;
 }
@@ -1691,7 +1694,11 @@ type ComfyTemplateSummary =
     | ComfyBuiltinTemplateFailure;
 
 interface ComfyTimelineItem {
-    /** Type-scoped 0-based address: image 0..8, video 0..2, audio 0..2. */
+    /**
+     * Address in the Director's slot space. Images and videos SHARE one visual
+     * track of twelve — images at 0..8, videos at 9..11 — while audio addresses
+     * a separate track at 0..2. A video at slot 0 is refused.
+     */
     slot: number;
     type: 'image' | 'video' | 'audio';
     /** An inlay asset id the core can read; it uploads and resolves it. */
@@ -1702,6 +1709,13 @@ interface ComfyTimelineItem {
     trim_end?: number;
     source_duration?: number;
     media_mode?: 'video_audio';
+    /**
+     * Source pixel dimensions, which ref_image_size='match' scaling may read.
+     * Supply them for video; images take theirs from the stored asset, and
+     * audio may not carry them.
+     */
+    source_width?: number;
+    source_height?: number;
 }
 
 interface ComfyTimelineSpec {

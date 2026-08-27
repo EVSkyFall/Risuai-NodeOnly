@@ -22,6 +22,24 @@ const WORKER_PREEMPTED_MESSAGE = 'ComfyUI 작업 전환 대기 — 자동으로 
 const SUBMISSION_PROOF_WAIT_MESSAGE = 'ComfyUI 원격 접수 여부를 증명할 수 없어요 — 대기 중이며 취소할 수 있어요';
 const CANCEL_PENDING_MESSAGE = 'ComfyUI 취소 진행 중 — 원격 작업을 확인하고 있어요';
 
+// A timeline can name twelve references; a bare COMFY_INPUT_* leaves the plugin
+// guessing which one it was. ComfyError has no details channel, so the item goes
+// in the message and the code carries through untouched.
+function describeTimelineItem({ type, slot, assetId }) {
+    const address = Number.isSafeInteger(slot) ? `${type} slot ${slot}` : String(type ?? 'item');
+    return `timeline ${address} (${assetId})`;
+}
+
+function attributeTimelineError(error, item) {
+    if (!isComfyError(error)) return error;
+    return comfyError(error.code, `${describeTimelineItem(item)}: ${error.message}`, {
+        httpStatus: error.httpStatus,
+        uncertain: error.uncertain,
+        retryMaterialization: error.retryMaterialization,
+        cause: error,
+    });
+}
+
 function normalizeEndpoint(value) {
     let parsed;
     try {
@@ -393,8 +411,13 @@ function createComfyOrchestrator(options) {
             inputAssets[imageSlot.name] = { assetId, hash: inputAsset.hash };
         }
         if (template.templateSlots.timeline) {
-            for (const { assetId, type } of collectTimelineAssets(resolvedSlots.timeline)) {
-                const inputAsset = await assets.readInputAsset(assetId, type);
+            for (const { assetId, type, slot } of collectTimelineAssets(resolvedSlots.timeline)) {
+                let inputAsset;
+                try {
+                    inputAsset = await assets.readInputAsset(assetId, type);
+                } catch (error) {
+                    throw attributeTimelineError(error, { type, slot, assetId });
+                }
                 // The sidecar dimensions are pinned here rather than re-read at
                 // dispatch: a resumed dispatch skips the read for anything it
                 // already uploaded, and the assembled document must not depend
@@ -403,6 +426,7 @@ function createComfyOrchestrator(options) {
                     assetId,
                     hash: inputAsset.hash,
                     type,
+                    slot,
                     ...(Number.isSafeInteger(inputAsset.width) ? { width: inputAsset.width } : {}),
                     ...(Number.isSafeInteger(inputAsset.height) ? { height: inputAsset.height } : {}),
                 };
@@ -683,10 +707,22 @@ function createComfyOrchestrator(options) {
             const remoteInputs = { ...(current.remoteInputs ?? {}) };
             for (const [slotName, snapshot] of Object.entries(current.inputAssets ?? {})) {
                 if (remoteInputs[slotName]) continue;
-                const input = await assets.readInputAsset(snapshot.assetId, snapshot.type ?? 'image');
+                const timelineItem = isTimelineAssetKey(slotName) ? snapshot : null;
+                let input;
+                try {
+                    input = await assets.readInputAsset(snapshot.assetId, snapshot.type ?? 'image');
+                } catch (error) {
+                    if (!timelineItem) throw error;
+                    throw attributeTimelineError(error, timelineItem);
+                }
                 if (generation !== localGeneration) return;
                 if (input.hash !== snapshot.hash) {
-                    return failJob(current, 'COMFY_INPUT_CHANGED', 'Input asset changed after submission');
+                    const changed = 'Input asset changed after submission';
+                    return failJob(
+                        current,
+                        'COMFY_INPUT_CHANGED',
+                        timelineItem ? `${describeTimelineItem(timelineItem)}: ${changed}` : changed,
+                    );
                 }
                 if (generation !== localGeneration || !store.getJob(current.jobId)) return;
                 try {
@@ -714,10 +750,14 @@ function createComfyOrchestrator(options) {
                 if (!isTimelineAssetKey(slotName)) compiledSlots[slotName] = remoteName;
             }
             if (current.templateSlots?.timeline) {
+                // The job's own creation timestamp — persisted at submit — is what
+                // stamps the assembled item ids, so a retried or resumed dispatch
+                // rebuilds the identical document.
                 compiledSlots.timeline = resolveTimelineSpec(
                     current.slots.timeline,
                     current.inputAssets,
                     remoteInputs,
+                    current.createdAt,
                 );
             }
             const compiled = registry.instantiateSnapshot(
@@ -726,6 +766,7 @@ function createComfyOrchestrator(options) {
                 compiledSlots,
                 current.templateId,
                 { templateSlots: current.templateSlots, outputDescriptor: current.outputDescriptor },
+                { timelineResolved: Boolean(current.templateSlots?.timeline) },
             );
             let attemptSequenceHorizon;
             try {
