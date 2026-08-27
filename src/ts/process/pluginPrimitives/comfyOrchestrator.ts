@@ -36,7 +36,8 @@ export interface ComfySlots {
     positive: string
     /** Absent on templates that address their media through {{timeline}}. */
     input_image?: string
-    seed: number
+    /** Absent on templates whose graph carries no seed input. */
+    seed?: number
     duration?: number
     timeline?: ComfyTimelineSpec
 }
