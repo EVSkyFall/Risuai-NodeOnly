@@ -1883,7 +1883,7 @@ export const languageChineseTraditional = {
     "pluginStorageBulkDeleted": (n: number) => `已刪除 ${n} 個項目`,
 
     "requestLogsTab": "請求記錄",
-    "requestLogsDesc": "記錄每次送往供應商的請求主體、回應與耗時。預設篩選僅顯示 LLM 請求。",
+    "requestLogsDesc": "記錄每次送往供應商的請求主體、回應與耗時。",
     "requestLogsFilters": "篩選",
     "requestLogsFilterClear": "清除篩選",
     "requestLogsFilterActive": (count: number) => count === 0 ? "" : `已套用 ${count} 項`,

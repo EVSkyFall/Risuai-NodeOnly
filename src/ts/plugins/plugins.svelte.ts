@@ -16,6 +16,11 @@ import { PLUGIN_CUSTOM_STORAGE_KEY, applyPluginDbKey, pluginCustomStorageProxy }
 
 export const customProviderStore = writable([] as string[])
 
+const withPluginFetchLog = <T extends { logCategory?: unknown, logSource?: unknown } | undefined>(options: T): T => {
+    if (options?.logCategory) return options
+    return { ...options, logCategory: 'other', logSource: 'plugin' } as T
+}
+
 interface ProviderPlugin {
     name: string
     displayName?: string
@@ -535,8 +540,10 @@ export const allowedDbKeys = [
 
 export const getV2PluginAPIs = () => {
     return {
-        risuFetch: globalFetch,
-        nativeFetch: fetchNative,
+        risuFetch: (url: string, options?: Parameters<typeof globalFetch>[1]) =>
+            globalFetch(url, withPluginFetchLog(options)),
+        nativeFetch: (url: string, options: Parameters<typeof fetchNative>[1]) =>
+            fetchNative(url, withPluginFetchLog(options)),
         getArg: (arg: string) => {
             const db = getDatabase()
             const [name, realArg] = arg.split('::')

@@ -1907,7 +1907,7 @@ export const languageEnglish = {
 
     // Request logs / usage (system settings)
     requestLogsTab: "Request Logs",
-    requestLogsDesc: "Records the body, response and timing of every request sent to a provider. The default filter shows LLM requests only.",
+    requestLogsDesc: "Records the body, response and timing of every request sent to a provider.",
     requestLogsFilters: "Filters",
     requestLogsFilterClear: "Clear filters",
     requestLogsFilterActive: (count: number) => count === 0 ? "" : `${count} active`,

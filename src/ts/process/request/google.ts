@@ -8,6 +8,7 @@ import { extractJSON, getGeneralJSONSchema } from "../templates/jsonSchema"
 import { callTool, decodeToolCall, encodeToolCall } from "../mcp/mcp"
 import { notifyError } from "src/ts/alert";
 import type { RequestDataArgumentExtended, requestDataResponse, StreamResponseChunk } from './request'
+import { toLogSource } from './logSource'
 import { applyAdditionalParameters, applyParameters, getAdditionalParameters, type LLMParameter } from './shared'
 import { bodyIntercepterStore } from "src/ts/stores.svelte"
 
@@ -684,7 +685,7 @@ async function requestGoogle(url:string, body:any, headers:{[key:string]:string}
             signal: arg.abortSignal,
             interceptor: 'gemini_base_stream',
             logCategory: 'llm',
-            logSource: 'main',
+            logSource: arg.logSource ?? toLogSource(arg.mode),
             logModel: arg.modelInfo?.id,
         })
 
@@ -720,7 +721,7 @@ async function requestGoogle(url:string, body:any, headers:{[key:string]:string}
         signal: arg.abortSignal,
         interceptor: 'gemini_base',
         logCategory: 'llm',
-        logSource: 'main',
+        logSource: arg.logSource ?? toLogSource(arg.mode),
         logModel: arg.modelInfo?.id,
     })
     

@@ -35,6 +35,7 @@ import { isLocalNetworkUrl } from "./network/localNetwork";
 import { decodeProxyJobWsChunk, formatProxyStreamErrorMessage, parseProxyJobWsEvent } from "./network/proxyJobWs";
 import {
     createRequestLogScope, recordRequestLog, fetchRequestLogs,
+    extractLegacyUsage,
     type RequestLogCategory, type RequestLogSource, type RequestLogRoute,
 } from "./requestLog";
 import { cacheFullAssetManifest } from './storage/assetManifestCache';
@@ -1338,6 +1339,7 @@ interface GlobalFetchArgs {
     logCategory?: RequestLogCategory;
     logSource?: RequestLogSource;
     logModel?: string;
+    logPlugin?: string;
 }
 
 /**
@@ -1437,12 +1439,14 @@ function addFetchLogInGlobalFetch(response: any, success: boolean, url: string, 
         source: arg.logSource ?? 'other',
         chatId: arg.chatId,
         model: arg.logModel,
+        provider: arg.logPlugin,
         url,
         method: arg.method ?? 'POST',
         status,
         success,
         streaming: false,
         durationMs: Date.now() - started,
+        ...(arg.logCategory === 'llm' ? extractLegacyUsage(response) : undefined),
         requestHeaders: stringify(arg.headers ?? {}),
         requestBody: stringify(arg.body),
         responseBody: stringify(response),
@@ -2133,6 +2137,7 @@ export interface FetchNativeArgs {
     logCategory?: RequestLogCategory
     logSource?: RequestLogSource
     logModel?: string
+    logPlugin?: string
     /** Reports which transport was actually used. Fires regardless of
      *  logCategory, so a caller that logs at a higher level (the model-preset
      *  path) can record the true route instead of guessing. */
@@ -2159,6 +2164,7 @@ export async function fetchNative(url: string, arg: FetchNativeArgs): Promise<Re
         source: arg.logSource ?? 'other',
         chatId: arg.chatId,
         model: arg.logModel,
+        logPlugin: arg.logPlugin,
         streaming: true,
     })
     const logged = scope.wrap(((_input: RequestInfo | URL, _init?: RequestInit) =>

@@ -2071,7 +2071,7 @@ export const languageKorean = {
   // 리퀘스트 로그 / 사용량 (시스템 설정)
   requestLogsTab: "리퀘스트 로그",
   requestLogsDesc:
-    "프로바이더로 나간 요청의 본문·응답·소요 시간을 기록합니다. 기본 필터는 LLM 요청만 표시합니다.",
+    "프로바이더로 나간 요청의 본문·응답·소요 시간을 기록합니다.",
   requestLogsFilters: "필터",
   requestLogsFilterClear: "필터 초기화",
   requestLogsFilterActive: (count: number) =>

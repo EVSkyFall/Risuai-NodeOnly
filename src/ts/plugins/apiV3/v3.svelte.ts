@@ -771,6 +771,11 @@ const authorizationHeaders = [
 const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
 
     const oldApis = getV2PluginAPIs();
+    const withPluginName = (options: any) => ({
+        ...(options ?? {}),
+        ...(options?.logCategory ? {} : { logCategory: 'other', logSource: 'plugin' }),
+        logPlugin: plugin.name,
+    })
     return {
 
         //Old APIs from v2.1
@@ -789,7 +794,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
                     console.warn(`Request contains potentially sensitive header '${headerName}'. handling of such headers may be changed to only work with nativeFetch.`);
                 }
             }
-            return oldApis.risuFetch(url, options);
+            return oldApis.risuFetch(url, withPluginName(options));
         },
         nativeFetch: (url, options) => {
             for(const blocked of urlBlacklist){
@@ -805,7 +810,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
                     console.warn(`Request contains potentially sensitive header '${headerName}'. handling of such headers may be changed to use server-side approch with write-only api access in the future for better security.`);
                 }
             }
-            return oldApis.nativeFetch(url, options);
+            return oldApis.nativeFetch(url, withPluginName(options));
         },
         getChar: oldApis.getChar,
         setChar: oldApis.setChar,
