@@ -153,6 +153,8 @@
             if (DBState.db.showTranslationLoading && !hasRenderableResult(lastParsed)) {
                 lastParsed = translationLoadingHTML
             }
+            // Leave the $derived sync section before writing bound state (state_unsafe_mutation)
+            await Promise.resolve()
             translating = true
 
             try {
