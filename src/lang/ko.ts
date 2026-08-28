@@ -810,6 +810,7 @@ export const languageKorean = {
   botSettingsLegacyDesc: "최신 모델 업데이트가 지연되거나 새 기능이 적용되지 않을 수 있습니다. 최신화된 모델과 기능을 사용하려면 [모델 프리셋]을 이용하세요.",
   botSettingsPresetMovedDesc: "프리셋은 [프롬프트] 메뉴로 이전되었습니다.",
   botSettingsParamScopeDesc: "이 페이지의 파라미터는 [채팅 봇]에서 선택한 모델에만 적용됩니다. 모델 프리셋을 사용 중이라면 해당 프리셋 안에서 파라미터를 수정하세요.",
+  botSettingsCustomFlagsScopeDesc: "커스텀 플래그 설정은 레거시 모델에서만 동작합니다. 모델 프리셋에는 모델 프로필에 맞게 자동으로 적용됩니다.",
   currentThemePreset: "현재 테마 프리셋",
   currentPromptPreset: "현재 프롬프트 프리셋",
   presetDuplicate: "복제하기",

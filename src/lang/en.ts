@@ -731,6 +731,7 @@ export const languageEnglish = {
     botSettingsLegacyDesc: "Model updates may be delayed and new features may not apply here. Use [Model Preset] for up-to-date models and features.",
     botSettingsPresetMovedDesc: "Presets have moved to the [Prompt] menu.",
     botSettingsParamScopeDesc: "Parameters on this page only apply to the model selected in [Chat Bot]. If you use a Model Preset, edit parameters inside that preset.",
+    botSettingsCustomFlagsScopeDesc: "Custom flags only apply to legacy models. Model Presets apply capabilities automatically, based on the model profile.",
     currentThemePreset: "Current Theme Preset",
     currentPromptPreset: "Current Prompt Preset",
     presetDuplicate: "Duplicate",
