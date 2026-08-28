@@ -2452,6 +2452,8 @@ export const languageKorean = {
   supportThanks: "후원해 주셔서 감사합니다",
   supportButton: "Patreon에서 후원하기",
   supportSetName: "후원자 이름 게시하기",
+  supportNotice: "후원은 전적으로 자유이며, 후원자 이름 게시 외에 추가 기능이나 혜택은 제공되지 않습니다.",
+  supportNoticeWarn: "아카라이브 AI 채팅 채널에서는 후원 관련 언급이 규정으로 금지되어 있으니 주의해 주세요.",
   supportStatActive: "현재 정기 후원자",
   supportStatLifetime: "누적 후원자",
   supportCaptionActive: "매달 함께하고 있는 분들이에요",

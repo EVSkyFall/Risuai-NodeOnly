@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { HeartIcon, ExternalLinkIcon, UserPenIcon } from "@lucide/svelte";
+    import { HeartIcon, ExternalLinkIcon, UserPenIcon, TriangleAlertIcon } from "@lucide/svelte";
     import { language } from "src/lang";
     import { openURL } from "src/ts/globalApi.svelte";
     import { supportDialogOpen, fetchSupporters, PATREON_URL, UPSTREAM_PATREON_URL, type SupportersData, type Supporter } from "src/ts/support";
@@ -108,6 +108,13 @@
                     </ShButton>
                 {/if}
             </div>
+            <p class="max-w-xs text-xs leading-relaxed text-textcolor2">{language.supportNotice}</p>
+            {#if language.supportNoticeWarn}
+                <ShAlert variant="warning" className="max-w-sm">
+                    {#snippet icon()}<TriangleAlertIcon />{/snippet}
+                    {language.supportNoticeWarn}
+                </ShAlert>
+            {/if}
         </div>
     </div>
 

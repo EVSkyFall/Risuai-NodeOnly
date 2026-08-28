@@ -2239,6 +2239,9 @@ export const languageEnglish = {
     supportThanks: "Thank you for your support",
     supportButton: "Support on Patreon",
     supportSetName: "Publish your supporter name",
+    supportNotice: "Supporting PocketRisu is entirely voluntary — aside from having your name listed, it doesn't grant any additional features or benefits.",
+    // Korean-only community-rule notice. Empty here so other locales inherit nothing and the block stays hidden.
+    supportNoticeWarn: "",
     supportStatActive: "Current supporters",
     supportStatLifetime: "All-time supporters",
     supportCaptionActive: "The people who are with us every month",
