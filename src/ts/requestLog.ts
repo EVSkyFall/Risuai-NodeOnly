@@ -486,7 +486,10 @@ export function createRequestLogScope(init: RequestLogScopeInit): RequestLogScop
             // Image providers return base64 payloads inside JSON, so the same
             // stripping the request body gets applies here — otherwise a single
             // generated image would occupy megabytes of the byte budget.
-            const stripped = stripInlineMedia(text)
+            // OpenRouter pads a non-streaming response with kilobytes of
+            // keep-alive whitespace before the JSON; kept verbatim it fills the
+            // viewer's response box with blank lines and looks like no response.
+            const stripped = stripInlineMedia(text.trimStart())
             entry.responseBody = overflowed ? stripped + '\n...[truncated by client]' : stripped
             entry.durationMs = Date.now() - started
         }
