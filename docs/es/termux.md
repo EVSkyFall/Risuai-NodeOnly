@@ -38,7 +38,7 @@ Instale Termux desde una de las siguientes fuentes:
 
 - **F-Droid (recomendado)**: https://f-droid.org/packages/com.termux/
 - **GitHub Releases**: https://github.com/termux/termux-app/releases
-- **Google Play**: https://play.google.com/store/apps/details?id=com.termux&hl=en&pli=1
+- **Google Play**: https://play.google.com/store/apps/details?id=com.termux&hl=es&pli=1
 
 
 ---

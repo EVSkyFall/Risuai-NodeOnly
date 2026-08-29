@@ -38,7 +38,7 @@ PocketRisu 不為 Termux 提供預先編譯的二進位檔,因此由手機自行
 
 - **F-Droid(建議)**: https://f-droid.org/packages/com.termux/
 - **GitHub Releases**: https://github.com/termux/termux-app/releases
-- **Google Play**: https://play.google.com/store/apps/details?id=com.termux&hl=en&pli=1
+- **Google Play**: https://play.google.com/store/apps/details?id=com.termux&hl=zh-TW&pli=1
 
 
 ---

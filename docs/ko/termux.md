@@ -36,7 +36,7 @@ PocketRisu는 Termux에서 미리 컴파일된 바이너리를 제공하지 않�
 
 - **F-Droid (권장)**: https://f-droid.org/packages/com.termux/
 - **GitHub Releases**: https://github.com/termux/termux-app/releases
-- **Google Play**: https://play.google.com/store/apps/details?id=com.termux&hl=en&pli=1
+- **Google Play**: https://play.google.com/store/apps/details?id=com.termux&hl=ko&pli=1
 
 
 ---

@@ -38,7 +38,7 @@ PocketRisu 不为 Termux 提供预编译的二进制文件,因此由手机自行
 
 - **F-Droid(推荐)**: https://f-droid.org/packages/com.termux/
 - **GitHub Releases**: https://github.com/termux/termux-app/releases
-- **Google Play**: https://play.google.com/store/apps/details?id=com.termux&hl=en&pli=1
+- **Google Play**: https://play.google.com/store/apps/details?id=com.termux&hl=zh-CN&pli=1
 
 
 ---
