@@ -1,4 +1,5 @@
 <script lang="ts">
+    import { getActiveHypaV3Preset } from "src/ts/process/memory/memoryPresets";
 
     import Suggestion from './Suggestion.svelte';
     import { CameraIcon, ChevronUpIcon, ChevronDownIcon, ChevronsUpIcon, ChevronsDownIcon, DatabaseIcon, GlobeIcon, ImagePlusIcon, LanguagesIcon, Laugh, MenuIcon, MicOffIcon, PackageIcon, Plus, RefreshCcwIcon, ReplyIcon, Send, StepForwardIcon, XIcon, BrainIcon, ArrowDown, ZapIcon, Maximize2, Minimize2 } from "@lucide/svelte";
@@ -1008,7 +1009,7 @@ import { isMobile } from 'src/ts/platform'
                                     <PluginDefinedIcon ico={menu} /><span>{menu.name}</span>
                                 </ShDropdownMenuItem>
                             {/each}
-                            {#if DBState.db.showMenuHypaMemoryModal && DBState.db.hypaV3}
+                            {#if DBState.db.showMenuHypaMemoryModal && getActiveHypaV3Preset(DBState.db, DBState.db.characters[$selectedCharID], DBState.db.characters[$selectedCharID]?.chats?.[DBState.db.characters[$selectedCharID]?.chatPage])}
                                 <ShDropdownMenuItem onSelect={() => { $hypaV3ModalOpen = true }}>
                                     <BrainIcon /><span>{language.hypaMemoryV3Modal}</span>
                                 </ShDropdownMenuItem>

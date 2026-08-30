@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { AccessibilityIcon, ActivityIcon, PackageIcon, BotIcon, CodeIcon, CogIcon, ContactIcon, FlaskConicalIcon, ImageIcon, LanguagesIcon, MonitorIcon, MonitorSmartphoneIcon, Sailboat, ScrollTextIcon, SearchIcon, UserIcon, CircleXIcon, KeyboardIcon, TruckIcon, FileBoxIcon, Volume2Icon, HeartIcon } from "@lucide/svelte";
+    import { AccessibilityIcon, ActivityIcon, PackageIcon, BotIcon, CodeIcon, CogIcon, ContactIcon, FlaskConicalIcon, ImageIcon, LanguagesIcon, MonitorIcon, MonitorSmartphoneIcon, Sailboat, ScrollTextIcon, SearchIcon, UserIcon, CircleXIcon, KeyboardIcon, TruckIcon, FileBoxIcon, Volume2Icon, HeartIcon, BrainIcon } from "@lucide/svelte";
     import { language } from "src/lang";
     import { supportDialogOpen, supportEnabled } from "src/ts/support";
     import DisplaySettings from "./Pages/DisplaySettings.svelte";
@@ -21,6 +21,7 @@
     import LanguageSettings from "./Pages/LanguageSettings.svelte";
     import AccessibilitySettings from "./Pages/AccessibilitySettings.svelte";
     import PersonaSettings from "./Pages/PersonaSettings.svelte";
+    import MemorySettings from "./Pages/MemorySettings.svelte";
     import PromptSettings from "./Pages/PromptSettings.svelte";
     import ModuleSettings from "./Pages/Module/ModuleSettings.svelte";
   import { isLite } from "src/ts/lite";
@@ -117,6 +118,15 @@
                     }}>
                         <ContactIcon />
                         <span>{language.persona}</span>
+                    </button>
+                    <button class="flex gap-2 items-center hover:text-textcolor"
+                        class:text-textcolor={$SettingsMenuIndex === 24}
+                        class:text-textcolor2={$SettingsMenuIndex !== 24}
+                        onclick={() => {
+                            $SettingsMenuIndex = 24
+                    }}>
+                        <BrainIcon />
+                        <span>{language.longTermMemory}</span>
                     </button>
                     <button class="flex gap-2 items-center hover:text-textcolor"
                         class:text-textcolor={$SettingsMenuIndex === 2}
@@ -312,6 +322,8 @@
                             <AccessibilitySettings/>
                         {:else if $SettingsMenuIndex === 12}
                             <PersonaSettings/>
+                        {:else if $SettingsMenuIndex === 24}
+                            <MemorySettings/>
                         {:else if $SettingsMenuIndex === 14}
                             <ModuleSettings/>
                         {:else if $SettingsMenuIndex === 13}

@@ -1,4 +1,5 @@
 import { writable } from "svelte/store";
+import { MEMORY_PRESET_DEFAULT, MEMORY_PRESET_OFF, getMemoryPreset, resolveMemoryPresetId, setChatMemoryPreset } from './process/memory/memoryPresets'
 import type { character, Database } from "./storage/database.svelte";
 import { type simpleCharacterArgument } from "./parser/parser.svelte";
 import type { alertData } from "./alert";
@@ -58,7 +59,9 @@ export const openModuleListStore = writable(false)
 export const openThemePresetList = writable(false)
 export const openPersonaList = writable(false)
 export const personaSelectCallback = writable<((index: number) => void) | null>(null)
-export const openHypaV3PresetList = writable(false)
+export const openMemoryPresetList = writable(false)
+/** Receives a preset id, 'off' or 'default' from the memory preset picker. */
+export const memoryPresetSelectCallback = writable<((value: string) => void) | null>(null)
 export const bookmarkListOpen = writable(false)
 export const MobileGUI = writable(false)
 export const MobileGUIStack = writable(0)
@@ -92,7 +95,7 @@ export const BotSubmenuIndex = writable(0)
 export const PromptPresetSubmenuIndex = writable(0)
 /** One-shot: open the prompt preset page directly in its editor (settings search deep link). */
 export const PromptPresetEditorOpen = writable(false)
-export const OtherBotsSubmenuIndex = writable(0)
+export const OtherBotsSubmenuIndex = writable(1)
 export const InlayGallerySubmenuIndex = writable(0)
 // List-view tab of the Model Preset page (Presets / API keys / Options).
 // Distinct from the editor's own sub-tabs, which stay page-local.
@@ -251,10 +254,16 @@ $effect.root(() => {
         selIdState.selId = v
 
         if (DBState?.db?.characters?.[selIdState.selId]) {
-            if (DBState.db.hypaV3 && DBState.db.hypaV3Presets?.[DBState.db.hypaV3PresetId]?.settings?.alwaysToggleOn) {
-                const char = DBState.db.characters[selIdState.selId]
-                if (char?.chats?.[char.chatPage]) {
-                    char.chats[char.chatPage].supaMemory = true
+            // "Always toggle on": a chat with no binding of its own follows the
+            // global default when that preset asks for it. Explicit bindings
+            // (including an explicit 'off') are respected.
+            const char = DBState.db.characters[selIdState.selId]
+            const chat = char?.chats?.[char.chatPage]
+            if (chat && chat.memoryPresetId === undefined && char.memoryPresetId === undefined) {
+                const preset = getMemoryPreset(DBState.db, DBState.db.memoryPresetId)
+                if (preset?.canon?.source === 'hypaV3' && preset.canon.settings.alwaysToggleOn
+                    && resolveMemoryPresetId(DBState.db, char, chat) === MEMORY_PRESET_OFF) {
+                    setChatMemoryPreset(DBState.db, char, chat, MEMORY_PRESET_DEFAULT)
                 }
             }
         }

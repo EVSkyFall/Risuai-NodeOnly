@@ -12,7 +12,8 @@ import { prebuiltNAIpresets, prebuiltPresets } from '../process/templates/templa
 import { defaultColorScheme, type ColorScheme } from '../gui/colorscheme';
 import type { PromptItem, PromptSettings } from '../process/prompt';
 import type { OobaChatCompletionRequestParams } from '../model/ooba';
-import { type HypaV3Settings, type HypaV3Preset, createHypaV3Preset } from '../process/memory/hypav3'
+import { type HypaV3Settings, type HypaV3Preset, createHypaV3Preset } from '../process/memory/hypav3Preset'
+import { migrateMemoryPresets, MEMORY_PRESET_DEFAULT, type MemoryPreset } from '../process/memory/memoryPresets'
 import { normalizeTranslatorPresetState, type TranslatorPreset } from '../translator/presets'
 import { safeStructuredClone } from '../polyfill';
 import { v4 as uuidv4 } from 'uuid';
@@ -669,6 +670,7 @@ export function setDatabase(data:Database){
         }
     }
     data.hypaV3PresetId ??= 0
+    migrateMemoryPresets(data, uuidv4)
     normalizeTranslatorPresetState(data)
     data.showDeprecatedTriggerV2 ??= false
     data.returnCSSError ??= true
@@ -873,11 +875,15 @@ export function setCurrentChat(chat:Chat){
  * literals. Do NOT call for hydration placeholders or chats being restored with
  * their own mode.
  */
-export function newChatModelDefaults(): Partial<Pick<Chat, 'useModelPreset' | 'modelBinding'>> {
+export function newChatModelDefaults(): Partial<Pick<Chat, 'useModelPreset' | 'modelBinding' | 'memoryPresetId'>> {
     const db = getDatabase()
-    if (!db.useModelPresetByDefault) return {}
+    // New chats follow the character / global memory preset; chats without a
+    // value are legacy and resolve from `supaMemory` instead (memoryPresets.ts).
+    const memory = { memoryPresetId: MEMORY_PRESET_DEFAULT }
+    if (!db.useModelPresetByDefault) return memory
     const def = db.defaultModelBinding
     return {
+        ...memory,
         useModelPreset: true,
         modelBinding: def ? structuredClone($state.snapshot(def)) : emptyModelBinding(),
     }
@@ -1397,6 +1403,11 @@ export interface Database{
     hypaV3Settings: HypaV3Settings // legacy
     hypaV3Presets: HypaV3Preset[]
     hypaV3PresetId: number
+    /** Long-term memory presets (truth). `hypaV3*` above are a mirror for upstream compatibility — see memoryPresets.ts. */
+    memoryPresets: MemoryPreset[]
+    /** Global default preset id, or 'off'. Chats without a binding inherit this. */
+    memoryPresetId: string
+    memoryPresetFolders?: PromptPresetFolder[]
     realmDirectOpen:boolean
     OaiCompAPIKeys: {[key:string]:string}
     inlayErrorResponse:boolean
@@ -1747,6 +1758,8 @@ export interface character{
 
     }
     supaMemory?:boolean
+    /** Memory preset id, 'off' or 'default'. Absent => derived from `supaMemory`. */
+    memoryPresetId?:string
     additionalAssets?:[string, string, string][]
     additionalAssetManifest?:import('./nodeStorage').AssetManifestDescriptor
     ttsReadOnlyQuoted?:boolean
@@ -2156,6 +2169,11 @@ export function normalizeChat(chat: Partial<Chat>): Chat {
     if (typeof c.note !== 'string') c.note = ''
     if (typeof c.name !== 'string') c.name = ''
     if (!Array.isArray(c.localLore)) c.localLore = []
+    // Every message needs a stable id: memory summaries, bookmarks and edit
+    // detection key on it. Imports and older saves may lack one.
+    for (const message of c.message) {
+        if (message && !message.chatId) message.chatId = uuidv4()
+    }
     return c
 }
 
@@ -2185,6 +2203,8 @@ export interface Chat{
     bookmarks?: string[];
     bookmarkNames?: { [chatId: string]: string };
     supaMemory?: boolean
+    /** Memory preset id, 'off' or 'default' (inherit). Absent => derived from `supaMemory`. */
+    memoryPresetId?: string
     savedToggleValues?: Record<string, string>
     // P4 dual-regime: per-chat model preset binding (plan v6 §7). useModelPreset
     // is the regime toggle; modelBinding (the bundle) persists across toggling so

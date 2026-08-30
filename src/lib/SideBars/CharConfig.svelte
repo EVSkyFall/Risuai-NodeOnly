@@ -1,4 +1,5 @@
 <script lang="ts">
+    import { getActiveHypaV3Preset } from "src/ts/process/memory/memoryPresets";
     import { language } from "../../lang";
     import { tokenizeAccurate } from "../../ts/tokenizer";
     import { saveImage as saveAsset, type character, getCurrentCharacter } from "../../ts/storage/database.svelte";
@@ -1337,7 +1338,7 @@ import ShButton from "../UI/GUI/ShButton.svelte";
             <Check bind:check={(DBState.db.characters[$selectedCharID] as import('src/ts/storage/database.svelte').character).escapeOutput} name={language.escapeOutput}/>
         </div>
 
-        {#if DBState.db.hypaV3}
+        {#if getActiveHypaV3Preset(DBState.db, DBState.db.characters[$selectedCharID], DBState.db.characters[$selectedCharID]?.chats?.[DBState.db.characters[$selectedCharID]?.chatPage])}
             <Button
                 onclick={() => {
                     $hypaV3ModalOpen = true

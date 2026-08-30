@@ -262,6 +262,14 @@ export const helpEn = {
             "Switches to the experimental HypaMemory V3 implementation. Enables rate limit settings and changes the query method.",
         hypaV3AlwaysToggleOn:
             "If enabled, the HypaMemory toggle is automatically activated when selecting a character.",
+        memoryPresetBinding:
+            "The long-term memory preset this chat uses.\n\n" +
+            "- **Default**: follows the default preset in Settings → Long Term Memory, and changes with it.\n" +
+            "- **Off**: messages beyond the context window are simply truncated and never reach the model.\n" +
+            "- **A preset**: this chat runs with that preset (summary model, ratios, ...) regardless of the default.\n\n" +
+            "Stored per chat, so other chats of the same character are not affected.",
+        memoryPresetDefault:
+            "The long-term memory preset used by chats left on 'Default'. With 'Off', memory only runs in chats that picked a preset themselves.",
         toggleHypaMemory:
             "Whether to use HypaMemory (long-term memory) for this chat.\n\n" +
             "- When on, past messages are automatically summarized into long-term memory once the context fills up, and relevant summaries are pulled back into later responses.\n" +

@@ -253,23 +253,6 @@
             {@render sep()}
         {/if}
         {@render toggles(groupedToggles, true)}
-        {#if chara && DBState.db.hypaV3}
-            <div class="w-full flex mt-2 items-center justify-between gap-2 min-h-10 rounded-md px-1">
-                <span class="flex items-center gap-1">
-                    <span>{language.ToggleHypaMemory}</span>
-                    <Help key="toggleHypaMemory" />
-                </span>
-                <ShSwitch
-                    checked={DBState.db.characters[$selectedCharID]?.chats?.[DBState.db.characters[$selectedCharID]?.chatPage]?.supaMemory ?? chara.supaMemory ?? false}
-                    onCheckedChange={() => {
-                        const char = DBState.db.characters[$selectedCharID]
-                        const chat = char?.chats?.[char.chatPage]
-                        if (!chat) return
-                        chat.supaMemory = !(chat.supaMemory ?? char.supaMemory ?? false)
-                    }}
-                />
-            </div>
-        {/if}
     </div>
 {:else}
     {#if hasJailbreakPrompt}
@@ -282,21 +265,4 @@
         {/if}
     {/if}
     {@render toggles(groupedToggles)}
-    {#if DBState.db.hypaV3}
-        <div class="w-full flex mt-2 items-center justify-between gap-2 min-h-10 rounded-md px-1">
-            <span class="flex items-center gap-1">
-                <span>{language.ToggleHypaMemory}</span>
-                <Help key="toggleHypaMemory" />
-            </span>
-            <ShSwitch
-                checked={DBState.db.characters[$selectedCharID]?.chats?.[DBState.db.characters[$selectedCharID]?.chatPage]?.supaMemory ?? chara.supaMemory ?? false}
-                onCheckedChange={() => {
-                    const char = DBState.db.characters[$selectedCharID]
-                    const chat = char?.chats?.[char.chatPage]
-                    if (!chat) return
-                    chat.supaMemory = !(chat.supaMemory ?? char.supaMemory ?? false)
-                }}
-            />
-        </div>
-    {/if}
 {/if}
