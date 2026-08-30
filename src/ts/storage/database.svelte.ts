@@ -454,6 +454,8 @@ export function setDatabase(data:Database){
             largePortrait: false
         }]
     }
+    data.personaFolders ??= []
+    data.promptPresetFolders ??= []
     data.classicMaxWidth ??= false
     data.ooba ??= safeStructuredClone(defaultOoba)
     data.ainconfig ??= safeStructuredClone(defaultAIN)
@@ -1017,7 +1019,15 @@ export interface RisuPersona {
     largePortrait?:boolean
     id?:string
     note?:string
+    /** Optional folder membership (see `personaFolders`). Missing means uncategorized. */
+    folderId?:string
     embeddedModule?:RisuModule
+}
+
+/** User-defined group for organizing list items (personas, presets, ...). */
+export interface PromptPresetFolder {
+    id: string
+    name: string
 }
 
 export interface Database{
@@ -1086,6 +1096,8 @@ export interface Database{
     waifuWidth:number
     waifuWidth2:number
     botPresets:botPreset[]
+    /** User-defined groups for organizing prompt presets. */
+    promptPresetFolders?:PromptPresetFolder[]
     /**
      * @deprecated New code: use getActiveBotPreset() / setActiveBotPresetById() helpers.
      * Kept as the physical store for upstream RisuAI .bin backup compatibility.
@@ -1205,6 +1217,8 @@ export interface Database{
     openrouterFallback:boolean
     selectedPersona:number
     personas:RisuPersona[]
+    /** User-defined groups for organizing personas. */
+    personaFolders?:PromptPresetFolder[]
     personaNote:boolean
     assetWidth:number
     animationSpeed:number
@@ -1827,6 +1841,8 @@ export function purgeUnsupportedGroupChats(db: Database): number {
 export interface botPreset{
     id?: string
     name?:string
+    /** Optional folder membership (see `promptPresetFolders`). Missing means uncategorized. */
+    folderId?: string
     apiType?: string
     openAIKey?: string
     localNetworkMode?: boolean
