@@ -740,6 +740,8 @@ export const languageEnglish = {
     presetNew: "New preset",
     presetManage: "Manage presets",
     moduleManage: "Manage modules",
+    pluginImport: "Import plugin",
+    pluginDevTools: "Developer tools",
     presetDelete: "Delete",
     presetDuplicated: "Preset duplicated",
     presetExported: "Preset exported",

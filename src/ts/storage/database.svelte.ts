@@ -123,6 +123,7 @@ export function setDatabase(data:Database){
     if(checkNullish(data.plugins)){
         data.plugins = []
     }
+    data.pluginFolders ??= []
     if(checkNullish(data.zoomsize)){
         data.zoomsize = 100
     }
@@ -1064,6 +1065,8 @@ export interface Database{
     language: string
     translator: string
     plugins: RisuPlugin[]
+    /** User-defined groups for organizing plugins. */
+    pluginFolders?: PromptPresetFolder[]
     currentPluginProvider: string
     zoomsize:number
     customBackground:string
