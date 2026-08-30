@@ -9,7 +9,7 @@ vi.mock('../globalApi.svelte', () => ({
 }))
 
 const cacheMod = await import('../storage/assetManifestCache')
-const { hydratePluginCharacterSnapshot, restorePluginCharacterManifest, hydratePluginDatabaseSnapshot, hydratePluginModuleSnapshot } = await import('./pluginCharacterSnapshot')
+const { hydratePluginCharacterSnapshot, restorePluginCharacterManifest, hydratePluginDatabaseSnapshot, hydratePluginModuleSnapshot, restorePluginDbKey } = await import('./pluginCharacterSnapshot')
 
 const descriptor = { id: 'm1', ownerKind: 'character', ownerId: 'c1', count: 2 } as any
 const items: [string, string, string][] = [['smile', 'key-a', 'png'], ['angry', 'key-b', 'png']]
@@ -184,5 +184,46 @@ describe('cache-first manifest lookup', () => {
         const mod: any = await hydratePluginModuleSnapshot({ assetManifest: { ...cachedDescriptor, ownerKind: 'module' } } as any)
         expect(mod.assets).toEqual(cachedItems)
         expect(loadAssetManifestItems).not.toHaveBeenCalled()
+    })
+})
+
+describe('restorePluginDbKey', () => {
+    const moduleManifest = { id: 'mod-rt', ownerKind: 'module', ownerId: 'm1' } as any
+    const current = {
+        modules: [{ id: 'm1', assetManifest: moduleManifest }, { id: 'm2', assets: [['x', 'k', 'png']] }],
+        personas: [{ id: 'p1', embeddedModule: { assetManifest: moduleManifest } }],
+    }
+
+    test('an untouched getDatabase() → setDatabase() round trip keeps module and persona manifests', () => {
+        cacheMod.cacheFullAssetManifest(moduleManifest.id, items)
+        const modules: any = [{ id: 'm1', assets: items.map((t) => [...t]) }, { id: 'm2', assets: [['x', 'k', 'png']] }, { id: 'new', assets: [['n', 'k', 'png']] }]
+        const out: any = restorePluginDbKey('modules', modules, current)
+        expect(out[0].assetManifest).toBe(moduleManifest)
+        expect(out[0].assets).toBeUndefined()
+        expect(out[1].assets).toEqual([['x', 'k', 'png']])
+        expect(out[2].assets).toEqual([['n', 'k', 'png']])
+
+        const personas: any = [{ id: 'p1', embeddedModule: { assets: items.map((t) => [...t]) } }]
+        restorePluginDbKey('personas', personas, current)
+        expect(personas[0].embeddedModule.assetManifest).toBe(moduleManifest)
+        expect(personas[0].embeddedModule.assets).toBeUndefined()
+    })
+
+    test('a changed module asset list stays inline', () => {
+        cacheMod.cacheFullAssetManifest(moduleManifest.id, items)
+        const modules: any = [{ id: 'm1', assets: [...items, ['extra', 'k', 'png']] }]
+        restorePluginDbKey('modules', modules, current)
+        expect(modules[0].assetManifest).toBeUndefined()
+        expect(modules[0].assets).toHaveLength(3)
+    })
+
+    test('personas without an id match by position; other keys pass through', () => {
+        cacheMod.cacheFullAssetManifest(moduleManifest.id, items)
+        const personas: any = [{ embeddedModule: { assets: items.map((t) => [...t]) } }]
+        restorePluginDbKey('personas', personas, current)
+        expect(personas[0].embeddedModule.assetManifest).toBe(moduleManifest)
+        const chars = [{ additionalAssets: items }]
+        expect(restorePluginDbKey('characters', chars, current)).toBe(chars)
+        expect(restorePluginDbKey('modules', 'not-an-array', current)).toBe('not-an-array')
     })
 })

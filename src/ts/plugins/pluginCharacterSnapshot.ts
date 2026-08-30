@@ -95,3 +95,42 @@ export async function hydratePluginDatabaseSnapshot(subset: {
     ]
     await Promise.all(modules.map((module) => hydratePluginModuleSnapshot(module)))
 }
+
+// Write-back counterpart for module-shaped entries. A plugin that round-trips
+// getDatabase() → setDatabase() hands every filled `assets` array straight
+// back; matching entries whose list still equals the cached manifest get
+// their descriptor back so the write is a no-op for assets.
+function restoreModuleManifest<T extends ModuleAssetFields>(incoming: T, current: ModuleAssetFields | undefined): T {
+    const descriptor = current?.assetManifest
+    if (!incoming || !descriptor || Array.isArray(current?.assets)) return incoming
+    if (!Array.isArray(incoming.assets) || incoming.assetManifest) return incoming
+    const cached = getCachedFullAssetManifest(descriptor.id)
+    if (!cached || !sameAssetTuples(cached, incoming.assets)) return incoming
+    delete incoming.assets
+    incoming.assetManifest = descriptor
+    return incoming
+}
+
+type PluginDbValue = unknown
+
+// Applies the write-back restore to a top-level DB key a plugin is writing.
+// Modules match by id, personas by id (falling back to position). Any other
+// key is returned untouched.
+export function restorePluginDbKey(key: string, value: PluginDbValue, currentDb: { modules?: any[]; personas?: any[] } | undefined): PluginDbValue {
+    if (!Array.isArray(value) || !currentDb) return value
+    if (key === 'modules') {
+        const byId = new Map((currentDb.modules ?? []).map((module) => [module?.id, module]))
+        for (const module of value) {
+            if (module) restoreModuleManifest(module, byId.get(module.id))
+        }
+    } else if (key === 'personas') {
+        const byId = new Map((currentDb.personas ?? []).map((persona) => [persona?.id, persona]))
+        value.forEach((persona, index) => {
+            const current = (persona?.id !== undefined ? byId.get(persona.id) : undefined) ?? currentDb.personas?.[index]
+            if (persona?.embeddedModule && current?.embeddedModule) {
+                restoreModuleManifest(persona.embeddedModule, current.embeddedModule)
+            }
+        })
+    }
+    return value
+}
