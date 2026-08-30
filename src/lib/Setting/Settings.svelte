@@ -67,6 +67,7 @@
         {#if (wide700.current && !$MobileGUI) || $SettingsMenuIndex === -1}
             <div class="flex h-full flex-col p-4 pt-8 gap-2 overflow-y-auto relative rs-setting-cont-3 shrink-0"
                 class:w-full={!wide700.current || $MobileGUI}
+                class:w-60={wide700.current && !$MobileGUI}
                 class:bg-darkbg={!$MobileGUI} class:bg-bgcolor={$MobileGUI}
             >
                 <!-- Fake-input trigger: the actual search lives in a dialog
@@ -268,7 +269,7 @@
                             onclick={() => {
                                 menu.callback()
                         }}>
-                            <PluginDefinedIcon ico={menu} />
+                            <PluginDefinedIcon ico={menu} className="w-5 h-5 shrink-0" />
                             <span>{menu.name}</span>
                         </button>
                     {/each}
@@ -358,5 +359,18 @@
     .setting-bg{
         background: linear-gradient(to right, var(--risu-theme-darkbg) 50%, var(--risu-theme-bgcolor) 50%);
 
+    }
+    /* The desktop sidebar is fixed-width, so a long menu name (plugins can
+       register any label) has to wrap inside it instead of widening the
+       column and squeezing the settings pane. */
+    .rs-setting-cont-3 button{
+        text-align: left;
+    }
+    .rs-setting-cont-3 span{
+        overflow-wrap: anywhere;
+    }
+    .rs-setting-cont-3 :global(svg),
+    .rs-setting-cont-3 :global(img){
+        flex-shrink: 0;
     }
 </style>
