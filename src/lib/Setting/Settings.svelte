@@ -283,7 +283,7 @@
         {/if}
         {#if (wide700.current && !$MobileGUI) || $SettingsMenuIndex !== -1}
             {#key $SettingsMenuIndex}
-                <div class="grow py-6 px-4 bg-bgcolor flex flex-col text-textcolor overflow-y-auto relative rs-setting-cont-4 min-w-0">
+                <div class="grow py-6 px-4 bg-bgcolor flex flex-col text-textcolor overflow-y-auto relative rs-setting-cont-4 min-w-0 [scrollbar-gutter:stable]">
                     <div class="w-full max-w-2xl mx-auto flex flex-col">
                         {#if $SettingsMenuIndex === 0}
                             <MigrationSettings />
