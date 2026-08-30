@@ -739,6 +739,7 @@ export const languageEnglish = {
     presetImport: "Import",
     presetNew: "New preset",
     presetManage: "Manage presets",
+    moduleManage: "Manage modules",
     presetDelete: "Delete",
     presetDuplicated: "Preset duplicated",
     presetExported: "Preset exported",

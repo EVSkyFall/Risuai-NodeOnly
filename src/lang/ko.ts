@@ -818,6 +818,7 @@ export const languageKorean = {
   presetImport: "불러오기",
   presetNew: "새 프리셋",
   presetManage: "프리셋 관리",
+  moduleManage: "모듈 관리",
   presetDelete: "삭제하기",
   presetDuplicated: "프리셋을 복제했습니다",
   presetExported: "프리셋을 내보냈습니다",

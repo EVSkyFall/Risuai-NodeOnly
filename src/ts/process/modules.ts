@@ -20,6 +20,8 @@ export interface MCPModule{
 export interface RisuModule{
     name: string
     description: string
+    /** Optional folder membership (see `db.moduleFolders`). Missing means uncategorized. */
+    folderId?: string
     lorebook?: loreBook[]
     regex?: customscript[]
     cjs?: string
