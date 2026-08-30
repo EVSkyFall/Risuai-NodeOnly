@@ -2,6 +2,7 @@
     import { ArrowLeft, ArrowLeftRightIcon, ArrowRight, BookmarkIcon, BotIcon, CopyIcon, PowerOff, GitBranch, HamburgerIcon, LanguagesIcon, MenuIcon, PencilIcon, RefreshCcwIcon, SplitIcon, TrashIcon, UserIcon, Volume2Icon, Scissors, EyeOff } from "@lucide/svelte"
     import { aiLawApplies, changeChatTo, foldChatToMessage, getFileSrc, createChatCopyName } from "src/ts/globalApi.svelte"
     import { ColorSchemeTypeStore } from "src/ts/gui/colorscheme"
+    import { MediaQuery } from "svelte/reactivity"
     import { getModelInfo } from "src/ts/model/modellist"
     import { runLuaButtonTrigger } from 'src/ts/process/scriptings'
     import { risuChatParser } from "src/ts/process/scripts"
@@ -25,6 +26,9 @@
     import PopupButton from "../UI/PopupButton.svelte";
     import PartialEditController from './PartialEditController.svelte';
 
+    // Reactive breakpoint: a raw window.innerWidth read here is evaluated once
+    // at mount and never follows a resize (#79).
+    const wide640 = new MediaQuery('(min-width: 640px)')
     let translating = $state(false)
     let editMode = $state(false)
     let statusMessage:string = $state('')
@@ -491,7 +495,7 @@
             <span class="text-xs">{statusMessage}</span>
             <div class="flex items-center ml-2 gap-2 flex-wrap justify-end">
                 {@render translationButton()}
-                {#if window.innerWidth >= 640}
+                {#if wide640.current}
                     {@render majorIconButtonsBody(false)}
                     {#if DBState.db.characters[selIdState.selId] && idx > -1}
                         <PopupButton>

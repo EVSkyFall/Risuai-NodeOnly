@@ -7,13 +7,21 @@ import { deepTouch } from "./gui/deepTouch.svelte";
 import { resetScriptCache } from "./process/scripts";
 import type { hubType } from "./characterCards";
 import type { PluginSafetyErrors } from "./plugins/pluginSafety";
+import { isWideShell, sidebarStateAfterResize } from "./gui/shellBreakpoint";
+
+let lastShellWidth: number | undefined
 
 function updateSize(){
     SizeStore.set({
         w: window.innerWidth,
         h: window.innerHeight
     })
-    DynamicGUI.set(window.innerWidth <= 1024)
+    DynamicGUI.set(!isWideShell(window.innerWidth))
+    // Crossing the docked/overlay breakpoint resets the sidebar to what a
+    // boot at the new width would pick; anything else is left alone (#79).
+    const sidebar = sidebarStateAfterResize(lastShellWidth, window.innerWidth)
+    lastShellWidth = window.innerWidth
+    if (sidebar !== undefined) sideBarStore.set(sidebar)
 }
 
 export const SizeStore = writable({
@@ -25,7 +33,7 @@ export const loadedStore = writable(false)
 export const isTouchDevice = writable(typeof window !== 'undefined' && window.matchMedia('(pointer: coarse)').matches)
 export const DynamicGUI = writable(false)
 export const sideBarClosing = writable(false)
-export const sideBarStore = writable(window.innerWidth > 1024)
+export const sideBarStore = writable(isWideShell(window.innerWidth))
 export const leftBarCollapsed = writable(false)
 export const selectedCharID = writable(-1)
 export const chatDeselected = writable(false)
@@ -153,6 +161,13 @@ export function createSimpleCharacter(char:character){
 
 updateSize()
 window.addEventListener("resize", updateSize);
+// A foldable or split-screen change can land while the page is hidden and
+// leave no resize behind; re-sample when it comes back into view.
+window.addEventListener("orientationchange", updateSize);
+window.addEventListener("pageshow", updateSize);
+document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === 'visible') updateSize()
+});
 export const DBState = $state({
     db: {} as any as Database
 });
