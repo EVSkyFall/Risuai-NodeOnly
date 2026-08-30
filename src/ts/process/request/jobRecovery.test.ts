@@ -307,6 +307,36 @@ describe('recoverTerminalJob', () => {
         expect(claims()).toEqual(['/api/model-jobs/job-1/claim'])
     })
 
+    test('a LIVE send owning the chat is left to the live path — no slot-in, no claim', async () => {
+        const { recovery, genState } = await loadModules()
+        const chat = makeChat({ message: [{ role: 'char', data: 'Hel', generationInfo: { generationId: 'gen-1' } }] })
+        mocks.db.characters = [makeChar(chat)]
+        const { calls, claims } = setupServer({ journals: { 'job-1': OPENAI_SSE } })
+        genState.startGeneration('chat-1', 'gen-1', 'live')
+
+        await recovery.recoverTerminalJob(makeJob() as any)
+
+        expect(chat.message[0].data).toBe('Hel')
+        expect(claims()).toEqual([])
+        expect(calls.some((c) => c.url.endsWith('/stream'))).toBe(false)
+        expect(mocks.saveChatToServer).not.toHaveBeenCalled()
+        genState.endGeneration('chat-1')
+    })
+
+    test('a BACKGROUND registration on the chat does not block the slot-in', async () => {
+        const { recovery, genState } = await loadModules()
+        const chat = makeChat()
+        mocks.db.characters = [makeChar(chat)]
+        const { claims } = setupServer({ journals: { 'job-1': OPENAI_SSE } })
+        genState.startGeneration('chat-1', 'gen-1', 'background')
+
+        await recovery.recoverTerminalJob(makeJob() as any)
+
+        expect(chat.message).toHaveLength(1)
+        expect(claims()).toEqual(['/api/model-jobs/job-1/claim'])
+        genState.endGeneration('chat-1')
+    })
+
     test('failed job with the live message already present adds no error block', async () => {
         const { recovery } = await loadModules()
         const chat = makeChat({ message: [{ role: 'char', data: 'partial', generationInfo: { generationId: 'gen-1' } }] })
