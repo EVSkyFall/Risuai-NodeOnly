@@ -1,7 +1,7 @@
 <script lang="ts">
     // Read-only long-term memory preset picker (sidebar / quick menu). Grouped
     // by folder; editing and folder management live in Settings → Long Term Memory.
-    import { BrainIcon, ChevronDownIcon, ChevronRightIcon, FolderIcon, SearchIcon, SettingsIcon, XIcon } from "@lucide/svelte";
+    import { ChevronDownIcon, ChevronRightIcon, FolderIcon, SearchIcon, SettingsIcon, XIcon } from "@lucide/svelte";
     import { language } from "../../lang";
     import { DBState, selectedCharID } from 'src/ts/stores.svelte';
     import { groupByFolder } from "src/ts/folders";
@@ -17,6 +17,9 @@
     let { close = () => {}, onSelect = null }: Props = $props();
     let searchQuery = $state('');
     // Folders start collapsed; searching shows everything that matches.
+    // Folders start collapsed; the uncategorized group (key '') starts open,
+    // so for that key the set records "collapsed" instead. Always shown as a
+    // header so the list reads the same with or without folders.
     let expanded = $state<Set<string>>(new Set());
 
     function toggle(key: string) {
@@ -57,13 +60,11 @@
         <button onclick={() => select(MEMORY_PRESET_DEFAULT)}
             class="flex items-center gap-2 text-textcolor border-t border-darkborderc p-2 cursor-pointer hover:bg-selected/30"
             class:bg-selected={current === MEMORY_PRESET_DEFAULT}>
-            <BrainIcon size={16} class="shrink-0 text-textcolor2"/>
             <span class="w-full text-left truncate"><span class="font-medium">{language.memoryPresetInherit}</span><span class="opacity-75"> ({defaultName})</span></span>
         </button>
         <button onclick={() => select(MEMORY_PRESET_OFF)}
-            class="flex items-center gap-2 text-textcolor border-t border-darkborderc p-2 cursor-pointer hover:bg-selected/30"
+            class="flex items-center gap-2 text-textcolor border-t border-darkborderc p-2 mb-2 cursor-pointer hover:bg-selected/30"
             class:bg-selected={current === MEMORY_PRESET_OFF}>
-            <span class="w-4 shrink-0"></span>
             <span class="w-full text-left truncate font-medium">{language.memoryPresetOff}</span>
         </button>
         <div class="risu-field-border flex items-center gap-2 rounded-md px-3 my-2">
@@ -74,8 +75,8 @@
         {#each groups as group (group.folder?.id ?? '')}
             {@const visible = group.indexes.filter(matches)}
             {@const key = group.folder?.id ?? ''}
-            {@const hasHeader = !!group.folder || !!DBState.db.memoryPresetFolders?.length}
-            {@const open = !hasHeader || !!query || expanded.has(key)}
+            {@const hasHeader = true}
+            {@const open = !!query || (key === '' ? !expanded.has(key) : expanded.has(key))}
             {#if visible.length > 0}
                 {#if hasHeader}
                     <button class="flex items-center gap-2 w-full rounded-md px-2 py-2 mt-1 text-textcolor cursor-pointer hover:bg-selected/30 select-none" onclick={() => toggle(key)}>
@@ -88,9 +89,8 @@
                 {#each open ? visible : [] as i}
                     {@const preset = presets[i]}
                     <button onclick={() => select(preset.id)}
-                        class="flex items-center gap-2 text-textcolor border-t border-darkborderc p-2 cursor-pointer hover:bg-selected/30"
+                        class="flex items-center gap-2 text-textcolor border-t border-darkborderc p-2 pl-7 cursor-pointer hover:bg-selected/30"
                         class:bg-selected={current === preset.id}>
-                        <span class="w-4 shrink-0"></span>
                         <span class="overflow-x-auto whitespace-nowrap w-full text-left">
                             <span class="font-medium">{preset.name}</span>
                             {#if preset.id === DBState.db.memoryPresetId}

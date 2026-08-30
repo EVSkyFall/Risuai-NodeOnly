@@ -26,6 +26,9 @@
 
     let searchQuery = $state('');
     // Folders start collapsed; searching shows everything that matches.
+    // Folders start collapsed; the uncategorized group (key '') starts open,
+    // so for that key the set records "collapsed" instead. Always shown as a
+    // header so the list reads the same with or without folders.
     let expanded = $state<Set<string>>(new Set());
 
     const query = $derived(searchQuery.trim().toLocaleLowerCase());
@@ -118,8 +121,8 @@
         {#each groups as group (group.folder?.id ?? '')}
             {@const visible = group.indexes.filter(matches)}
             {@const key = group.folder?.id ?? ''}
-            {@const hasHeader = !!group.folder || !!DBState.db.promptPresetFolders?.length}
-            {@const open = !hasHeader || !!query || expanded.has(key)}
+            {@const hasHeader = true}
+            {@const open = !!query || (key === '' ? !expanded.has(key) : expanded.has(key))}
             {#if visible.length > 0}
                 {#if hasHeader}
                     <button class="flex items-center gap-2 w-full rounded-md px-2 py-2 mt-1 text-textcolor cursor-pointer hover:bg-selected/30 select-none" onclick={() => toggle(key)}>
@@ -132,7 +135,7 @@
                 {#each open ? visible : [] as i}
                     {@const preset = DBState.db.botPresets[i]}
                     <button onclick={() => select(i)}
-                        class="flex items-center gap-2 text-textcolor border-t border-darkborderc p-2 cursor-pointer hover:bg-selected/30"
+                        class="flex items-center gap-2 text-textcolor border-t border-darkborderc p-2 pl-7 cursor-pointer hover:bg-selected/30"
                         class:bg-selected={i === highlightIndex}>
                         {#if preset.image}
                             <img src={preset.image} alt="" class="h-7 w-7 shrink-0 rounded-md object-cover" decoding="async"/>

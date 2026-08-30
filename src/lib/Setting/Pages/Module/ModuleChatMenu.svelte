@@ -17,6 +17,9 @@
     let { close = (i:string) => {}, alertMode = false }: Props = $props();
     let moduleSearch = $state('')
     // Folders start collapsed; searching shows everything that matches.
+    // Folders start collapsed; the uncategorized group (key '') starts open,
+    // so for that key the set records "collapsed" instead. Always shown as a
+    // header so the list reads the same with or without folders.
     let expanded = $state<Set<string>>(new Set());
 
     const query = $derived(moduleSearch.trim().toLocaleLowerCase())
@@ -86,8 +89,8 @@
         {#each groups as group (group.folder?.id ?? '')}
             {@const visible = group.indexes.filter(matches)}
             {@const key = group.folder?.id ?? ''}
-            {@const hasHeader = !!group.folder || !!DBState.db.moduleFolders?.length}
-            {@const open = !hasHeader || !!query || expanded.has(key)}
+            {@const hasHeader = true}
+            {@const open = !!query || (key === '' ? !expanded.has(key) : expanded.has(key))}
             {#if visible.length > 0}
                 {#if hasHeader}
                     <button class="flex items-center gap-2 w-full rounded-md px-2 py-2 mt-1 text-textcolor cursor-pointer hover:bg-selected/30 select-none" onclick={() => toggle(key)}>
@@ -102,7 +105,7 @@
                     {@const isGlobal = DBState.db.enabledModules.includes(rmodule.id)}
                     {@const inChat = currentChat()?.modules?.includes(rmodule.id) ?? false}
                     {@const inCharacter = DBState.db.characters[$selectedCharID]?.modules?.includes(rmodule.id) ?? false}
-                    <div class="flex items-center gap-2 text-textcolor border-t border-darkborderc p-2">
+                    <div class="flex items-center gap-2 text-textcolor border-t border-darkborderc p-2 pl-7">
                         {#if rmodule.mcp}
                             <Waypoints size={18} class="shrink-0 text-textcolor2" />
                         {/if}
