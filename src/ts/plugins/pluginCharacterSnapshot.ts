@@ -12,6 +12,39 @@ function manifestItems(descriptor: AssetManifestDescriptor) {
     return cached ? Promise.resolve(cached) : loadAssetManifestItems(descriptor)
 }
 
+// Fingerprint of every list handed to a plugin, by manifest id. The
+// write-back compares against this rather than the full-manifest cache,
+// which is a small LRU and may have evicted the entry by the time the
+// plugin writes (e.g. getDatabase() filling more than eight modules).
+const HANDED_OUT_LIMIT = 4096
+const handedOut = new Map<string, string>()
+
+function fingerprint(items: readonly (readonly string[])[]): string {
+    // Two independent FNV-1a passes over the joined tuples.
+    let a = 0x811c9dc5, b = 0x01000193
+    const text = items.map((tuple) => tuple.join('\u0000')).join('\u0001')
+    for (let i = 0; i < text.length; i++) {
+        const c = text.charCodeAt(i)
+        a = Math.imul(a ^ c, 0x01000193)
+        b = Math.imul(b ^ c, 0x2f0b4a3d) + 0x9e3779b9
+    }
+    return `${items.length}:${(a >>> 0).toString(16)}:${(b >>> 0).toString(16)}`
+}
+
+function rememberHandedOut(id: string, items: readonly (readonly string[])[]) {
+    if (handedOut.size >= HANDED_OUT_LIMIT) handedOut.delete(handedOut.keys().next().value as string)
+    handedOut.set(id, fingerprint(items))
+}
+
+// True when `incoming` is the list we handed out for `descriptor`, or, if we
+// never handed it out, the list the cache still holds.
+function matchesManifest(descriptor: AssetManifestDescriptor, incoming: readonly (readonly string[])[]): boolean {
+    const remembered = handedOut.get(descriptor.id)
+    if (remembered !== undefined) return remembered === fingerprint(incoming)
+    const cached = getCachedFullAssetManifest(descriptor.id)
+    return !!cached && sameAssetTuples(cached, incoming)
+}
+
 // Manifest-backed characters keep only an `additionalAssetManifest` descriptor
 // in DBState (lazy asset manifests, issue #80). Plugins predate that and read
 // `additionalAssets`, so a detached snapshot handed to a plugin is filled for
@@ -30,6 +63,7 @@ export async function hydratePluginCharacterSnapshot<T extends AssetFields>(
         // editing it in place must not edit the cache the write-back compares
         // against below.
         const items = await manifestItems(snapshot.additionalAssetManifest)
+        rememberHandedOut(snapshot.additionalAssetManifest.id, items)
         snapshot.additionalAssets = items.map((tuple) => [...tuple]) as [string, string, string][]
         delete snapshot.additionalAssetManifest
     } catch (error) {
@@ -57,8 +91,7 @@ export function restorePluginCharacterManifest<T extends AssetFields>(incoming: 
     const descriptor = current?.additionalAssetManifest
     if (!incoming || !descriptor || Array.isArray(current?.additionalAssets)) return incoming
     if (!Array.isArray(incoming.additionalAssets) || incoming.additionalAssetManifest) return incoming
-    const cached = getCachedFullAssetManifest(descriptor.id)
-    if (!cached || !sameAssetTuples(cached, incoming.additionalAssets)) return incoming
+    if (!matchesManifest(descriptor, incoming.additionalAssets)) return incoming
     delete incoming.additionalAssets
     incoming.additionalAssetManifest = descriptor
     return incoming
@@ -75,6 +108,7 @@ export async function hydratePluginModuleSnapshot<T extends ModuleAssetFields>(
     if (Array.isArray(snapshot.assets) || !snapshot.assetManifest) return snapshot
     try {
         const items = await manifestItems(snapshot.assetManifest)
+        rememberHandedOut(snapshot.assetManifest.id, items)
         snapshot.assets = items.map((tuple) => [...tuple]) as [string, string, string][]
         delete snapshot.assetManifest
     } catch (error) {
@@ -104,8 +138,7 @@ function restoreModuleManifest<T extends ModuleAssetFields>(incoming: T, current
     const descriptor = current?.assetManifest
     if (!incoming || !descriptor || Array.isArray(current?.assets)) return incoming
     if (!Array.isArray(incoming.assets) || incoming.assetManifest) return incoming
-    const cached = getCachedFullAssetManifest(descriptor.id)
-    if (!cached || !sameAssetTuples(cached, incoming.assets)) return incoming
+    if (!matchesManifest(descriptor, incoming.assets)) return incoming
     delete incoming.assets
     incoming.assetManifest = descriptor
     return incoming

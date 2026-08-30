@@ -227,3 +227,36 @@ describe('restorePluginDbKey', () => {
         expect(restorePluginDbKey('modules', 'not-an-array', current)).toBe('not-an-array')
     })
 })
+
+describe('write-back survives full-manifest cache eviction', () => {
+    test('a list handed out through getDatabase() is restored even after the LRU dropped it', async () => {
+        const manifests = Array.from({ length: 10 }, (_, i) => ({ id: `evict-${i}`, ownerKind: 'module', ownerId: `m${i}` } as any))
+        loadAssetManifestItems.mockImplementation(async (m: any) => {
+            const list: [string, string, string][] = [[`a${m.id}`, 'k', 'png']]
+            cacheMod.cacheFullAssetManifest(m.id, list)
+            return list
+        })
+        const subset: any = { modules: manifests.map((assetManifest, i) => ({ id: `m${i}`, assetManifest })) }
+        await hydratePluginDatabaseSnapshot(subset)
+        // The first manifest is gone from the 8-entry LRU by now.
+        expect(cacheMod.getCachedFullAssetManifest('evict-0')).toBeUndefined()
+
+        const current = { modules: manifests.map((assetManifest, i) => ({ id: `m${i}`, assetManifest })) }
+        restorePluginDbKey('modules', subset.modules, current)
+        for (let i = 0; i < 10; i++) {
+            expect(subset.modules[i].assetManifest).toBe(manifests[i])
+            expect(subset.modules[i].assets).toBeUndefined()
+        }
+    })
+
+    test('an edited list is still detected as a change without the cache', async () => {
+        const manifest = { id: 'evict-edit', ownerKind: 'character', ownerId: 'c' } as any
+        loadAssetManifestItems.mockResolvedValue([['a', 'k', 'png']])
+        const snap: any = await hydratePluginCharacterSnapshot({ additionalAssetManifest: manifest } as any)
+        for (let i = 0; i < 9; i++) cacheMod.cacheFullAssetManifest(`filler-${i}`, [])
+        snap.additionalAssets[0][0] = 'renamed'
+        const out: any = restorePluginCharacterManifest(snap, { additionalAssetManifest: manifest } as any)
+        expect(out.additionalAssetManifest).toBeUndefined()
+        expect(out.additionalAssets[0][0]).toBe('renamed')
+    })
+})
