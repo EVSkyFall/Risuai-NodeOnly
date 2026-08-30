@@ -13,6 +13,7 @@ import { loadV3Plugins, reloadV3Plugin } from "./apiV3/v3.svelte";
 import { pluginCodeTranspiler } from "./apiV3/transpiler";
 import * as pluginStorageStore from "./pluginStorageStore";
 import { PLUGIN_CUSTOM_STORAGE_KEY, applyPluginDbKey, pluginCustomStorageProxy } from "./pluginDbProxy";
+import { restorePluginDbKey } from './pluginCharacterSnapshot';
 
 export const customProviderStore = writable([] as string[])
 
@@ -740,7 +741,7 @@ export const getV2PluginAPIs = () => {
                         return true;
                     }
                     if (typeof prop === 'string' && allowedDbKeys.includes(prop)) {
-                        (target as any)[prop] = value;
+                        (target as any)[prop] = restorePluginDbKey(prop, value, target as any);
                         return true;
                     }
                     else{
@@ -795,7 +796,7 @@ export const getV2PluginAPIs = () => {
                     continue;
                 }
                 if (allowedDbKeys.includes(key)) {
-                    (db as any)[key] = newDb[key];
+                    (db as any)[key] = restorePluginDbKey(key, newDb[key], db);
                 }
                 else{
                     pluginStorageStore.setItemSync(key, newDb[key]);
@@ -815,7 +816,7 @@ export const getV2PluginAPIs = () => {
                     continue;
                 }
                 if (allowedDbKeys.includes(key)) {
-                    (db as any)[key] = newDb[key];
+                    (db as any)[key] = restorePluginDbKey(key, newDb[key], db);
                 }
                 else{
                     pluginStorageStore.setItemSync(key, newDb[key]);

@@ -26,7 +26,7 @@ import type { ModelModeExtended } from "src/ts/process/request/shared";
 import { requestChatDataMain } from "src/ts/process/request/request";
 import type { OpenAIChat } from "src/ts/process/index.svelte";
 import { getModuleLorebooks } from "src/ts/process/modules";
-import { hydratePluginCharacterSnapshot, restorePluginCharacterManifest } from "../pluginCharacterSnapshot";
+import { hydratePluginCharacterSnapshot, hydratePluginDatabaseSnapshot, restorePluginCharacterManifest } from "../pluginCharacterSnapshot";
 import {
     registerTTSPreprocessor,
     unregisterTTSPreprocessor,
@@ -932,6 +932,9 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
                 }
                 (liteDB as any)[key] = $state.snapshot((db as any)[key]);
             }
+            // Modules and persona-embedded modules have no per-item getter,
+            // so their lazy asset manifests are filled here (#80 follow-up).
+            await hydratePluginDatabaseSnapshot(liteDB);
             return liteDB;
         },
 

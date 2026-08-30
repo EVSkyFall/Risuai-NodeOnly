@@ -9,7 +9,7 @@ vi.mock('../globalApi.svelte', () => ({
 }))
 
 const cacheMod = await import('../storage/assetManifestCache')
-const { hydratePluginCharacterSnapshot, restorePluginCharacterManifest } = await import('./pluginCharacterSnapshot')
+const { hydratePluginCharacterSnapshot, restorePluginCharacterManifest, hydratePluginDatabaseSnapshot, hydratePluginModuleSnapshot, restorePluginDbKey } = await import('./pluginCharacterSnapshot')
 
 const descriptor = { id: 'm1', ownerKind: 'character', ownerId: 'c1', count: 2 } as any
 const items: [string, string, string][] = [['smile', 'key-a', 'png'], ['angry', 'key-b', 'png']]
@@ -129,5 +129,134 @@ describe('read-modify-write round trip', () => {
         const out: any = restorePluginCharacterManifest(snap, { additionalAssetManifest: descriptor } as any)
         expect(out.additionalAssetManifest).toBe(descriptor)
         expect(out.additionalAssets).toBeUndefined()
+    })
+})
+
+describe('hydratePluginDatabaseSnapshot', () => {
+    const moduleManifest = { id: 'mod-1', ownerKind: 'module', ownerId: 'm1' } as any
+
+    test('fills module and persona embedded-module assets, leaving characters alone', async () => {
+        const subset: any = {
+            modules: [{ name: 'm', assetManifest: moduleManifest }, { name: 'inline', assets: [['x', 'k', 'png']] }],
+            personas: [{ name: 'p', embeddedModule: { assetManifest: moduleManifest } }, { name: 'plain' }],
+            characters: [{ additionalAssetManifest: descriptor }],
+        }
+        await hydratePluginDatabaseSnapshot(subset)
+        expect(subset.modules[0].assets).toEqual(items)
+        expect(subset.modules[0].assetManifest).toBeUndefined()
+        expect(subset.modules[1].assets).toEqual([['x', 'k', 'png']])
+        expect(subset.personas[0].embeddedModule.assets).toEqual(items)
+        expect(subset.personas[0].embeddedModule.assetManifest).toBeUndefined()
+        expect(subset.characters[0].additionalAssetManifest).toBe(descriptor)
+        expect(loadAssetManifestItems).toHaveBeenCalledTimes(2)
+    })
+
+    test('tolerates subsets without modules or personas', async () => {
+        await expect(hydratePluginDatabaseSnapshot({})).resolves.toBeUndefined()
+        await expect(hydratePluginDatabaseSnapshot({ modules: undefined, personas: [{}] } as any)).resolves.toBeUndefined()
+        expect(loadAssetManifestItems).not.toHaveBeenCalled()
+    })
+
+    test('a failed module load keeps the descriptor and hands back a copy of the tuples otherwise', async () => {
+        loadAssetManifestItems.mockRejectedValueOnce(new Error('offline'))
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+        const failed: any = await hydratePluginModuleSnapshot({ assetManifest: moduleManifest } as any)
+        expect(failed.assets).toBeUndefined()
+        expect(failed.assetManifest).toBe(moduleManifest)
+        warn.mockRestore()
+
+        const ok: any = await hydratePluginModuleSnapshot({ assetManifest: moduleManifest } as any)
+        expect(ok.assets).toEqual(items)
+        expect(ok.assets).not.toBe(items)
+    })
+})
+
+describe('cache-first manifest lookup', () => {
+    test('a cached manifest is served without a server round trip, as a copy', async () => {
+        const cachedDescriptor = { ...descriptor, id: 'cached-char' }
+        const cachedItems: [string, string, string][] = [['c', 'k', 'png']]
+        cacheMod.cacheFullAssetManifest(cachedDescriptor.id, cachedItems)
+        const snap: any = await hydratePluginCharacterSnapshot({ additionalAssetManifest: cachedDescriptor } as any)
+        expect(snap.additionalAssets).toEqual(cachedItems)
+        expect(snap.additionalAssets).not.toBe(cachedItems)
+        expect(loadAssetManifestItems).not.toHaveBeenCalled()
+
+        const mod: any = await hydratePluginModuleSnapshot({ assetManifest: { ...cachedDescriptor, ownerKind: 'module' } } as any)
+        expect(mod.assets).toEqual(cachedItems)
+        expect(loadAssetManifestItems).not.toHaveBeenCalled()
+    })
+})
+
+describe('restorePluginDbKey', () => {
+    const moduleManifest = { id: 'mod-rt', ownerKind: 'module', ownerId: 'm1' } as any
+    const current = {
+        modules: [{ id: 'm1', assetManifest: moduleManifest }, { id: 'm2', assets: [['x', 'k', 'png']] }],
+        personas: [{ id: 'p1', embeddedModule: { assetManifest: moduleManifest } }],
+    }
+
+    test('an untouched getDatabase() → setDatabase() round trip keeps module and persona manifests', () => {
+        cacheMod.cacheFullAssetManifest(moduleManifest.id, items)
+        const modules: any = [{ id: 'm1', assets: items.map((t) => [...t]) }, { id: 'm2', assets: [['x', 'k', 'png']] }, { id: 'new', assets: [['n', 'k', 'png']] }]
+        const out: any = restorePluginDbKey('modules', modules, current)
+        expect(out[0].assetManifest).toBe(moduleManifest)
+        expect(out[0].assets).toBeUndefined()
+        expect(out[1].assets).toEqual([['x', 'k', 'png']])
+        expect(out[2].assets).toEqual([['n', 'k', 'png']])
+
+        const personas: any = [{ id: 'p1', embeddedModule: { assets: items.map((t) => [...t]) } }]
+        restorePluginDbKey('personas', personas, current)
+        expect(personas[0].embeddedModule.assetManifest).toBe(moduleManifest)
+        expect(personas[0].embeddedModule.assets).toBeUndefined()
+    })
+
+    test('a changed module asset list stays inline', () => {
+        cacheMod.cacheFullAssetManifest(moduleManifest.id, items)
+        const modules: any = [{ id: 'm1', assets: [...items, ['extra', 'k', 'png']] }]
+        restorePluginDbKey('modules', modules, current)
+        expect(modules[0].assetManifest).toBeUndefined()
+        expect(modules[0].assets).toHaveLength(3)
+    })
+
+    test('personas without an id match by position; other keys pass through', () => {
+        cacheMod.cacheFullAssetManifest(moduleManifest.id, items)
+        const personas: any = [{ embeddedModule: { assets: items.map((t) => [...t]) } }]
+        restorePluginDbKey('personas', personas, current)
+        expect(personas[0].embeddedModule.assetManifest).toBe(moduleManifest)
+        const chars = [{ additionalAssets: items }]
+        expect(restorePluginDbKey('characters', chars, current)).toBe(chars)
+        expect(restorePluginDbKey('modules', 'not-an-array', current)).toBe('not-an-array')
+    })
+})
+
+describe('write-back survives full-manifest cache eviction', () => {
+    test('a list handed out through getDatabase() is restored even after the LRU dropped it', async () => {
+        const manifests = Array.from({ length: 10 }, (_, i) => ({ id: `evict-${i}`, ownerKind: 'module', ownerId: `m${i}` } as any))
+        loadAssetManifestItems.mockImplementation(async (m: any) => {
+            const list: [string, string, string][] = [[`a${m.id}`, 'k', 'png']]
+            cacheMod.cacheFullAssetManifest(m.id, list)
+            return list
+        })
+        const subset: any = { modules: manifests.map((assetManifest, i) => ({ id: `m${i}`, assetManifest })) }
+        await hydratePluginDatabaseSnapshot(subset)
+        // The first manifest is gone from the 8-entry LRU by now.
+        expect(cacheMod.getCachedFullAssetManifest('evict-0')).toBeUndefined()
+
+        const current = { modules: manifests.map((assetManifest, i) => ({ id: `m${i}`, assetManifest })) }
+        restorePluginDbKey('modules', subset.modules, current)
+        for (let i = 0; i < 10; i++) {
+            expect(subset.modules[i].assetManifest).toBe(manifests[i])
+            expect(subset.modules[i].assets).toBeUndefined()
+        }
+    })
+
+    test('an edited list is still detected as a change without the cache', async () => {
+        const manifest = { id: 'evict-edit', ownerKind: 'character', ownerId: 'c' } as any
+        loadAssetManifestItems.mockResolvedValue([['a', 'k', 'png']])
+        const snap: any = await hydratePluginCharacterSnapshot({ additionalAssetManifest: manifest } as any)
+        for (let i = 0; i < 9; i++) cacheMod.cacheFullAssetManifest(`filler-${i}`, [])
+        snap.additionalAssets[0][0] = 'renamed'
+        const out: any = restorePluginCharacterManifest(snap, { additionalAssetManifest: manifest } as any)
+        expect(out.additionalAssetManifest).toBeUndefined()
+        expect(out.additionalAssets[0][0]).toBe('renamed')
     })
 })

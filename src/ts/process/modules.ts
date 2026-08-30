@@ -404,9 +404,17 @@ function getModuleById(id:string){
 function getModuleByIds(ids:string[]){
     const db = getDatabase()
     const idSet = new Set(ids)
-    const modules = db.modules.filter(m => 
+    const modules = db.modules.filter(m =>
         idSet.has(m.id) || (m.namespace && idSet.has(m.namespace))
     )
+    // The bound persona's embedded module lives on the persona, not in
+    // db.modules; getModules() lists its id but it was never resolved here.
+    if(idSet.has('$embedded')){
+        const embedded = getModuleById('$embedded')
+        if(embedded){
+            modules.push(embedded)
+        }
+    }
     return deduplicateModuleById(modules)
 }
 
@@ -444,7 +452,10 @@ export function getModules(){
         const intList = db.moduleIntergration.split(',').map((s) => s.trim())
         ids = ids.concat(intList)
     }
-    const idsJoined = ids.join('-')
+    // Every persona's embedded module shares the id '$embedded', so the
+    // persona itself has to be part of the cache key or switching personas
+    // would keep serving the previous one's module.
+    const idsJoined = ids.join('-') + (persona?.embeddedModule ? `|persona:${persona.id ?? persona.name}` : '')
     if(lastModules === idsJoined){
         return lastModuleData
     }
