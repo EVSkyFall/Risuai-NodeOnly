@@ -55,6 +55,10 @@ export const languageKorean = {
       "이 채팅은 서버에서 아직 생성 중이에요. 완료되면 자동으로 채워지니 잠시 기다려주세요.",
     modelJobConnectionLost:
       "연결이 끊겼지만 서버에서 계속 생성 중이에요. 다시 돌아오면 자동으로 이어집니다 — 다시 보내지 않아도 돼요.",
+    chatStillGenerating:
+      "이 채팅은 아직 생성 중이에요. 완료되거나 중지한 뒤 다시 보내주세요.",
+    otherChatGenerating:
+      "다른 채팅에서 생성이 진행 중이에요. 그 채팅이 완료되거나 중지된 뒤 다시 보내주세요.",
     assetManifestConflictTitle: "다른 세션에서 에셋 목록이 변경되었습니다",
     assetManifestConflictDesc:
       "최신 에셋 페이지를 다시 불러왔습니다. 내용을 확인한 뒤 편집을 다시 시도해주세요.",

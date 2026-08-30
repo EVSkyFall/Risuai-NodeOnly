@@ -6,7 +6,7 @@
     import ShDropdownMenuTrigger from 'src/lib/UI/GUI/ShDropdownMenuTrigger.svelte';
     import ShDropdownMenuContent from 'src/lib/UI/GUI/ShDropdownMenuContent.svelte';
     import ShDropdownMenuItem from 'src/lib/UI/GUI/ShDropdownMenuItem.svelte';
-    import { selectedCharID, PlaygroundStore, createSimpleCharacter, hypaV3ModalOpen, ScrollToMessageStore, additionalChatMenu, additionalFloatingActionButtons, chatDeselected, chatPanelStore } from "../../ts/stores.svelte";
+    import { selectedCharID, PlaygroundStore, createSimpleCharacter, hypaV3ModalOpen, ScrollToMessageStore, additionalChatMenu, additionalFloatingActionButtons, chatDeselected, chatPanelStore, alertStore } from "../../ts/stores.svelte";
     import { tick, untrack } from 'svelte';
     import Chat from "./Chat.svelte";
     import { getAdditionalChatLoadPages, getInitialChatLoadPages } from 'src/ts/chatLoadPages';
@@ -20,7 +20,7 @@
     import { sleep } from "../../ts/util";
     import { language } from "../../lang";
     import { isExpTranslator, translate } from "../../ts/translator/translator";
-    import { alertError, alertWait, notifySuccess, notifyError } from "../../ts/alert";
+    import { alertError, alertWait, notifySuccess, notifyError, notifyInfo } from "../../ts/alert";
     import { playNotificationSound } from '../../ts/notificationSound'
 import { isMobile } from 'src/ts/platform'
     import { processScript } from "src/ts/process/scripts";
@@ -69,6 +69,7 @@ import { isMobile } from 'src/ts/platform'
     let openMenu = $state(false)
     let loadPages = $state(getInitialChatLoadPages(DBState.db))
     let doingChatInputTranslate = false
+    let lastBlockedSendToastAt = 0
     let toggleStickers:boolean = $state(false)
     let fileInput:string[] = $state([])
     let showNewMessageButton = $state(false)
@@ -329,7 +330,22 @@ import { isMobile } from 'src/ts/platform'
 
     async function sendMain(continueResponse:boolean) {
         let selectedChar = $selectedCharID
+        // Global guard on purpose: sendChat reads getCurrentChat() at request
+        // time (triggers, model binding), so a second live send from another
+        // chat would cross-contaminate the first. A blocked send must say so
+        // though — a silent return reads as a dead Send button and hides a
+        // stuck entry in some other chat.
         if($doingChat){
+            // Throttled (Enter auto-repeat re-enters here every keydown) and
+            // skipped while a modal is up: notifyInfo clears transitional
+            // alerts, which would dismiss an unrelated alertWait.
+            const now = Date.now()
+            if($alertStore.type === 'none' && now - lastBlockedSendToastAt > 1000){
+                lastBlockedSendToastAt = now
+                notifyInfo($generationStates.has(currentChatGenKey())
+                    ? language.errors.chatStillGenerating
+                    : language.errors.otherChatGenerating)
+            }
             return
         }
 
