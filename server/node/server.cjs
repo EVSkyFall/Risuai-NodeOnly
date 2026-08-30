@@ -272,6 +272,15 @@ function createBackupAndRotate({ force = false } = {}) {
     if (!force && lastBackupTime && now - lastBackupTime < BACKUP_INTERVAL_MS) {
         return;
     }
+    // Nothing to snapshot before the first database exists (fresh install
+    // importing a backup). kvCopyValue would silently skip the blob while
+    // snapshotTo still wrote a plugin-storage map row, leaving an orphan map
+    // with no snapshot behind it. The cooldown still advances, as it always
+    // has for this attempt.
+    if (kvSize('database/database.bin') === null) {
+        lastBackupTime = now;
+        return;
+    }
 
     const backupKey = `${DB_BACKUP_PREFIX}${(now / 100).toFixed()}.bin`;
     // Blob + plugin rows land atomically so a snapshot never exists half-made.

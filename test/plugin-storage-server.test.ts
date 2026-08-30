@@ -115,6 +115,13 @@ async function snapshots(client: RisuClient) {
     return ((await res.json()) as { snapshots: { key: string; size: number; timestamp: number }[] }).snapshots
 }
 
+// The plugin-storage map key every listed snapshot must have exactly once.
+async function snapshotMapKeys(client: RisuClient) {
+    return (await snapshots(client))
+        .map(s => `${SNAPSHOT_PREFIX}${s.key.slice('database/dbbackup-'.length, -4)}`)
+        .sort()
+}
+
 async function restoreSnapshot(client: RisuClient, key: string) {
     const res = await client.fetch('/api/db/snapshots/restore', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key }),
@@ -136,8 +143,13 @@ describe('F1: snapshots carry plugin storage', () => {
         const s1 = (await snapshots(client))[0]
         expect(s1).toBeDefined()
         const s1Id = s1.key.slice('database/dbbackup-'.length, -4)
-        // Pre-split: an empty map (no entries, no marker) and no blobs.
-        expect(await listKv(client, SNAPSHOT_PREFIX)).toEqual([`${SNAPSHOT_PREFIX}${s1Id}`])
+        // Pre-split: an empty map (no entries, no marker) and no blobs. The
+        // import may also take a pre-import snapshot of the boot database; it
+        // lands under a different key only when the two calls straddle a
+        // 100ms tick, so assert the invariant (one map row per snapshot)
+        // rather than an exact count.
+        expect(await listKv(client, SNAPSHOT_PREFIX)).toEqual(await snapshotMapKeys(client))
+        expect(await listKv(client, SNAPSHOT_PREFIX)).toContain(`${SNAPSHOT_PREFIX}${s1Id}`)
         expect(await readKvJson(client, `${SNAPSHOT_PREFIX}${s1Id}`)).toMatchObject({ entries: [], marker: null })
         expect(await listKv(client, BLOB_PREFIX)).toEqual([])
 
@@ -150,7 +162,8 @@ describe('F1: snapshots carry plugin storage', () => {
         const s2Id = s2.key.slice('database/dbbackup-'.length, -4)
         // Content-addressed: one map row for S2, no per-key row copies, and
         // one blob per distinct value.
-        expect(await listKv(client, SNAPSHOT_PREFIX)).toEqual([`${SNAPSHOT_PREFIX}${s1Id}`, `${SNAPSHOT_PREFIX}${s2Id}`].sort())
+        expect(await listKv(client, SNAPSHOT_PREFIX)).toEqual(await snapshotMapKeys(client))
+        expect(await listKv(client, SNAPSHOT_PREFIX)).toEqual(expect.arrayContaining([`${SNAPSHOT_PREFIX}${s1Id}`, `${SNAPSHOT_PREFIX}${s2Id}`]))
         const s2Map = await readKvJson(client, `${SNAPSHOT_PREFIX}${s2Id}`)
         expect(s2Map.entries.sort()).toEqual([[encodeKey('a'), sha('A')], [encodeKey('b'), sha('B')]].sort())
         expect(JSON.parse(s2Map.marker)).toMatchObject({ version: 1 })
