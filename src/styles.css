@@ -428,40 +428,35 @@ body {
 }
 
 ::-webkit-scrollbar {
-  width: 4px;
-  height: 4px;
+  width: 3px;
+  height: 3px;
 }
 
-/* Track */
 ::-webkit-scrollbar-track {
   background: transparent;
 }
 
-/* Handle — global auto-hide. Transparent by default; fades in on hover.
-   The tint is a translucent form of the theme's secondary text color, so it
-   adapts to every theme. `visibility`/`opacity` are avoided: on a webkit thumb
-   they make Chrome fall back to the default system gray bar instead of hiding,
-   so we toggle the thumb's background-color instead. */
+/* Handle — shown only while scrolling. ts/gui/scrollbarAutoHide.ts stamps the
+   scrolling element with `data-scrolling` for the duration of a scroll; the
+   thumb color is passed through a custom property on the scroller because
+   Chromium only re-resolves scrollbar part styles when the scroller's own
+   computed style changes. Verified on macOS Chrome 151 (classic scrollbars). */
 ::-webkit-scrollbar-thumb {
-  background-color: transparent;
+  background-color: var(--risu-scrollbar-thumb, transparent);
   border-radius: 9999px;
-  transition: background-color 0.3s linear;
 }
 
-/* Hovering any scrollable area (hover bubbles to ancestors) reveals the thumb. */
-*:hover::-webkit-scrollbar-thumb {
-  background-color: color-mix(in srgb, var(--color-textcolor2) 35%, transparent);
+[data-scrolling] {
+  --risu-scrollbar-thumb: color-mix(in srgb, var(--color-textcolor2) 45%, transparent);
 }
 
-/* Stronger when pointing directly at the thumb. */
-::-webkit-scrollbar-thumb:hover {
-  background-color: color-mix(in srgb, var(--color-textcolor2) 55%, transparent);
-}
-
-/* Firefox: thin neutral scrollbar (inherits from root; no per-element auto-hide). */
-html {
-  scrollbar-width: thin;
-  scrollbar-color: color-mix(in srgb, var(--color-textcolor2) 35%, transparent) transparent;
+/* Firefox only. Must not reach Chromium: a non-auto `scrollbar-width` on the
+   root would make the document scroller native (always visible). */
+@supports not selector(::-webkit-scrollbar) {
+  html {
+    scrollbar-width: thin;
+    scrollbar-color: color-mix(in srgb, var(--color-textcolor2) 35%, transparent) transparent;
+  }
 }
 
 /* Touch devices: the chat scroller's scrollbar spans the container's full height,
