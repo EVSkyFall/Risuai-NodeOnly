@@ -7,6 +7,8 @@
  */
 
 export const helpZhHant = {
+    "memoryPresetBinding": "此聊天使用的長期記憶預設集。\n\n- **預設**：跟隨 設定 → 長期記憶 中的預設集，並隨之變更。\n- **不使用**：超出上下文的舊訊息會直接被截斷。\n- **選擇預設集**：此聊天單獨使用該預設集（摘要模型、比例等）。\n\n以聊天為單位儲存，不影響同一角色的其他聊天。",
+    "memoryPresetDefault": "設為「預設」的聊天所使用的長期記憶預設集。設為「不使用」時，只有自行選擇預設集的聊天才會執行長期記憶。",
         "model": "此模型是對話時使用的主要模型。",
         "submodel": "輔助模型是一個用於分析情緒立繪、生成自動建議等的模型。",
         "oaiapikey": "OpenAI 的 API 金鑰，可在 https://platform.openai.com/account/api-keys 取得。",
