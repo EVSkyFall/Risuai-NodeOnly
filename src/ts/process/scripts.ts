@@ -6,6 +6,7 @@ import { alertError, notifySuccess } from "../alert";
 import { language } from "src/lang";
 import { selectSingleFile } from "../util";
 import { assetRegex, type CbsConditions, risuChatParser as risuChatParserOrg, type simpleCharacterArgument } from "../parser/parser.svelte";
+import { hydrateAssetListsForCbs } from "../parser/assetListHydration";
 import { getModuleAssets, getModuleRegexScripts, getModules } from "./modules";
 import { HypaProcesser } from "./memory/hypamemory";
 import { runLuaEditTrigger } from "./scriptings";
@@ -130,8 +131,14 @@ export async function processScriptFull(char:character|simpleCharacterArgument, 
         }
     }
 
-    data = risuChatParser(data, { chatID: chatID, cbsConditions })
     const scripts = (db.presetRegex ?? []).concat(char.customscript).concat(getModuleRegexScripts())
+    // Scripts below run the synchronous parser on their own output, so a list
+    // token introduced by a script template needs its manifests loaded now.
+    await hydrateAssetListsForCbs(char, [
+        data,
+        ...scripts.filter((script) => script.type === mode).flatMap((script) => [script.in, script.out]),
+    ])
+    data = risuChatParser(data, { chatID: chatID, cbsConditions })
     const hash = generateScriptCacheKey(scripts, data, mode, chatID, cbsConditions)
     const cached = getScriptCache(hash)
     if(cached){

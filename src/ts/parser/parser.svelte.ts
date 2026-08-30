@@ -2,7 +2,8 @@ import DOMPurify from 'dompurify';
 import markdownit from 'markdown-it'
 import { appVer, getCurrentCharacter, getDatabase, type Database, type character, type customscript, type triggerscript } from '../storage/database.svelte';
 import { DBState, selIdState } from '../stores.svelte';
-import { aiWatermarkingLawApplies, getFileSrc, loadAssetManifestItems, resolvePrioritizedAssetManifestNames } from '../globalApi.svelte';
+import { aiWatermarkingLawApplies, getFileSrc, resolvePrioritizedAssetManifestNames } from '../globalApi.svelte';
+import { hydrateAssetListsForCbs } from './assetListHydration';
 import { isNodeServer } from "src/ts/platform"
 import { getChatVar, setChatVar, getGlobalChatVar } from './chatVar.svelte';
 import { processScriptFull } from '../process/scripts';
@@ -997,13 +998,7 @@ export async function ParseMarkdown(
         // CBS list functions are synchronous. Only when a prompt explicitly
         // asks for a complete asset list do we hydrate the corresponding full
         // manifests into the bounded compatibility cache.
-        if (/\{\{(?:assetlist|chardisplayasset|module_?assetlist)(?:::|\}\})/i.test(data)) {
-            const manifests = getModules()
-                .map((module) => module?.assetManifest)
-                .filter((manifest) => !!manifest)
-            if (char.additionalAssetManifest) manifests.push(char.additionalAssetManifest)
-            await Promise.all(manifests.map((manifest) => loadAssetManifestItems(manifest)))
-        }
+        await hydrateAssetListsForCbs(char, [data])
         data = await parseAdditionalAssets(data, char, additionalAssetMode, {
             ch: chatID
         })
