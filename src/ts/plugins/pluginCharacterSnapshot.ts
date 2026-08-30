@@ -1,8 +1,16 @@
 import { loadAssetManifestItems } from '../globalApi.svelte'
 import { getCachedFullAssetManifest } from '../storage/assetManifestCache'
 import type { character } from '../storage/database.svelte'
+import type { AssetManifestDescriptor } from '../storage/nodeStorage'
 
 type AssetFields = Pick<character, 'additionalAssets' | 'additionalAssetManifest'>
+
+// Manifest ids are content-addressed, so a cached copy is never stale; only
+// go to the server for what the cache is missing (plugins may poll).
+function manifestItems(descriptor: AssetManifestDescriptor) {
+    const cached = getCachedFullAssetManifest(descriptor.id)
+    return cached ? Promise.resolve(cached) : loadAssetManifestItems(descriptor)
+}
 
 // Manifest-backed characters keep only an `additionalAssetManifest` descriptor
 // in DBState (lazy asset manifests, issue #80). Plugins predate that and read
@@ -21,7 +29,7 @@ export async function hydratePluginCharacterSnapshot<T extends AssetFields>(
         // Copy: the loader hands back the cached array instance, and a plugin
         // editing it in place must not edit the cache the write-back compares
         // against below.
-        const items = await loadAssetManifestItems(snapshot.additionalAssetManifest)
+        const items = await manifestItems(snapshot.additionalAssetManifest)
         snapshot.additionalAssets = items.map((tuple) => [...tuple]) as [string, string, string][]
         delete snapshot.additionalAssetManifest
     } catch (error) {
@@ -54,4 +62,36 @@ export function restorePluginCharacterManifest<T extends AssetFields>(incoming: 
     delete incoming.additionalAssets
     incoming.additionalAssetManifest = descriptor
     return incoming
+}
+
+type ModuleAssetFields = { assets?: [string, string, string][]; assetManifest?: AssetManifestDescriptor }
+
+// Module counterpart: modules (and a persona's embedded module) are only
+// reachable through getDatabase(), so their lazy manifests are filled there.
+export async function hydratePluginModuleSnapshot<T extends ModuleAssetFields>(
+    snapshot: T | null | undefined,
+): Promise<T | null | undefined> {
+    if (!snapshot) return snapshot
+    if (Array.isArray(snapshot.assets) || !snapshot.assetManifest) return snapshot
+    try {
+        const items = await manifestItems(snapshot.assetManifest)
+        snapshot.assets = items.map((tuple) => [...tuple]) as [string, string, string][]
+        delete snapshot.assetManifest
+    } catch (error) {
+        console.warn('[plugin] failed to load module assets for plugin snapshot', error)
+    }
+    return snapshot
+}
+
+// Fills the module-shaped entries of a detached getDatabase() subset in
+// place. Characters are deliberately left lazy (see getCharacter*).
+export async function hydratePluginDatabaseSnapshot(subset: {
+    modules?: ModuleAssetFields[]
+    personas?: { embeddedModule?: ModuleAssetFields }[]
+}): Promise<void> {
+    const modules = [
+        ...(Array.isArray(subset.modules) ? subset.modules : []),
+        ...(Array.isArray(subset.personas) ? subset.personas.map((persona) => persona?.embeddedModule) : []),
+    ]
+    await Promise.all(modules.map((module) => hydratePluginModuleSnapshot(module)))
 }

@@ -9,7 +9,7 @@ vi.mock('../globalApi.svelte', () => ({
 }))
 
 const cacheMod = await import('../storage/assetManifestCache')
-const { hydratePluginCharacterSnapshot, restorePluginCharacterManifest } = await import('./pluginCharacterSnapshot')
+const { hydratePluginCharacterSnapshot, restorePluginCharacterManifest, hydratePluginDatabaseSnapshot, hydratePluginModuleSnapshot } = await import('./pluginCharacterSnapshot')
 
 const descriptor = { id: 'm1', ownerKind: 'character', ownerId: 'c1', count: 2 } as any
 const items: [string, string, string][] = [['smile', 'key-a', 'png'], ['angry', 'key-b', 'png']]
@@ -129,5 +129,60 @@ describe('read-modify-write round trip', () => {
         const out: any = restorePluginCharacterManifest(snap, { additionalAssetManifest: descriptor } as any)
         expect(out.additionalAssetManifest).toBe(descriptor)
         expect(out.additionalAssets).toBeUndefined()
+    })
+})
+
+describe('hydratePluginDatabaseSnapshot', () => {
+    const moduleManifest = { id: 'mod-1', ownerKind: 'module', ownerId: 'm1' } as any
+
+    test('fills module and persona embedded-module assets, leaving characters alone', async () => {
+        const subset: any = {
+            modules: [{ name: 'm', assetManifest: moduleManifest }, { name: 'inline', assets: [['x', 'k', 'png']] }],
+            personas: [{ name: 'p', embeddedModule: { assetManifest: moduleManifest } }, { name: 'plain' }],
+            characters: [{ additionalAssetManifest: descriptor }],
+        }
+        await hydratePluginDatabaseSnapshot(subset)
+        expect(subset.modules[0].assets).toEqual(items)
+        expect(subset.modules[0].assetManifest).toBeUndefined()
+        expect(subset.modules[1].assets).toEqual([['x', 'k', 'png']])
+        expect(subset.personas[0].embeddedModule.assets).toEqual(items)
+        expect(subset.personas[0].embeddedModule.assetManifest).toBeUndefined()
+        expect(subset.characters[0].additionalAssetManifest).toBe(descriptor)
+        expect(loadAssetManifestItems).toHaveBeenCalledTimes(2)
+    })
+
+    test('tolerates subsets without modules or personas', async () => {
+        await expect(hydratePluginDatabaseSnapshot({})).resolves.toBeUndefined()
+        await expect(hydratePluginDatabaseSnapshot({ modules: undefined, personas: [{}] } as any)).resolves.toBeUndefined()
+        expect(loadAssetManifestItems).not.toHaveBeenCalled()
+    })
+
+    test('a failed module load keeps the descriptor and hands back a copy of the tuples otherwise', async () => {
+        loadAssetManifestItems.mockRejectedValueOnce(new Error('offline'))
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+        const failed: any = await hydratePluginModuleSnapshot({ assetManifest: moduleManifest } as any)
+        expect(failed.assets).toBeUndefined()
+        expect(failed.assetManifest).toBe(moduleManifest)
+        warn.mockRestore()
+
+        const ok: any = await hydratePluginModuleSnapshot({ assetManifest: moduleManifest } as any)
+        expect(ok.assets).toEqual(items)
+        expect(ok.assets).not.toBe(items)
+    })
+})
+
+describe('cache-first manifest lookup', () => {
+    test('a cached manifest is served without a server round trip, as a copy', async () => {
+        const cachedDescriptor = { ...descriptor, id: 'cached-char' }
+        const cachedItems: [string, string, string][] = [['c', 'k', 'png']]
+        cacheMod.cacheFullAssetManifest(cachedDescriptor.id, cachedItems)
+        const snap: any = await hydratePluginCharacterSnapshot({ additionalAssetManifest: cachedDescriptor } as any)
+        expect(snap.additionalAssets).toEqual(cachedItems)
+        expect(snap.additionalAssets).not.toBe(cachedItems)
+        expect(loadAssetManifestItems).not.toHaveBeenCalled()
+
+        const mod: any = await hydratePluginModuleSnapshot({ assetManifest: { ...cachedDescriptor, ownerKind: 'module' } } as any)
+        expect(mod.assets).toEqual(cachedItems)
+        expect(loadAssetManifestItems).not.toHaveBeenCalled()
     })
 })

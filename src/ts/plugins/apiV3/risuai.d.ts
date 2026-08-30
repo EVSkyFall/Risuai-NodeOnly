@@ -339,6 +339,8 @@ interface RisuModule {
     backgroundEmbedding?: string;
     /** Module assets */
     assets?: [string, string, string][];
+    /** Lazy asset manifest descriptor. Only present when `assets` could not be loaded for the returned copy. */
+    assetManifest?: { id: string; [key: string]: unknown };
     /** Module namespace */
     namespace?: string;
     /** Custom module toggle */
@@ -359,6 +361,8 @@ interface Persona {
     icon: string;
     /** Use large portrait */
     largePortrait?: boolean;
+    /** Module embedded in the persona (persona ↔ module conversion). Returned with `assets` filled. */
+    embeddedModule?: RisuModule;
     /** Persona ID */
     id?: string;
     /** Persona note */
@@ -1439,10 +1443,11 @@ interface RisuaiPluginAPI {
      *
      * Use includeOnly to limit which keys to retrieve for better performance.
      *
-     * Note: entries in `characters` / `modules` / `personas` may carry a lazy
-     * asset manifest descriptor (`additionalAssetManifest` / `assetManifest`)
-     * instead of the full asset array. Use getCharacterFromIndex() when you
-     * need a character's complete `additionalAssets`.
+     * Note: entries in `characters` may carry a lazy asset manifest descriptor
+     * (`additionalAssetManifest`) instead of the full `additionalAssets`
+     * array; use getCharacterFromIndex() when you need a character's complete
+     * list. `modules` and persona `embeddedModule` entries are returned with
+     * their `assets` filled.
      *
      * @example
      * ```typescript
