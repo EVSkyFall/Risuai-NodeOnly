@@ -10,7 +10,7 @@ vi.mock('../../process/modules', () => ({
 }))
 
 const cacheMod = await import('../../storage/assetManifestCache')
-const { mentionsAssetListCbs, hydrateAssetListsForCbs } = await import('../assetListHydration')
+const { mentionsAssetListCbs, hydrateAssetListsForCbs, serializeForCbsScan } = await import('../assetListHydration')
 
 const charManifest = { id: 'char-m', ownerKind: 'character', ownerId: 'c1' } as any
 const moduleManifest = { id: 'mod-m', ownerKind: 'module', ownerId: 'm1' } as any
@@ -99,5 +99,23 @@ describe('hydrateAssetListsForCbs', () => {
         await expect(hydrateAssetListsForCbs({ additionalAssetManifest: uncached }, ['{{assetlist}}'])).resolves.toBeUndefined()
         expect(warn).toHaveBeenCalled()
         warn.mockRestore()
+    })
+})
+
+describe('serializeForCbsScan', () => {
+
+    test('tokens survive serialization, including whitespace inside the name', () => {
+        const sources = [
+            { content: 'lore {{module\nassetlist::TEST}}' },
+            ['{{char\tdisplay asset}}'],
+            'plain {{assetlist}}',
+        ]
+        for (const source of sources) {
+            expect(mentionsAssetListCbs([serializeForCbsScan([source])])).toBe(true)
+        }
+    })
+
+    test('does not invent tokens from unrelated text', () => {
+        expect(mentionsAssetListCbs([serializeForCbsScan([{ a: '{{asset::x}}', b: 'assetlist', c: '{{modules}}' }])])).toBe(false)
     })
 })

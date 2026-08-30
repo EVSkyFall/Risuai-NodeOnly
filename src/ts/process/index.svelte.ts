@@ -25,7 +25,8 @@ import { runLuaEditTrigger } from "./scriptings";
 import { getModelInfo, LLMFlags } from "../model/modellist";
 import { resolveChatModelBinding, resolvePresetMaxOutputTokens, presetSupportsVision } from "./request/modelPresetBinding";
 import { hypaMemoryV3 } from "./memory/hypav3";
-import { getModuleAssets, getModules, getModuleToggles } from "./modules";
+import { getModuleAssets, getModuleLorebooks, getModules, getModuleToggles, getModuleTriggers } from "./modules";
+import { hydrateAssetListsForCbs, serializeForCbsScan } from "../parser/assetListHydration";
 import { forageStorage, readImage, resolvePrioritizedAssetManifestNames } from "../globalApi.svelte";
 import { pluginV2 } from "../plugins/plugins.svelte";
 import { chatGenKey, chatProcessStage, endGeneration, isChatGenerating, setGenerationStage, startGeneration } from "./generationState";
@@ -95,6 +96,22 @@ let termuxNotifyUnavailable = false
 export let requestTokenParts:{[key:string]:requestTokenPart[]} = {}
 export let previewFormated:OpenAIChat[] = []
 export let previewBody:string = ''
+
+// Text that sendChat feeds to the synchronous parser, serialized so one scan
+// covers all of it.
+function promptCbsSources(char:character, chat:Chat):string[] {
+    const db = DBState.db
+    return [serializeForCbsScan([
+        db.mainPrompt, db.jailbreak, db.globalNote, db.descriptionPrefix, db.additionalPrompt, db.promptTemplate,
+        char.systemPrompt, char.replaceGlobalNote, char.desc, char.personality, char.scenario,
+        char.firstMessage, char.alternateGreetings, char.exampleMessage, char.additionalText, char.depth_prompt,
+        char.globalLore, char.triggerscript, chat?.note, chat?.localLore, chat?.message,
+        // Injected into the prompt when the character opts in (see the
+        // customimageinstruction handling below); it carries {{chardisplayasset}}.
+        char.prebuiltAssetCommand ? prebuiltAssetCommand : '',
+        getPersonaPrompt(), getModuleLorebooks(), getModuleTriggers(),
+    ])]
+}
 
 export async function sendChat(chatProcessIndex = -1,arg:{
     chatAdditonalTokens?:number,
@@ -303,6 +320,11 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     }
 
     currentChar = nowChatroom
+
+    // Everything below runs the synchronous parser (messages, prompt, lorebook,
+    // triggers). Asset-list CBS in any of those sources needs its manifests
+    // loaded first — same rule as the display path (#82).
+    await hydrateAssetListsForCbs(currentChar, promptCbsSources(currentChar, nowChatroom.chats[selectedChat]))
 
     let chatAdditonalTokens = arg.chatAdditonalTokens ?? caculatedChatTokens
     const tokenizer = new ChatTokenizer(chatAdditonalTokens, DBState.db.aiModel.startsWith('gpt') ? 'noName' : 'name')

@@ -14,6 +14,14 @@ import type { AssetManifestDescriptor } from '../storage/nodeStorage'
 // parser accepts is detected here.
 const ASSET_LIST_CBS = /\{\{\s*(?:asset[\s_-]*list|char[\s_-]*display[\s_-]*asset|module[\s_-]*asset[\s_-]*list)\s*(?::|\}\})/i
 
+// Serialize a bundle of prompt sources (strings, lorebooks, templates …) into
+// one scannable string. JSON turns a newline/tab inside a token name into a
+// two-character escape that `[\s_-]*` would not match, so those escapes are
+// folded back to a space; no other escape can hide `{{`.
+export function serializeForCbsScan(values: readonly unknown[]): string {
+    return JSON.stringify(values).replace(/\\[ntr]/g, ' ')
+}
+
 export function mentionsAssetListCbs(texts: readonly (string | null | undefined)[]): boolean {
     return texts.some((text) => typeof text === 'string' && ASSET_LIST_CBS.test(text))
 }
