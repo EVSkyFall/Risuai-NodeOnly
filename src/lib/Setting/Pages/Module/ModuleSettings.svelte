@@ -112,7 +112,7 @@
                 <Waypoints size={18} class="shrink-0 text-textcolor2" />
             {/if}
             <div class="flex flex-col min-w-0 grow">
-                <span class="text-sm text-textcolor truncate">{rmodule.name}</span>
+                <span class="text-textcolor truncate">{rmodule.name}</span>
                 <span class="text-xs text-textcolor2 truncate">{rmodule.description || 'No description provided'}</span>
             </div>
             <button class="no-sort shrink-0 p-1 cursor-pointer {isGlobal(rmodule) ? 'text-blue-500' : isIntegrated(rmodule) ? 'text-amber-500 hover:text-primary' : 'text-textcolor2 hover:text-primary'}"

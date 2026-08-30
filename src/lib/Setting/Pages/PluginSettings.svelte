@@ -112,7 +112,7 @@
         {@const expanded = showParams.includes(plugin.name)}
         <div class="flex flex-col min-w-0 grow">
             <div class="flex items-center gap-2 min-w-0">
-                <span class="text-sm text-textcolor truncate">{plugin.displayName ?? plugin.name}</span>
+                <span class="text-textcolor truncate">{plugin.displayName ?? plugin.name}</span>
                 {#if hotReloading.includes(plugin.name)}
                     <span class="text-xs rounded bg-amber-700 px-2 py-0.5 text-white shrink-0">Hot</span>
                 {/if}
