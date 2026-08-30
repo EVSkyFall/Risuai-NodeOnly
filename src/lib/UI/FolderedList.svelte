@@ -242,9 +242,9 @@
 
     {#each groups as group (group.folder?.id ?? '')}
         {#if !group.folder}
-            {@const isCollapsed = folders.length > 0 && collapsed.has('')}
+            {@const isCollapsed = collapsed.has('')}
             <div class="rounded-md border border-darkborderc bg-darkbg">
-                {#if folders.length > 0}
+                <!-- Always shown (even with no folders) so users discover that folders exist. -->
                     <!-- Same structure/sizing as a folder header (icon + menu-width spacer) so rows line up. -->
                     <div class="flex items-center gap-2 px-2 py-2 text-textcolor2 cursor-pointer select-none"
                         role="button" tabindex="0"
@@ -256,10 +256,9 @@
                         <span class="text-xs">{group.indexes.length}</span>
                         <span class="shrink-0 p-1 w-6 h-6" aria-hidden="true"></span>
                     </div>
-                {/if}
                 <div data-folder-container="" class:hidden={isCollapsed}>
                     <ShSortableList
-                        className="flex flex-col px-2 pb-2 gap-0.5 min-h-8 {folders.length === 0 ? 'pt-2' : ''}"
+                        className="flex flex-col px-2 pb-2 gap-0.5 min-h-8"
                         disabled={dragDisabled}
                         options={{ group: 'foldered-list-items' }}
                         onReorder={onItemDrop}
