@@ -97,7 +97,8 @@ jobs:
           mkdir -p portable/scripts
           cp scripts/updater.cjs portable/scripts/updater.cjs
           node scripts/portable/gen-server-deps.cjs portable server-deps-check
-          if ! cmp -s server-deps-check/package.json scripts/portable/server-deps/package.json; then
+          # --strip-trailing-cr: the Windows runner checks the committed file out with CRLF
+          if ! diff -q --strip-trailing-cr server-deps-check/package.json scripts/portable/server-deps/package.json >/dev/null; then
             echo "scripts/portable/server-deps/ is stale — server dependencies changed."
             echo "Regenerate it (see the header of scripts/portable/gen-server-deps.cjs)."
             diff server-deps-check/package.json scripts/portable/server-deps/package.json || true
