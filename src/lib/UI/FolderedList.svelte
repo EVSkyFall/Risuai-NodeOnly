@@ -278,7 +278,7 @@
     <div
         data-sortable-key={String(index)}
         data-sortable-no-scale
-        class="flex items-center gap-2 rounded-md px-2 h-11 text-textcolor cursor-pointer {index === selectedIndex ? 'bg-selected' : 'risu-interactive-surface'}"
+        class="flex items-center gap-2 rounded-md px-2 min-h-11 py-1 text-textcolor cursor-pointer {index === selectedIndex ? 'bg-selected' : 'risu-interactive-surface'}"
         class:hidden={!matches(index)}
         role="button" tabindex="0"
         onclick={() => onSelect(index)}

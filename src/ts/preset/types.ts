@@ -252,6 +252,8 @@ export interface ResolvedModelProfileSnapshot {
 export interface ModelPreset {
     id: string
     name: string
+    /** Optional folder membership (see `db.modelPresetFolders`). Missing means uncategorized. */
+    folderId?: string
     notes?: string
     sourceProfile?: ModelPresetSourceProfile
     migrationSource?: {

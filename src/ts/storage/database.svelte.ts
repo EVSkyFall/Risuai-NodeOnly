@@ -532,6 +532,7 @@ export function setDatabase(data:Database){
     data.openrouterMiddleOut ??= false
     data.memoryLimitThickness ??= 1
     data.modules ??= []
+    data.moduleFolders ??= []
     data.enabledModules ??= []
     data.additionalParams ??= []
     data.heightMode ??= 'normal'
@@ -1279,6 +1280,8 @@ export interface Database{
     lastPatchNoteCheckVersion?:string,
     memoryLimitThickness?:number
     modules: RisuModule[]
+    /** User-defined groups for organizing modules. */
+    moduleFolders?: PromptPresetFolder[]
     enabledModules: string[]
     sideMenuRerollButton?:boolean
     requestInfoInsideChat?:boolean
@@ -1460,6 +1463,8 @@ export interface Database{
         flags: LLMFlags[]
     }[]
     modelPresets: ModelPreset[]
+    /** User-defined groups for organizing model presets. */
+    modelPresetFolders?: PromptPresetFolder[]
     // P4 dual-regime global default binding (plan v6 §7). Copied into new chats
     // (seeding); useModelPresetByDefault seeds the new-chat regime toggle.
     useModelPresetByDefault?: boolean
