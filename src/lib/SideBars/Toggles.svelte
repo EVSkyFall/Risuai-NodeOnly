@@ -6,7 +6,8 @@
     import type { PromptItem } from "src/ts/process/prompt";
     import type { character } from "src/ts/storage/database.svelte";
     import { getCurrentChat, snapshotToggleValues, saveTogglesToChat } from "src/ts/storage/database.svelte";
-    import { alertConfirm, alertTogglePresets, notifySuccess } from "src/ts/alert";
+    import { alertConfirm, alertConfirmMulti, alertTogglePresets, notifySuccess } from "src/ts/alert";
+    import { requestImmediateSave } from "src/ts/globalApi.svelte";
     import { tooltip } from "src/ts/gui/tooltip";
     import { PinIcon, SaveIcon, FolderHeartIcon } from "@lucide/svelte";
     import ShAccordion from '../UI/GUI/ShAccordion.svelte'
@@ -60,6 +61,29 @@
     function updatePin() {
         saveTogglesToChat()
         notifySuccess(language.togglePinSaved)
+    }
+
+    // Same idea as the model binding's "save as default": new chats start
+    // pinned to this snapshot. Existing chats are not touched.
+    async function saveAsDefault() {
+        if (DBState.db.defaultToggleValues) {
+            const sel = await alertConfirmMulti(language.toggleDefaultManage, [
+                language.toggleDefaultOverwrite,
+                { label: language.toggleDefaultClear, variant: 'destructive' },
+            ])
+            if (sel === 1) {
+                DBState.db.defaultToggleValues = undefined
+                void requestImmediateSave()
+                notifySuccess(language.toggleDefaultCleared)
+                return
+            }
+            if (sel !== 0) return
+        } else if (!(await alertConfirm(language.toggleSetDefaultConfirm))) {
+            return
+        }
+        DBState.db.defaultToggleValues = snapshotToggleValues()
+        void requestImmediateSave()
+        notifySuccess(language.toggleDefaultSaved)
     }
 
     async function openPresetList() {
@@ -265,4 +289,10 @@
         {/if}
     {/if}
     {@render toggles(groupedToggles)}
+{/if}
+
+{#if !DBState.db.disableToggleBinding && currentChat}
+    <ShButton variant="ghost" size="xs" className="w-full text-textcolor2 mt-1" onclick={saveAsDefault}>
+        {DBState.db.defaultToggleValues ? language.toggleDefaultSavedButton : language.toggleSaveAsDefaultButton}
+    </ShButton>
 {/if}

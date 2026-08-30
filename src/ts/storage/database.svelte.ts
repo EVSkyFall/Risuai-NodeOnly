@@ -875,11 +875,15 @@ export function setCurrentChat(chat:Chat){
  * literals. Do NOT call for hydration placeholders or chats being restored with
  * their own mode.
  */
-export function newChatModelDefaults(): Partial<Pick<Chat, 'useModelPreset' | 'modelBinding' | 'memoryPresetId'>> {
+export function newChatModelDefaults(): Partial<Pick<Chat, 'useModelPreset' | 'modelBinding' | 'memoryPresetId' | 'savedToggleValues'>> {
     const db = getDatabase()
     // New chats follow the character / global memory preset; chats without a
     // value are legacy and resolve from `supaMemory` instead (memoryPresets.ts).
-    const memory = { memoryPresetId: MEMORY_PRESET_DEFAULT }
+    // A saved toggle default starts the chat pinned to those values.
+    const memory: Partial<Pick<Chat, 'memoryPresetId' | 'savedToggleValues'>> = { memoryPresetId: MEMORY_PRESET_DEFAULT }
+    if (db.defaultToggleValues && !db.disableToggleBinding) {
+        memory.savedToggleValues = structuredClone($state.snapshot(db.defaultToggleValues))
+    }
     if (!db.useModelPresetByDefault) return memory
     const def = db.defaultModelBinding
     return {
@@ -1483,6 +1487,8 @@ export interface Database{
     // (seeding); useModelPresetByDefault seeds the new-chat regime toggle.
     useModelPresetByDefault?: boolean
     defaultModelBinding?: ModelBindingSet
+    /** Toggle values (`toggle_*`) new chats start pinned to. Absent => new chats start unpinned as before. */
+    defaultToggleValues?: Record<string, string>
     // Global model-mode lock. 'legacy'/'preset' force every chat into that
     // regime (the per-chat dropdown is hidden); 'none' lets each chat decide,
     // falling back to useModelPresetByDefault for chats that never chose. Read
