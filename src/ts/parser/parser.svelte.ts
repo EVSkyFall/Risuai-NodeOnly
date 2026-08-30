@@ -730,6 +730,51 @@ function applyInlayDimensions(img: HTMLImageElement, source: { width?: number; h
     img.setAttribute('height', String(dimensions.height))
 }
 
+// The fast path publishes a cache entry before its dimensions arrive. Any
+// <img> rendered from that entry in the meantime — including one remounted
+// by a re-render, which never goes through the resolve queue — must be able
+// to pick the dimensions up when they land, so one pending lookup per id is
+// kept here until it settles.
+const pendingInlayDimensions = new Map<string, Promise<InlayDimensions | undefined>>()
+
+function requestInlayDimensions(ids: string[]) {
+    const missing = ids.filter((id) => !pendingInlayDimensions.has(id))
+    if(missing.length === 0) return
+    const infos = getInlayInfosBatch(missing)
+    for(const id of missing){
+        const request = infos.then((result) => {
+            const cached = blobUrlCache.get(id)
+            const dimensions = getInlayDimensions(result[id])
+            if(!cached || cached.type !== 'image' || !dimensions) return undefined
+            cached.width = dimensions.width
+            cached.height = dimensions.height
+            return dimensions
+        }).catch(() => undefined)
+        pendingInlayDimensions.set(id, request)
+        // A legacy inlay without inlay_info settles to undefined and is simply
+        // not retried: no entry, no attribute, no further requests.
+        void request.finally(() => {
+            if(pendingInlayDimensions.get(id) === request) pendingInlayDimensions.delete(id)
+        })
+    }
+}
+
+// Size an <img> from the cache now, or from the pending lookup once it lands.
+// Only an element actually showing this inlay qualifies — the marker attribute
+// is user-writable HTML, so the src must match the cached URL.
+function sizeInlayImage(img: HTMLImageElement, id: string) {
+    const cached = blobUrlCache.get(id)
+    if(cached?.type !== 'image' || img.getAttribute('src') !== cached.url) return
+    applyInlayDimensions(img, cached)
+    if(getInlayDimensions(cached)) return
+    void pendingInlayDimensions.get(id)?.then((dimensions) => {
+        const current = blobUrlCache.get(id)
+        if(dimensions && img.isConnected && !DBState.db.hideAllImages && current?.type === 'image' && img.getAttribute('src') === current.url){
+            applyInlayDimensions(img, dimensions)
+        }
+    })
+}
+
 function createMissingInlayPlaceholder(id: string): HTMLDivElement {
     const box = document.createElement('div')
     box.className = 'risu-inlay-missing'
@@ -773,7 +818,12 @@ export function parseInlayAssets(data:string){
                         data = data.replace(inlay, '')
                         break
                     }
-                    data = data.replace(inlay, `${prefix}<img src="${url}"${getInlayDimensionAttributes(cached)}/>${postfix}`)
+                    // No dimensions yet but a lookup in flight: mark the
+                    // element so resolveInlayPlaceholders can reconnect it.
+                    const pending = !getInlayDimensions(cached) && pendingInlayDimensions.has(id)
+                        ? ` data-inlay-pending="${id}"`
+                        : ''
+                    data = data.replace(inlay, `${prefix}<img src="${url}"${getInlayDimensionAttributes(cached)}${pending}/>${postfix}`)
                     break
                 case 'video':
                     data = data.replace(inlay, `${prefix}<video controls><source src="${url}" type="video/mp4"></video>${postfix}`)
@@ -797,13 +847,10 @@ async function processInlayQueue() {
 
     while (resolveQueue.length > 0) {
         const batch = resolveQueue.splice(0, 20)
-        // <img> elements inserted below, so late-arriving dimensions can still
-        // reserve their box before the image finishes decoding.
-        const insertedImages = new Map<string, HTMLImageElement[]>()
 
-        const unknownIds = batch
+        const unknownIds = Array.from(new Set(batch
             .filter(({ id }) => !blobUrlCache.has(id))
-            .map(({ id }) => id)
+            .map(({ id }) => id)))
 
         if (unknownIds.length > 0) {
             if (DBState.db.inlayImagePriority) {
@@ -811,22 +858,10 @@ async function processInlayQueue() {
                 for (const id of unknownIds) {
                     blobUrlCache.set(id, { url: assetUrl(`inlay/${id}`), type: 'image' })
                 }
-                // Dimensions are fetched without blocking the image load; when
-                // they arrive, size the already-inserted <img> so it doesn't
-                // jump from 0 height once decoded.
-                getInlayInfosBatch(unknownIds).then((infos) => {
-                    for (const id of unknownIds) {
-                        const cached = blobUrlCache.get(id)
-                        if(!cached) continue
-                        const dimensions = getInlayDimensions(infos[id])
-                        if(!dimensions) continue
-                        cached.width = dimensions.width
-                        cached.height = dimensions.height
-                        for (const img of insertedImages.get(id) ?? []) {
-                            if (img.isConnected) applyInlayDimensions(img, dimensions)
-                        }
-                    }
-                }).catch(() => {})
+                // Dimensions are fetched without blocking the image load; the
+                // <img> elements below (and any remounted later) size
+                // themselves from the shared lookup when it lands.
+                requestInlayDimensions(unknownIds)
             } else {
                 // Accurate path: fetch type info first
                 try {
@@ -859,8 +894,7 @@ async function processInlayQueue() {
                         if (DBState.db.hideAllImages) { el.remove(); break }
                         const img = document.createElement('img')
                         img.src = url
-                        applyInlayDimensions(img, cached)
-                        insertedImages.set(id, [...(insertedImages.get(id) ?? []), img])
+                        sizeInlayImage(img, id)
                         img.style.animation = 'risu-fade-in 0.3s ease-out'
                         // Fallback for legacy inlays without inlay_info:
                         // if <img> fails, probe Content-Type and swap to video/audio
@@ -928,6 +962,12 @@ async function processInlayQueue() {
 
 export function resolveInlayPlaceholders(root: HTMLElement) {
     if (!root) return
+    // Images rendered from a cache entry whose dimensions are still loading.
+    for (const img of Array.from(root.querySelectorAll<HTMLImageElement>('img[data-inlay-pending]'))) {
+        const id = img.getAttribute('data-inlay-pending')
+        img.removeAttribute('data-inlay-pending')
+        if (id) sizeInlayImage(img, id)
+    }
     const placeholders = Array.from(root.querySelectorAll('[data-inlay-id]')) as HTMLElement[]
     if (placeholders.length === 0) return
 
@@ -1032,7 +1072,7 @@ export async function ParseMarkdown(
 
 const trimPurifyConfig = {
     ADD_TAGS: ["iframe", "style", "risu-style", "x-em", 'annotation', 'semantics', 'mrow', 'mi', 'mo', 'mn', 'msup', 'msub', 'mfrac', 'msqrt'],
-    ADD_ATTR: ["allow", "allowfullscreen", "frameborder", "scrolling", "risu-ctrl" ,"risu-btn", 'risu-trigger', 'risu-mark', 'risu-id', 'x-hl-lang', 'x-hl-text', 'data-inlay-id', 'data-inlay-type'],
+    ADD_ATTR: ["allow", "allowfullscreen", "frameborder", "scrolling", "risu-ctrl" ,"risu-btn", 'risu-trigger', 'risu-mark', 'risu-id', 'x-hl-lang', 'x-hl-text', 'data-inlay-id', 'data-inlay-type', 'data-inlay-pending'],
 }
 
 // LRU cache for DOMPurify + decodeStyle results.
