@@ -51,6 +51,11 @@ export interface ModelJobRecord {
     adapterKind?: string | null
     /** Model id, recorded at job creation (absent on jobs from older builds). */
     model?: string | null
+    /** User-facing preset label and live generation token estimates. */
+    modelLabel?: string | null
+    inputTokens?: number | null
+    outputTokens?: number | null
+    maxContext?: number | null
     /** origin+pathname of the provider endpoint — never the query string. */
     targetOrigin?: string | null
     createdAt?: number
@@ -280,20 +285,44 @@ async function claimJob(jobId: string): Promise<void> {
 
 // Message shape mirrors the live write path (index.svelte.ts streaming push):
 // data/saying/time/generationInfo, message-level chatId = generationId.
-// generationInfo.model goes through the same formatter as the live path
+// generationInfo.model prefers the preset label persisted with the job, then
+// falls back to the same formatter as the live path
 // (generationInfo.model = getGenerationModelString(req.model)) so a recovered
 // message shows the same model string a live one would, not "unknown".
-// Jobs from older builds have no model recorded — leave the field unset.
-function insertRecoveredMessage(loc: LocatedChat, job: ModelJobRecord, text: string): void {
+// Jobs from older builds have neither recorded — leave the fields unset.
+// Token counts fall back to provider-reported usage parsed from the journal.
+function recoveredGenerationInfo(job: ModelJobRecord, usage?: AdapterUsage): Message['generationInfo'] {
+    return {
+        generationId: job.generationId ?? undefined,
+        model: job.modelLabel ?? (job.model ? getGenerationModelString(job.model) : undefined),
+        modelId: job.model ?? undefined,
+        inputTokens: job.inputTokens ?? usage?.promptTokens,
+        outputTokens: job.outputTokens ?? usage?.completionTokens,
+        maxContext: job.maxContext ?? undefined,
+    }
+}
+
+function mergeRecoveredGenerationInfo(message: Message, job: ModelJobRecord, usage?: AdapterUsage): boolean {
+    const recovered = recoveredGenerationInfo(job, usage)
+    const current = message.generationInfo ?? {}
+    let changed = message.generationInfo === undefined
+    for (const [key, value] of Object.entries(recovered)) {
+        if (value !== undefined && current[key as keyof typeof current] === undefined) {
+            Object.assign(current, { [key]: value })
+            changed = true
+        }
+    }
+    if (changed) message.generationInfo = current
+    return changed
+}
+
+function insertRecoveredMessage(loc: LocatedChat, job: ModelJobRecord, text: string, usage?: AdapterUsage): void {
     const message: Message = {
         role: 'char',
         data: text,
         time: Date.now(),
         chatId: job.generationId ?? uuidv4(),
-        generationInfo: {
-            generationId: job.generationId ?? undefined,
-            model: job.model ? getGenerationModelString(job.model) : undefined,
-        },
+        generationInfo: recoveredGenerationInfo(job, usage),
     }
     if (loc.char.chaId) message.saying = loc.char.chaId
     loc.chat.message.push(message)
@@ -322,7 +351,7 @@ function insertJobError(loc: LocatedChat, job: ModelJobRecord, error: string): b
         time: Date.now(),
     }
     if (loc.char.chaId) message.saying = loc.char.chaId
-    if (job.generationId) message.generationInfo = { generationId: job.generationId }
+    if (job.generationId || job.model || job.modelLabel) message.generationInfo = recoveredGenerationInfo(job)
     loc.chat.message.push(message)
     bumpReload(loc)
     return true
@@ -428,6 +457,17 @@ function fillPartialMessage(loc: LocatedChat, index: number, text: string): bool
 // an existing message with this generationId is never duplicated — it is either
 // left alone or filled in from the journal (see fillPartialMessage).
 export async function recoverTerminalJob(job: ModelJobRecord): Promise<void> {
+    // A LIVE send still owns this chat: the job finished server-side while the
+    // tab was frozen and its stream is still replaying/reattaching (discovery
+    // fires on tab-return mid-send). The live path fills the message, runs the
+    // full post-processing and claims the job itself — slotting in here would
+    // race it with a raw fill, a redundant save and a duplicate request-log
+    // entry. Same guard as attachRunningJob / evaluatePendingSend; if the live
+    // send dies instead, its guard is released and the next pass recovers.
+    if (get(generationStates).get(chatGenKey(job.chatId))?.kind === 'live') {
+        diag(`recover ${job.id.slice(0, 8)}: live send owns chat -> skipped`)
+        return
+    }
     const loc = await locateChat(job.chatId)
     if (!loc) {
         // Chat was deleted while the job ran — nothing to slot into.
@@ -464,12 +504,14 @@ export async function recoverTerminalJob(job: ModelJobRecord): Promise<void> {
     let mutated = false
     if (result.ok === true) {
         if (existingIdx === -1) {
-            insertRecoveredMessage(loc, job, result.text)
+            insertRecoveredMessage(loc, job, result.text, result.usage)
             mutated = true
             diag(`recover ${job.id.slice(0, 8)}: inserted len=${result.text.length}`)
         } else {
             const before = loc.chat.message[existingIdx]?.data?.length ?? 0
-            mutated = fillPartialMessage(loc, existingIdx, result.text)
+            const metadataChanged = mergeRecoveredGenerationInfo(loc.chat.message[existingIdx], job, result.usage)
+            const textChanged = fillPartialMessage(loc, existingIdx, result.text)
+            mutated = metadataChanged || textChanged
             const after = loc.chat.message[existingIdx]?.data?.length ?? 0
             // Independent read-back through a FRESH proxied lookup: proves the
             // write is visible to the reactive graph, not only to our local
@@ -691,6 +733,11 @@ export async function evaluatePendingSend(
 // A record deferred by the min-age gate gets exactly one scheduled re-check
 // when it comes of age — without this, a desktop tab that stays visible would
 // never re-run discovery and the resume would be missed for the session.
+//
+// Deliberately a SEPARATE timer from the failure-retry backoff below: sharing
+// one slot would let a retry schedule erase the pending-send "comes of age"
+// guarantee (or vice versa). Both timers just re-run discovery, so an extra
+// firing is harmless; a lost one is not.
 let deferredDiscoveryTimer: ReturnType<typeof setTimeout> | null = null
 function scheduleDeferredDiscovery(delayMs: number): void {
     if (deferredDiscoveryTimer !== null) clearTimeout(deferredDiscoveryTimer)
@@ -698,6 +745,19 @@ function scheduleDeferredDiscovery(delayMs: number): void {
         deferredDiscoveryTimer = null
         void recoverModelJobs()
     }, delayMs)
+}
+
+let retryDiscoveryTimer: ReturnType<typeof setTimeout> | null = null
+function scheduleDiscoveryRetry(delayMs: number): void {
+    if (retryDiscoveryTimer !== null) clearTimeout(retryDiscoveryTimer)
+    retryDiscoveryTimer = setTimeout(() => {
+        retryDiscoveryTimer = null
+        void recoverModelJobs()
+    }, delayMs)
+}
+function clearDiscoveryRetry(): void {
+    if (retryDiscoveryTimer !== null) clearTimeout(retryDiscoveryTimer)
+    retryDiscoveryTimer = null
 }
 
 async function discoverPendingSends(jobChatIds: Set<string>): Promise<string[]> {
@@ -726,6 +786,17 @@ async function discoverPendingSends(jobChatIds: Set<string>): Promise<string[]> 
 
 let recoveryInFlight: Promise<void> | null = null
 
+// Discovery retry policy: a return-triggered pass often races the radio coming
+// back up — visibilitychange fires the moment the tab resumes, while the
+// network needs a few more seconds. A silent give-up there strands finished
+// jobs until the NEXT return (the exact failure observed in the field: the
+// resume-time pass died on an unreachable job API and the response sat
+// unclaimed while the user regenerated). Bounded backoff, reset on any
+// successful pass — never an open-ended poll.
+const DISCOVERY_RETRY_MAX = 3
+const DISCOVERY_RETRY_BASE_MS = 3000
+let discoveryRetries = 0
+
 // Discovery pass. Never throws, and is a no-op when the job API is unreachable
 // or returns nothing. NOT gated on the nodeOnlyServerSideRequests toggle: jobs
 // created before the toggle was switched off must still be recovered.
@@ -746,11 +817,17 @@ async function runDiscovery(): Promise<void> {
             diag(`discovery: unclaimed=${unclaimedJobs.length} active=${activeJobs.length}`)
         }
         // Sequential on purpose: slot-ins mutate the DB and a failure on one
-        // job must not stop the rest.
+        // job must not stop the rest. A swallowed per-job failure still counts
+        // against the pass for retry purposes: the list fetch succeeding while
+        // the journal read dies (network came back mid-pass) must not strand
+        // the job until the next return — the exact failure mode the retry
+        // exists for. Genuinely broken jobs cannot loop: the budget is bounded.
+        let jobFailures = false
         for (const job of unclaimedJobs) {
             try {
                 await recoverTerminalJob(job)
             } catch (err) {
+                jobFailures = true
                 console.warn('[ModelJobRecovery] recovery failed for job', job?.id, err)
             }
         }
@@ -758,6 +835,7 @@ async function runDiscovery(): Promise<void> {
             try {
                 attachRunningJob(job)
             } catch (err) {
+                jobFailures = true
                 console.warn('[ModelJobRecovery] reattach failed for job', job?.id, err)
             }
         }
@@ -775,9 +853,22 @@ async function runDiscovery(): Promise<void> {
             safeStatus(() => notifyInfo(
                 language.pendingSendNotice.replace('{chars}', newNames.join(', '))))
         }
+        if (jobFailures) {
+            scheduleRetryIfBudgeted()
+        } else {
+            discoveryRetries = 0
+            clearDiscoveryRetry()
+        }
     } catch (err) {
         console.warn('[ModelJobRecovery] discovery failed', err)
+        scheduleRetryIfBudgeted()
     }
+}
+
+function scheduleRetryIfBudgeted(): void {
+    if (discoveryRetries >= DISCOVERY_RETRY_MAX) return
+    scheduleDiscoveryRetry(DISCOVERY_RETRY_BASE_MS * 2 ** discoveryRetries)
+    discoveryRetries += 1
 }
 
 let triggersInstalled = false
@@ -794,9 +885,17 @@ let triggersInstalled = false
 export function initModelJobRecovery(): void {
     if (triggersInstalled) return
     triggersInstalled = true
+    // Each real return grants a fresh retry budget: an earlier exhausted
+    // backoff (network stayed down) must not mute the retries of a later,
+    // unrelated return.
     document.addEventListener('visibilitychange', () => {
-        if (document.visibilityState === 'visible') void recoverModelJobs()
+        if (document.visibilityState !== 'visible') return
+        discoveryRetries = 0
+        void recoverModelJobs()
     })
-    window.addEventListener('online', () => { void recoverModelJobs() })
+    window.addEventListener('online', () => {
+        discoveryRetries = 0
+        void recoverModelJobs()
+    })
     void recoverModelJobs()
 }

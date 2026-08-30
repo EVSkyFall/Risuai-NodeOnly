@@ -1,11 +1,12 @@
 import { language } from "src/lang"
 import { alertClear, alertConfirm, alertError, alertModuleSelect, alertNormal, alertStore, alertWait, notifySuccess } from "../alert"
 import { getCurrentCharacter, getCurrentChat, getDatabase, setCurrentCharacter, setDatabase, type customscript, type loreBook, type triggerscript } from "../storage/database.svelte"
-import { AppendableBuffer, downloadFile, forageStorage, LocalWriter, readImage, saveAsset, VirtualWriter } from "../globalApi.svelte"
+import { AppendableBuffer, downloadFile, forageStorage, loadAssetManifestItems, LocalWriter, readImage, saveAsset, VirtualWriter } from "../globalApi.svelte"
 import { checkPersonaBinded, selectSingleFile, sleep } from "../util"
 import { v4 } from "uuid"
 import { convertExternalLorebook } from "./lorebook.svelte"
 import { compressImage } from '../media'
+import type { AssetManifestDescriptor } from '../storage/nodeStorage'
 import { decodeRPack, encodeRPack } from "../rpack/rpack_js"
 import { HideIconStore, moduleBackgroundEmbedding, ReloadGUIPointer } from "../stores.svelte"
 import {get} from "svelte/store"
@@ -19,6 +20,8 @@ export interface MCPModule{
 export interface RisuModule{
     name: string
     description: string
+    /** Optional folder membership (see `db.moduleFolders`). Missing means uncategorized. */
+    folderId?: string
     lorebook?: loreBook[]
     regex?: customscript[]
     cjs?: string
@@ -28,15 +31,25 @@ export interface RisuModule{
     hideIcon?: boolean
     backgroundEmbedding?:string
     assets?:[string,string,string][]
+    assetManifest?:AssetManifestDescriptor
     namespace?:string
     customModuleToggle?:string
     mcp?:MCPModule
     icon?:string
 }
 
+export async function hydrateModuleAssets(module: RisuModule): Promise<RisuModule> {
+    if (Array.isArray(module.assets) || !module.assetManifest) return module
+    const hydrated = safeStructuredClone(module)
+    hydrated.assets = await loadAssetManifestItems(module.assetManifest) as [string, string, string][]
+    delete hydrated.assetManifest
+    return hydrated
+}
+
 export async function exportModule(module:RisuModule, arg:{
     alertEnd?:boolean
 } = {}){
+    module = await hydrateModuleAssets(module)
     const alertEnd = arg.alertEnd ?? true
 
     const char = convertModuleToCharacter(module)
@@ -62,6 +75,7 @@ export async function exportModuleLegacy(module:RisuModule, arg:{
     alertEnd?:boolean
     saveData?:boolean
 } = {}){
+    module = await hydrateModuleAssets(module)
     const alertEnd = arg.alertEnd ?? true
     const saveData = arg.saveData ?? true
     const apb = new AppendableBuffer()
@@ -304,6 +318,16 @@ export async function importModule(){
                 return
             }
             importData.id = v4()
+            // A hand-edited export may still carry a lazy manifest descriptor;
+            // keeping it would make the copy edit the source module's manifest.
+            if(importData.assetManifest){
+                try {
+                    Object.assign(importData, await hydrateModuleAssets(importData))
+                } catch {
+                    importData.assets = []
+                }
+                delete importData.assetManifest
+            }
 
             if(importData.lowLevelAccess){
                 const conf = await alertConfirm(language.lowLevelAccessConfirm)
@@ -380,9 +404,17 @@ function getModuleById(id:string){
 function getModuleByIds(ids:string[]){
     const db = getDatabase()
     const idSet = new Set(ids)
-    const modules = db.modules.filter(m => 
+    const modules = db.modules.filter(m =>
         idSet.has(m.id) || (m.namespace && idSet.has(m.namespace))
     )
+    // The bound persona's embedded module lives on the persona, not in
+    // db.modules; getModules() lists its id but it was never resolved here.
+    if(idSet.has('$embedded')){
+        const embedded = getModuleById('$embedded')
+        if(embedded){
+            modules.push(embedded)
+        }
+    }
     return deduplicateModuleById(modules)
 }
 
@@ -420,7 +452,10 @@ export function getModules(){
         const intList = db.moduleIntergration.split(',').map((s) => s.trim())
         ids = ids.concat(intList)
     }
-    const idsJoined = ids.join('-')
+    // Every persona's embedded module shares the id '$embedded', so the
+    // persona itself has to be part of the cache key or switching personas
+    // would keep serving the previous one's module.
+    const idsJoined = ids.join('-') + (persona?.embeddedModule ? `|persona:${persona.id ?? persona.name}` : '')
     if(lastModules === idsJoined){
         return lastModuleData
     }

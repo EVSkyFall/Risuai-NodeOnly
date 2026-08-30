@@ -9,12 +9,22 @@ import { DBState, hotReloading, pluginAlertModalStore, selectedCharID } from "..
 import type { ScriptMode } from "../process/scripts";
 import { checkCodeSafety } from "./pluginSafety";
 import { SafeDocument, SafeIdbFactory, SafeLocalStorage } from "./pluginSafeClass";
-import { loadV3Plugins } from "./apiV3/v3.svelte";
+import { loadV3Plugins, reloadV3Plugin } from "./apiV3/v3.svelte";
 import { pluginCodeTranspiler } from "./apiV3/transpiler";
+import * as pluginStorageStore from "./pluginStorageStore";
+import { PLUGIN_CUSTOM_STORAGE_KEY, applyPluginDbKey, pluginCustomStorageProxy } from "./pluginDbProxy";
+import { restorePluginDbKey } from './pluginCharacterSnapshot';
 
 export const customProviderStore = writable([] as string[])
 
+const withPluginFetchLog = <T extends { logCategory?: unknown, logSource?: unknown } | undefined>(options: T): T => {
+    if (options?.logCategory) return options
+    return { ...options, logCategory: 'other', logSource: 'plugin' } as T
+}
+
 interface ProviderPlugin {
+    /** Optional folder membership (see `db.pluginFolders`). Missing means uncategorized. */
+    folderId?: string
     name: string
     displayName?: string
     script: string
@@ -343,6 +353,13 @@ export async function importPlugin(code:string|null = null, argu:{
         let apiInternalVersion: 2|'2.1'|'3.0' = '2.1'
 
         if(apiVersion === '2.1'){
+            // Upstream blocks 2.1 installs outright; NodeOnly keeps it behind an
+            // opt-in (same policy as allowV2Plugin). Already-installed 2.1 plugins
+            // keep running regardless — this only gates new installs/updates.
+            if(!DBState.db.allowV21Plugin){
+                showError('Your plugin specifies API version 2.1, which is outdated and no longer supported. Please update your plugin to use at least API version 3.0.')
+                return
+            }
             const safety = await checkCodeSafety(jsFile)
             if(!safety.isSafe){
                 pluginAlertModalStore.errors = safety.errors
@@ -361,7 +378,7 @@ export async function importPlugin(code:string|null = null, argu:{
         }
         else if(apiVersion === '2.0'){
             if(!DBState.db.allowV2Plugin){
-                showError('Your code does not include //@api or specifies API version 2.0, which is outdated. Please update your plugin to use at least API version 2.1.')
+                showError('Your code does not include //@api or specifies API version 2.0, which is outdated. Please update your plugin to use at least API version 3.0.')
                 return
             }
             apiInternalVersion = 2
@@ -393,6 +410,7 @@ export async function importPlugin(code:string|null = null, argu:{
         db.plugins ??= []
 
         const oldPluginIndex = db.plugins.findIndex((p: RisuPlugin) => p.name === pluginData.name);
+        const oldPlugin = oldPluginIndex !== -1 ? db.plugins[oldPluginIndex] : undefined;
 
         if(originalPluginName && originalPluginName !== pluginData.name){
             showError(`When updating plugin "${originalPluginName}", the plugin name cannot be changed to "${pluginData.name}". Please keep the original name to update.`)
@@ -422,7 +440,12 @@ export async function importPlugin(code:string|null = null, argu:{
         setDatabaseLite(db)
         void requestImmediateSave()
 
-        loadPlugins()
+        if(isUpdate && oldPlugin?.version === '3.0' && apiInternalVersion === '3.0'){
+            await reloadV3Plugin(pluginData)
+        }
+        else{
+            loadPlugins()
+        }
         
     } catch (error) {
         console.error(error)
@@ -440,6 +463,16 @@ export async function loadPlugins() {
     const enabledPlugins = safeStructuredClone(db.plugins).filter((p: RisuPlugin) => p.enabled)
     const pluginV2 = enabledPlugins.filter((a: RisuPlugin) => a.version === 2 || a.version === '2.1')
     const pluginV3 = enabledPlugins.filter((a: RisuPlugin) => a.version === '3.0')
+
+    // Plugin values live on the server, never in db.pluginCustomStorage. V3
+    // reads on demand; the V2 API is synchronous, so any enabled V2 plugin
+    // forces a full preload into the store's cache.
+    try {
+        await pluginStorageStore.init()
+        if (pluginV2.length > 0) await pluginStorageStore.preloadAll()
+    } catch (e) {
+        console.error('[pluginStorage] init failed', e)
+    }
 
     await loadV2Plugin(pluginV2)
     await loadV3Plugins(pluginV3)
@@ -465,6 +498,8 @@ export type PluginV2ProviderOptions = {
 
 export type EditFunction = (content: string) => string | null | undefined | Promise<string | null | undefined>
 type ReplacerFunction = (content: OpenAIChat[], type: string) => OpenAIChat[] | Promise<OpenAIChat[]>
+type ChatOutputListenerArg = { char: any, chat: any, characterIndex: number, chatIndex: number, messageIndex: number }
+type ChatOutputListener = (arg: ChatOutputListenerArg) => void | Promise<void>
 
 export const pluginV2 = {
     providers: new Map<string, (arg: PluginV2ProviderArgument, abortSignal?: AbortSignal) => Promise<{ success: boolean, content: string | ReadableStream<string> }>>(),
@@ -475,6 +510,7 @@ export const pluginV2 = {
     editinput: new Set<EditFunction>(),
     replacerbeforeRequest: new Set<ReplacerFunction>(),
     replacerafterRequest: new Set<(content: string, type: string) => string | Promise<string>>(),
+    chatOutput: new Set<ChatOutputListener>(),
     unload: new Set<() => void | Promise<void>>(),
     loaded: false
 }
@@ -507,8 +543,10 @@ export const allowedDbKeys = [
 
 export const getV2PluginAPIs = () => {
     return {
-        risuFetch: globalFetch,
-        nativeFetch: fetchNative,
+        risuFetch: (url: string, options?: Parameters<typeof globalFetch>[1]) =>
+            globalFetch(url, withPluginFetchLog(options)),
+        nativeFetch: (url: string, options: Parameters<typeof fetchNative>[1]) =>
+            fetchNative(url, withPluginFetchLog(options)),
         getArg: (arg: string) => {
             const db = getDatabase()
             const [name, realArg] = arg.split('::')
@@ -564,6 +602,22 @@ export const getV2PluginAPIs = () => {
             }
             else {
                 throw (`replacer handler named ${name} not found`)
+            }
+        },
+        addRisuChatListener: (mode: string, func: ChatOutputListener) => {
+            if (mode === 'output') {
+                pluginV2.chatOutput.add(func)
+            }
+            else {
+                throw (`chat listener mode ${mode} not found`)
+            }
+        },
+        removeRisuChatListener: (mode: string, func: ChatOutputListener) => {
+            if (mode === 'output') {
+                pluginV2.chatOutput.delete(func)
+            }
+            else {
+                throw (`chat listener mode ${mode} not found`)
             }
         },
         onUnload: (func: () => void | Promise<void>) => {
@@ -671,32 +725,34 @@ export const getV2PluginAPIs = () => {
             }
             return new Proxy(db, {
                 get(target, prop) {
+                    // Live store view; the real DB field is always {} (see pluginDbProxy).
+                    if (prop === PLUGIN_CUSTOM_STORAGE_KEY) {
+                        return pluginCustomStorageProxy();
+                    }
                     if (typeof prop === 'string' && allowedDbKeys.includes(prop)) {
                         return (target as any)[prop];
                     }
-                    else if(target.pluginCustomStorage){
-                        console.log('Getting custom db property', prop.toString());
-                        return target.pluginCustomStorage[prop.toString()];
-                    }
-                    return undefined;
+                    // Custom props map to plugin storage (server-backed, not the DB).
+                    console.log('Getting custom db property', prop.toString());
+                    return pluginStorageStore.getItemSync(prop.toString()) ?? undefined;
                 },
                 set(target, prop, value) {
+                    if (typeof prop === 'string' && applyPluginDbKey(prop, value)) {
+                        return true;
+                    }
                     if (typeof prop === 'string' && allowedDbKeys.includes(prop)) {
-                        (target as any)[prop] = value;
+                        (target as any)[prop] = restorePluginDbKey(prop, value, target as any);
                         return true;
                     }
                     else{
                         console.log('Setting custom db property', prop.toString(), value);
-                        target.pluginCustomStorage ??= {}
-                        target.pluginCustomStorage[prop.toString()] = value;
+                        pluginStorageStore.setItemSync(prop.toString(), value);
                         return true;
                     }
                 },
                 ownKeys(target) {
                     const keys = Reflect.ownKeys(target).filter(key => typeof key === 'string' && allowedDbKeys.includes(key));
-                    if(target.pluginCustomStorage){
-                        keys.push(...Object.keys(target.pluginCustomStorage));
-                    }
+                    keys.push(...pluginStorageStore.keys());
                     return keys;
                 },
                 deleteProperty(target, prop) {
@@ -708,70 +764,62 @@ export const getV2PluginAPIs = () => {
                 },
             })
         },
+        // Sync API over the store's cache; loadPlugins() preloads every key
+        // when a V2 plugin is enabled. Values never touch db.pluginCustomStorage.
         pluginStorage: {
             getItem: (key: string) => {
-                const db = getDatabase({ snapshot: true });
-                db.pluginCustomStorage ??= {}
-                return db.pluginCustomStorage[key] || null;
+                return pluginStorageStore.getItemSync(key) || null;
             },
             setItem: (key: string, value: string) => {
-                const db = getDatabase();
-                db.pluginCustomStorage ??= {}
-                db.pluginCustomStorage[key] = value;
+                pluginStorageStore.setItemSync(key, value);
             },
             removeItem: (key: string) => {
-                const db = getDatabase();
-                db.pluginCustomStorage ??= {}
-                delete db.pluginCustomStorage[key];
+                pluginStorageStore.removeItemSync(key);
             },
             clear: () => {
-                const db = getDatabase();
-                db.pluginCustomStorage = {};
+                pluginStorageStore.clearSync();
             },
             key: (index: number) => {
-                const db = getDatabase();
-                db.pluginCustomStorage ??= {}
-                const keys = Object.keys(db.pluginCustomStorage);
-                return keys[index] || null;
+                return pluginStorageStore.key(index);
             },
             keys: () => {
-                const db = getDatabase();
-                db.pluginCustomStorage ??= {}
-                return Object.keys(db.pluginCustomStorage);
+                return pluginStorageStore.keys();
             },
             length: () => {
-                const db = getDatabase();
-                db.pluginCustomStorage ??= {}
-                return Object.keys(db.pluginCustomStorage).length;
+                return pluginStorageStore.length();
             }
         },
         setDatabaseLite: (newDb: any) => {
             const db = getDatabase();
-            db.pluginCustomStorage ??= {}
             for (const key of Object.keys(newDb)) {
+                if (applyPluginDbKey(key, newDb[key])) {
+                    continue;
+                }
                 if (allowedDbKeys.includes(key)) {
-                    (db as any)[key] = newDb[key];
+                    (db as any)[key] = restorePluginDbKey(key, newDb[key], db);
                 }
                 else{
-                    db.pluginCustomStorage[key] = newDb[key];
+                    pluginStorageStore.setItemSync(key, newDb[key]);
                 }
             }
             DBState.db = db;
         },
         setDatabase: async (newDb: any) => {
             const db = getDatabase();
-            db.pluginCustomStorage ??= {}
             for (const key of Object.keys(newDb)) {
                 if (key === 'plugins') {
                     console.warn('[WARN] Plugin attempted to access plugin directly. this would be blocked in future versions. Instead, use the provided APIs to manage plugins. Attempting to handle plugin installation via plugin for new plugins in the provided database object.')
                     newDb[key] = await handlePluginInstallViaPlugin(newDb.plugins)
                 }
                 
+                if (applyPluginDbKey(key, newDb[key])) {
+                    continue;
+                }
                 if (allowedDbKeys.includes(key)) {
-                    (db as any)[key] = newDb[key];
+                    (db as any)[key] = restorePluginDbKey(key, newDb[key], db);
                 }
                 else{
-                    db.pluginCustomStorage[key] = newDb[key];
+                    pluginStorageStore.setItemSync(key, newDb[key]);
                 }
             }
             setDatabase(db);
@@ -822,6 +870,7 @@ export async function loadV2Plugin(plugins: RisuPlugin[]) {
         pluginV2.editoutput.clear()
         pluginV2.editprocess.clear()
         pluginV2.editinput.clear()
+        pluginV2.chatOutput.clear()
     }
 
     pluginV2.loaded = true

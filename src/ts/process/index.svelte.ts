@@ -23,10 +23,13 @@ import { runInlayScreen } from "./inlayScreen";
 import { runImageEmbedding } from "./transformers";
 import { runLuaEditTrigger } from "./scriptings";
 import { getModelInfo, LLMFlags } from "../model/modellist";
-import { resolveChatModelBinding, resolvePresetMaxOutputTokens } from "./request/modelPresetBinding";
+import { resolveChatModelBinding, resolvePresetMaxOutputTokens, presetSupportsVision } from "./request/modelPresetBinding";
 import { hypaMemoryV3 } from "./memory/hypav3";
-import { getModuleAssets, getModuleToggles } from "./modules";
-import { readImage } from "../globalApi.svelte";
+import { getActiveHypaV3Preset } from "./memory/memoryPresets"
+import { getModuleAssets, getModuleLorebooks, getModules, getModuleToggles, getModuleTriggers } from "./modules";
+import { hydrateAssetListsForCbs, serializeForCbsScan } from "../parser/assetListHydration";
+import { forageStorage, readImage, resolvePrioritizedAssetManifestNames } from "../globalApi.svelte";
+import { pluginV2 } from "../plugins/plugins.svelte";
 import { chatGenKey, chatProcessStage, endGeneration, isChatGenerating, setGenerationStage, startGeneration } from "./generationState";
 import { clearPendingSend, registerPendingSend } from "./request/pendingSends";
 
@@ -42,6 +45,37 @@ export interface OpenAIChat{
     cachePoint?: boolean
 }
 
+function findMessageIndexByChatId(chat: Chat, chatId?: string){
+    if(!chatId){
+        return -1
+    }
+
+    return chat.message.findIndex((message) => message.chatId === chatId)
+}
+
+async function runChatOutputListeners(char: any, chat: any, characterIndex: number, chatIndex: number, messageIndex: number){
+    if(pluginV2.chatOutput.size === 0){
+        return
+    }
+
+    const charSnapshot = $state.snapshot(char)
+    const chatSnapshot = $state.snapshot(chat)
+    for(const listener of pluginV2.chatOutput){
+        try {
+            await listener({
+                char: charSnapshot,
+                chat: chatSnapshot,
+                characterIndex,
+                chatIndex,
+                messageIndex,
+            })
+        }
+        catch(e) {
+            console.error(e)
+        }
+    }
+}
+
 export interface MultiModal{
     type:'image'|'video'|'audio'|'signature'
     base64:string,
@@ -55,9 +89,30 @@ export interface requestTokenPart{
 }
 
 export { doingChat, chatProcessStage } from "./generationState"
+
+// 403 (not loopback) and 503 (not a Termux environment) cannot change within
+// a session, so remember the verdict instead of probing on every response.
+let termuxNotifyUnavailable = false
+
 export let requestTokenParts:{[key:string]:requestTokenPart[]} = {}
 export let previewFormated:OpenAIChat[] = []
 export let previewBody:string = ''
+
+// Text that sendChat feeds to the synchronous parser, serialized so one scan
+// covers all of it.
+function promptCbsSources(char:character, chat:Chat):string[] {
+    const db = DBState.db
+    return [serializeForCbsScan([
+        db.mainPrompt, db.jailbreak, db.globalNote, db.descriptionPrefix, db.additionalPrompt, db.promptTemplate,
+        char.systemPrompt, char.replaceGlobalNote, char.desc, char.personality, char.scenario,
+        char.firstMessage, char.alternateGreetings, char.exampleMessage, char.additionalText, char.depth_prompt,
+        char.globalLore, char.triggerscript, chat?.note, chat?.localLore, chat?.message,
+        // Injected into the prompt when the character opts in (see the
+        // customimageinstruction handling below); it carries {{chardisplayasset}}.
+        char.prebuiltAssetCommand ? prebuiltAssetCommand : '',
+        getPersonaPrompt(), getModuleLorebooks(), getModuleTriggers(),
+    ])]
+}
 
 export async function sendChat(chatProcessIndex = -1,arg:{
     chatAdditonalTokens?:number,
@@ -66,10 +121,12 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     usedContinueTokens?:number,
     preview?:boolean
     previewPrompt?:boolean
+    responseStartedAt?:number
 } = {}):Promise<boolean> {
 
     chatProcessStage.set(0)
     const abortSignal = arg.signal ?? (new AbortController()).signal
+    const responseStartedAt = arg.responseStartedAt ?? performance.now()
     
     // NOTE: `throwError()` can be called before these are populated (e.g. HypaV3 early validation errors).
     // Keep them declared up-front to avoid TDZ ReferenceErrors in production builds.
@@ -265,6 +322,11 @@ export async function sendChat(chatProcessIndex = -1,arg:{
 
     currentChar = nowChatroom
 
+    // Everything below runs the synchronous parser (messages, prompt, lorebook,
+    // triggers). Asset-list CBS in any of those sources needs its manifests
+    // loaded first — same rule as the display path (#82).
+    await hydrateAssetListsForCbs(currentChar, promptCbsSources(currentChar, nowChatroom.chats[selectedChat]))
+
     let chatAdditonalTokens = arg.chatAdditonalTokens ?? caculatedChatTokens
     const tokenizer = new ChatTokenizer(chatAdditonalTokens, DBState.db.aiModel.startsWith('gpt') ? 'noName' : 'name')
     let currentChat = runCurrentChatFunction(nowChatroom.chats[selectedChat])
@@ -274,6 +336,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     // global db.maxResponse (the "[채팅 봇]" max response size), overridden below
     // when this chat is bound to a ModelPreset.
     let maxResponseTokens = DBState.db.maxResponse
+    let presetVisionCapable = false
     // When this chat is bound to a ModelPreset, use the preset's own input
     // budget (preset.maxContext, default 65000) instead of the global
     // db.maxContext — clamped to the model's context window when known.
@@ -292,6 +355,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             // first message fail with a false "too much token" error.
             const presetOut = resolvePresetMaxOutputTokens(mainBinding.preset)
             if (presetOut !== undefined) maxResponseTokens = presetOut
+            presetVisionCapable = presetSupportsVision(mainBinding.preset)
         }
     }
 
@@ -892,7 +956,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 const inlayName = inlay.replace('{{inlayed::', '').replace('{{inlay::', '').replace('}}', '').replace('{{inlayeddata::', '')
                 const inlayData = await getInlayAsset(inlayName)
                 if(inlayData?.type === 'image'){
-                    if(modelinfo.flags.includes(LLMFlags.hasImageInput)){
+                    if(modelinfo.flags.includes(LLMFlags.hasImageInput) || presetVisionCapable){
                         multimodal.push({
                             type: 'image',
                             base64: inlayData.data,
@@ -955,14 +1019,31 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     })
                 })())
             }
-            else if(p1 === 'icon'){
-                assetPromises.push((async () => {
-                    const assetDataBuf = await readImage(currentChar.image ?? '')
-                    multimodal.push({
-                        type: "image",
-                        base64: `data:image/png;base64,${Buffer.from(assetDataBuf).toString('base64')}`
-                    })
-                })())
+            else {
+                const moduleManifests = getModules()
+                    .map((module) => module?.assetManifest)
+                    .filter((manifest) => !!manifest)
+                if (moduleManifests.length > 0 || currentChar.additionalAssetManifest || p1 === 'icon') {
+                    assetPromises.push((async () => {
+                        // The legacy array path above matches asset_prompt names
+                        // exactly; keep the manifest path at the same strictness.
+                        const resolved = await resolvePrioritizedAssetManifestNames(
+                            currentChar.additionalAssetManifest,
+                            moduleManifests,
+                            [p1],
+                            { fuzzy: false },
+                        )
+                        const key = p1.toLocaleLowerCase()
+                        const path = resolved.character[key] ?? resolved.modules[key]
+                        const source = path || (p1 === 'icon' ? currentChar.image ?? '' : '')
+                        if (!source) return
+                        const assetDataBuf = await readImage(source)
+                        multimodal.push({
+                            type: "image",
+                            base64: `data:image/png;base64,${Buffer.from(assetDataBuf).toString('base64')}`
+                        })
+                    })())
+                }
             }
             return ''          
         })
@@ -997,7 +1078,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         currentTokens += await tokenizer.tokenizeChat(chat)
     }
     
-    if((currentChat.supaMemory ?? nowChatroom.supaMemory) && DBState.db.hypaV3){
+    if(getActiveHypaV3Preset(DBState.db, nowChatroom, currentChat)){
         stageTimings.stage1Duration = Date.now() - stageTimings.stage1Start
         setGenerationStage(genKey, 2)
         stageTimings.stage2Start = Date.now()
@@ -1463,11 +1544,15 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         previewBody: arg.previewPrompt,
         escape: nowChatroom.type === 'character' && nowChatroom.escapeOutput,
         rememberToolUsage: DBState.db.rememberToolUsage,
+        generationInfo,
     }, 'model', abortSignal)
 
     console.log(req)
     if(req.model){
-        generationInfo.model = getGenerationModelString(req.model)
+        // Preset requests carry a user-facing label; the wire model id then
+        // moves to generationInfo.modelId so both survive on the message.
+        generationInfo.model = req.modelLabel ?? getGenerationModelString(req.model)
+        if(req.modelLabel) generationInfo.modelId = req.model
         console.log(generationInfo.model, req.model)
     }
 
@@ -1495,7 +1580,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         let prefix = ''
         if(arg.continue){
             msgIndex -= 1
-            prefix = DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data
+            const outputMessage = DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex]
+            prefix = outputMessage.data
         }
         else{
             DBState.db.characters[selectedChar].chats[selectedChat].message.push({
@@ -1508,6 +1594,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 chatId: generationId,
             })
         }
+        const outputMessageId = DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex]?.chatId
         const performanceMode: StreamingDisplayOptimizationMode = DBState.db.streamingDisplayOptimizationMode ?? 'balanced'
         DBState.db.characters[selectedChar].chats[selectedChat].isStreaming = true
         DBState.db.characters[selectedChar].chats[selectedChat].activeStreamingDisplayOptimizationMode = performanceMode
@@ -1665,14 +1752,27 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         if(triggerResult && triggerResult.sendAIprompt){
             resendChat = true
         }
-        const inlayr = runInlayScreen(currentChar, currentChat.message[msgIndex].data)
-        currentChat.message[msgIndex].data = inlayr.text
         DBState.db.characters[selectedChar].chats[selectedChat] = currentChat
-        if(inlayr.promise){
-            const t = await inlayr.promise
-            currentChat.message[msgIndex].data = t
+        currentChat = DBState.db.characters[selectedChar].chats[selectedChat]
+        const inlayMessageIndex = findMessageIndexByChatId(currentChat, outputMessageId)
+        const outputMessage = currentChat.message[inlayMessageIndex]
+        if(outputMessage){
+            const inlayr = runInlayScreen(currentChar, outputMessage.data)
+            outputMessage.data = inlayr.text
             DBState.db.characters[selectedChar].chats[selectedChat] = currentChat
+            if(inlayr.promise){
+                const t = await inlayr.promise
+                currentChat = DBState.db.characters[selectedChar].chats[selectedChat]
+                const asyncInlayMessageIndex = findMessageIndexByChatId(currentChat, outputMessageId)
+                if(asyncInlayMessageIndex !== -1){
+                    currentChat.message[asyncInlayMessageIndex].data = t
+                    DBState.db.characters[selectedChar].chats[selectedChat] = currentChat
+                }
+            }
         }
+        currentChat = DBState.db.characters[selectedChar].chats[selectedChat]
+        const listenerMessageIndex = findMessageIndexByChatId(currentChat, outputMessageId)
+        await runChatOutputListeners(currentChar, currentChat, selectedChar, selectedChat, listenerMessageIndex)
         if(DBState.db.ttsAutoSpeech){
             await sayTTS(currentChar, result)
         }
@@ -1682,6 +1782,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     : (req.type === 'multiline') ? req.result
                     : []
         let mrerolls:string[] = []
+        let outputMessageIndex = -1
+        let outputMessageId: string | undefined
         for(let i=0;i<msgs.length;i++){
             let msg = msgs[i]
             let mess = msg[1]
@@ -1715,6 +1817,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     const p = await inlayResult.promise
                     DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = p
                 }
+                outputMessageIndex = msgIndex
+                outputMessageId = DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex]?.chatId
             }
             else if(i===0){
                 DBState.db.characters[selectedChar].chats[selectedChat].message.push({
@@ -1732,6 +1836,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     DBState.db.characters[selectedChar].chats[selectedChat].message[ind].data = p
                 }
                 mrerolls.push(result)
+                outputMessageIndex = ind
+                outputMessageId = DBState.db.characters[selectedChar].chats[selectedChat].message[ind]?.chatId
             }
             else{
                 mrerolls.push(result)
@@ -1752,6 +1858,11 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         if(triggerResult && triggerResult.sendAIprompt){
             resendChat = true
         }
+        currentChat = DBState.db.characters[selectedChar].chats[selectedChat]
+        if(outputMessageId){
+            outputMessageIndex = findMessageIndexByChatId(currentChat, outputMessageId)
+            await runChatOutputListeners(currentChar, currentChat, selectedChar, selectedChat, outputMessageIndex)
+        }
     }
 
     let needsAutoContinue = false
@@ -1768,6 +1879,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     if(needsAutoContinue){
         endGeneration(genKey, { keepPendingAbort: true })
         return await sendChat(chatProcessIndex, {
+            responseStartedAt,
             chatAdditonalTokens: arg.chatAdditonalTokens,
             continue: true,
             signal: abortSignal,
@@ -1812,24 +1924,55 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         
         endGeneration(genKey, { keepPendingAbort: true })
         return await sendChat(chatProcessIndex, {
+            responseStartedAt,
             signal: abortSignal
         })
     }
 
     if(DBState.db.notification){
-        try {
-            const permission = await Notification.requestPermission()
-            if(permission === 'granted'){
-                const noti = new Notification('Risuai', {
-                    body: result
-                })
-                noti.onclick = () => {
-                    window.focus()
-                }
+        void (async () => {
+            let termuxNotified = false
+
+            if(!termuxNotifyUnavailable){
+                try {
+                    const elapsedMs = performance.now() - responseStartedAt
+                    const response = await fetch('/api/termux-notify', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'risu-auth': await forageStorage.createAuth()
+                        },
+                        body: JSON.stringify({
+                            elapsedMs,
+                            character: currentChar?.name ?? ''
+                        })
+                    })
+
+                    if(response.status === 403 || response.status === 503){
+                        termuxNotifyUnavailable = true
+                    }
+                    termuxNotified = response.ok
+                } catch {}
             }
-        } catch (error) {
-            
-        }
+
+            if(termuxNotified){
+                return
+            }
+
+            try {
+                const permission = await Notification.requestPermission()
+                if(permission === 'granted'){
+                    const noti = new Notification('Risuai', {
+                        body: result
+                    })
+                    noti.onclick = () => {
+                        window.focus()
+                    }
+                }
+            } catch (error) {
+
+            }
+        })()
     }
 
     if(req.special){

@@ -12,5 +12,9 @@
 </script>
 
 {#if CustomComponent}
-    <CustomComponent {...item.componentProps} />
+    <!-- Anchor for settings-search deep links (scrollIntoView + highlight need
+         a real box, so a plain block wrapper rather than display:contents). -->
+    <div data-setting-id={item.id}>
+        <CustomComponent {...item.componentProps} />
+    </div>
 {/if}
