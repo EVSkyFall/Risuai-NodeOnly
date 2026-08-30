@@ -22,6 +22,8 @@ const withPluginFetchLog = <T extends { logCategory?: unknown, logSource?: unkno
 }
 
 interface ProviderPlugin {
+    /** Optional folder membership (see `db.pluginFolders`). Missing means uncategorized. */
+    folderId?: string
     name: string
     displayName?: string
     script: string

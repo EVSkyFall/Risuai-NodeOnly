@@ -123,6 +123,7 @@ export function setDatabase(data:Database){
     if(checkNullish(data.plugins)){
         data.plugins = []
     }
+    data.pluginFolders ??= []
     if(checkNullish(data.zoomsize)){
         data.zoomsize = 100
     }
@@ -454,6 +455,8 @@ export function setDatabase(data:Database){
             largePortrait: false
         }]
     }
+    data.personaFolders ??= []
+    data.promptPresetFolders ??= []
     data.classicMaxWidth ??= false
     data.ooba ??= safeStructuredClone(defaultOoba)
     data.ainconfig ??= safeStructuredClone(defaultAIN)
@@ -530,6 +533,7 @@ export function setDatabase(data:Database){
     data.openrouterMiddleOut ??= false
     data.memoryLimitThickness ??= 1
     data.modules ??= []
+    data.moduleFolders ??= []
     data.enabledModules ??= []
     data.additionalParams ??= []
     data.heightMode ??= 'normal'
@@ -1017,7 +1021,15 @@ export interface RisuPersona {
     largePortrait?:boolean
     id?:string
     note?:string
+    /** Optional folder membership (see `personaFolders`). Missing means uncategorized. */
+    folderId?:string
     embeddedModule?:RisuModule
+}
+
+/** User-defined group for organizing list items (personas, presets, ...). */
+export interface PromptPresetFolder {
+    id: string
+    name: string
 }
 
 export interface Database{
@@ -1053,6 +1065,8 @@ export interface Database{
     language: string
     translator: string
     plugins: RisuPlugin[]
+    /** User-defined groups for organizing plugins. */
+    pluginFolders?: PromptPresetFolder[]
     currentPluginProvider: string
     zoomsize:number
     customBackground:string
@@ -1086,6 +1100,8 @@ export interface Database{
     waifuWidth:number
     waifuWidth2:number
     botPresets:botPreset[]
+    /** User-defined groups for organizing prompt presets. */
+    promptPresetFolders?:PromptPresetFolder[]
     /**
      * @deprecated New code: use getActiveBotPreset() / setActiveBotPresetById() helpers.
      * Kept as the physical store for upstream RisuAI .bin backup compatibility.
@@ -1205,6 +1221,8 @@ export interface Database{
     openrouterFallback:boolean
     selectedPersona:number
     personas:RisuPersona[]
+    /** User-defined groups for organizing personas. */
+    personaFolders?:PromptPresetFolder[]
     personaNote:boolean
     assetWidth:number
     animationSpeed:number
@@ -1265,6 +1283,8 @@ export interface Database{
     lastPatchNoteCheckVersion?:string,
     memoryLimitThickness?:number
     modules: RisuModule[]
+    /** User-defined groups for organizing modules. */
+    moduleFolders?: PromptPresetFolder[]
     enabledModules: string[]
     sideMenuRerollButton?:boolean
     requestInfoInsideChat?:boolean
@@ -1446,6 +1466,8 @@ export interface Database{
         flags: LLMFlags[]
     }[]
     modelPresets: ModelPreset[]
+    /** User-defined groups for organizing model presets. */
+    modelPresetFolders?: PromptPresetFolder[]
     // P4 dual-regime global default binding (plan v6 §7). Copied into new chats
     // (seeding); useModelPresetByDefault seeds the new-chat regime toggle.
     useModelPresetByDefault?: boolean
@@ -1827,6 +1849,8 @@ export function purgeUnsupportedGroupChats(db: Database): number {
 export interface botPreset{
     id?: string
     name?:string
+    /** Optional folder membership (see `promptPresetFolders`). Missing means uncategorized. */
+    folderId?: string
     apiType?: string
     openAIKey?: string
     localNetworkMode?: boolean
