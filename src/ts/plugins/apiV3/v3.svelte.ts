@@ -26,6 +26,7 @@ import type { ModelModeExtended } from "src/ts/process/request/shared";
 import { requestChatDataMain } from "src/ts/process/request/request";
 import type { OpenAIChat } from "src/ts/process/index.svelte";
 import { getModuleLorebooks } from "src/ts/process/modules";
+import { hydratePluginCharacterSnapshot, restorePluginCharacterManifest } from "../pluginCharacterSnapshot";
 import {
     registerTTSPreprocessor,
     unregisterTTSPreprocessor,
@@ -771,6 +772,15 @@ const authorizationHeaders = [
 const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
 
     const oldApis = getV2PluginAPIs();
+    // Same character as oldApis.getChar/setChar, but with lazy assets filled
+    // on read and the manifest kept on an assets-unchanged write (#80).
+    const getCharacterForPlugin = async () => {
+        const char = DBState.db.characters?.[get(selectedCharID)]
+        return await hydratePluginCharacterSnapshot(char ? $state.snapshot(char) : char)
+    }
+    const setCharacterForPlugin = (char: any) => {
+        oldApis.setChar(restorePluginCharacterManifest(char, DBState.db.characters?.[get(selectedCharID)]))
+    }
     const withPluginName = (options: any) => ({
         ...(options ?? {}),
         ...(options?.logCategory ? {} : { logCategory: 'other', logSource: 'plugin' }),
@@ -812,8 +822,8 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             }
             return oldApis.nativeFetch(url, withPluginName(options));
         },
-        getChar: oldApis.getChar,
-        setChar: oldApis.setChar,
+        getChar: getCharacterForPlugin,
+        setChar: setCharacterForPlugin,
         addProvider: (name: string, func: (arg: PluginV2ProviderArgument, abortSignal?: AbortSignal) => Promise<{ success: boolean, content: string | ReadableStream<string> }>, options?: PluginV3ProviderOptions) => {
             console.warn(`[WARN] addProvider is a powerful API that can potentially be unsafe if used incorrectly. addProvider's functionality might be limited or changed in future updates to ensure security. please use other APIs if possible.`);
             let provs = get(customProviderStore)
@@ -1012,12 +1022,12 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
                 }
             }
         },
-        getCharacterFromIndex: (index:number) => {
+        getCharacterFromIndex: async (index:number) => {
             const db = DBState.db
             const charIds = Object.keys(db.characters);
             const charId = charIds[index];
             if(charId){
-                return $state.snapshot(db.characters[charId]);
+                return await hydratePluginCharacterSnapshot($state.snapshot(db.characters[charId]));
             }
             return null;
         },
@@ -1026,7 +1036,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             const charIds = Object.keys(db.characters);
             const charId = charIds[index];
             if(charId){
-                DBState.db.characters[charId] = char
+                DBState.db.characters[charId] = restorePluginCharacterManifest(char, db.characters[charId])
             }
         },
         getChatFromIndex: (characterIndex:number, chatIndex:number) => {
@@ -1073,8 +1083,8 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             return $state.snapshot(characterLore.concat(chatLore).concat(moduleLore))
         },
         //New names for character APIs, to match API naming conventions
-        getCharacter: oldApis.getChar,
-        setCharacter: oldApis.setChar,
+        getCharacter: getCharacterForPlugin,
+        setCharacter: setCharacterForPlugin,
 
         showContainer: (
             //more types may be added in future

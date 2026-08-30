@@ -1283,7 +1283,10 @@ interface RisuaiPluginAPI {
 
     /**
      * Gets the current character
-     * @returns Current character object
+     * @returns Current character object. `additionalAssets` is filled for the
+     * returned character even when the app stores its assets lazily (if the
+     * asset list cannot be loaded, the lazy `additionalAssetManifest`
+     * descriptor is returned instead).
      *
      * @example
      * ```typescript
@@ -1319,7 +1322,8 @@ interface RisuaiPluginAPI {
         /**
      * Gets a character by index
      * @param index - Character index
-     * @returns Character object or null if not found
+     * @returns Character object or null if not found. `additionalAssets` is
+     * filled for the returned character (see getCharacter).
      */
     getCharacterFromIndex(index: number): Promise<any|null>;
 
@@ -1434,7 +1438,12 @@ interface RisuaiPluginAPI {
      * customCSS, guiHTML, colorSchemeName, characterOrder, selectedPersona
      *
      * Use includeOnly to limit which keys to retrieve for better performance.
-     * 
+     *
+     * Note: entries in `characters` / `modules` / `personas` may carry a lazy
+     * asset manifest descriptor (`additionalAssetManifest` / `assetManifest`)
+     * instead of the full asset array. Use getCharacterFromIndex() when you
+     * need a character's complete `additionalAssets`.
+     *
      * @example
      * ```typescript
      * const db = await risuai.getDatabase();
