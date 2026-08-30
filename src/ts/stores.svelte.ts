@@ -82,6 +82,8 @@ export const AccessibilitySubmenuIndex = writable(0)
 export const DisplaySubmenuIndex = writable(0)
 export const BotSubmenuIndex = writable(0)
 export const PromptPresetSubmenuIndex = writable(0)
+/** One-shot: open the prompt preset page directly in its editor (settings search deep link). */
+export const PromptPresetEditorOpen = writable(false)
 export const OtherBotsSubmenuIndex = writable(0)
 export const InlayGallerySubmenuIndex = writable(0)
 // List-view tab of the Model Preset page (Presets / API keys / Options).
