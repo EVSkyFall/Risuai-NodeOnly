@@ -4,7 +4,7 @@
     import { ChevronDownIcon, ChevronRightIcon, FolderIcon, GitCompare, SearchIcon, SettingsIcon, XIcon } from "@lucide/svelte";
     import { language } from "../../lang";
     import { changeToPreset } from "../../ts/storage/database.svelte";
-    import { DBState, presetSelectCallback } from 'src/ts/stores.svelte';
+    import { DBState, presetSelectCallback, selectedCharID } from 'src/ts/stores.svelte';
     import { get } from 'svelte/store';
     import { openSettings, SettingsRoute } from 'src/ts/routing';
     import { groupByFolder } from "src/ts/folders";
@@ -29,6 +29,16 @@
     let expanded = $state<Set<string>>(new Set());
 
     const query = $derived(searchQuery.trim().toLocaleLowerCase());
+    // Binding mode (opened from the sidebar binding button): a top "default"
+    // row unbinds and the highlighted item is the chat's bound preset.
+    const bindingMode = $derived($presetSelectCallback !== null);
+    const boundIndex = $derived.by(() => {
+        if (!bindingMode) return -1
+        const char = DBState.db.characters[$selectedCharID]
+        const id = char?.chats?.[char?.chatPage]?.bindedBotPreset
+        return id ? DBState.db.botPresets.findIndex(p => p.id === id) : -1
+    });
+    const highlightIndex = $derived(bindingMode ? boundIndex : DBState.db.botPresetsId);
     const groups = $derived(groupByFolder(DBState.db.botPresets.map(p => p.folderId), DBState.db.promptPresetFolders ?? []));
 
     function matches(index: number) {
@@ -93,6 +103,13 @@
                 </button>
             </div>
         </div>
+        {#if bindingMode}
+            <button onclick={() => select(-1)}
+                class="flex items-center gap-2 text-textcolor border-t border-darkborderc p-2 mb-2 cursor-pointer hover:bg-selected/30"
+                class:bg-selected={boundIndex < 0}>
+                <span class="min-w-0 grow truncate text-left"><span class="font-medium">{language.memoryPresetInherit}</span><span class="opacity-75"> ({DBState.db.botPresets[DBState.db.botPresetsId]?.name ?? language.none})</span></span>
+            </button>
+        {/if}
         <div class="risu-field-border flex items-center gap-2 rounded-md px-3 mb-2">
             <SearchIcon size={16} class="text-textcolor2 shrink-0"/>
             <input bind:value={searchQuery} placeholder={language.search}
@@ -116,7 +133,7 @@
                     {@const preset = DBState.db.botPresets[i]}
                     <button onclick={() => select(i)}
                         class="flex items-center gap-2 text-textcolor border-t border-darkborderc p-2 cursor-pointer hover:bg-selected/30"
-                        class:bg-selected={i === DBState.db.botPresetsId}>
+                        class:bg-selected={i === highlightIndex}>
                         {#if preset.image}
                             <img src={preset.image} alt="" class="h-7 w-7 shrink-0 rounded-md object-cover" decoding="async"/>
                         {/if}

@@ -490,10 +490,10 @@
             {#if DBState.db.showPresetInSidebar}
                 <PromptBind />
             {/if}
-            <MemoryBind />
             {#if DBState.db.showPersonaInSidebar}
                 <PersonaBind />
             {/if}
+            <MemoryBind />
             <Toggles bind:chara={chara} noContainer />
             <ShButton className="w-full mt-2" onclick={() => {
                 const char = DBState.db.characters[$selectedCharID]

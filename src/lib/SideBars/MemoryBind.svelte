@@ -5,11 +5,13 @@
     import { notifySuccess } from "src/ts/alert";
     import ShButton from "../UI/GUI/ShButton.svelte";
     import Help from "../Others/Help.svelte";
-    import { MEMORY_PRESET_DEFAULT, MEMORY_PRESET_OFF, getMemoryBinding, getMemoryPreset, resolveMemoryPresetId, setChatMemoryPreset } from "src/ts/process/memory/memoryPresets";
+    import { MEMORY_PRESET_DEFAULT, MEMORY_PRESET_OFF, getMemoryBinding, getMemoryPreset, setChatMemoryPreset } from "src/ts/process/memory/memoryPresets";
 
     let char = $derived(DBState.db.characters[$selectedCharID])
     let chat = $derived(char?.chats?.[char?.chatPage])
-    let active = $derived(resolveMemoryPresetId(DBState.db, char, chat) !== MEMORY_PRESET_OFF)
+    // Highlighted only when this chat picked something itself; chats on the
+    // default (or legacy chats with no value) read as unbound, like the other bindings.
+    let active = $derived(chat?.memoryPresetId !== undefined && chat.memoryPresetId !== MEMORY_PRESET_DEFAULT)
     let label = $derived.by(() => {
         const binding = getMemoryBinding(char, chat)
         const inherit = `${language.memoryPresetInherit} (${getMemoryPreset(DBState.db, DBState.db.memoryPresetId)?.name ?? language.memoryPresetOff})`

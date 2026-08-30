@@ -3,7 +3,7 @@
     // folder management live in Settings → Persona.
     import { ChevronDownIcon, ChevronRightIcon, FolderIcon, SearchIcon, SettingsIcon, XIcon } from "@lucide/svelte";
     import { language } from "../../lang";
-    import { DBState } from 'src/ts/stores.svelte';
+    import { DBState, selectedCharID } from 'src/ts/stores.svelte';
     import { changeUserPersona } from "src/ts/persona";
     import { getCharImage } from "src/ts/characters";
     import { groupByFolder } from "src/ts/folders";
@@ -26,6 +26,16 @@
     }
 
     const query = $derived(searchQuery.trim().toLocaleLowerCase());
+    // Binding mode (opened from the sidebar binding button): a top "default"
+    // row unbinds and the highlighted item is the chat's bound persona.
+    const bindingMode = $derived(onSelect !== null);
+    const boundIndex = $derived.by(() => {
+        if (!bindingMode) return -1
+        const char = DBState.db.characters[$selectedCharID]
+        const id = char?.chats?.[char?.chatPage]?.bindedPersona
+        return id ? DBState.db.personas.findIndex(p => p.id === id) : -1
+    });
+    const highlightIndex = $derived(bindingMode ? boundIndex : DBState.db.selectedPersona);
     const groups = $derived(groupByFolder(DBState.db.personas.map(p => p.folderId), DBState.db.personaFolders ?? []));
 
     function matches(index: number) {
@@ -50,6 +60,13 @@
                 </button>
             </div>
         </div>
+        {#if bindingMode}
+            <button onclick={() => select(-1)}
+                class="flex items-center gap-2 text-textcolor border-t border-darkborderc p-2 mb-2 cursor-pointer hover:bg-selected/30"
+                class:bg-selected={boundIndex < 0}>
+                <span class="overflow-x-auto whitespace-nowrap w-full text-left"><span class="font-medium">{language.memoryPresetInherit}</span><span class="opacity-75"> ({DBState.db.personas[DBState.db.selectedPersona]?.name ?? 'User'})</span></span>
+            </button>
+        {/if}
         <div class="risu-field-border flex items-center gap-2 rounded-md px-3 mb-2">
             <SearchIcon size={16} class="text-textcolor2 shrink-0"/>
             <input bind:value={searchQuery} placeholder={language.personaSearch}
@@ -73,7 +90,7 @@
                     {@const persona = DBState.db.personas[i]}
                     <button onclick={() => select(i)}
                         class="flex items-center gap-2 text-textcolor border-t border-darkborderc p-2 cursor-pointer hover:bg-selected/30"
-                        class:bg-selected={i === DBState.db.selectedPersona}>
+                        class:bg-selected={i === highlightIndex}>
                         <div class="h-7 w-7 shrink-0 overflow-hidden rounded-md bg-textcolor2">
                             {#if persona.icon}
                                 {#await getCharImage(persona.icon, 'css') then im}
