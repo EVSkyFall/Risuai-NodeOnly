@@ -25,7 +25,18 @@ function cachedItems(id: string): AssetManifestTuple[] | undefined {
         itemCache.set(id, own)
         return own.items
     }
-    return getCachedFullAssetManifest(id) ?? undefined
+    const parser = getCachedFullAssetManifest(id)
+    // Promote a parser-cache hit: that cache is tiny and evicts fast.
+    if (parser) rememberItems(id, parser)
+    return parser ?? undefined
+}
+
+// Non-enumerable mark on a snapshot whose list this module filled. Survives
+// in-place edits of that object; a structured/JSON clone drops it, which is
+// fine because such a clone also lacks the descriptor (hydrate deleted it).
+const HYDRATED = Symbol('risu.plugin.hydrated')
+function markHydrated(snapshot: object, manifestId: string) {
+    Object.defineProperty(snapshot, HYDRATED, { value: manifestId, enumerable: false, configurable: true, writable: true })
 }
 
 function rememberItems(id: string, items: AssetManifestTuple[]) {
@@ -92,10 +103,25 @@ function matchesManifest(descriptor: AssetManifestDescriptor, incoming: readonly
 // manifest; an edit built from the lazy shape (a sync V2 read on a cache
 // miss) started from nothing, so replacing the manifest with it would drop
 // every existing asset. That edit is discarded with a warning instead.
+//
+// "Received" means the written object carries the hydrate mark, or — for a
+// plugin that cloned the snapshot before writing — the manifest was handed
+// out and the write no longer carries the descriptor (hydrate removed it; a
+// lazy-shape writer never knows to). handedOut alone is not enough: it is
+// keyed by manifest id, and another plugin's lazy read of the same character
+// must not inherit this plugin's hydrate.
 type Resolution = 'restore' | 'inline' | 'discard'
-function resolveIncoming(descriptor: AssetManifestDescriptor, incoming: readonly (readonly string[])[], what: string): Resolution {
-    if (matchesManifest(descriptor, incoming)) return 'restore'
-    if (handedOut.has(descriptor.id)) return 'inline'
+function resolveIncoming(
+    descriptor: AssetManifestDescriptor,
+    incoming: object & { [HYDRATED]?: string },
+    list: readonly (readonly string[])[],
+    stillHasDescriptor: boolean,
+    what: string,
+): Resolution {
+    if (matchesManifest(descriptor, list)) return 'restore'
+    const received = incoming[HYDRATED] === descriptor.id
+        || (!stillHasDescriptor && handedOut.has(descriptor.id))
+    if (received) return 'inline'
     console.warn(`[plugin] ${what} asset list was written from a lazy (never hydrated) read — keeping the stored manifest, discarding the write`)
     return 'discard'
 }
@@ -119,6 +145,7 @@ export async function hydratePluginCharacterSnapshot<T extends AssetFields>(
         // against below.
         const items = await manifestItems(snapshot.additionalAssetManifest)
         rememberHandedOut(snapshot.additionalAssetManifest.id, items)
+        markHydrated(snapshot, snapshot.additionalAssetManifest.id)
         snapshot.additionalAssets = items.map((tuple) => [...tuple]) as [string, string, string][]
         delete snapshot.additionalAssetManifest
     } catch (error) {
@@ -136,6 +163,7 @@ export function hydratePluginCharacterSnapshotSync<T extends AssetFields>(snapsh
     const items = cachedItems(snapshot.additionalAssetManifest.id)
     if (!items) return snapshot
     rememberHandedOut(snapshot.additionalAssetManifest.id, items)
+    markHydrated(snapshot, snapshot.additionalAssetManifest.id)
     snapshot.additionalAssets = items.map((tuple) => [...tuple]) as [string, string, string][]
     delete snapshot.additionalAssetManifest
     return snapshot
@@ -166,7 +194,7 @@ export function restorePluginCharacterManifest<T extends AssetFields>(incoming: 
     const descriptor = current?.additionalAssetManifest
     if (!incoming || !descriptor || Array.isArray(current?.additionalAssets)) return incoming
     if (!Array.isArray(incoming.additionalAssets)) return incoming
-    const resolution = resolveIncoming(descriptor, incoming.additionalAssets, 'character')
+    const resolution = resolveIncoming(descriptor, incoming, incoming.additionalAssets, !!incoming.additionalAssetManifest, 'character')
     if (resolution === 'inline') {
         delete incoming.additionalAssetManifest
     } else {
@@ -188,6 +216,7 @@ export async function hydratePluginModuleSnapshot<T extends ModuleAssetFields>(
     try {
         const items = await manifestItems(snapshot.assetManifest)
         rememberHandedOut(snapshot.assetManifest.id, items)
+        markHydrated(snapshot, snapshot.assetManifest.id)
         snapshot.assets = items.map((tuple) => [...tuple]) as [string, string, string][]
         delete snapshot.assetManifest
     } catch (error) {
@@ -226,7 +255,7 @@ function restoreModuleManifest<T extends ModuleAssetFields>(incoming: T, current
     if (!incoming || !descriptor || Array.isArray(current?.assets)) return incoming
     if (!Array.isArray(incoming.assets)) return incoming
     // Same array-vs-descriptor rule as restorePluginCharacterManifest.
-    const resolution = resolveIncoming(descriptor, incoming.assets, 'module')
+    const resolution = resolveIncoming(descriptor, incoming, incoming.assets, !!incoming.assetManifest, 'module')
     if (resolution === 'inline') {
         delete incoming.assetManifest
     } else {

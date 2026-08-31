@@ -3732,9 +3732,17 @@ app.get('/api/plugin-storage/all', async (req, res, next) => {
     }
     try {
         res.setHeader('content-type', 'application/x-ndjson; charset=utf-8');
+        let closed = false;
+        res.once('close', () => { closed = true; });
         for (const entry of pluginStorage.entriesRaw()) {
+            if (closed) return;
             const ok = res.write(JSON.stringify([entry.key, entry.text]) + '\n');
-            if (!ok) await new Promise((resolve) => res.once('drain', resolve));
+            // Wait for backpressure to clear, but stop if the client went away.
+            if (!ok) await new Promise((resolve) => {
+                const done = () => { res.off('drain', done); res.off('close', done); resolve(); };
+                res.once('drain', done);
+                res.once('close', done);
+            });
         }
         res.end();
     } catch (error) {

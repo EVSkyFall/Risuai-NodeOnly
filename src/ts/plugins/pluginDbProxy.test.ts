@@ -17,6 +17,12 @@ vi.mock('../globalApi.svelte', () => ({
                 }))
             return { entries, migrated: true }
         },
+        async getPluginStorageAll(onEntry: (key: string, text: string) => void) {
+            for (const [k, v] of kv.entries()) {
+                if (!k.startsWith('plugin-storage/')) continue
+                onEntry(Buffer.from(k.slice('plugin-storage/'.length), 'base64url').toString('utf-8'), new TextDecoder().decode(v))
+            }
+        },
         async getItem(key: string) {
             return kv.get(key) ?? null
         },

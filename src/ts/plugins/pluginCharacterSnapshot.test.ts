@@ -108,15 +108,35 @@ describe('restorePluginCharacterManifest', () => {
         expect(incoming.additionalAssetManifest).toBe(descriptor)
     })
 
-    test('a write carrying the descriptor next to an edited array drops the descriptor (AssetGod v1.11.0 report)', async () => {
-        // A plugin that received the filled list edits it in place but never
-        // removes the descriptor; the edit wins and the descriptor goes.
+    test('an in-place edit of the hydrated snapshot wins (AssetGod v1.11.0 report)', async () => {
+        const snap: any = await hydratePluginCharacterSnapshot({ additionalAssetManifest: descriptor } as any)
+        snap.additionalAssets = [['new', 'key-c', 'png']]
+        expect(restorePluginCharacterManifest(snap, current)).toBe(snap)
+        expect(snap.additionalAssets).toEqual([['new', 'key-c', 'png']])
+        expect(snap.additionalAssetManifest).toBeUndefined()
+    })
+
+    test('a JSON clone of the hydrated snapshot (no descriptor) is still honoured', async () => {
+        const snap: any = await hydratePluginCharacterSnapshot({ additionalAssetManifest: descriptor } as any)
+        const clone = JSON.parse(JSON.stringify(snap))
+        clone.additionalAssets.push(['new', 'key-c', 'png'])
+        restorePluginCharacterManifest(clone, current)
+        expect(clone.additionalAssets).toHaveLength(items.length + 1)
+        expect(clone.additionalAssetManifest).toBeUndefined()
+    })
+
+    test("another plugin's lazy write (descriptor still present) is discarded even after a hydrate elsewhere", async () => {
+        // Plugin A hydrated the list; plugin B's sync read missed the cache,
+        // kept the descriptor and started from []. B's write must not replace
+        // the list just because A had it handed out.
         await hydratePluginCharacterSnapshot({ additionalAssetManifest: descriptor } as any)
-        const edited = [['new', 'key-c', 'png']]
-        const incoming: any = { additionalAssetManifest: descriptor, additionalAssets: edited }
-        expect(restorePluginCharacterManifest(incoming, current)).toBe(incoming)
-        expect(incoming.additionalAssets).toBe(edited)
-        expect(incoming.additionalAssetManifest).toBeUndefined()
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+        const lazyWrite: any = { additionalAssetManifest: descriptor, additionalAssets: [['only', 'key-z', 'png']] }
+        restorePluginCharacterManifest(lazyWrite, current)
+        expect(lazyWrite.additionalAssets).toBeUndefined()
+        expect(lazyWrite.additionalAssetManifest).toBe(descriptor)
+        expect(warn).toHaveBeenCalled()
+        warn.mockRestore()
     })
 
     test('an edit built from a never-hydrated (lazy) read is discarded, keeping the manifest', () => {
