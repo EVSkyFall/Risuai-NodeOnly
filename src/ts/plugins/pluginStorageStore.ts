@@ -231,6 +231,22 @@ function maybeRefreshInBackground() {
 export async function getItem(key: string): Promise<any | null> {
     await init();
     const hit = cacheGet(key);
+    // A write still on its way to the server is what the caller expects to
+    // read back (upstream's setItem was synchronous). Async setItem only
+    // updates the cache after the server confirms, so a cached copy may be
+    // older than the pending write; the sync path caches at once, and then
+    // the hashes match and the cached object is served as-is.
+    const pending = pendingOp(key);
+    if (pending) {
+        if (pending.op === "remove") return null;
+        if (hit && hit.hash === pending.hash) return hit.value;
+        try {
+            return JSON.parse(decoder.decode(pending.bytes));
+        } catch (e) {
+            console.warn(`[pluginStorage] unparseable pending value for "${key}"`, e);
+            return null;
+        }
+    }
     if (hit) return hit.value;
     // Removed by this store in this session → the server has nothing. Any
     // other index miss is read anyway: a miss is cheap and the key may have

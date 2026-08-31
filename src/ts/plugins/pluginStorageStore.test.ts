@@ -185,6 +185,22 @@ describe('write-through', () => {
         expect(new TextDecoder().decode(kv.get(store.kvKeyFor('k')))).toBe('"new"')
     })
 
+    test('getItem during an in-flight async setItem returns the pending value', async () => {
+        seed('k', 'old')
+        await store.init()
+        expect(await store.getItem('k')).toBe('old') // now cached
+        let release!: () => void
+        mockState.holdNextSet = new Promise<void>((r) => { release = r })
+        const write = store.setItem('k', 'new')
+        await vi.waitFor(() => expect(setValues).toEqual(['"new"'])) // 'new' is in flight (held)
+        expect(await store.getItem('k')).toBe('new')
+        const removal = store.removeItem('k')
+        expect(await store.getItem('k')).toBeNull()
+        release()
+        await Promise.all([write, removal])
+        expect(await store.getItem('k')).toBeNull()
+    })
+
     test('removeItem + clear go through the server', async () => {
         seed('a', 1)
         seed('b', 2)
@@ -545,6 +561,19 @@ describe('snapshotAll', () => {
         expect(snap).toEqual({ k0: 0, k1: 'local', k2: 2 })
         expect(calls.filter((c) => c === 'all')).toHaveLength(1)
         expect(calls.filter((c) => c.startsWith('get:'))).toHaveLength(0)
+    })
+
+    test('includes the value of an in-flight async setItem, not the server copy', async () => {
+        for (let i = 0; i < 3; i++) seed('k' + i, i)
+        await store.init()
+        let release!: () => void
+        mockState.holdNextSet = new Promise<void>((r) => { release = r })
+        const write = store.setItem('k1', 'new')
+        await vi.waitFor(() => expect(setValues).toEqual(['"new"'])) // 'new' is in flight (held)
+        const snap = await store.snapshotAll()
+        expect(snap).toEqual({ k0: 0, k1: 'new', k2: 2 })
+        release()
+        await write
     })
 
     test('falls back to per-key reads when the bulk stream fails', async () => {
