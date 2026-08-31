@@ -7,9 +7,51 @@ type AssetFields = Pick<character, 'additionalAssets' | 'additionalAssetManifest
 
 // Manifest ids are content-addressed, so a cached copy is never stale; only
 // go to the server for what the cache is missing (plugins may poll).
-function manifestItems(descriptor: AssetManifestDescriptor) {
-    const cached = getCachedFullAssetManifest(descriptor.id)
-    return cached ? Promise.resolve(cached) : loadAssetManifestItems(descriptor)
+//
+// The parser's full-manifest cache holds eight entries, which is far below
+// the character count getDatabase() fills, so lists handed to plugins are
+// also kept here (bounded by bytes) — otherwise a plugin polling
+// getDatabase() would re-fetch every character manifest on each call.
+const ITEM_CACHE_LIMIT_BYTES = 64 * 1024 * 1024
+const itemCache = new Map<string, { items: AssetManifestTuple[]; bytes: number }>()
+let itemCacheBytes = 0
+
+type AssetManifestTuple = readonly string[]
+
+function cachedItems(id: string): AssetManifestTuple[] | undefined {
+    const own = itemCache.get(id)
+    if (own) {
+        itemCache.delete(id)
+        itemCache.set(id, own)
+        return own.items
+    }
+    return getCachedFullAssetManifest(id) ?? undefined
+}
+
+function rememberItems(id: string, items: AssetManifestTuple[]) {
+    let bytes = 0
+    for (const tuple of items) for (const part of tuple) bytes += part.length * 2
+    if (bytes > ITEM_CACHE_LIMIT_BYTES) return
+    const existing = itemCache.get(id)
+    if (existing) {
+        itemCache.delete(id)
+        itemCacheBytes -= existing.bytes
+    }
+    itemCache.set(id, { items, bytes })
+    itemCacheBytes += bytes
+    for (const [key, entry] of itemCache) {
+        if (itemCacheBytes <= ITEM_CACHE_LIMIT_BYTES) break
+        itemCache.delete(key)
+        itemCacheBytes -= entry.bytes
+    }
+}
+
+async function manifestItems(descriptor: AssetManifestDescriptor): Promise<AssetManifestTuple[]> {
+    const cached = cachedItems(descriptor.id)
+    if (cached) return cached
+    const items = await loadAssetManifestItems(descriptor)
+    rememberItems(descriptor.id, items)
+    return items
 }
 
 // Fingerprint of every list handed to a plugin, by manifest id. The
@@ -41,8 +83,21 @@ function rememberHandedOut(id: string, items: readonly (readonly string[])[]) {
 function matchesManifest(descriptor: AssetManifestDescriptor, incoming: readonly (readonly string[])[]): boolean {
     const remembered = handedOut.get(descriptor.id)
     if (remembered !== undefined) return remembered === fingerprint(incoming)
-    const cached = getCachedFullAssetManifest(descriptor.id)
+    const cached = cachedItems(descriptor.id)
     return !!cached && sameAssetTuples(cached, incoming)
+}
+
+// Resolves an incoming array against the stored descriptor. Only a list the
+// plugin actually received (handed out by a hydrate) may replace the
+// manifest; an edit built from the lazy shape (a sync V2 read on a cache
+// miss) started from nothing, so replacing the manifest with it would drop
+// every existing asset. That edit is discarded with a warning instead.
+type Resolution = 'restore' | 'inline' | 'discard'
+function resolveIncoming(descriptor: AssetManifestDescriptor, incoming: readonly (readonly string[])[], what: string): Resolution {
+    if (matchesManifest(descriptor, incoming)) return 'restore'
+    if (handedOut.has(descriptor.id)) return 'inline'
+    console.warn(`[plugin] ${what} asset list was written from a lazy (never hydrated) read — keeping the stored manifest, discarding the write`)
+    return 'discard'
 }
 
 // Manifest-backed characters keep only an `additionalAssetManifest` descriptor
@@ -72,6 +127,20 @@ export async function hydratePluginCharacterSnapshot<T extends AssetFields>(
     return snapshot
 }
 
+// Synchronous variant for the V2 API, which cannot await: fills from the
+// caches only and otherwise leaves the lazy shape (a later write from that
+// shape is then discarded by restorePluginCharacterManifest, not applied).
+export function hydratePluginCharacterSnapshotSync<T extends AssetFields>(snapshot: T | null | undefined): T | null | undefined {
+    if (!snapshot) return snapshot
+    if (Array.isArray(snapshot.additionalAssets) || !snapshot.additionalAssetManifest) return snapshot
+    const items = cachedItems(snapshot.additionalAssetManifest.id)
+    if (!items) return snapshot
+    rememberHandedOut(snapshot.additionalAssetManifest.id, items)
+    snapshot.additionalAssets = items.map((tuple) => [...tuple]) as [string, string, string][]
+    delete snapshot.additionalAssetManifest
+    return snapshot
+}
+
 function sameAssetTuples(a: readonly (readonly string[])[], b: readonly (readonly string[])[]) {
     if (a.length !== b.length) return false
     for (let i = 0; i < a.length; i++) {
@@ -91,18 +160,18 @@ function sameAssetTuples(a: readonly (readonly string[])[], b: readonly (readonl
 // An array and a descriptor must never coexist on the stored character: the
 // client reads the array while the server persists the descriptor, so the
 // plugin's edit would show locally and silently vanish from disk (v1.11.0
-// AssetGod report). If a plugin hands both back, the array decides — it is
-// either the untouched list (descriptor restored) or the plugin's edit
-// (descriptor dropped, list stays inline).
+// AssetGod report). If a plugin hands both back, the array decides — see
+// resolveIncoming for which of the two survives.
 export function restorePluginCharacterManifest<T extends AssetFields>(incoming: T, current: AssetFields | undefined): T {
     const descriptor = current?.additionalAssetManifest
     if (!incoming || !descriptor || Array.isArray(current?.additionalAssets)) return incoming
     if (!Array.isArray(incoming.additionalAssets)) return incoming
-    if (matchesManifest(descriptor, incoming.additionalAssets)) {
+    const resolution = resolveIncoming(descriptor, incoming.additionalAssets, 'character')
+    if (resolution === 'inline') {
+        delete incoming.additionalAssetManifest
+    } else {
         delete incoming.additionalAssets
         incoming.additionalAssetManifest = descriptor
-    } else {
-        delete incoming.additionalAssetManifest
     }
     return incoming
 }
@@ -157,11 +226,12 @@ function restoreModuleManifest<T extends ModuleAssetFields>(incoming: T, current
     if (!incoming || !descriptor || Array.isArray(current?.assets)) return incoming
     if (!Array.isArray(incoming.assets)) return incoming
     // Same array-vs-descriptor rule as restorePluginCharacterManifest.
-    if (matchesManifest(descriptor, incoming.assets)) {
+    const resolution = resolveIncoming(descriptor, incoming.assets, 'module')
+    if (resolution === 'inline') {
+        delete incoming.assetManifest
+    } else {
         delete incoming.assets
         incoming.assetManifest = descriptor
-    } else {
-        delete incoming.assetManifest
     }
     return incoming
 }
@@ -169,17 +239,17 @@ function restoreModuleManifest<T extends ModuleAssetFields>(incoming: T, current
 type PluginDbValue = unknown
 
 // Applies the write-back restore to a top-level DB key a plugin is writing.
-// Characters match by chaId, modules by id, personas by id (each falling back
-// to position). Any other key is returned untouched.
+// Characters match by chaId only (a positional fallback could pin a stranger's
+// manifest onto a new or reordered character), modules by id, personas by id
+// falling back to position. Any other key is returned untouched.
 export function restorePluginDbKey(key: string, value: PluginDbValue, currentDb: { characters?: any[]; modules?: any[]; personas?: any[] } | undefined): PluginDbValue {
     if (!Array.isArray(value) || !currentDb) return value
     if (key === 'characters') {
         const byId = new Map((currentDb.characters ?? []).map((character) => [character?.chaId, character]))
-        value.forEach((character, index) => {
-            if (!character) return
-            const current = (character.chaId !== undefined ? byId.get(character.chaId) : undefined) ?? currentDb.characters?.[index]
-            restorePluginCharacterManifest(character, current)
-        })
+        for (const character of value) {
+            if (!character || character.chaId === undefined) continue
+            restorePluginCharacterManifest(character, byId.get(character.chaId))
+        }
     } else if (key === 'modules') {
         const byId = new Map((currentDb.modules ?? []).map((module) => [module?.id, module]))
         for (const module of value) {

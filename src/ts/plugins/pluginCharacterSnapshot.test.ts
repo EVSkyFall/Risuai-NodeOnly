@@ -9,7 +9,7 @@ vi.mock('../globalApi.svelte', () => ({
 }))
 
 const cacheMod = await import('../storage/assetManifestCache')
-const { hydratePluginCharacterSnapshot, restorePluginCharacterManifest, hydratePluginDatabaseSnapshot, hydratePluginModuleSnapshot, restorePluginDbKey } = await import('./pluginCharacterSnapshot')
+const { hydratePluginCharacterSnapshot, hydratePluginCharacterSnapshotSync, restorePluginCharacterManifest, hydratePluginDatabaseSnapshot, hydratePluginModuleSnapshot, restorePluginDbKey } = await import('./pluginCharacterSnapshot')
 
 const descriptor = { id: 'm1', ownerKind: 'character', ownerId: 'c1', count: 2 } as any
 const items: [string, string, string][] = [['smile', 'key-a', 'png'], ['angry', 'key-b', 'png']]
@@ -52,10 +52,12 @@ describe('hydratePluginCharacterSnapshot', () => {
     test('keeps the descriptor-only shape instead of rejecting when the load fails', async () => {
         loadAssetManifestItems.mockRejectedValue(new Error('offline'))
         const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
-        const snap: any = { additionalAssetManifest: descriptor }
+        // A fresh id: lists handed out earlier stay in the plugin item cache.
+        const uncached = { ...descriptor, id: 'load-fails' }
+        const snap: any = { additionalAssetManifest: uncached }
         const out: any = await hydratePluginCharacterSnapshot(snap)
         expect(out.additionalAssets).toBeUndefined()
-        expect(out.additionalAssetManifest).toBe(descriptor)
+        expect(out.additionalAssetManifest).toBe(uncached)
         expect(warn).toHaveBeenCalled()
         warn.mockRestore()
     })
@@ -73,18 +75,22 @@ describe('restorePluginCharacterManifest', () => {
         expect(out.name).toBe('renamed')
     })
 
-    test('keeps a changed array inline', () => {
-        cacheMod.cacheFullAssetManifest(descriptor.id, items)
+    test('keeps a changed array inline once the list was handed out', async () => {
+        await hydratePluginCharacterSnapshot({ additionalAssetManifest: descriptor } as any)
         const changed = [...items, ['new', 'key-c', 'png']]
         const out: any = restorePluginCharacterManifest({ additionalAssets: changed } as any, current)
         expect(out.additionalAssets).toBe(changed)
         expect(out.additionalAssetManifest).toBeUndefined()
     })
 
-    test('keeps the array inline when the manifest is no longer cached', () => {
+    test('a write for a manifest that was never handed out keeps the manifest', () => {
         cacheMod.cacheFullAssetManifest('other', [])
-        const out: any = restorePluginCharacterManifest({ additionalAssets: items } as any, { additionalAssetManifest: { ...descriptor, id: 'evicted' } } as any)
-        expect(out.additionalAssets).toBe(items)
+        const evicted = { ...descriptor, id: 'evicted' }
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+        const out: any = restorePluginCharacterManifest({ additionalAssets: items } as any, { additionalAssetManifest: evicted } as any)
+        expect(out.additionalAssets).toBeUndefined()
+        expect(out.additionalAssetManifest).toBe(evicted)
+        warn.mockRestore()
     })
 
     test('does not touch writes for characters that were never manifest-backed', () => {
@@ -102,15 +108,43 @@ describe('restorePluginCharacterManifest', () => {
         expect(incoming.additionalAssetManifest).toBe(descriptor)
     })
 
-    test('a write carrying the descriptor next to an edited array drops the descriptor (AssetGod v1.11.0 report)', () => {
-        // A plugin that saw the lazy shape starts from [] and pushes its new
-        // asset; the descriptor it never removed must not survive next to it.
-        cacheMod.cacheFullAssetManifest(descriptor.id, items)
+    test('a write carrying the descriptor next to an edited array drops the descriptor (AssetGod v1.11.0 report)', async () => {
+        // A plugin that received the filled list edits it in place but never
+        // removes the descriptor; the edit wins and the descriptor goes.
+        await hydratePluginCharacterSnapshot({ additionalAssetManifest: descriptor } as any)
         const edited = [['new', 'key-c', 'png']]
         const incoming: any = { additionalAssetManifest: descriptor, additionalAssets: edited }
         expect(restorePluginCharacterManifest(incoming, current)).toBe(incoming)
         expect(incoming.additionalAssets).toBe(edited)
         expect(incoming.additionalAssetManifest).toBeUndefined()
+    })
+
+    test('an edit built from a never-hydrated (lazy) read is discarded, keeping the manifest', () => {
+        // A sync V2 read on a cache miss sees no assets; a write from that
+        // shape must not replace the whole list with the plugin's few items.
+        const lazy = { ...descriptor, id: 'never-handed-out' }
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+        const incoming: any = { additionalAssetManifest: lazy, additionalAssets: [['only', 'key-z', 'png']] }
+        restorePluginCharacterManifest(incoming, { additionalAssetManifest: lazy } as any)
+        expect(incoming.additionalAssets).toBeUndefined()
+        expect(incoming.additionalAssetManifest).toBe(lazy)
+        expect(warn).toHaveBeenCalled()
+        warn.mockRestore()
+    })
+
+    test('the sync hydrate fills from cache and otherwise leaves the lazy shape', async () => {
+        const miss = { ...descriptor, id: 'sync-miss' }
+        const lazy: any = hydratePluginCharacterSnapshotSync({ additionalAssetManifest: miss } as any)
+        expect(lazy.additionalAssets).toBeUndefined()
+        expect(lazy.additionalAssetManifest).toBe(miss)
+
+        await hydratePluginCharacterSnapshot({ additionalAssetManifest: miss } as any)
+        const hit: any = hydratePluginCharacterSnapshotSync({ additionalAssetManifest: miss } as any)
+        expect(hit.additionalAssets).toEqual(items)
+        expect(hit.additionalAssetManifest).toBeUndefined()
+        // Handed out by the sync read → a later edit from it is honoured.
+        const out: any = restorePluginCharacterManifest({ additionalAssets: [['x', 'k', 'png']] } as any, { additionalAssetManifest: miss } as any)
+        expect(out.additionalAssetManifest).toBeUndefined()
     })
 
     test('leaves a write that already carries a descriptor alone', () => {
@@ -182,12 +216,13 @@ describe('hydratePluginDatabaseSnapshot', () => {
     test('a failed module load keeps the descriptor and hands back a copy of the tuples otherwise', async () => {
         loadAssetManifestItems.mockRejectedValueOnce(new Error('offline'))
         const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
-        const failed: any = await hydratePluginModuleSnapshot({ assetManifest: moduleManifest } as any)
+        const uncached = { ...moduleManifest, id: 'mod-load-fails' }
+        const failed: any = await hydratePluginModuleSnapshot({ assetManifest: uncached } as any)
         expect(failed.assets).toBeUndefined()
-        expect(failed.assetManifest).toBe(moduleManifest)
+        expect(failed.assetManifest).toBe(uncached)
         warn.mockRestore()
 
-        const ok: any = await hydratePluginModuleSnapshot({ assetManifest: moduleManifest } as any)
+        const ok: any = await hydratePluginModuleSnapshot({ assetManifest: uncached } as any)
         expect(ok.assets).toEqual(items)
         expect(ok.assets).not.toBe(items)
     })
@@ -246,8 +281,8 @@ describe('restorePluginDbKey', () => {
         expect(personas[0].embeddedModule.assets).toBeUndefined()
     })
 
-    test('a changed module asset list stays inline', () => {
-        cacheMod.cacheFullAssetManifest(moduleManifest.id, items)
+    test('a changed module asset list stays inline once the list was handed out', async () => {
+        await hydratePluginModuleSnapshot({ assetManifest: moduleManifest } as any)
         const modules: any = [{ id: 'm1', assets: [...items, ['extra', 'k', 'png']] }]
         restorePluginDbKey('modules', modules, current)
         expect(modules[0].assetManifest).toBeUndefined()
