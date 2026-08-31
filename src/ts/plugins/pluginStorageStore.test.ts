@@ -257,6 +257,34 @@ describe('preloadAll + sync ops (V2 mode)', () => {
         await vi.waitFor(() => expect(kv.has(store.kvKeyFor('s'))).toBe(false))
     })
 
+    // v1.11.0 report: a V2 setDatabase() round trip re-sent every key of the
+    // store (hundreds of MB for long-term-memory plugins) on each save.
+    test('rewriting an unchanged value is not uploaded again', async () => {
+        seed('fromServer', { n: 1 })
+        await store.preloadAll()
+        const sets = () => calls.filter((c) => c.startsWith('set:')).length
+        const before = sets()
+
+        store.setItemSync('fromServer', { n: 1 })
+        store.setItemSync('s', { n: 2 })
+        await vi.waitFor(() => expect(kv.has(store.kvKeyFor('s'))).toBe(true))
+        expect(sets()).toBe(before + 1)
+
+        store.setItemSync('s', { n: 2 })
+        await store.setItem('s', { n: 2 })
+        expect(sets()).toBe(before + 1)
+
+        store.setItemSync('s', { n: 3 })
+        await vi.waitFor(() => expect(sets()).toBe(before + 2))
+        expect(store.getItemSync('s')).toEqual({ n: 3 })
+
+        // A removed key must be written again even with its old content.
+        store.removeItemSync('s')
+        await vi.waitFor(() => expect(kv.has(store.kvKeyFor('s'))).toBe(false))
+        store.setItemSync('s', { n: 3 })
+        await vi.waitFor(() => expect(kv.has(store.kvKeyFor('s'))).toBe(true))
+    })
+
     // C2: a slow first write must not overwrite a later one.
     test('setItemSync: slow first write, fast second → server ends with the newest', async () => {
         await store.preloadAll()

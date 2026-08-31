@@ -38,6 +38,28 @@ const decoder = new TextDecoder();
 interface CacheEntry {
     value: any;
     bytes: number;
+    // Content hash of the serialized value, so a rewrite of an unchanged value
+    // (V2 setDatabase() round trips re-send every key) is not uploaded again.
+    hash: string;
+}
+
+// Two independent FNV-1a passes over the serialized value.
+function contentHash(text: string): string {
+    let a = 0x811c9dc5, b = 0x01000193;
+    for (let i = 0; i < text.length; i++) {
+        const c = text.charCodeAt(i);
+        a = Math.imul(a ^ c, 0x01000193);
+        b = Math.imul(b ^ c, 0x2f0b4a3d) + 0x9e3779b9;
+    }
+    return `${text.length}:${(a >>> 0).toString(16)}:${(b >>> 0).toString(16)}`;
+}
+
+// True when the server already holds (or will hold, once the key's pending
+// writes drain) exactly this serialized value.
+function serverHasValue(key: string, hash: string): boolean {
+    const pending = pendingOp(key);
+    if (pending) return pending.op === "set" && pending.hash === hash;
+    return !tombstones.has(key) && cache.get(key)?.hash === hash;
 }
 
 let index = new Map<string, number>();
@@ -67,7 +89,7 @@ let refreshing: Promise<void> | null = null;
 // and never sent) and settles all their promises together with the survivor.
 // Retries re-check the queue before each attempt so a superseded value is
 // never sent after a newer one arrived.
-type PendingOp = { op: "set"; bytes: Uint8Array } | { op: "remove" };
+type PendingOp = { op: "set"; bytes: Uint8Array; hash: string } | { op: "remove" };
 interface Intent {
     op: PendingOp;
     sync: boolean;
@@ -105,7 +127,7 @@ function evict() {
 }
 
 // `bytes` is the UTF-8 encoded size, matching the index/server sizes.
-function cacheSet(key: string, value: any, bytes: number) {
+function cacheSet(key: string, value: any, bytes: number, hash: string) {
     const existing = cache.get(key);
     if (existing) {
         cache.delete(key);
@@ -113,7 +135,7 @@ function cacheSet(key: string, value: any, bytes: number) {
     }
     // A single value over the cap would only be evicted again — skip caching it.
     if (!preloaded && bytes > cacheCap) return;
-    cache.set(key, { value, bytes });
+    cache.set(key, { value, bytes, hash });
     cacheBytes += bytes;
     evict();
 }
@@ -210,15 +232,16 @@ export async function getItem(key: string): Promise<any | null> {
         return null;
     }
     let value: any;
+    const text = decoder.decode(data);
     try {
-        value = JSON.parse(decoder.decode(data));
+        value = JSON.parse(text);
     } catch (e) {
         console.warn(`[pluginStorage] unparseable value for "${key}" — treating as missing`, e);
         index.delete(key);
         return null;
     }
     index.set(key, data.length);
-    cacheSet(key, value, data.length);
+    cacheSet(key, value, data.length, contentHash(text));
     return value;
 }
 
@@ -294,12 +317,18 @@ export async function setItem(key: string, value: any): Promise<void> {
     await init();
     const json = JSON.stringify(value);
     const bytes = encoder.encode(json);
+    const hash = contentHash(json);
+    if (serverHasValue(key, hash)) {
+        // Unchanged content: refresh the cached object only, no upload.
+        cacheSet(key, value, bytes.length, hash);
+        return;
+    }
     // Server first: the cache must never claim a value the server never got.
-    const superseded = await enqueue(key, { op: "set", bytes }, false);
+    const superseded = await enqueue(key, { op: "set", bytes, hash }, false);
     if (superseded) return; // a newer write already owns cache/index
     index.set(key, bytes.length);
     tombstones.delete(key);
-    cacheSet(key, value, bytes.length);
+    cacheSet(key, value, bytes.length, hash);
 }
 
 export async function removeItem(key: string): Promise<void> {
@@ -412,10 +441,15 @@ export function setItemSync(key: string, value: any): void {
     if (value === undefined) return removeItemSync(key);
     const json = JSON.stringify(value);
     const bytes = encoder.encode(json);
+    const hash = contentHash(json);
+    if (serverHasValue(key, hash)) {
+        cacheSet(key, value, bytes.length, hash);
+        return;
+    }
     index.set(key, bytes.length);
     tombstones.delete(key);
-    cacheSet(key, value, bytes.length);
-    enqueueSync(key, { op: "set", bytes });
+    cacheSet(key, value, bytes.length, hash);
+    enqueueSync(key, { op: "set", bytes, hash });
 }
 
 export function removeItemSync(key: string): void {
