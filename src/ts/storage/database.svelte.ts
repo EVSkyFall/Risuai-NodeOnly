@@ -2632,6 +2632,9 @@ export function saveCurrentPreset(){
         enableCustomFlags: db.enableCustomFlags,
         regex: db.presetRegex,
         image: pres?.[db.botPresetsId]?.image ?? '',
+        // Folder membership lives only on the stored preset (not mirrored to
+        // top-level db fields), so carry it over or it is lost on every save.
+        folderId: pres?.[db.botPresetsId]?.folderId,
         reasonEffort: db.reasoningEffort ?? 0,
         thinkingTokens: db.thinkingTokens ?? null,
         thinkingType: db.thinkingType ?? 'budget',
