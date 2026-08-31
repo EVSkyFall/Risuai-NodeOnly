@@ -13,8 +13,10 @@
 
 {#if CustomComponent}
     <!-- Anchor for settings-search deep links (scrollIntoView + highlight need
-         a real box, so a plain block wrapper rather than display:contents). -->
-    <div data-setting-id={item.id}>
+         a real box, so a plain block wrapper rather than display:contents).
+         flex-col keeps the component's root children stacked like they were
+         when the page's flex column was their direct parent. -->
+    <div class="flex flex-col" data-setting-id={item.id}>
         <CustomComponent {...item.componentProps} />
     </div>
 {/if}
