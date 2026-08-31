@@ -213,8 +213,12 @@ export async function refreshIndex(): Promise<void> {
             if (!index.has(key) && !pendingOp(key)) knownHashes.delete(key);
         }
         if (preloaded) {
-            preloadPromise = null;
-            await preloadAll();
+            // Top up only the keys the fresh index has that the cache does
+            // not (written by another device). Never re-run the bulk preload
+            // stream here: this refresh fires every INDEX_STALE_MS while a V2
+            // plugin enumerates keys, and re-streaming the whole store each
+            // time saturated remote links for minutes (v1.11.1 regression).
+            await topUpMissing();
         }
     })().finally(() => {
         refreshing = null;
@@ -439,6 +443,17 @@ function ingestStreamed(key: string, text: string): any | undefined {
     return value;
 }
 
+// Fetch every indexed key the cache is missing, a few at a time. Used to
+// finish the first preload after the bulk stream and to top up after an
+// index refresh — both only ever pay for keys that are actually missing.
+async function topUpMissing(): Promise<void> {
+    const pending = [...index.keys()].filter((k) => !cache.has(k));
+    const CONCURRENCY = 8;
+    for (let i = 0; i < pending.length; i += CONCURRENCY) {
+        await Promise.all(pending.slice(i, i + CONCURRENCY).map((k) => getItem(k)));
+    }
+}
+
 export function preloadAll(): Promise<void> {
     if (!preloadPromise) {
         preloadPromise = (async () => {
@@ -449,11 +464,7 @@ export function preloadAll(): Promise<void> {
             } catch (e) {
                 console.warn('[pluginStorage] bulk preload failed, reading keys one by one', e);
             }
-            const pending = [...index.keys()].filter((k) => !cache.has(k));
-            const CONCURRENCY = 8;
-            for (let i = 0; i < pending.length; i += CONCURRENCY) {
-                await Promise.all(pending.slice(i, i + CONCURRENCY).map((k) => getItem(k)));
-            }
+            await topUpMissing();
         })().catch((e) => {
             preloadPromise = null;
             preloaded = false;
