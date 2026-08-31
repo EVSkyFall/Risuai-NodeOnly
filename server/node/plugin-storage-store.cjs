@@ -118,6 +118,17 @@ function createPluginStorageStore(deps) {
     // had before the split. Only for export; it holds all values in memory.
     // Keys are added with defineProperty so a stored "__proto__" key stays an
     // own property instead of rewiring the prototype.
+    // Every value as { key, text } with the JSON left unparsed, one row at a
+    // time, for streaming the whole store to a client.
+    function* entriesRaw() {
+        for (const entry of kvListWithSizes(PREFIX)) {
+            if (entry.key === MIGRATED_MARKER_KEY) continue;
+            const raw = kvGet(entry.key);
+            if (raw === null || raw === undefined) continue;
+            yield { key: decodeKey(entry.key), text: Buffer.from(raw).toString('utf-8') };
+        }
+    }
+
     function readAll() {
         const out = {};
         for (const entry of kvListWithSizes(PREFIX)) {
@@ -403,7 +414,7 @@ function createPluginStorageStore(deps) {
     return {
         PREFIX, MIGRATED_MARKER_KEY, SNAPSHOT_PREFIX, BLOB_PREFIX, encodeKey, decodeKey,
         snapshotPrefixFor, snapshotMapKeyFor, blobKeyFor,
-        list, get, set, remove, removeAll, readAll, isMigrated, migrateFromDb,
+        list, get, set, remove, removeAll, readAll, entriesRaw, isMigrated, migrateFromDb,
         snapshotTo, restoreFrom, dropSnapshot, gcBlobs, snapshotBytes, snapshotLogicalBytes,
     };
 }
@@ -447,6 +458,7 @@ module.exports = {
     remove: (...a) => getDefaultStore().remove(...a),
     removeAll: (...a) => getDefaultStore().removeAll(...a),
     readAll: (...a) => getDefaultStore().readAll(...a),
+    entriesRaw: (...a) => getDefaultStore().entriesRaw(...a),
     isMigrated: (...a) => getDefaultStore().isMigrated(...a),
     migrateFromDb: (...a) => getDefaultStore().migrateFromDb(...a),
 };

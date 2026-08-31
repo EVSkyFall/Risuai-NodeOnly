@@ -378,11 +378,37 @@ export function isPreloaded(): boolean {
 // Load every value into the cache so the synchronous V2 API can be served.
 // This is the pre-lazy memory footprint (one copy), only paid when a V2
 // plugin is enabled.
+// One streamed response for the whole store; falls back to per-key reads if
+// the bulk endpoint fails (older server, transport error mid-stream).
+async function preloadBulk(): Promise<void> {
+    await forageStorage.getPluginStorageAll((key, text) => {
+        // Local state wins: a cached value, a pending write or a removal made
+        // in this session is newer than what the server streams.
+        if (cache.has(key) || pendingOp(key) || tombstones.has(key)) return;
+        let value: any;
+        try {
+            value = JSON.parse(text);
+        } catch (e) {
+            console.warn(`[pluginStorage] unparseable value for "${key}" — treating as missing`, e);
+            index.delete(key);
+            return;
+        }
+        const bytes = encoder.encode(text).length;
+        index.set(key, bytes);
+        cacheSet(key, value, bytes, contentHash(text));
+    });
+}
+
 export function preloadAll(): Promise<void> {
     if (!preloadPromise) {
         preloadPromise = (async () => {
             await init();
             preloaded = true;
+            try {
+                await preloadBulk();
+            } catch (e) {
+                console.warn('[pluginStorage] bulk preload failed, reading keys one by one', e);
+            }
             const pending = [...index.keys()].filter((k) => !cache.has(k));
             const CONCURRENCY = 8;
             for (let i = 0; i < pending.length; i += CONCURRENCY) {

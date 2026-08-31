@@ -3721,6 +3721,28 @@ app.get('/api/plugin-storage/index', async (req, res, next) => {
     }
 });
 
+// Every plugin-storage value, streamed as NDJSON lines `[key, json]` straight
+// from kv so the set is never materialized as one object. Backs the V2
+// preload: the V2 API is synchronous, so every key has to be in the client
+// cache before a V2 plugin runs, and fetching N keys one GET at a time made
+// plugin loading take minutes over a remote link (v1.11.0 report).
+app.get('/api/plugin-storage/all', async (req, res, next) => {
+    if(!await checkAuth(req, res)){
+        return;
+    }
+    try {
+        res.setHeader('content-type', 'application/x-ndjson; charset=utf-8');
+        for (const entry of pluginStorage.entriesRaw()) {
+            const ok = res.write(JSON.stringify([entry.key, entry.text]) + '\n');
+            if (!ok) await new Promise((resolve) => res.once('drain', resolve));
+        }
+        res.end();
+    } catch (error) {
+        if (res.headersSent) { res.destroy(error); return; }
+        next(error);
+    }
+});
+
 app.get('/api/remove', async (req, res, next) => {
     if(!await checkAuth(req, res)){
         return;

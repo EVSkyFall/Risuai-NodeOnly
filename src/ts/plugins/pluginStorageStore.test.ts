@@ -5,7 +5,7 @@ import { describe, test, expect, vi, beforeEach } from 'vitest'
 const kv = new Map<string, Uint8Array>()
 const calls: string[] = []
 const setValues: string[] = []
-const mockState = { setItemFails: 0, holdNextSet: null as Promise<void> | null }
+const mockState = { setItemFails: 0, holdNextSet: null as Promise<void> | null, bulkFails: false }
 
 vi.mock('../globalApi.svelte', () => ({
     forageStorage: {
@@ -23,6 +23,14 @@ vi.mock('../globalApi.svelte', () => ({
         async getItem(key: string) {
             calls.push('get:' + key)
             return kv.get(key) ?? null
+        },
+        async getPluginStorageAll(onEntry: (key: string, text: string) => void) {
+            calls.push('all')
+            if (mockState.bulkFails) { mockState.bulkFails = false; throw new Error('no bulk endpoint') }
+            for (const [k, v] of kv.entries()) {
+                if (!k.startsWith('plugin-storage/')) continue
+                onEntry(Buffer.from(k.slice('plugin-storage/'.length), 'base64url').toString('utf-8'), new TextDecoder().decode(v))
+            }
         },
         async setItem(key: string, value: Uint8Array) {
             calls.push('set:' + key)
@@ -242,6 +250,21 @@ describe('preloadAll + sync ops (V2 mode)', () => {
         expect(store.isPreloaded()).toBe(true)
         for (let i = 0; i < 20; i++) expect(store.getItemSync('k' + i)).toBe('v'.repeat(50))
         expect(store.getItemSync('missing')).toBeNull()
+        // One streamed response, not one GET per key.
+        expect(calls.filter((c) => c === 'all')).toHaveLength(1)
+        expect(calls.filter((c) => c.startsWith('get:'))).toHaveLength(0)
+    })
+
+    test('preload falls back to per-key reads when the bulk stream fails, and local writes win', async () => {
+        for (let i = 0; i < 3; i++) seed('k' + i, i)
+        mockState.bulkFails = true
+        await store.init()
+        store.setItemSync('k1', 'local')
+        await store.preloadAll()
+        expect(calls.filter((c) => c.startsWith('get:'))).toHaveLength(2)
+        expect(store.getItemSync('k0')).toBe(0)
+        expect(store.getItemSync('k1')).toBe('local')
+        expect(store.getItemSync('k2')).toBe(2)
     })
 
     test('setItemSync updates cache/index at once and writes in the background', async () => {

@@ -778,6 +778,32 @@ export class NodeStorage{
         return await da.json()
     }
 
+    // Streams every plugin-storage value (NDJSON `[key, json]` per line).
+    async getPluginStorageAll(onEntry: (key: string, text: string) => void): Promise<void> {
+        const da = await this.authFetch('/api/plugin-storage/all', { method: 'GET' })
+        if (da.status < 200 || da.status >= 300) throw await this.storageRequestError('pluginStorageAll', da)
+        const reader = da.body!.getReader()
+        const decoder = new TextDecoder()
+        let buffer = ''
+        while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
+            buffer += decoder.decode(value, { stream: true })
+            const lines = buffer.split('\n')
+            buffer = lines.pop()!
+            for (const line of lines) {
+                if (!line) continue
+                const [key, text] = JSON.parse(line)
+                onEntry(key, text)
+            }
+        }
+        buffer += decoder.decode()
+        if (buffer.trim()) {
+            const [key, text] = JSON.parse(buffer)
+            onEntry(key, text)
+        }
+    }
+
     async settingsBackupEstimate(): Promise<SettingsBackupEstimate> {
         const da = await this.authFetch('/api/backup/export/settings-estimate')
         if (da.status < 200 || da.status >= 300) throw `settings estimate error: ${da.status}`

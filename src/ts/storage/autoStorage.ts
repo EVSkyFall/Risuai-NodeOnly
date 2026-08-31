@@ -92,6 +92,7 @@ export class AutoStorage{
 
     // ── Plugin storage (server kv, per key) ───────────────────────────────────
     async getPluginStorageIndex() { await this.Init(); return this.realStorage.getPluginStorageIndex() }
+    async getPluginStorageAll(onEntry: (key: string, text: string) => void) { await this.Init(); return this.realStorage.getPluginStorageAll(onEntry) }
 
     // ── Lazy asset-reference manifests ────────────────────────────────────────
     async getAssetManifestPage(manifest: string | AssetManifestDescriptor, options?: { offset?: number; limit?: number; search?: string }) {
