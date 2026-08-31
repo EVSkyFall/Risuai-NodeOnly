@@ -1108,7 +1108,9 @@ export const languageKorean = {
   edit: "수정",
   enableGlobal: "글로벌 활성화",
   chatModulesInfo:
-    "모듈을 이 채팅 한정으로 활성화/비활성화합니다. 우클릭 또는 길게 눌러 캐릭터 한정으로 활성화/비활성화할 수 있습니다.",
+    "모듈을 이 채팅 또는 이 캐릭터 한정으로 활성화/비활성화합니다. 말풍선 버튼은 채팅, 사람 버튼은 캐릭터입니다.",
+  moduleScopeChat: "이 채팅에서 사용",
+  moduleScopeCharacter: "이 캐릭터에서 사용",
   sideMenuRerollButton: "사이드 메뉴 리롤 버튼",
   persistentStorage: "영구 저장소",
   persistentStorageSuccess: "저장소가 영구적으로 설정되었습니다.",

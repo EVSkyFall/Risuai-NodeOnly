@@ -2,7 +2,7 @@
     // Chat module picker. Grouped by folder; folder management lives in
     // Settings → Modules. Click = chat scope, right click = character scope
     // (unchanged behavior).
-    import { ChevronDownIcon, ChevronRightIcon, CircleCheckIcon, FolderIcon, SearchIcon, SettingsIcon, Waypoints, XIcon } from "@lucide/svelte";
+    import { ChevronDownIcon, ChevronRightIcon, CircleCheckIcon, FolderIcon, MessageSquareIcon, SearchIcon, SettingsIcon, UserRoundIcon, Waypoints, XIcon } from "@lucide/svelte";
     import { language } from "src/lang";
     import { groupByFolder } from "src/ts/folders";
 
@@ -105,15 +105,10 @@
                     {@const isGlobal = DBState.db.enabledModules.includes(rmodule.id)}
                     {@const inChat = currentChat()?.modules?.includes(rmodule.id) ?? false}
                     {@const inCharacter = DBState.db.characters[$selectedCharID]?.modules?.includes(rmodule.id) ?? false}
-                    <!-- Character-scope toggle on the whole row, not just the check icon:
-                         the folder layout shrank the icon and users right-clicked the
-                         name, which only opened the browser menu. -->
-                    <!-- svelte-ignore a11y_no_static_element_interactions -->
-                    <div class="flex items-center gap-2 text-textcolor border-t border-darkborderc p-2 pl-7"
-                        oncontextmenu={(e) => {
-                            if (alertMode || isGlobal) return
-                            e.preventDefault(); e.stopPropagation(); toggleCharacterScope(rmodule.id)
-                        }}>
+                    <!-- Chat and character scope are separate buttons: the old
+                         right-click / long-press toggle is not reachable on iOS
+                         (Safari fires no contextmenu on long press). -->
+                    <div class="flex items-center gap-2 text-textcolor border-t border-darkborderc p-2 pl-7">
                         {#if rmodule.mcp}
                             <Waypoints size={18} class="shrink-0 text-textcolor2" />
                         {/if}
@@ -128,10 +123,15 @@
                         {:else if isGlobal}
                             <span class="text-textcolor2 cursor-not-allowed shrink-0" aria-label="disabled"></span>
                         {:else}
-                            <button class="shrink-0 cursor-pointer {inChat ? 'text-blue-500' : inCharacter ? 'text-violet-500' : 'text-textcolor2 hover:text-blue-400'}"
-                                onclick={(e) => { e.stopPropagation(); toggleChatScope(rmodule.id) }}
-                                oncontextmenu={(e) => { e.preventDefault(); e.stopPropagation(); toggleCharacterScope(rmodule.id) }}>
-                                <CircleCheckIcon size={18}/>
+                            <button class="shrink-0 cursor-pointer p-1 rounded-sm {inChat ? 'text-blue-500 bg-blue-500/15' : 'text-textcolor2 hover:text-blue-400'}"
+                                title={language.moduleScopeChat} aria-label={language.moduleScopeChat} aria-pressed={inChat}
+                                onclick={(e) => { e.stopPropagation(); toggleChatScope(rmodule.id) }}>
+                                <MessageSquareIcon size={18}/>
+                            </button>
+                            <button class="shrink-0 cursor-pointer p-1 rounded-sm {inCharacter ? 'text-violet-500 bg-violet-500/15' : 'text-textcolor2 hover:text-violet-400'}"
+                                title={language.moduleScopeCharacter} aria-label={language.moduleScopeCharacter} aria-pressed={inCharacter}
+                                onclick={(e) => { e.stopPropagation(); toggleCharacterScope(rmodule.id) }}>
+                                <UserRoundIcon size={18}/>
                             </button>
                         {/if}
                     </div>
