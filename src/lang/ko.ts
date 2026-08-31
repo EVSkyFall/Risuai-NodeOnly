@@ -1574,6 +1574,10 @@ export const languageKorean = {
   modelPresetSetDefaultConfirm:
     "현재 모델 바인딩을 새 채팅 기본값으로 지정할까요?",
   modelPresetBindedSuccess: "모델 프리셋이 성공적으로 바인드되었습니다.",
+  maxContextCapInfo: "모델 프로필 한도: {} 토큰. 비워 두거나 이 값을 넘게 입력하면 이 한도까지만 사용합니다.",
+  maxContextCapExceeded: "입력값이 모델 프로필 한도를 넘어 {} 토큰까지만 사용됩니다. 그대로 쓰려면 아래 \"모델 한도 무시\"를 켜세요.",
+  maxContextIgnoreCap: "모델 한도 무시",
+  maxContextIgnoreCapHelp: "프로필에 적힌 컨텍스트 한도가 실제와 다를 때 켭니다. 위에 입력한 값을 그대로 쓰며, 실제 한도를 넘기면 서비스 쪽에서 에러가 납니다. 값을 비워 두면 효과가 없습니다.",
   streamingOverride: "응답 스트리밍",
   streamingOverrideHelp: "이 프리셋이 응답을 스트리밍할지 여부.",
   decoupledStreaming: "디커플드 스트리밍 (한 번에 출력)",

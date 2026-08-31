@@ -351,10 +351,15 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             const ctxWindow = mainBinding.preset.profileSnapshot.limits?.contextWindowTokens
             const set = mainBinding.preset.maxContext
             const budget = set && set > 0 ? set : 65000
-            maxContextTokens = ctxWindow ? Math.min(budget, ctxWindow) : budget
-            maxContextSource = ctxWindow && ctxWindow < budget
+            // An explicit budget with "ignore context window cap" wins over the
+            // profile cap (the cap can be wrong in a custom registry); the
+            // default budget is always capped.
+            const capIgnored = !!(set && set > 0 && mainBinding.preset.ignoreContextWindowCap)
+            const capApplies = !!ctxWindow && !capIgnored
+            maxContextTokens = capApplies ? Math.min(budget, ctxWindow) : budget
+            maxContextSource = capApplies && ctxWindow < budget
                 ? `model context window cap ${ctxWindow} from the model profile "${mainBinding.preset.name}" (preset budget ${budget})`
-                : `model preset "${mainBinding.preset.name}" max context ${set && set > 0 ? set : '(unset, default 65000)'}`
+                : `model preset "${mainBinding.preset.name}" max context ${set && set > 0 ? set : '(unset, default 65000)'}${capIgnored && ctxWindow && ctxWindow < set ? ` (context window cap ${ctxWindow} ignored)` : ''}`
             // Reserve output tokens from the preset's own max-output setting
             // rather than db.maxResponse — the legacy global value can be a
             // stray figure (e.g. 65535 carried over from an imported prompt
