@@ -67,7 +67,7 @@
                 {:else}
                     <span>{preset.name}</span>
                 {/if}
-                <div class="grow flex justify-end">
+                <div class="grow flex justify-end no-sort">
                     <div class="text-textcolor2 hover:text-primary cursor-pointer mr-2" role="button" tabindex="0" onclick={(e) => {
                         e.stopPropagation()
                         copyThemePreset(i)

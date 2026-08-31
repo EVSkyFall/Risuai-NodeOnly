@@ -1,7 +1,7 @@
 <script lang="ts">
     // Chat module picker. Grouped by folder; folder management lives in
-    // Settings → Modules. Click = chat scope, right click = character scope
-    // (unchanged behavior).
+    // Settings → Modules. Each row has two scope buttons: chat scope and
+    // character scope. Globally enabled modules show a globe instead.
     import { ChevronDownIcon, ChevronRightIcon, CircleCheckIcon, FolderIcon, GlobeIcon, MessageSquareIcon, SearchIcon, SettingsIcon, UserRoundIcon, Waypoints, XIcon } from "@lucide/svelte";
     import { language } from "src/lang";
     import { groupByFolder } from "src/ts/folders";

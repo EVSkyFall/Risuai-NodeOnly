@@ -1484,7 +1484,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         let pointer = 0
         while(inputTokens > maxContextTokens){
             if(pointer >= formated.length){
-                throwError(language.errors.toomuchtoken + "\n\nAt token rechecking. Required Tokens: " + inputTokens)
+                throwError(language.errors.toomuchtoken + "\n\nAt token rechecking. Required Tokens: " + inputTokens + " / Max Context: " + maxContextTokens + " / Reserved Output: " + maxResponseTokens + "\nMax context source: " + maxContextSource)
                 if (realChatId) clearPendingSend(realChatId)
                 return false
             }
