@@ -536,6 +536,26 @@ describe('snapshotAll', () => {
         expect(await store.getItem('a')).toBe(1)
     })
 
+    test('reads the store from one streamed response; local state wins over the stream', async () => {
+        for (let i = 0; i < 3; i++) seed('k' + i, i)
+        await store.init()
+        store.setItemSync('k1', 'local')
+        calls.length = 0
+        const snap = await store.snapshotAll()
+        expect(snap).toEqual({ k0: 0, k1: 'local', k2: 2 })
+        expect(calls.filter((c) => c === 'all')).toHaveLength(1)
+        expect(calls.filter((c) => c.startsWith('get:'))).toHaveLength(0)
+    })
+
+    test('falls back to per-key reads when the bulk stream fails', async () => {
+        for (let i = 0; i < 3; i++) seed('k' + i, i)
+        mockState.bulkFails = true
+        calls.length = 0
+        const snap = await store.snapshotAll()
+        expect(snap).toEqual({ k0: 0, k1: 1, k2: 2 })
+        expect(calls.filter((c) => c.startsWith('get:'))).toHaveLength(3)
+    })
+
     test('keeps a "__proto__" key as an own property', async () => {
         kv.set('plugin-storage/' + Buffer.from('__proto__').toString('base64url'), new TextEncoder().encode('{"p":1}'))
         const snap = await store.snapshotAll()

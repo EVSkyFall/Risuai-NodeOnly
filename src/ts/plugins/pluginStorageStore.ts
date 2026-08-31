@@ -400,22 +400,27 @@ export function isPreloaded(): boolean {
 // One streamed response for the whole store; falls back to per-key reads if
 // the bulk endpoint fails (older server, transport error mid-stream).
 async function preloadBulk(): Promise<void> {
-    await forageStorage.getPluginStorageAll((key, text) => {
-        // Local state wins: a cached value, a pending write or a removal made
-        // in this session is newer than what the server streams.
-        if (cache.has(key) || pendingOp(key) || tombstones.has(key)) return;
-        let value: any;
-        try {
-            value = JSON.parse(text);
-        } catch (e) {
-            console.warn(`[pluginStorage] unparseable value for "${key}" — treating as missing`, e);
-            index.delete(key);
-            return;
-        }
-        const bytes = encoder.encode(text).length;
-        index.set(key, bytes);
-        cacheSet(key, value, bytes, contentHash(text));
-    });
+    await forageStorage.getPluginStorageAll((key, text) => { ingestStreamed(key, text); });
+}
+
+// One entry of the streamed store into index/cache. Returns the parsed value,
+// or undefined when it was not taken: local state wins (a cached value, a
+// pending write or a removal made in this session is newer than what the
+// server streams), and unparseable text counts as missing.
+function ingestStreamed(key: string, text: string): any | undefined {
+    if (cache.has(key) || pendingOp(key) || tombstones.has(key)) return undefined;
+    let value: any;
+    try {
+        value = JSON.parse(text);
+    } catch (e) {
+        console.warn(`[pluginStorage] unparseable value for "${key}" — treating as missing`, e);
+        index.delete(key);
+        return undefined;
+    }
+    const bytes = encoder.encode(text).length;
+    index.set(key, bytes);
+    cacheSet(key, value, bytes, contentHash(text));
+    return value;
 }
 
 export function preloadAll(): Promise<void> {
@@ -449,19 +454,28 @@ export function preloadAll(): Promise<void> {
 export async function snapshotAll(): Promise<Record<string, any>> {
     await refreshIndex();
     const out: Record<string, any> = {};
-    const all = [...index.keys()];
+    // defineProperty so a stored "__proto__" key stays an own property (same
+    // as the server's readAll).
+    const put = (k: string, v: any) => {
+        if (v === null || v === undefined) return;
+        Object.defineProperty(out, k, { value: v, enumerable: true, writable: true, configurable: true });
+    };
+    // One streamed response, like the V2 preload: thousands of keys over a
+    // remote link would otherwise mean thousands of round trips per snapshot.
+    try {
+        await forageStorage.getPluginStorageAll((key, text) => { put(key, ingestStreamed(key, text)); });
+    } catch (e) {
+        console.warn('[pluginStorage] bulk snapshot failed, reading keys one by one', e);
+    }
+    // Whatever the stream did not fill (values already cached, pending
+    // writes, or everything after a failed stream) comes through the normal
+    // read path.
+    const rest = [...index.keys()].filter((k) => !Object.prototype.hasOwnProperty.call(out, k));
     const CONCURRENCY = 8;
-    for (let i = 0; i < all.length; i += CONCURRENCY) {
-        const chunk = all.slice(i, i + CONCURRENCY);
+    for (let i = 0; i < rest.length; i += CONCURRENCY) {
+        const chunk = rest.slice(i, i + CONCURRENCY);
         const values = await Promise.all(chunk.map((k) => getItem(k)));
-        chunk.forEach((k, j) => {
-            if (values[j] === null || values[j] === undefined) return;
-            // defineProperty so a stored "__proto__" key stays an own property
-            // (same as the server's readAll).
-            Object.defineProperty(out, k, {
-                value: values[j], enumerable: true, writable: true, configurable: true,
-            });
-        });
+        chunk.forEach((k, j) => put(k, values[j]));
     }
     return out;
 }

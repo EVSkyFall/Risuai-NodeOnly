@@ -40,7 +40,7 @@ If you are unsure whether a plugin needs it, check the browser developer console
 
 ## 3. For plugin authors
 
-A V3 plugin has three ways to read a stored value of another plugin (or its own).
+A V3 plugin has two ways to read a stored value of another plugin (or its own).
 
 ### Option A. `pluginStorage.getItem(key)` (recommended)
 
@@ -50,18 +50,11 @@ const value = await risuai.pluginStorage.getItem('other-plugin-key')
 
 Reads just that one key from the server. Cheapest by far, and the cost stays flat no matter how large the store grows. The key space is shared across plugins, so pass the key name the other plugin used.
 
-### Option B. `getDatabase(['pluginCustomStorage'])`
+### Option B. The user option
 
-```js
-const db = await risuai.getDatabase(['pluginCustomStorage'])
-const value = db.pluginCustomStorage['other-plugin-key']
-```
+If the code cannot be changed, the user can enable the option from section 2 and `getDatabase()` returns the full values. Since this requires instructing users, option A is preferred.
 
-When `'pluginCustomStorage'` is **named explicitly** in `includeOnly`, PocketRisu fills it with every value, exactly like upstream. `includeOnly` is part of the upstream RisuAI v3 API, so the same code works there. This call reads and copies the whole store, so keep it to once at startup and never call it per message.
-
-### Option C. The user option
-
-If the code cannot be changed, the user can enable the option from section 2 and `getDatabase()` returns the full values regardless of its arguments. Since this requires instructing users, options A or B are preferred.
+`getDatabase(['pluginCustomStorage'])` does **not** fill the field on its own. Naming the key in `includeOnly` is common in plugins that never use the values (Plugin Manager, for one), so it cannot be treated as a request for the whole store; only the user option turns it on.
 
 ### Writing
 

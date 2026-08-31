@@ -40,7 +40,7 @@ PocketRisu v1.11.0부터는 플러그인 값이 **서버 데이터베이스에 �
 
 ## 3. 제작자 안내
 
-V3 플러그인에서 다른 플러그인(또는 자기 자신)의 저장값을 읽는 방법은 세 가지입니다.
+V3 플러그인에서 다른 플러그인(또는 자기 자신)의 저장값을 읽는 방법은 두 가지입니다.
 
 ### 방법 A. `pluginStorage.getItem(key)` (권장)
 
@@ -50,18 +50,11 @@ const value = await risuai.pluginStorage.getItem('other-plugin-key')
 
 필요한 키 하나만 서버에서 읽습니다. 가장 가볍고, 저장소가 아무리 커도 비용이 일정합니다. 키 공간은 플러그인 구분 없이 하나이므로 다른 플러그인이 쓴 키 이름을 그대로 넘기면 됩니다.
 
-### 방법 B. `getDatabase(['pluginCustomStorage'])`
+### 방법 B. 사용자 옵션
 
-```js
-const db = await risuai.getDatabase(['pluginCustomStorage'])
-const value = db.pluginCustomStorage['other-plugin-key']
-```
+코드를 고칠 수 없는 경우 사용자가 2절의 옵션을 켜면 `getDatabase()`가 전체 값을 돌려줍니다. 제작자 입장에서는 사용자에게 옵션을 켜도록 안내해야 하므로 A를 권장합니다.
 
-`includeOnly` 인자에 `'pluginCustomStorage'`를 **명시**하면 PocketRisu도 원본과 같이 전체 값을 채워 줍니다. `includeOnly`는 원본 RisuAI v3 API에 있는 정식 인자이므로 원본에서도 그대로 동작합니다. 단, 이 호출은 저장소 전체를 읽어 복사하므로 부팅 시 한 번 정도로 제한하고, 메시지마다 호출하지 마세요.
-
-### 방법 C. 사용자 옵션
-
-코드를 고칠 수 없는 경우 사용자가 2절의 옵션을 켜면 `getDatabase()`가 인자와 상관없이 전체 값을 돌려줍니다. 제작자 입장에서는 사용자에게 옵션을 켜도록 안내해야 하므로 A 또는 B를 권장합니다.
+`getDatabase(['pluginCustomStorage'])`처럼 `includeOnly`에 키를 명시해도 값이 채워지지 **않습니다.** 값을 쓰지 않으면서 이 키를 습관적으로 명시하는 플러그인(플러그인 매니저 등)이 흔해서, 명시를 "저장소 전체가 필요하다"는 요청으로 볼 수 없기 때문입니다. 전체 제공은 사용자 옵션으로만 켜집니다.
 
 ### 쓰기
 

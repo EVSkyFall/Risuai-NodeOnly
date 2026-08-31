@@ -60,14 +60,14 @@ export function mergePluginCustomStorage(obj: unknown): void {
 // V3 getDatabase(): whether to fill `pluginCustomStorage` with every stored
 // value (RisuAI shape) instead of the empty field. The whole store (all
 // plugins, hundreds of MB with long-term-memory plugins) is loaded and copied
-// into the plugin sandbox on every call, so it is opt-in: either the plugin
-// names the key in includeOnly, or the user enabled it for that plugin.
+// into the plugin sandbox on every call, so only the user can turn it on, per
+// plugin. Naming the key in includeOnly is deliberately not enough: widely
+// used plugins (Plugin Manager 2.1.2) list it by default without needing it,
+// which would make every one of their reads pull the whole store.
 export function wantsFullPluginStorage(
-    includeOnly: readonly string[] | 'all' | undefined,
     plugin: { nodeOnlyFullStorageAccess?: boolean } | undefined,
 ): boolean {
-    if (plugin?.nodeOnlyFullStorageAccess) return true;
-    return Array.isArray(includeOnly) && includeOnly.includes(PLUGIN_CUSTOM_STORAGE_KEY);
+    return plugin?.nodeOnlyFullStorageAccess === true;
 }
 
 // Applies one key of a plugin-supplied DB object. Returns true when the key

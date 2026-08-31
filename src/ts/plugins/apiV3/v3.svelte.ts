@@ -938,14 +938,15 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             // database instead of getCharacter* must see the same shape.
             await hydratePluginDatabaseSnapshot(liteDB);
             // Plugin values live on the server, so the DB field is always {}.
-            // Fill it with every stored value only on request (see
-            // wantsFullPluginStorage); otherwise say once why it is empty.
+            // Fill it with every stored value only when the user allowed it
+            // for this plugin (see wantsFullPluginStorage); otherwise say once
+            // why it is empty.
             if (PLUGIN_CUSTOM_STORAGE_KEY in liteDB) {
-                if (wantsFullPluginStorage(includeOnly, plugin)) {
+                if (wantsFullPluginStorage(plugin)) {
                     (liteDB as any)[PLUGIN_CUSTOM_STORAGE_KEY] = await pluginStorageStore.snapshotAll();
                 } else if (!fullStorageHintShown.has(plugin.name)) {
                     fullStorageHintShown.add(plugin.name);
-                    console.warn(`[RisuAI Plugin: ${plugin.name}] getDatabase() returns an empty pluginCustomStorage on PocketRisu. Read other plugins' values with pluginStorage.getItem(key), request them with getDatabase(['pluginCustomStorage']), or allow full storage access for this plugin in Settings > Plugins. See docs/en/plugin-storage.md.`);
+                    console.warn(`[RisuAI Plugin: ${plugin.name}] getDatabase() returns an empty pluginCustomStorage on PocketRisu. Read other plugins' values with pluginStorage.getItem(key), or allow full storage access for this plugin in Settings > Plugins. See docs/en/plugin-storage.md.`);
                 }
             }
             return liteDB;
