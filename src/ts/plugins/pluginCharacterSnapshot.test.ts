@@ -167,6 +167,30 @@ describe('restorePluginCharacterManifest', () => {
         expect(out.additionalAssetManifest).toBeUndefined()
     })
 
+    test('a stale hydrated object (older manifest) does not overwrite the current list', async () => {
+        const older = { ...descriptor, id: 'rev-1' }
+        const newer = { ...descriptor, id: 'rev-2' }
+        const stale: any = await hydratePluginCharacterSnapshot({ additionalAssetManifest: older } as any)
+        await hydratePluginCharacterSnapshot({ additionalAssetManifest: newer } as any) // someone else read rev-2
+        stale.additionalAssets.push(['late', 'key-l', 'png'])
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+        restorePluginCharacterManifest(stale, { additionalAssetManifest: newer } as any)
+        expect(stale.additionalAssets).toBeUndefined()
+        expect(stale.additionalAssetManifest).toBe(newer)
+        warn.mockRestore()
+    })
+
+    test('an in-place lazy edit of the live object (V2 getDatabase proxy) is resolved when written back', () => {
+        const live: any = { chaId: 'c1', additionalAssetManifest: descriptor }
+        live.additionalAssets ??= []
+        live.additionalAssets.push(['only', 'key-z', 'png'])
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+        restorePluginDbKey('characters', [live], { characters: [live] })
+        expect(live.additionalAssets).toBeUndefined()
+        expect(live.additionalAssetManifest).toBe(descriptor)
+        warn.mockRestore()
+    })
+
     test('leaves a write that already carries a descriptor alone', () => {
         const incoming: any = { additionalAssetManifest: descriptor }
         expect(restorePluginCharacterManifest(incoming, current)).toBe(incoming)

@@ -119,7 +119,14 @@ function resolveIncoming(
     what: string,
 ): Resolution {
     if (matchesManifest(descriptor, list)) return 'restore'
-    const received = incoming[HYDRATED] === descriptor.id
+    const mark = incoming[HYDRATED]
+    if (mark !== undefined && mark !== descriptor.id) {
+        // Hydrated from an older manifest of this owner: the list moved on
+        // since the plugin read it. Keep the current list over the stale one.
+        console.warn(`[plugin] ${what} asset list was written from a stale read (manifest ${mark} → ${descriptor.id}) — keeping the stored manifest, discarding the write`)
+        return 'discard'
+    }
+    const received = mark === descriptor.id
         || (!stillHasDescriptor && handedOut.has(descriptor.id))
     if (received) return 'inline'
     console.warn(`[plugin] ${what} asset list was written from a lazy (never hydrated) read — keeping the stored manifest, discarding the write`)
@@ -190,9 +197,14 @@ function sameAssetTuples(a: readonly (readonly string[])[], b: readonly (readonl
 // plugin's edit would show locally and silently vanish from disk (v1.11.0
 // AssetGod report). If a plugin hands both back, the array decides — see
 // resolveIncoming for which of the two survives.
+//
+// `current` may be the very object being written (V2 getDatabase() hands out
+// the live DB, and a plugin may have edited it in place before setDatabase*):
+// a descriptor next to an array there is the coexistence this resolves, so
+// it is not treated as "never manifest-backed".
 export function restorePluginCharacterManifest<T extends AssetFields>(incoming: T, current: AssetFields | undefined): T {
     const descriptor = current?.additionalAssetManifest
-    if (!incoming || !descriptor || Array.isArray(current?.additionalAssets)) return incoming
+    if (!incoming || !descriptor) return incoming
     if (!Array.isArray(incoming.additionalAssets)) return incoming
     const resolution = resolveIncoming(descriptor, incoming, incoming.additionalAssets, !!incoming.additionalAssetManifest, 'character')
     if (resolution === 'inline') {
@@ -252,7 +264,7 @@ export async function hydratePluginDatabaseSnapshot(subset: {
 // their descriptor back so the write is a no-op for assets.
 function restoreModuleManifest<T extends ModuleAssetFields>(incoming: T, current: ModuleAssetFields | undefined): T {
     const descriptor = current?.assetManifest
-    if (!incoming || !descriptor || Array.isArray(current?.assets)) return incoming
+    if (!incoming || !descriptor) return incoming
     if (!Array.isArray(incoming.assets)) return incoming
     // Same array-vs-descriptor rule as restorePluginCharacterManifest.
     const resolution = resolveIncoming(descriptor, incoming, incoming.assets, !!incoming.assetManifest, 'module')
