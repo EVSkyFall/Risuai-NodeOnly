@@ -26,6 +26,7 @@ import { getModelInfo, LLMFlags } from "../model/modellist";
 import { resolveChatModelBinding, resolvePresetMaxOutputTokens, presetSupportsVision } from "./request/modelPresetBinding";
 import { hypaMemoryV3 } from "./memory/hypav3";
 import { getActiveHypaV3Preset } from "./memory/memoryPresets"
+import { resolveModelPresetContextBudget } from "./request/contextBudget"
 import { getModuleAssets, getModuleLorebooks, getModules, getModuleToggles, getModuleTriggers } from "./modules";
 import { hydrateAssetListsForCbs, serializeForCbsScan } from "../parser/assetListHydration";
 import { forageStorage, readImage, resolvePrioritizedAssetManifestNames } from "../globalApi.svelte";
@@ -348,18 +349,12 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     {
         const mainBinding = resolveChatModelBinding(currentChat, 'model')
         if (mainBinding.kind === 'modelPreset') {
-            const ctxWindow = mainBinding.preset.profileSnapshot.limits?.contextWindowTokens
-            const set = mainBinding.preset.maxContext
-            const budget = set && set > 0 ? set : 65000
-            // An explicit budget with "ignore context window cap" wins over the
-            // profile cap (the cap can be wrong in a custom registry); the
-            // default budget is always capped.
-            const capIgnored = !!(set && set > 0 && mainBinding.preset.ignoreContextWindowCap)
-            const capApplies = !!ctxWindow && !capIgnored
-            maxContextTokens = capApplies ? Math.min(budget, ctxWindow) : budget
-            maxContextSource = capApplies && ctxWindow < budget
-                ? `model context window cap ${ctxWindow} from the model profile "${mainBinding.preset.name}" (preset budget ${budget})`
-                : `model preset "${mainBinding.preset.name}" max context ${set && set > 0 ? set : '(unset, default 65000)'}${capIgnored && ctxWindow && ctxWindow < set ? ` (context window cap ${ctxWindow} ignored)` : ''}`
+            const contextBudget = resolveModelPresetContextBudget(
+                mainBinding.preset,
+                mainBinding.preset.profileSnapshot.limits?.contextWindowTokens,
+            )
+            maxContextTokens = contextBudget.maxContextTokens
+            maxContextSource = contextBudget.source
             // Reserve output tokens from the preset's own max-output setting
             // rather than db.maxResponse — the legacy global value can be a
             // stray figure (e.g. 65535 carried over from an imported prompt
