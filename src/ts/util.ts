@@ -1018,6 +1018,11 @@ export const sortableOptions = {
 	delay: 300, // time in milliseconds to define when the sorting should start
 	delayOnTouchOnly: true,
     filter: '.no-sort',
+    // Sortable's default preventOnFilter calls preventDefault() on the
+    // pointerdown of filtered elements, which blocks input focus by mouse and
+    // cancels the synthetic click on iOS — the .no-sort areas hold the plugin
+    // toggle and argument inputs, which must stay interactive.
+    preventOnFilter: false,
     onMove: (event) => {
         return event.related.className.indexOf('no-sort') === -1
     }
