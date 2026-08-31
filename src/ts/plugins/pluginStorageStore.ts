@@ -54,12 +54,18 @@ function contentHash(text: string): string {
     return `${text.length}:${(a >>> 0).toString(16)}:${(b >>> 0).toString(16)}`;
 }
 
+// Content hash of the value the server holds for each key we have seen this
+// session. Kept apart from the value LRU so unchanged-write detection still
+// works for values that were evicted or never fit the cap (a full-store
+// snapshot handed to a V3 plugin and written straight back).
+let knownHashes = new Map<string, string>();
+
 // True when the server already holds (or will hold, once the key's pending
 // writes drain) exactly this serialized value.
 function serverHasValue(key: string, hash: string): boolean {
     const pending = pendingOp(key);
     if (pending) return pending.op === "set" && pending.hash === hash;
-    return !tombstones.has(key) && cache.get(key)?.hash === hash;
+    return !tombstones.has(key) && knownHashes.get(key) === hash;
 }
 
 let index = new Map<string, number>();
@@ -128,6 +134,7 @@ function evict() {
 
 // `bytes` is the UTF-8 encoded size, matching the index/server sizes.
 function cacheSet(key: string, value: any, bytes: number, hash: string) {
+    knownHashes.set(key, hash);
     const existing = cache.get(key);
     if (existing) {
         cache.delete(key);
@@ -202,6 +209,9 @@ export async function refreshIndex(): Promise<void> {
         for (const key of [...cache.keys()]) {
             if (!index.has(key) && !pendingOp(key)) cacheDelete(key);
         }
+        for (const key of [...knownHashes.keys()]) {
+            if (!index.has(key) && !pendingOp(key)) knownHashes.delete(key);
+        }
         if (preloaded) {
             preloadPromise = null;
             await preloadAll();
@@ -229,6 +239,7 @@ export async function getItem(key: string): Promise<any | null> {
     const data = await forageStorage.getItem(kvKeyFor(key));
     if (!data || data.length === 0) {
         index.delete(key);
+        knownHashes.delete(key);
         return null;
     }
     let value: any;
@@ -340,6 +351,7 @@ export async function removeItem(key: string): Promise<void> {
     index.delete(key);
     tombstones.add(key);
     cacheDelete(key);
+    knownHashes.delete(key);
 }
 
 export async function clear(): Promise<void> {
@@ -488,6 +500,7 @@ export function setItemSync(key: string, value: any): void {
 export function removeItemSync(key: string): void {
     const existed = index.delete(key);
     cacheDelete(key);
+    knownHashes.delete(key);
     tombstones.add(key);
     if (existed || pendingOp(key)) {
         enqueueSync(key, { op: "remove" });
@@ -504,6 +517,7 @@ export function _resetForTests() {
     initPromise = null;
     cache = new Map();
     cacheBytes = 0;
+    knownHashes = new Map();
     cacheCap = DEFAULT_CACHE_CAP;
     preloaded = false;
     preloadPromise = null;

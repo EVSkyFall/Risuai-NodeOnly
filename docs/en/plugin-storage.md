@@ -19,8 +19,8 @@ In upstream RisuAI every plugin's data sits in one `pluginCustomStorage` object 
 
 Since PocketRisu v1.11.0 plugin values are stored **per key in the server database**, and the browser reads only the keys it needs. Consequences:
 
-- Plugin data no longer sits in `database.bin` or browser memory, so the app keeps working with very large plugin data.
-- V2 / V2.1 plugins use a synchronous API, so every key is preloaded before they run. Same behaviour as before, fetched once at boot.
+- Plugin data no longer sits in `database.bin` or in the app's main in-memory database, so the app keeps working with very large plugin data. (V2 preloads and the full-access option below do bring values into memory; see section 4.)
+- V2 / V2.1 plugins use a synchronous API, so every key is preloaded right before the first enabled V2 plugin runs. Same behaviour as before, fetched once per plugin load.
 - The `pluginCustomStorage` field of the snapshot a V3 plugin gets from `getDatabase()` is **empty by default**, because copying every value into the plugin is expensive.
 
 That last point is where PocketRisu differs from upstream. A V3 plugin that reads another plugin's data through `getDatabase().pluginCustomStorage[...]` receives an empty object on PocketRisu.
@@ -81,7 +81,7 @@ If the app becomes slow or unresponsive, disable the option for that plugin and 
 
 ## 5. Backups and compatibility
 
-- `.bin` backups reassemble plugin data on export, so they open in upstream RisuAI and older PocketRisu versions.
+- Full `.bin` backups reassemble plugin data on export, so they open in upstream RisuAI and older PocketRisu versions. Settings-only exports leave the field empty.
 - The "Provide all plugin data" setting is stored on the plugin entry and ignored by upstream RisuAI.
 - PocketRisu v1.10.x and older cannot read plugin data from the server store. Before downgrading, restore the pre-update snapshot from Settings > DB backup list.
 

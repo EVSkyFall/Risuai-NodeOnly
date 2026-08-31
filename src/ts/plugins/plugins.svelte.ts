@@ -428,6 +428,9 @@ export async function importPlugin(code:string|null = null, argu:{
         }
 
         if(oldPluginIndex !== -1){
+            // User-owned settings on the entry survive an update/reinstall.
+            pluginData.folderId = oldPlugin.folderId
+            pluginData.nodeOnlyFullStorageAccess = oldPlugin.nodeOnlyFullStorageAccess
             db.plugins[oldPluginIndex] = pluginData;
         }
         else if(!isUpdate || argu.isHotReload){

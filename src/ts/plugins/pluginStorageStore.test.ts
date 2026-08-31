@@ -308,6 +308,23 @@ describe('preloadAll + sync ops (V2 mode)', () => {
         await vi.waitFor(() => expect(kv.has(store.kvKeyFor('s'))).toBe(true))
     })
 
+    test('unchanged-write detection survives value-cache eviction (full snapshot written back)', async () => {
+        // A V3 plugin gets snapshotAll() and hands it straight back; values
+        // over the cap never sit in the LRU, but their hashes are known.
+        await store.init()
+        store.setCacheCap(100)
+        const big = 'v'.repeat(500)
+        await store.setItem('big', big)
+        expect(store.isPreloaded()).toBe(false)
+        const sets = () => calls.filter((c) => c.startsWith('set:')).length
+        const before = sets()
+        const snapshot = await store.snapshotAll()
+        expect(snapshot.big).toBe(big)
+        for (const [k, v] of Object.entries(snapshot)) store.setItemSync(k, v)
+        await new Promise((r) => setTimeout(r, 20))
+        expect(sets()).toBe(before)
+    })
+
     // C2: a slow first write must not overwrite a later one.
     test('setItemSync: slow first write, fast second → server ends with the newest', async () => {
         await store.preloadAll()
