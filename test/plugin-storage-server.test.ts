@@ -586,3 +586,34 @@ describe('F4: full /api/write of database.bin', () => {
         expect(await readPluginKey(client, 'a')).toBe('A-later')
     })
 })
+
+describe('GET /api/plugin-storage/all', () => {
+    test('streams every value as NDJSON [key, json] rows; an empty store streams nothing', async () => {
+        const { client } = await boot()
+        const empty = await client.fetch('/api/plugin-storage/all')
+        expect(empty.status).toBe(200)
+        expect(await empty.text()).toBe('')
+
+        await writePluginKey(client, 'plain', 'hello')
+        await writePluginKey(client, 'multi\nline', { text: 'a\nb\t"c"', n: [1, 2] })
+        await writePluginKey(client, '한글 키', '값')
+
+        const res = await client.fetch('/api/plugin-storage/all')
+        expect(res.status).toBe(200)
+        expect(res.headers.get('content-type')).toContain('application/x-ndjson')
+        const body = await res.text()
+        expect(body.endsWith('\n')).toBe(true)
+        const rows = body.split('\n').filter(Boolean).map(line => JSON.parse(line) as [string, string])
+        const byKey = Object.fromEntries(rows.map(([k, text]) => [k, JSON.parse(text)]))
+        expect(Object.keys(byKey).sort()).toEqual(['multi\nline', 'plain', '한글 키'])
+        expect(byKey['multi\nline']).toEqual({ text: 'a\nb\t"c"', n: [1, 2] })
+        expect(byKey['plain']).toBe('hello')
+        expect(byKey['한글 키']).toBe('값')
+    })
+
+    test('rejects unauthenticated requests', async () => {
+        const { srv } = await boot()
+        const res = await fetch(`http://127.0.0.1:${srv.port}/api/plugin-storage/all`)
+        expect(res.status).not.toBe(200)
+    })
+})
