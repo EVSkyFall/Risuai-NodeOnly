@@ -216,7 +216,7 @@
             class:hover:bg-gray-600={!isDragging}
             role="listitem"
             ondragover={(e) => {
-                e.preventDefault()
+                if (!handlePresetDragOver(e)) return
                 dragOverIndex = DBState.db.themePresets.length
             }}
             ondragleave={(e) => {
