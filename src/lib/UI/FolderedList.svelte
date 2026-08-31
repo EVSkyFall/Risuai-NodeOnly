@@ -48,10 +48,10 @@
         onExport?: (index: number) => void;
         onDelete?: (index: number) => void;
         itemContent: Snippet<[number]>;
-        /** Optional inline panel rendered under the item whose index equals `expandedIndex`.
+        /** Optional inline panel rendered under items for which `isExpanded` returns true.
          *  Unlike itemContent it sits outside the click/hover header, so it can hold inputs. */
         itemPanel?: Snippet<[number]>;
-        expandedIndex?: number;
+        isExpanded?: (index: number) => boolean;
         /** Extra menu entries per item, rendered before the destructive ones. */
         itemMenu?: Snippet<[number]>;
         /** Toolbar content shown top-left, opposite the "new folder" button. */
@@ -73,7 +73,7 @@
         onDelete,
         itemContent,
         itemPanel,
-        expandedIndex = -1,
+        isExpanded = () => false,
         itemMenu,
         actions,
     }: Props = $props();
@@ -315,7 +315,7 @@
             </ShDropdownMenuContent>
         </ShDropdownMenu>
     </div>
-    {#if itemPanel && index === expandedIndex}
+    {#if itemPanel && isExpanded(index)}
         <div class="no-sort px-2 pb-2 cursor-default">
             {@render itemPanel(index)}
         </div>

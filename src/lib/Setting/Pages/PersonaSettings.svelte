@@ -118,7 +118,7 @@
         itemSearchTexts={DBState.db.personas.map(p => `${p.name ?? ''}\n${p.note ?? ''}`)}
         searchPlaceholder={language.personaSearch}
         selectedIndex={DBState.db.selectedPersona}
-        expandedIndex={expanded ? DBState.db.selectedPersona : -1}
+        isExpanded={(index) => expanded && index === DBState.db.selectedPersona}
         storageKey="risu-persona-folders-collapsed"
         onSelect={toggleRow}
         onItemsChange={applyPlacements}
