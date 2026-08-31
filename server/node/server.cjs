@@ -4419,11 +4419,12 @@ app.post('/api/asset-manifests/resolve', async (req, res, next) => {
         if (owners.length > 200 || names.length > 1000) {
             return res.status(413).json({ error: 'Too many asset manifest owners or names' });
         }
-        res.json({
-            resolved: assetManifestStore.resolveNames(owners, names, {
-                maxDistance: req.body?.maxDistance,
-            }),
+        const fuzzy = new Set();
+        const resolved = assetManifestStore.resolveNames(owners, names, {
+            maxDistance: req.body?.maxDistance,
+            fuzzyNamesOut: fuzzy,
         });
+        res.json({ resolved, fuzzy: [...fuzzy] });
     } catch (error) { next(error); }
 });
 

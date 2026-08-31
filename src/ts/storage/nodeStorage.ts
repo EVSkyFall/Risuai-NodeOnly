@@ -121,6 +121,8 @@ export interface SettingsBackupEstimate {
 
 export type AssetManifestTuple = [string, string] | [string, string, string]
 
+export type AssetNameResolution = { resolved: Record<string, string>; fuzzy: string[] }
+
 export interface AssetManifestDescriptor {
     id: string
     version: number
@@ -722,7 +724,7 @@ export class NodeStorage{
         owners: Array<{ kind?: string; ownerId?: string; manifestId?: string; fuzzy?: boolean }>,
         names: string[],
         maxDistance: number,
-    ): Promise<Record<string, string>> {
+    ): Promise<AssetNameResolution> {
         const da = await this.authFetch('/api/asset-manifests/resolve', {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
@@ -730,7 +732,9 @@ export class NodeStorage{
         })
         if (!da.ok) throw new Error(`asset manifest resolve error: ${da.status}`)
         const body = await da.json()
-        return body.resolved ?? {}
+        // `fuzzy` lists the names only the fuzzy fallback matched (older
+        // servers omit it: treat everything as exact, as before).
+        return { resolved: body.resolved ?? {}, fuzzy: Array.isArray(body.fuzzy) ? body.fuzzy : [] }
     }
 
     async editAssetManifest(

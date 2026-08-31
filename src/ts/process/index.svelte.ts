@@ -1033,7 +1033,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                             [p1],
                             { fuzzy: false },
                         )
-                        const path = resolved[p1.toLocaleLowerCase()]
+                        const path = resolved[p1.toLocaleLowerCase()]?.path
                         const source = path || (p1 === 'icon' ? currentChar.image ?? '' : '')
                         if (!source) return
                         const assetDataBuf = await readImage(source)

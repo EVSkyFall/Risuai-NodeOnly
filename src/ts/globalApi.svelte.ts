@@ -39,7 +39,7 @@ import {
     type RequestLogCategory, type RequestLogSource, type RequestLogRoute,
 } from "./requestLog";
 import { cacheFullAssetManifest } from './storage/assetManifestCache';
-import { createAssetNameResolver } from './storage/assetNameResolver'
+import { createAssetNameResolver, type AssetNameHit } from './storage/assetNameResolver'
 
 export const forageStorage = new AutoStorage()
 
@@ -60,27 +60,11 @@ export async function loadAssetManifestItems(manifest?: AssetManifestDescriptor)
     return items
 }
 
-export async function resolveAssetManifestNames(
-    manifests: AssetManifestDescriptor[],
-    names: string[],
-    fuzzyManifestIds: ReadonlySet<string> = new Set(),
-): Promise<Record<string, string>> {
-    const owners = manifests
-        .filter((manifest) => manifest?.id)
-        .map((manifest) => ({
-            manifestId: manifest.id,
-            kind: manifest.ownerKind,
-            ownerId: manifest.ownerId,
-            fuzzy: fuzzyManifestIds.has(manifest.id),
-        }))
-    return forageStorage.resolveAssetManifestNames(owners, names, getDatabase().assetMaxDifference ?? 4)
-}
-
 // One call for character + modules, answers remembered per manifest set —
 // see assetNameResolver.ts for why (module names lost to character fuzzy
 // matches, and a round trip per parsed message).
-const resolveAssetNamesCached = createAssetNameResolver((owners, names) =>
-    forageStorage.resolveAssetManifestNames(owners, names, getDatabase().assetMaxDifference ?? 4),
+const resolveAssetNamesCached = createAssetNameResolver((owners, names, maxDistance) =>
+    forageStorage.resolveAssetManifestNames(owners, names, maxDistance),
 )
 
 export async function resolvePrioritizedAssetManifestNames(
@@ -88,8 +72,8 @@ export async function resolvePrioritizedAssetManifestNames(
     moduleManifests: AssetManifestDescriptor[],
     names: string[],
     { fuzzy = true }: { fuzzy?: boolean } = {},
-): Promise<Record<string, string>> {
-    return resolveAssetNamesCached(characterManifest, moduleManifests, names, fuzzy)
+): Promise<Record<string, AssetNameHit>> {
+    return resolveAssetNamesCached(characterManifest, moduleManifests, names, fuzzy, getDatabase().assetMaxDifference ?? 4)
 }
 
 export async function editAssetManifest(
