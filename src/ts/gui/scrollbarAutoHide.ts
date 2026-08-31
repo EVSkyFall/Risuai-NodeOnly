@@ -1,6 +1,6 @@
 /**
- * Show-while-scrolling scrollbars. The thumb is transparent by default
- * (styles.css) and painted only while the scroller carries `data-scrolling`.
+ * Scroll-aware scrollbars. The thumb is faint by default (styles.css) and
+ * painted stronger while the scroller carries `data-scrolling`.
  * One capture-phase listener stamps the scrolling element and clears the
  * stamp shortly after scrolling stops — no per-component wiring.
  */
