@@ -5,7 +5,9 @@
     import ShButton from "src/lib/UI/GUI/ShButton.svelte";
     import SettingRenderer from "../SettingRenderer.svelte";
     import FolderedList, { type FolderedItemPlacement } from "src/lib/UI/FolderedList.svelte";
-    import { ArrowLeftIcon, HardDriveUploadIcon, InfoIcon, PlusIcon } from "@lucide/svelte";
+    import { ArrowLeftIcon, GitCompare, HardDriveUploadIcon, InfoIcon, PlusIcon } from "@lucide/svelte";
+    import PromptDiffModal from "src/lib/Others/PromptDiffModal.svelte";
+    import { tooltip } from "src/ts/gui/tooltip";
     import { language } from "src/lang";
     import { alertConfirm, notifyError, notifySuccess } from "src/ts/alert";
     import { DBState, PromptPresetEditorOpen, PromptPresetSubmenuIndex } from "src/ts/stores.svelte";
@@ -106,6 +108,38 @@
         notifySuccess(language.presetDeleted)
         void requestImmediateSave()
     }
+
+    // Prompt diff (display.showPromptComparison): pick two presets with the
+    // compare icon to open the diff modal. Same flow as the sidebar picker.
+    let showDiffModal = $state(false)
+    let selectedDiffPreset = $state<number | null>(null)
+    let firstPresetId = $state<number | null>(null)
+    let secondPresetId = $state<number | null>(null)
+
+    function handleDiffMode(index: number) {
+        if (selectedDiffPreset === index) {
+            selectedDiffPreset = null
+            firstPresetId = null
+            secondPresetId = null
+            return
+        }
+        selectedDiffPreset = index
+        if (firstPresetId === null) {
+            firstPresetId = index
+            secondPresetId = null
+            return
+        }
+        secondPresetId = index
+        selectedDiffPreset = null
+        showDiffModal = true
+    }
+
+    function closeDiff() {
+        showDiffModal = false
+        firstPresetId = null
+        secondPresetId = null
+        selectedDiffPreset = null
+    }
 </script>
 
 {#if view === 'list'}
@@ -135,9 +169,22 @@
                 <div class="h-8 w-8 shrink-0 rounded-md bg-textcolor2/30"></div>
             {/if}
             <span class="min-w-0 grow truncate">{preset.name}</span>
+            {#if DBState.db.showPromptComparison}
+                <button class="no-sort shrink-0 p-1 rounded {selectedDiffPreset === index ? 'text-green-500' : 'text-textcolor2 hover:text-primary'}"
+                    aria-label="compare" use:tooltip={language.showPromptComparison}
+                    onclick={(e) => { e.stopPropagation(); handleDiffMode(index) }}>
+                    <GitCompare size={16}/>
+                </button>
+            {/if}
         {/snippet}
     </FolderedList>
 </SettingPage>
+{#if showDiffModal && firstPresetId !== null && secondPresetId !== null}
+    <!-- The modal is `absolute inset-0`; anchor it to the viewport, not the settings panel. -->
+    <div class="fixed inset-0 z-50">
+        <PromptDiffModal {firstPresetId} {secondPresetId} onClose={closeDiff} />
+    </div>
+{/if}
 {:else}
 <div class="flex items-center gap-2 mt-2 mb-2">
     <ShButton size="sm" variant="ghost" onclick={backToList}><ArrowLeftIcon />{language.backToList}</ShButton>
