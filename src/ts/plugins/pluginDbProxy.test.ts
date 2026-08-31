@@ -141,3 +141,15 @@ describe('risuai.db.pluginCustomStorage', () => {
         expect(store.getItemSync('other-plugin')).toBe(1)
     })
 })
+
+describe('wantsFullPluginStorage', () => {
+    test('off by default, on when the key is named in includeOnly or the plugin is allowed', async () => {
+        const { wantsFullPluginStorage } = await import('./pluginDbProxy')
+        expect(wantsFullPluginStorage('all', {})).toBe(false)
+        expect(wantsFullPluginStorage(undefined, undefined)).toBe(false)
+        expect(wantsFullPluginStorage(['characters'], {})).toBe(false)
+        expect(wantsFullPluginStorage(['characters', 'pluginCustomStorage'], {})).toBe(true)
+        expect(wantsFullPluginStorage('all', { nodeOnlyFullStorageAccess: true })).toBe(true)
+        expect(wantsFullPluginStorage(['characters'], { nodeOnlyFullStorageAccess: true })).toBe(true)
+    })
+})

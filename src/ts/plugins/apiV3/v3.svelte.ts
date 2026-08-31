@@ -27,6 +27,7 @@ import { requestChatDataMain } from "src/ts/process/request/request";
 import type { OpenAIChat } from "src/ts/process/index.svelte";
 import { getModuleLorebooks } from "src/ts/process/modules";
 import { hydratePluginCharacterSnapshot, hydratePluginDatabaseSnapshot, restorePluginCharacterManifest } from "../pluginCharacterSnapshot";
+import { PLUGIN_CUSTOM_STORAGE_KEY, wantsFullPluginStorage } from "../pluginDbProxy";
 import {
     registerTTSPreprocessor,
     unregisterTTSPreprocessor,
@@ -936,6 +937,17 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             // modules (#80 follow-up) and characters — a plugin reading the
             // database instead of getCharacter* must see the same shape.
             await hydratePluginDatabaseSnapshot(liteDB);
+            // Plugin values live on the server, so the DB field is always {}.
+            // Fill it with every stored value only on request (see
+            // wantsFullPluginStorage); otherwise say once why it is empty.
+            if (PLUGIN_CUSTOM_STORAGE_KEY in liteDB) {
+                if (wantsFullPluginStorage(includeOnly, plugin)) {
+                    (liteDB as any)[PLUGIN_CUSTOM_STORAGE_KEY] = await pluginStorageStore.snapshotAll();
+                } else if (!fullStorageHintShown.has(plugin.name)) {
+                    fullStorageHintShown.add(plugin.name);
+                    console.warn(`[RisuAI Plugin: ${plugin.name}] getDatabase() returns an empty pluginCustomStorage on PocketRisu. Read other plugins' values with pluginStorage.getItem(key), request them with getDatabase(['pluginCustomStorage']), or allow full storage access for this plugin in Settings > Plugins. See docs/en/plugin-storage.md.`);
+                }
+            }
             return liteDB;
         },
 
@@ -1580,6 +1592,9 @@ type V3PluginInstance = {
 }
 
 const v3PluginInstances: V3PluginInstance[] = [];
+
+// Plugins already told (once per session) why pluginCustomStorage is empty.
+const fullStorageHintShown = new Set<string>()
 
 export async function loadV3Plugins(plugins:RisuPlugin[]){
     await Promise.all([...v3PluginInstances].map(async (instance) => {

@@ -1819,6 +1819,11 @@ export const languageKorean = {
     "플러그인 {} 이(가) 사용자 대신 채팅 메시지를 전송할 권한을 요청합니다. AI 응답이 트리거됩니다. 허용하시겠습니까?",
   pluginPermissionDenyGuide:
     '플러그인 "{}"의 권한 요청을 거부했습니다. 거부한 권한은 다시 묻지 않습니다.\n\n실수로 거부했다면 [설정] > [플러그인]에서 해당 플러그인의 "권한 응답 초기화"로 되돌릴 수 있습니다.',
+  pluginFullStorageAccess: "다른 플러그인 데이터 전체 제공 (원본 RisuAI 호환)",
+  pluginFullStorageAccessDesc:
+    "이 플러그인이 DB를 읽을 때 모든 플러그인의 저장 데이터를 함께 넘깁니다. 현재 플러그인 저장소 {} 전체가 읽을 때마다 복사되므로, 다른 플러그인 데이터가 필요한 플러그인에만 켜세요.",
+  pluginFullStorageAccessLarge: "플러그인 저장소가 100 MB를 넘습니다. 자주 읽는 플러그인에 켜면 앱이 느려지거나 멈출 수 있습니다.",
+  pluginFullStorageAccessGuide: "자세히 보기",
   resetPluginPermission: "권한 응답 초기화",
   resetPluginPermissionConfirm:
     '플러그인 "{}"의 저장된 권한 응답(허용/거부 이력)을 모두 삭제하시겠습니까?\n\n다음에 플러그인이 권한을 요청할 때 다시 묻게 됩니다.',

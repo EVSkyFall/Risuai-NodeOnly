@@ -37,6 +37,8 @@ interface ProviderPlugin {
     updateURL?: string
     enabled?: boolean
     allowedIPC?: string[]
+    /** V3 only: getDatabase() hands this plugin the whole plugin storage (RisuAI-compatible), even without includeOnly. Off by default; see docs/plugin-storage.md. */
+    nodeOnlyFullStorageAccess?: boolean
 }
 interface ProviderPluginCustomLink {
     link: string

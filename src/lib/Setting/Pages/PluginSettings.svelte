@@ -19,6 +19,7 @@
     import CheckInput from "src/lib/UI/GUI/CheckInput.svelte";
     import TextAreaInput from "src/lib/UI/GUI/TextAreaInput.svelte";
     import { hotReloadPluginFiles } from "src/ts/plugins/apiV3/developMode";
+    import * as pluginStorageStore from "src/ts/plugins/pluginStorageStore";
 
     // Plugins are keyed by name (no id); track expanded parameter panels by name.
     let showParams = $state<string[]>([])
@@ -31,6 +32,22 @@
 
     function hasParams(plugin: typeof DBState.db.plugins[number]) {
         return plugin.version !== 1 && Object.keys(plugin.arguments ?? {}).filter((k) => !k.startsWith("hidden_")).length > 0
+    }
+
+    // V3 plugins always have a detail panel (the storage access switch).
+    function hasPanel(plugin: typeof DBState.db.plugins[number]) {
+        return hasParams(plugin) || plugin.version === '3.0'
+    }
+
+    const FULL_STORAGE_WARN_BYTES = 100 * 1024 * 1024
+    function storageSizeText(bytes: number) {
+        return bytes >= 1024 * 1024
+            ? `${(bytes / 1024 / 1024).toFixed(1)} MB`
+            : `${Math.ceil(bytes / 1024)} KB`
+    }
+    function fullStorageGuideUrl() {
+        const lang = DBState.db.language === 'ko' ? 'ko' : 'en'
+        return `https://github.com/PocketRisu/PocketRisu/blob/main/docs/${lang}/plugin-storage.md`
     }
 
     function togglePlugin(index: number) {
@@ -157,10 +174,26 @@
                         .replace("{{plugin_version}}", "API V1")
                         .replace("{{required_version}}", "API V3")}
                 </span>
-            {:else if hasParams(plugin) && expanded}
+            {:else if hasPanel(plugin) && expanded}
                 <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
                 <div class="no-sort flex flex-col mt-2 mb-1 bg-dark-900/50 p-3 rounded-md cursor-default" onclick={(e) => e.stopPropagation()}>
-                    {#each Object.keys(plugin.arguments) as arg}
+                    {#if plugin.version === '3.0'}
+                        {@const storageBytes = pluginStorageStore.totalBytes()}
+                        <div class="flex items-center">
+                            <CheckInput bind:check={DBState.db.plugins[index].nodeOnlyFullStorageAccess} name={language.pluginFullStorageAccess} />
+                        </div>
+                        <span class="mt-1 text-sm text-textcolor2">
+                            {language.pluginFullStorageAccessDesc.replace('{}', storageSizeText(storageBytes))}
+                            <a href={fullStorageGuideUrl()} target="_blank" rel="nofollow noopener noreferrer" class="text-blue-400 hover:underline">{language.pluginFullStorageAccessGuide}</a>
+                        </span>
+                        {#if storageBytes >= FULL_STORAGE_WARN_BYTES}
+                            <span class="mt-1 text-sm text-draculared">{language.pluginFullStorageAccessLarge}</span>
+                        {/if}
+                        {#if hasParams(plugin)}
+                            <div aria-hidden="true" class="w-full border-t border-darkborderc mt-4"></div>
+                        {/if}
+                    {/if}
+                    {#each Object.keys(plugin.arguments ?? {}) as arg}
                         {#if !arg.startsWith("hidden_")}
                             {#if typeof(plugin?.argMeta?.[arg]?.divider) === 'string'}
                                 {#if plugin?.argMeta?.[arg]?.divider}

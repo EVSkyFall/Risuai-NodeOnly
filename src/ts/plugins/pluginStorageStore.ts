@@ -363,6 +363,13 @@ export function length(): number {
     return index.size;
 }
 
+// Sum of every stored value's size (from the index; pending writes included).
+export function totalBytes(): number {
+    let total = 0;
+    for (const bytes of index.values()) total += bytes;
+    return total;
+}
+
 export function size(key: string): number | undefined {
     return index.get(key);
 }
