@@ -94,6 +94,25 @@ describe('restorePluginCharacterManifest', () => {
         expect(restorePluginCharacterManifest(incoming, undefined)).toBe(incoming)
     })
 
+    test('a write carrying both the descriptor and the untouched array keeps only the descriptor', () => {
+        cacheMod.cacheFullAssetManifest(descriptor.id, items)
+        const incoming: any = { additionalAssetManifest: descriptor, additionalAssets: items.map((t) => [...t]) }
+        expect(restorePluginCharacterManifest(incoming, current)).toBe(incoming)
+        expect(incoming.additionalAssets).toBeUndefined()
+        expect(incoming.additionalAssetManifest).toBe(descriptor)
+    })
+
+    test('a write carrying the descriptor next to an edited array drops the descriptor (AssetGod v1.11.0 report)', () => {
+        // A plugin that saw the lazy shape starts from [] and pushes its new
+        // asset; the descriptor it never removed must not survive next to it.
+        cacheMod.cacheFullAssetManifest(descriptor.id, items)
+        const edited = [['new', 'key-c', 'png']]
+        const incoming: any = { additionalAssetManifest: descriptor, additionalAssets: edited }
+        expect(restorePluginCharacterManifest(incoming, current)).toBe(incoming)
+        expect(incoming.additionalAssets).toBe(edited)
+        expect(incoming.additionalAssetManifest).toBeUndefined()
+    })
+
     test('leaves a write that already carries a descriptor alone', () => {
         const incoming: any = { additionalAssetManifest: descriptor }
         expect(restorePluginCharacterManifest(incoming, current)).toBe(incoming)
@@ -135,7 +154,7 @@ describe('read-modify-write round trip', () => {
 describe('hydratePluginDatabaseSnapshot', () => {
     const moduleManifest = { id: 'mod-1', ownerKind: 'module', ownerId: 'm1' } as any
 
-    test('fills module and persona embedded-module assets, leaving characters alone', async () => {
+    test('fills module, persona embedded-module and character assets', async () => {
         const subset: any = {
             modules: [{ name: 'm', assetManifest: moduleManifest }, { name: 'inline', assets: [['x', 'k', 'png']] }],
             personas: [{ name: 'p', embeddedModule: { assetManifest: moduleManifest } }, { name: 'plain' }],
@@ -147,8 +166,11 @@ describe('hydratePluginDatabaseSnapshot', () => {
         expect(subset.modules[1].assets).toEqual([['x', 'k', 'png']])
         expect(subset.personas[0].embeddedModule.assets).toEqual(items)
         expect(subset.personas[0].embeddedModule.assetManifest).toBeUndefined()
-        expect(subset.characters[0].additionalAssetManifest).toBe(descriptor)
-        expect(loadAssetManifestItems).toHaveBeenCalledTimes(2)
+        expect(subset.characters[0].additionalAssets).toEqual(items)
+        expect(subset.characters[0].additionalAssetManifest).toBeUndefined()
+        // The character manifest may already sit in the shared full-manifest
+        // cache from earlier tests; the module manifest is loaded twice here.
+        expect(loadAssetManifestItems).toHaveBeenCalledWith(moduleManifest)
     })
 
     test('tolerates subsets without modules or personas', async () => {
@@ -190,9 +212,24 @@ describe('cache-first manifest lookup', () => {
 describe('restorePluginDbKey', () => {
     const moduleManifest = { id: 'mod-rt', ownerKind: 'module', ownerId: 'm1' } as any
     const current = {
+        characters: [{ chaId: 'c1', additionalAssetManifest: descriptor }, { chaId: 'c2', additionalAssets: [['x', 'k', 'png']] }],
         modules: [{ id: 'm1', assetManifest: moduleManifest }, { id: 'm2', assets: [['x', 'k', 'png']] }],
         personas: [{ id: 'p1', embeddedModule: { assetManifest: moduleManifest } }],
     }
+
+    test('a characters round trip through setDatabase() restores manifests by chaId', () => {
+        cacheMod.cacheFullAssetManifest(descriptor.id, items)
+        const characters: any = [
+            { chaId: 'c2', additionalAssets: [['x', 'k', 'png']] },
+            { chaId: 'c1', additionalAssets: items.map((t) => [...t]) },
+            { chaId: 'new', additionalAssets: [['n', 'k', 'png']] },
+        ]
+        restorePluginDbKey('characters', characters, current)
+        expect(characters[1].additionalAssetManifest).toBe(descriptor)
+        expect(characters[1].additionalAssets).toBeUndefined()
+        expect(characters[0].additionalAssets).toEqual([['x', 'k', 'png']])
+        expect(characters[2].additionalAssets).toEqual([['n', 'k', 'png']])
+    })
 
     test('an untouched getDatabase() → setDatabase() round trip keeps module and persona manifests', () => {
         cacheMod.cacheFullAssetManifest(moduleManifest.id, items)

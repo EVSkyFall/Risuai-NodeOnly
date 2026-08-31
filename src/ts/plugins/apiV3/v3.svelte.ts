@@ -932,8 +932,9 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
                 }
                 (liteDB as any)[key] = $state.snapshot((db as any)[key]);
             }
-            // Modules and persona-embedded modules have no per-item getter,
-            // so their lazy asset manifests are filled here (#80 follow-up).
+            // Lazy asset manifests are filled here for modules, persona-embedded
+            // modules (#80 follow-up) and characters — a plugin reading the
+            // database instead of getCharacter* must see the same shape.
             await hydratePluginDatabaseSnapshot(liteDB);
             return liteDB;
         },

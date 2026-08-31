@@ -87,13 +87,23 @@ function sameAssetTuples(a: readonly (readonly string[])[], b: readonly (readonl
 // write is a no-op for assets, exactly like before lazy manifests. A genuinely
 // changed list is left inline and takes the same path as a character import
 // (re-canonicalized into a manifest on the next cold load).
+//
+// An array and a descriptor must never coexist on the stored character: the
+// client reads the array while the server persists the descriptor, so the
+// plugin's edit would show locally and silently vanish from disk (v1.11.0
+// AssetGod report). If a plugin hands both back, the array decides — it is
+// either the untouched list (descriptor restored) or the plugin's edit
+// (descriptor dropped, list stays inline).
 export function restorePluginCharacterManifest<T extends AssetFields>(incoming: T, current: AssetFields | undefined): T {
     const descriptor = current?.additionalAssetManifest
     if (!incoming || !descriptor || Array.isArray(current?.additionalAssets)) return incoming
-    if (!Array.isArray(incoming.additionalAssets) || incoming.additionalAssetManifest) return incoming
-    if (!matchesManifest(descriptor, incoming.additionalAssets)) return incoming
-    delete incoming.additionalAssets
-    incoming.additionalAssetManifest = descriptor
+    if (!Array.isArray(incoming.additionalAssets)) return incoming
+    if (matchesManifest(descriptor, incoming.additionalAssets)) {
+        delete incoming.additionalAssets
+        incoming.additionalAssetManifest = descriptor
+    } else {
+        delete incoming.additionalAssetManifest
+    }
     return incoming
 }
 
@@ -117,9 +127,13 @@ export async function hydratePluginModuleSnapshot<T extends ModuleAssetFields>(
     return snapshot
 }
 
-// Fills the module-shaped entries of a detached getDatabase() subset in
-// place. Characters are deliberately left lazy (see getCharacter*).
+// Fills every asset-carrying entry of a detached getDatabase() subset in
+// place. Characters are filled too: plugins that read the database instead
+// of getCharacter* (AssetGod does, to dodge structured-clone errors) otherwise
+// see every manifest-backed character with no assets at all, and any edit
+// they save from that view replaces the real list with just the new items.
 export async function hydratePluginDatabaseSnapshot(subset: {
+    characters?: AssetFields[]
     modules?: ModuleAssetFields[]
     personas?: { embeddedModule?: ModuleAssetFields }[]
 }): Promise<void> {
@@ -127,7 +141,11 @@ export async function hydratePluginDatabaseSnapshot(subset: {
         ...(Array.isArray(subset.modules) ? subset.modules : []),
         ...(Array.isArray(subset.personas) ? subset.personas.map((persona) => persona?.embeddedModule) : []),
     ]
-    await Promise.all(modules.map((module) => hydratePluginModuleSnapshot(module)))
+    const characters = Array.isArray(subset.characters) ? subset.characters : []
+    await Promise.all([
+        ...modules.map((module) => hydratePluginModuleSnapshot(module)),
+        ...characters.map((character) => hydratePluginCharacterSnapshot(character)),
+    ])
 }
 
 // Write-back counterpart for module-shaped entries. A plugin that round-trips
@@ -137,21 +155,32 @@ export async function hydratePluginDatabaseSnapshot(subset: {
 function restoreModuleManifest<T extends ModuleAssetFields>(incoming: T, current: ModuleAssetFields | undefined): T {
     const descriptor = current?.assetManifest
     if (!incoming || !descriptor || Array.isArray(current?.assets)) return incoming
-    if (!Array.isArray(incoming.assets) || incoming.assetManifest) return incoming
-    if (!matchesManifest(descriptor, incoming.assets)) return incoming
-    delete incoming.assets
-    incoming.assetManifest = descriptor
+    if (!Array.isArray(incoming.assets)) return incoming
+    // Same array-vs-descriptor rule as restorePluginCharacterManifest.
+    if (matchesManifest(descriptor, incoming.assets)) {
+        delete incoming.assets
+        incoming.assetManifest = descriptor
+    } else {
+        delete incoming.assetManifest
+    }
     return incoming
 }
 
 type PluginDbValue = unknown
 
 // Applies the write-back restore to a top-level DB key a plugin is writing.
-// Modules match by id, personas by id (falling back to position). Any other
-// key is returned untouched.
-export function restorePluginDbKey(key: string, value: PluginDbValue, currentDb: { modules?: any[]; personas?: any[] } | undefined): PluginDbValue {
+// Characters match by chaId, modules by id, personas by id (each falling back
+// to position). Any other key is returned untouched.
+export function restorePluginDbKey(key: string, value: PluginDbValue, currentDb: { characters?: any[]; modules?: any[]; personas?: any[] } | undefined): PluginDbValue {
     if (!Array.isArray(value) || !currentDb) return value
-    if (key === 'modules') {
+    if (key === 'characters') {
+        const byId = new Map((currentDb.characters ?? []).map((character) => [character?.chaId, character]))
+        value.forEach((character, index) => {
+            if (!character) return
+            const current = (character.chaId !== undefined ? byId.get(character.chaId) : undefined) ?? currentDb.characters?.[index]
+            restorePluginCharacterManifest(character, current)
+        })
+    } else if (key === 'modules') {
         const byId = new Map((currentDb.modules ?? []).map((module) => [module?.id, module]))
         for (const module of value) {
             if (module) restoreModuleManifest(module, byId.get(module.id))
