@@ -93,7 +93,7 @@
             {@const open = !!query || (key === '' ? !expanded.has(key) : expanded.has(key))}
             {#if visible.length > 0}
                 {#if hasHeader}
-                    <button class="flex items-center gap-2 w-full rounded-md px-2 py-2 mt-1 text-textcolor cursor-pointer hover:bg-selected/30 select-none" onclick={() => toggle(key)}>
+                    <button class="flex items-center gap-2 w-full rounded-md px-2 py-2 mt-1 border-t border-darkborderc text-textcolor cursor-pointer hover:bg-selected/30 select-none" onclick={() => toggle(key)}>
                         {#if open}<ChevronDownIcon size={16} class="shrink-0 text-textcolor2"/>{:else}<ChevronRightIcon size={16} class="shrink-0 text-textcolor2"/>{/if}
                         <FolderIcon size={16} class="shrink-0 text-textcolor2"/>
                         <span class="grow text-left truncate {group.folder ? '' : 'text-textcolor2'}">{group.folder?.name ?? language.folderUncategorized}</span>
@@ -105,7 +105,15 @@
                     {@const isGlobal = DBState.db.enabledModules.includes(rmodule.id)}
                     {@const inChat = currentChat()?.modules?.includes(rmodule.id) ?? false}
                     {@const inCharacter = DBState.db.characters[$selectedCharID]?.modules?.includes(rmodule.id) ?? false}
-                    <div class="flex items-center gap-2 text-textcolor border-t border-darkborderc p-2 pl-7">
+                    <!-- Character-scope toggle on the whole row, not just the check icon:
+                         the folder layout shrank the icon and users right-clicked the
+                         name, which only opened the browser menu. -->
+                    <!-- svelte-ignore a11y_no_static_element_interactions -->
+                    <div class="flex items-center gap-2 text-textcolor border-t border-darkborderc p-2 pl-7"
+                        oncontextmenu={(e) => {
+                            if (alertMode || isGlobal) return
+                            e.preventDefault(); e.stopPropagation(); toggleCharacterScope(rmodule.id)
+                        }}>
                         {#if rmodule.mcp}
                             <Waypoints size={18} class="shrink-0 text-textcolor2" />
                         {/if}
@@ -130,7 +138,7 @@
                 {/each}
             {/if}
         {/each}
-        <button class="mt-3 pt-2 border-t border-darkborderc flex items-center gap-2 text-sm text-textcolor2 hover:text-primary cursor-pointer self-start"
+        <button class="mt-3 pt-2 w-full border-t border-darkborderc flex items-center gap-2 text-sm text-textcolor2 hover:text-primary cursor-pointer"
             onclick={() => { openSettings(SettingsRoute.Module); close('') }}>
             <SettingsIcon size={16}/><span>{language.moduleManage}</span>
         </button>
