@@ -2,7 +2,7 @@
     // Chat module picker. Grouped by folder; folder management lives in
     // Settings → Modules. Click = chat scope, right click = character scope
     // (unchanged behavior).
-    import { ChevronDownIcon, ChevronRightIcon, CircleCheckIcon, FolderIcon, MessageSquareIcon, SearchIcon, SettingsIcon, UserRoundIcon, Waypoints, XIcon } from "@lucide/svelte";
+    import { ChevronDownIcon, ChevronRightIcon, CircleCheckIcon, FolderIcon, GlobeIcon, MessageSquareIcon, SearchIcon, SettingsIcon, UserRoundIcon, Waypoints, XIcon } from "@lucide/svelte";
     import { language } from "src/lang";
     import { groupByFolder } from "src/ts/folders";
 
@@ -121,7 +121,11 @@
                                 <CircleCheckIcon size={18}/>
                             </button>
                         {:else if isGlobal}
-                            <span class="text-textcolor2 cursor-not-allowed shrink-0" aria-label="disabled"></span>
+                            <!-- Globally enabled: always on, managed in Settings > Modules.
+                                 Shown explicitly so the row does not read as "off". -->
+                            <span class="shrink-0 p-1 rounded-sm text-emerald-500 bg-emerald-500/15" title={language.moduleScopeGlobal} aria-label={language.moduleScopeGlobal}>
+                                <GlobeIcon size={18}/>
+                            </span>
                         {:else}
                             <button class="shrink-0 cursor-pointer p-1 rounded-sm {inChat ? 'text-blue-500 bg-blue-500/15' : 'text-textcolor2 hover:text-blue-400'}"
                                 title={language.moduleScopeChat} aria-label={language.moduleScopeChat} aria-pressed={inChat}
