@@ -13,7 +13,7 @@ import { loadV3Plugins, reloadV3Plugin } from "./apiV3/v3.svelte";
 import { pluginCodeTranspiler } from "./apiV3/transpiler";
 import * as pluginStorageStore from "./pluginStorageStore";
 import { PLUGIN_CUSTOM_STORAGE_KEY, applyPluginDbKey, pluginCustomStorageProxy } from "./pluginDbProxy";
-import { restorePluginDbKey } from './pluginCharacterSnapshot';
+import { hydratePluginCharacterSnapshotSync, restorePluginCharacterManifest, restorePluginDbKey } from './pluginCharacterSnapshot';
 
 export const customProviderStore = writable([] as string[])
 
@@ -37,6 +37,8 @@ interface ProviderPlugin {
     updateURL?: string
     enabled?: boolean
     allowedIPC?: string[]
+    /** V3 only: getDatabase() hands this plugin the whole plugin storage (RisuAI-compatible), even without includeOnly. Off by default; see docs/plugin-storage.md. */
+    nodeOnlyFullStorageAccess?: boolean
 }
 interface ProviderPluginCustomLink {
     link: string
@@ -426,6 +428,9 @@ export async function importPlugin(code:string|null = null, argu:{
         }
 
         if(oldPluginIndex !== -1){
+            // User-owned settings on the entry survive an update/reinstall.
+            pluginData.folderId = oldPlugin.folderId
+            pluginData.nodeOnlyFullStorageAccess = oldPlugin.nodeOnlyFullStorageAccess
             db.plugins[oldPluginIndex] = pluginData;
         }
         else if(!isUpdate || argu.isHotReload){
@@ -557,12 +562,13 @@ export const getV2PluginAPIs = () => {
             }
         },
         getChar: () => {
-            return getCurrentCharacter({ snapshot: true })
+            // Sync API: lazy asset manifests are filled from cache when possible.
+            return hydratePluginCharacterSnapshotSync(getCurrentCharacter({ snapshot: true }))
         },
         setChar: (char: any) => {
             const db = getDatabase()
             const charid = get(selectedCharID)
-            db.characters[charid] = char
+            db.characters[charid] = restorePluginCharacterManifest(char, db.characters[charid])
             setDatabaseLite(db)
         },
         addProvider: (name: string, func: (arg: PluginV2ProviderArgument, abortSignal?: AbortSignal) => Promise<{ success: boolean, content: string }>, options?: PluginV2ProviderOptions) => {

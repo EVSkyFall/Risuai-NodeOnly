@@ -245,7 +245,7 @@ async function hypaMemoryV3MainExp(
                 return {
                     currentTokens,
                     chats,
-                    error: `${logPrefix} Cannot summarize further: input token count (${currentTokens}) exceeds max context size (${maxContextTokens}), but minimum ${settings.queryChatCount} messages required.`,
+                    error: `${logPrefix} Cannot summarize further: input token count (${currentTokens}) exceeds max context size (${maxContextTokens}), but minimum ${settings.queryChatCount} messages required. (reserved memory: ${memoryTokens}, memoryTokensRatio: ${settings.memoryTokensRatio})`,
                     memory: toSerializableHypaV3Data(data),
                 };
             }
@@ -1028,7 +1028,7 @@ async function hypaMemoryV3Main(
                 return {
                     currentTokens,
                     chats,
-                    error: `${logPrefix} Cannot summarize further: input token count (${currentTokens}) exceeds max context size (${maxContextTokens}), but minimum ${settings.queryChatCount} messages required.`,
+                    error: `${logPrefix} Cannot summarize further: input token count (${currentTokens}) exceeds max context size (${maxContextTokens}), but minimum ${settings.queryChatCount} messages required. (reserved memory: ${memoryTokens}, memoryTokensRatio: ${settings.memoryTokensRatio})`,
                     memory: toSerializableHypaV3Data(data),
                 };
             }

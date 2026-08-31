@@ -221,3 +221,29 @@ describe('asset manifest store', () => {
         ])
     })
 })
+
+describe('resolveNames priority (v1.11.1 regression)', () => {
+    it('an exact module asset is not shadowed by a fuzzy near-miss on the character', () => {
+        const { store } = freshStore()
+        store.putManifest('character', 'chara', [['bg-01', 'assets/char-bg-01', 'png'], ['평온', 'assets/char-calm', 'png']])
+        store.putManifest('module', 'risuco', [['bg-fog', 'assets/mod-bg-fog', 'webp'], ['평정', 'assets/mod-composure', 'png']])
+        const owners = [
+            { kind: 'character', ownerId: 'chara', fuzzy: true },
+            { kind: 'module', ownerId: 'risuco', fuzzy: false },
+        ]
+        // Both names are within edit distance 4 of a character asset, but
+        // the module holds them exactly: exact wins across every owner.
+        expect(store.resolveNames(owners, ['bg-fog', '평정'], { maxDistance: 4 })).toEqual({
+            'bg-fog': 'assets/mod-bg-fog',
+            '평정': 'assets/mod-composure',
+        })
+        // A name nobody holds still falls back to the character's fuzzy match,
+        // and the caller is told which names were fuzzy.
+        const fuzzy = new Set<string>()
+        expect(store.resolveNames(owners, ['bg-02', 'bg-fog'], { maxDistance: 4, fuzzyNamesOut: fuzzy })).toEqual({
+            'bg-02': 'assets/char-bg-01',
+            'bg-fog': 'assets/mod-bg-fog',
+        })
+        expect([...fuzzy]).toEqual(['bg-02'])
+    })
+})

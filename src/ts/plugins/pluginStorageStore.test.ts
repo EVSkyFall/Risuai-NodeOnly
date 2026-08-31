@@ -5,7 +5,7 @@ import { describe, test, expect, vi, beforeEach } from 'vitest'
 const kv = new Map<string, Uint8Array>()
 const calls: string[] = []
 const setValues: string[] = []
-const mockState = { setItemFails: 0, holdNextSet: null as Promise<void> | null }
+const mockState = { setItemFails: 0, holdNextSet: null as Promise<void> | null, bulkFails: false }
 
 vi.mock('../globalApi.svelte', () => ({
     forageStorage: {
@@ -23,6 +23,14 @@ vi.mock('../globalApi.svelte', () => ({
         async getItem(key: string) {
             calls.push('get:' + key)
             return kv.get(key) ?? null
+        },
+        async getPluginStorageAll(onEntry: (key: string, text: string) => void) {
+            calls.push('all')
+            if (mockState.bulkFails) { mockState.bulkFails = false; throw new Error('no bulk endpoint') }
+            for (const [k, v] of kv.entries()) {
+                if (!k.startsWith('plugin-storage/')) continue
+                onEntry(Buffer.from(k.slice('plugin-storage/'.length), 'base64url').toString('utf-8'), new TextDecoder().decode(v))
+            }
         },
         async setItem(key: string, value: Uint8Array) {
             calls.push('set:' + key)
@@ -177,6 +185,22 @@ describe('write-through', () => {
         expect(new TextDecoder().decode(kv.get(store.kvKeyFor('k')))).toBe('"new"')
     })
 
+    test('getItem during an in-flight async setItem returns the pending value', async () => {
+        seed('k', 'old')
+        await store.init()
+        expect(await store.getItem('k')).toBe('old') // now cached
+        let release!: () => void
+        mockState.holdNextSet = new Promise<void>((r) => { release = r })
+        const write = store.setItem('k', 'new')
+        await vi.waitFor(() => expect(setValues).toEqual(['"new"'])) // 'new' is in flight (held)
+        expect(await store.getItem('k')).toBe('new')
+        const removal = store.removeItem('k')
+        expect(await store.getItem('k')).toBeNull()
+        release()
+        await Promise.all([write, removal])
+        expect(await store.getItem('k')).toBeNull()
+    })
+
     test('removeItem + clear go through the server', async () => {
         seed('a', 1)
         seed('b', 2)
@@ -242,6 +266,21 @@ describe('preloadAll + sync ops (V2 mode)', () => {
         expect(store.isPreloaded()).toBe(true)
         for (let i = 0; i < 20; i++) expect(store.getItemSync('k' + i)).toBe('v'.repeat(50))
         expect(store.getItemSync('missing')).toBeNull()
+        // One streamed response, not one GET per key.
+        expect(calls.filter((c) => c === 'all')).toHaveLength(1)
+        expect(calls.filter((c) => c.startsWith('get:'))).toHaveLength(0)
+    })
+
+    test('preload falls back to per-key reads when the bulk stream fails, and local writes win', async () => {
+        for (let i = 0; i < 3; i++) seed('k' + i, i)
+        mockState.bulkFails = true
+        await store.init()
+        store.setItemSync('k1', 'local')
+        await store.preloadAll()
+        expect(calls.filter((c) => c.startsWith('get:'))).toHaveLength(2)
+        expect(store.getItemSync('k0')).toBe(0)
+        expect(store.getItemSync('k1')).toBe('local')
+        expect(store.getItemSync('k2')).toBe(2)
     })
 
     test('setItemSync updates cache/index at once and writes in the background', async () => {
@@ -255,6 +294,51 @@ describe('preloadAll + sync ops (V2 mode)', () => {
         expect(store.getItemSync('s')).toBeNull()
         expect(store.length()).toBe(0)
         await vi.waitFor(() => expect(kv.has(store.kvKeyFor('s'))).toBe(false))
+    })
+
+    // v1.11.0 report: a V2 setDatabase() round trip re-sent every key of the
+    // store (hundreds of MB for long-term-memory plugins) on each save.
+    test('rewriting an unchanged value is not uploaded again', async () => {
+        seed('fromServer', { n: 1 })
+        await store.preloadAll()
+        const sets = () => calls.filter((c) => c.startsWith('set:')).length
+        const before = sets()
+
+        store.setItemSync('fromServer', { n: 1 })
+        store.setItemSync('s', { n: 2 })
+        await vi.waitFor(() => expect(kv.has(store.kvKeyFor('s'))).toBe(true))
+        expect(sets()).toBe(before + 1)
+
+        store.setItemSync('s', { n: 2 })
+        await store.setItem('s', { n: 2 })
+        expect(sets()).toBe(before + 1)
+
+        store.setItemSync('s', { n: 3 })
+        await vi.waitFor(() => expect(sets()).toBe(before + 2))
+        expect(store.getItemSync('s')).toEqual({ n: 3 })
+
+        // A removed key must be written again even with its old content.
+        store.removeItemSync('s')
+        await vi.waitFor(() => expect(kv.has(store.kvKeyFor('s'))).toBe(false))
+        store.setItemSync('s', { n: 3 })
+        await vi.waitFor(() => expect(kv.has(store.kvKeyFor('s'))).toBe(true))
+    })
+
+    test('unchanged-write detection survives value-cache eviction (full snapshot written back)', async () => {
+        // A V3 plugin gets snapshotAll() and hands it straight back; values
+        // over the cap never sit in the LRU, but their hashes are known.
+        await store.init()
+        store.setCacheCap(100)
+        const big = 'v'.repeat(500)
+        await store.setItem('big', big)
+        expect(store.isPreloaded()).toBe(false)
+        const sets = () => calls.filter((c) => c.startsWith('set:')).length
+        const before = sets()
+        const snapshot = await store.snapshotAll()
+        expect(snapshot.big).toBe(big)
+        for (const [k, v] of Object.entries(snapshot)) store.setItemSync(k, v)
+        await new Promise((r) => setTimeout(r, 20))
+        expect(sets()).toBe(before)
     })
 
     // C2: a slow first write must not overwrite a later one.
@@ -466,6 +550,39 @@ describe('snapshotAll', () => {
         // the copy is detached from the store
         snap.a = 99
         expect(await store.getItem('a')).toBe(1)
+    })
+
+    test('reads the store from one streamed response; local state wins over the stream', async () => {
+        for (let i = 0; i < 3; i++) seed('k' + i, i)
+        await store.init()
+        store.setItemSync('k1', 'local')
+        calls.length = 0
+        const snap = await store.snapshotAll()
+        expect(snap).toEqual({ k0: 0, k1: 'local', k2: 2 })
+        expect(calls.filter((c) => c === 'all')).toHaveLength(1)
+        expect(calls.filter((c) => c.startsWith('get:'))).toHaveLength(0)
+    })
+
+    test('includes the value of an in-flight async setItem, not the server copy', async () => {
+        for (let i = 0; i < 3; i++) seed('k' + i, i)
+        await store.init()
+        let release!: () => void
+        mockState.holdNextSet = new Promise<void>((r) => { release = r })
+        const write = store.setItem('k1', 'new')
+        await vi.waitFor(() => expect(setValues).toEqual(['"new"'])) // 'new' is in flight (held)
+        const snap = await store.snapshotAll()
+        expect(snap).toEqual({ k0: 0, k1: 'new', k2: 2 })
+        release()
+        await write
+    })
+
+    test('falls back to per-key reads when the bulk stream fails', async () => {
+        for (let i = 0; i < 3; i++) seed('k' + i, i)
+        mockState.bulkFails = true
+        calls.length = 0
+        const snap = await store.snapshotAll()
+        expect(snap).toEqual({ k0: 0, k1: 1, k2: 2 })
+        expect(calls.filter((c) => c.startsWith('get:'))).toHaveLength(3)
     })
 
     test('keeps a "__proto__" key as an own property', async () => {

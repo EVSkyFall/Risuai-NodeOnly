@@ -1,14 +1,13 @@
 <script lang="ts">
     import { language } from "src/lang";
     import SettingPage from "src/lib/UI/GUI/SettingPage.svelte";
-    import Button from "src/lib/UI/GUI/Button.svelte";
     import ShButton from "src/lib/UI/GUI/ShButton.svelte";
     import Check from "src/lib/UI/GUI/CheckInput.svelte";
     import Help from "src/lib/Others/Help.svelte";
     import TextAreaInput from "src/lib/UI/GUI/TextAreaInput.svelte";
     import TextInput from "src/lib/UI/GUI/TextInput.svelte";
     import FolderedList, { type FolderedItemPlacement } from "src/lib/UI/FolderedList.svelte";
-    import { ArrowLeftIcon, HardDriveUploadIcon, PlusIcon } from "@lucide/svelte";
+    import { HardDriveUploadIcon, PlusIcon, StarIcon } from "@lucide/svelte";
     import { alertConfirm } from "src/ts/alert";
     import { getCharImage } from "src/ts/characters";
     import { changeUserPersona, exportUserPersona, importUserPersona, saveUserPersona, selectUserImg } from "src/ts/persona";
@@ -23,10 +22,11 @@
         DBState.db.selectedPersona = 0
     }
 
-    // The page opens on the list; tapping an item activates it and switches
-    // to the editor. The editor still edits the DB top-level persona fields
-    // (username/personaPrompt/...) exactly as before — only the shell changed.
-    let view = $state<'list' | 'edit'>('list')
+    // Tapping a row activates that persona and expands the editor inline
+    // beneath it (same pattern as the plugin page). The editor edits the DB
+    // top-level persona fields (username/personaPrompt/...), which always
+    // mirror the *selected* persona — so only the selected row can be open.
+    let expanded = $state(false)
 
     const folders = $derived(DBState.db.personaFolders ?? [])
 
@@ -35,14 +35,14 @@
         return persona.id
     }
 
-    function openEditor(index: number) {
+    function toggleRow(index: number) {
+        if (index === DBState.db.selectedPersona) {
+            expanded = !expanded
+            if (!expanded) saveUserPersona()
+            return
+        }
         changeUserPersona(index)
-        view = 'edit'
-    }
-
-    function backToList() {
-        saveUserPersona()
-        view = 'list'
+        expanded = true
     }
 
     /** Rebuilds `db.personas` from the list's reported order/folder membership. */
@@ -66,7 +66,8 @@
             personaPrompt: '',
             note: '',
         }]
-        openEditor(DBState.db.personas.length - 1)
+        changeUserPersona(DBState.db.personas.length - 1, 'noSave')
+        expanded = true
         void requestImmediateSave()
     }
 
@@ -100,6 +101,8 @@
         DBState.db.personas = next
         const selectedIndex = next.indexOf(selected)
         changeUserPersona(selectedIndex >= 0 ? selectedIndex : 0, 'noSave')
+        // Don't pop open whichever persona became selected after the removal.
+        if (selectedIndex < 0) expanded = false
         void requestImmediateSave()
     }
 
@@ -108,7 +111,6 @@
     })
 </script>
 
-{#if view === 'list'}
 <SettingPage title={language.persona}>
     <FolderedList
         {folders}
@@ -116,8 +118,9 @@
         itemSearchTexts={DBState.db.personas.map(p => `${p.name ?? ''}\n${p.note ?? ''}`)}
         searchPlaceholder={language.personaSearch}
         selectedIndex={DBState.db.selectedPersona}
+        isExpanded={(index) => expanded && index === DBState.db.selectedPersona}
         storageKey="risu-persona-folders-collapsed"
-        onSelect={openEditor}
+        onSelect={toggleRow}
         onItemsChange={applyPlacements}
         onFoldersChange={(next) => { DBState.db.personaFolders = next; void requestImmediateSave() }}
         onDuplicate={duplicatePersona}
@@ -141,49 +144,46 @@
                 <span>{persona.name}</span>
                 {#if persona.note}<span class="text-textcolor2"> / {persona.note}</span>{/if}
             </div>
+            <!-- Active persona marker (same convention as the memory preset default star). -->
+            {#if index === DBState.db.selectedPersona}
+                <StarIcon size={14} class="shrink-0 text-primary" />
+            {/if}
+        {/snippet}
+        {#snippet itemPanel(index)}
+            {@const persona = DBState.db.personas[index]}
+            <div class="flex flex-wrap gap-4 bg-dark-900/50 p-3 rounded-md">
+                <button class="shrink-0 self-start" onclick={() => {selectUserImg()}}>
+                    {#if DBState.db.userIcon === ''}
+                        <div class="rounded-md h-28 w-28 shadow-lg bg-textcolor2 cursor-pointer hover:text-primary"></div>
+                    {:else}
+                        {#await getCharImage(DBState.db.userIcon, persona.largePortrait ? 'lgcss' : 'css')}
+                            <div class="rounded-md h-28 w-28 shadow-lg bg-textcolor2 cursor-pointer hover:text-primary"></div>
+                        {:then im}
+                            <div class="rounded-md h-28 w-28 shadow-lg bg-textcolor2 cursor-pointer hover:text-primary" style={im}></div>
+                        {/await}
+                    {/if}
+                </button>
+                <div class="flex grow flex-col min-w-0 basis-64">
+                    <span class="text-sm text-textcolor2">{language.name} <Help key="personaName" /></span>
+                    <TextInput className="mt-2" marginBottom placeholder="User" bind:value={DBState.db.username}/>
+                    <span class="text-sm text-textcolor2">{language.note} <Help key="personaNote" /></span>
+                    {#if DBState.db.personaNote}
+                        <TextInput className="mt-2" marginBottom bind:value={DBState.db.userNote} placeholder={`Put a unique identifier for this persona here.\nExample: [Alternate Hunters persona]`} />
+                    {/if}
+                    <span class="text-sm text-textcolor2">{language.description} <Help key="personaDescription" /></span>
+                    <TextAreaInput className="mt-2 mb-4" autocomplete="off" bind:value={DBState.db.personaPrompt} placeholder={`Put the description of this persona here.\nExample: [<user> is a 20 year old girl.]`} />
+                    <div class="flex gap-2 max-w-full flex-wrap items-center">
+                        <ShButton size="sm" variant="outline" onclick={() => exportPersona(index)}>{language.export}</ShButton>
+                        <ShButton size="sm" variant="outline" onclick={() => {
+                            duplicatePersona(index)
+                            changeUserPersona(DBState.db.personas.length - 1, 'noSave')
+                        }}>{language.personaDuplicate}</ShButton>
+                        <ShButton size="sm" variant="destructive" onclick={() => deletePersona(index)}>{language.remove}</ShButton>
+                        <Check bind:check={DBState.db.personas[DBState.db.selectedPersona].largePortrait} name={language.largePortrait}/>
+                        <Help key="personaLargePortrait" />
+                    </div>
+                </div>
+            </div>
         {/snippet}
     </FolderedList>
 </SettingPage>
-{:else}
-<div class="flex items-center gap-2 mt-2 mb-4">
-    <ShButton size="sm" variant="ghost" onclick={backToList}><ArrowLeftIcon />{language.backToList}</ShButton>
-</div>
-<div class="flex w-full items-starts rounded-md border-darkborderc border p-4 max-w-full flex-wrap">
-    <div class="flex flex-col mt-4 mr-4">
-        <button onclick={() => {selectUserImg()}}>
-            {#if DBState.db.userIcon === ''}
-                <div class="rounded-md h-28 w-28 shadow-lg bg-textcolor2 cursor-pointer hover:text-primary"></div>
-            {:else}
-                {#await getCharImage(DBState.db.userIcon, DBState.db.personas[DBState.db.selectedPersona].largePortrait ? 'lgcss' : 'css')}
-                    <div class="rounded-md h-28 w-28 shadow-lg bg-textcolor2 cursor-pointer hover:text-primary"></div>
-                {:then im}
-                    <div class="rounded-md h-28 w-28 shadow-lg bg-textcolor2 cursor-pointer hover:text-primary" style={im}></div>
-                {/await}
-            {/if}
-        </button>
-    </div>
-    <div class="flex grow flex-col p-2 max-w-full">
-        <span class="text-sm text-textcolor2">{language.name} <Help key="personaName" /></span>
-        <TextInput className="mt-2" marginBottom placeholder="User" bind:value={DBState.db.username}/>
-        <span class="text-sm text-textcolor2">{language.note} <Help key="personaNote" /></span>
-        {#if DBState.db.personaNote}
-            <TextInput className="mt-2" marginBottom bind:value={DBState.db.userNote} placeholder={`Put a unique identifier for this persona here.\nExample: [Alternate Hunters persona]`} />
-        {/if}
-        <span class="text-sm text-textcolor2">{language.description} <Help key="personaDescription" /></span>
-        <TextAreaInput className="mt-2 mb-4" autocomplete="off" bind:value={DBState.db.personaPrompt} placeholder={`Put the description of this persona here.\nExample: [<user> is a 20 year old girl.]`} />
-        <div class="flex gap-2 mt-4 max-w-full flex-wrap items-center">
-            <Button onclick={() => exportPersona(DBState.db.selectedPersona)}>{language.export}</Button>
-            <Button onclick={importPersona}>{language.import}</Button>
-            <Button onclick={() => {
-                duplicatePersona(DBState.db.selectedPersona)
-                changeUserPersona(DBState.db.personas.length - 1, 'noSave')
-            }}>{language.personaDuplicate}</Button>
-            <Button styled="danger" onclick={async () => {
-                await deletePersona(DBState.db.selectedPersona)
-            }}>{language.remove}</Button>
-            <Check bind:check={DBState.db.personas[DBState.db.selectedPersona].largePortrait} name={language.largePortrait}/>
-            <Help key="personaLargePortrait" />
-        </div>
-    </div>
-</div>
-{/if}

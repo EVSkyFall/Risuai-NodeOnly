@@ -428,26 +428,25 @@ body {
 }
 
 ::-webkit-scrollbar {
-  width: 3px;
-  height: 3px;
+  width: 6px;
+  height: 6px;
 }
 
 ::-webkit-scrollbar-track {
   background: transparent;
 }
 
-/* Handle — shown only while scrolling. ts/gui/scrollbarAutoHide.ts stamps the
-   scrolling element with `data-scrolling` for the duration of a scroll; the
-   thumb color is passed through a custom property on the scroller because
-   Chromium only re-resolves scrollbar part styles when the scroller's own
-   computed style changes. Verified on macOS Chrome 151 (classic scrollbars). */
+/* Handle — always faintly visible so it can be found and grabbed, drawn
+   stronger while scrolling and faded back afterwards. ts/gui/scrollbarAutoHide.ts
+   steps `--risu-scrollbar-alpha` on the scrolling element (0.22 at rest, 0.45
+   while scrolling); the alpha lives on the scroller because Chromium only
+   re-resolves scrollbar part styles when the scroller's own computed style
+   changes and cannot animate scrollbar parts itself. Verified on macOS Chrome
+   151 (classic scrollbars). A fully hidden 3px thumb (v1.11.0) could not be
+   located or dragged on long lists. */
 ::-webkit-scrollbar-thumb {
-  background-color: var(--risu-scrollbar-thumb, transparent);
+  background-color: color-mix(in srgb, var(--color-textcolor2) calc(var(--risu-scrollbar-alpha, 0.22) * 100%), transparent);
   border-radius: 9999px;
-}
-
-[data-scrolling] {
-  --risu-scrollbar-thumb: color-mix(in srgb, var(--color-textcolor2) 45%, transparent);
 }
 
 /* Firefox only. Must not reach Chromium: a non-auto `scrollbar-width` on the

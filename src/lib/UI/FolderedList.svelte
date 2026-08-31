@@ -48,6 +48,10 @@
         onExport?: (index: number) => void;
         onDelete?: (index: number) => void;
         itemContent: Snippet<[number]>;
+        /** Optional inline panel rendered under items for which `isExpanded` returns true.
+         *  Unlike itemContent it sits outside the click/hover header, so it can hold inputs. */
+        itemPanel?: Snippet<[number]>;
+        isExpanded?: (index: number) => boolean;
         /** Extra menu entries per item, rendered before the destructive ones. */
         itemMenu?: Snippet<[number]>;
         /** Toolbar content shown top-left, opposite the "new folder" button. */
@@ -68,6 +72,8 @@
         onExport,
         onDelete,
         itemContent,
+        itemPanel,
+        isExpanded = () => false,
         itemMenu,
         actions,
     }: Props = $props();
@@ -274,14 +280,17 @@
 </div>
 
 {#snippet row(index)}
+    <div data-sortable-key={String(index)} data-sortable-no-scale class:hidden={!matches(index)}>
+    <!-- Header line is the only click/hover target; an expanded panel below it is inert. -->
     <div
-        data-sortable-key={String(index)}
-        data-sortable-no-scale
         class="flex items-center gap-2 rounded-md px-2 min-h-11 py-1 text-textcolor cursor-pointer {index === selectedIndex ? 'bg-selected' : 'risu-interactive-surface'}"
-        class:hidden={!matches(index)}
         role="button" tabindex="0"
         onclick={() => onSelect(index)}
-        onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelect(index) } }}>
+        onkeydown={(e) => {
+            // Only the header itself — inputs rendered inside itemContent must keep their Space/Enter.
+            if (e.target !== e.currentTarget) return
+            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelect(index) }
+        }}>
         {@render itemContent(index)}
         <ShDropdownMenu>
             <ShDropdownMenuTrigger>
@@ -305,6 +314,12 @@
                 {/if}
             </ShDropdownMenuContent>
         </ShDropdownMenu>
+    </div>
+    {#if itemPanel && isExpanded(index)}
+        <div class="no-sort px-2 pb-2 cursor-default">
+            {@render itemPanel(index)}
+        </div>
+    {/if}
     </div>
 {/snippet}
 

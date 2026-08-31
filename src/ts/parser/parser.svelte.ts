@@ -515,11 +515,11 @@ async function parseAdditionalAssets(data:string, char:simpleCharacterArgument|c
                     moduleManifests,
                     names,
                 )
-                for (const [name, path] of Object.entries(resolved.modules)) {
-                    assetPaths[name] ??= { srcPaths: [path] }
-                }
-                for (const [name, path] of Object.entries(resolved.character)) {
-                    assetPaths[name] = { srcPaths: [path] }
+                for (const [name, hit] of Object.entries(resolved)) {
+                    // An exact manifest hit replaces whatever the cache held; a
+                    // fuzzy near-miss only fills a gap, never an inline exact match.
+                    if (hit.fuzzy) assetPaths[name] ??= { srcPaths: [hit.path] }
+                    else assetPaths[name] = { srcPaths: [hit.path] }
                 }
             } catch (error) {
                 console.warn('[Assets] Failed to resolve parser asset manifests', error)

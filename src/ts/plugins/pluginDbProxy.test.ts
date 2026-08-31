@@ -17,6 +17,12 @@ vi.mock('../globalApi.svelte', () => ({
                 }))
             return { entries, migrated: true }
         },
+        async getPluginStorageAll(onEntry: (key: string, text: string) => void) {
+            for (const [k, v] of kv.entries()) {
+                if (!k.startsWith('plugin-storage/')) continue
+                onEntry(Buffer.from(k.slice('plugin-storage/'.length), 'base64url').toString('utf-8'), new TextDecoder().decode(v))
+            }
+        },
         async getItem(key: string) {
             return kv.get(key) ?? null
         },
@@ -133,5 +139,15 @@ describe('risuai.db.pluginCustomStorage', () => {
         bulkSet(db, { pluginCustomStorage: { __mm_disabledModules__: [] } })
         expect(store.getItemSync('__mm_disabledModules__')).toEqual([])
         expect(store.getItemSync('other-plugin')).toBe(1)
+    })
+})
+
+describe('wantsFullPluginStorage', () => {
+    test('off unless the user allowed it for the plugin', async () => {
+        const { wantsFullPluginStorage } = await import('./pluginDbProxy')
+        expect(wantsFullPluginStorage({})).toBe(false)
+        expect(wantsFullPluginStorage(undefined)).toBe(false)
+        expect(wantsFullPluginStorage({ nodeOnlyFullStorageAccess: false })).toBe(false)
+        expect(wantsFullPluginStorage({ nodeOnlyFullStorageAccess: true })).toBe(true)
     })
 })

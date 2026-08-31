@@ -1,8 +1,8 @@
 <script lang="ts">
     // Chat module picker. Grouped by folder; folder management lives in
-    // Settings → Modules. Click = chat scope, right click = character scope
-    // (unchanged behavior).
-    import { ChevronDownIcon, ChevronRightIcon, CircleCheckIcon, FolderIcon, SearchIcon, SettingsIcon, Waypoints, XIcon } from "@lucide/svelte";
+    // Settings → Modules. Each row has two scope buttons: chat scope and
+    // character scope. Globally enabled modules show a globe instead.
+    import { ChevronDownIcon, ChevronRightIcon, CircleCheckIcon, FolderIcon, GlobeIcon, MessageSquareIcon, SearchIcon, SettingsIcon, UserRoundIcon, Waypoints, XIcon } from "@lucide/svelte";
     import { language } from "src/lang";
     import { groupByFolder } from "src/ts/folders";
 
@@ -93,7 +93,7 @@
             {@const open = !!query || (key === '' ? !expanded.has(key) : expanded.has(key))}
             {#if visible.length > 0}
                 {#if hasHeader}
-                    <button class="flex items-center gap-2 w-full rounded-md px-2 py-2 mt-1 text-textcolor cursor-pointer hover:bg-selected/30 select-none" onclick={() => toggle(key)}>
+                    <button class="flex items-center gap-2 w-full rounded-md px-2 py-2 mt-1 border-t border-darkborderc text-textcolor cursor-pointer hover:bg-selected/30 select-none" onclick={() => toggle(key)}>
                         {#if open}<ChevronDownIcon size={16} class="shrink-0 text-textcolor2"/>{:else}<ChevronRightIcon size={16} class="shrink-0 text-textcolor2"/>{/if}
                         <FolderIcon size={16} class="shrink-0 text-textcolor2"/>
                         <span class="grow text-left truncate {group.folder ? '' : 'text-textcolor2'}">{group.folder?.name ?? language.folderUncategorized}</span>
@@ -105,6 +105,9 @@
                     {@const isGlobal = DBState.db.enabledModules.includes(rmodule.id)}
                     {@const inChat = currentChat()?.modules?.includes(rmodule.id) ?? false}
                     {@const inCharacter = DBState.db.characters[$selectedCharID]?.modules?.includes(rmodule.id) ?? false}
+                    <!-- Chat and character scope are separate buttons: the old
+                         right-click / long-press toggle is not reachable on iOS
+                         (Safari fires no contextmenu on long press). -->
                     <div class="flex items-center gap-2 text-textcolor border-t border-darkborderc p-2 pl-7">
                         {#if rmodule.mcp}
                             <Waypoints size={18} class="shrink-0 text-textcolor2" />
@@ -118,19 +121,28 @@
                                 <CircleCheckIcon size={18}/>
                             </button>
                         {:else if isGlobal}
-                            <span class="text-textcolor2 cursor-not-allowed shrink-0" aria-label="disabled"></span>
+                            <!-- Globally enabled: always on, managed in Settings > Modules.
+                                 Shown explicitly so the row does not read as "off". -->
+                            <span class="shrink-0 p-1 rounded-sm text-emerald-500 bg-emerald-500/15" title={language.moduleScopeGlobal} aria-label={language.moduleScopeGlobal}>
+                                <GlobeIcon size={18}/>
+                            </span>
                         {:else}
-                            <button class="shrink-0 cursor-pointer {inChat ? 'text-blue-500' : inCharacter ? 'text-violet-500' : 'text-textcolor2 hover:text-blue-400'}"
-                                onclick={(e) => { e.stopPropagation(); toggleChatScope(rmodule.id) }}
-                                oncontextmenu={(e) => { e.preventDefault(); e.stopPropagation(); toggleCharacterScope(rmodule.id) }}>
-                                <CircleCheckIcon size={18}/>
+                            <button class="shrink-0 cursor-pointer p-1 rounded-sm {inChat ? 'text-blue-500 bg-blue-500/15' : 'text-textcolor2 hover:text-blue-400'}"
+                                title={language.moduleScopeChat} aria-label={language.moduleScopeChat} aria-pressed={inChat}
+                                onclick={(e) => { e.stopPropagation(); toggleChatScope(rmodule.id) }}>
+                                <MessageSquareIcon size={18}/>
+                            </button>
+                            <button class="shrink-0 cursor-pointer p-1 rounded-sm {inCharacter ? 'text-violet-500 bg-violet-500/15' : 'text-textcolor2 hover:text-violet-400'}"
+                                title={language.moduleScopeCharacter} aria-label={language.moduleScopeCharacter} aria-pressed={inCharacter}
+                                onclick={(e) => { e.stopPropagation(); toggleCharacterScope(rmodule.id) }}>
+                                <UserRoundIcon size={18}/>
                             </button>
                         {/if}
                     </div>
                 {/each}
             {/if}
         {/each}
-        <button class="mt-3 pt-2 border-t border-darkborderc flex items-center gap-2 text-sm text-textcolor2 hover:text-primary cursor-pointer self-start"
+        <button class="mt-3 pt-2 w-full border-t border-darkborderc flex items-center gap-2 text-sm text-textcolor2 hover:text-primary cursor-pointer"
             onclick={() => { openSettings(SettingsRoute.Module); close('') }}>
             <SettingsIcon size={16}/><span>{language.moduleManage}</span>
         </button>

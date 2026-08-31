@@ -3721,6 +3721,36 @@ app.get('/api/plugin-storage/index', async (req, res, next) => {
     }
 });
 
+// Every plugin-storage value, streamed as NDJSON lines `[key, json]` straight
+// from kv so the set is never materialized as one object. Backs the V2
+// preload: the V2 API is synchronous, so every key has to be in the client
+// cache before a V2 plugin runs, and fetching N keys one GET at a time made
+// plugin loading take minutes over a remote link (v1.11.0 report).
+app.get('/api/plugin-storage/all', async (req, res, next) => {
+    if(!await checkAuth(req, res)){
+        return;
+    }
+    try {
+        res.setHeader('content-type', 'application/x-ndjson; charset=utf-8');
+        let closed = false;
+        res.once('close', () => { closed = true; });
+        for (const entry of pluginStorage.entriesRaw()) {
+            if (closed) return;
+            const ok = res.write(JSON.stringify([entry.key, entry.text]) + '\n');
+            // Wait for backpressure to clear, but stop if the client went away.
+            if (!ok) await new Promise((resolve) => {
+                const done = () => { res.off('drain', done); res.off('close', done); resolve(); };
+                res.once('drain', done);
+                res.once('close', done);
+            });
+        }
+        res.end();
+    } catch (error) {
+        if (res.headersSent) { res.destroy(error); return; }
+        next(error);
+    }
+});
+
 app.get('/api/remove', async (req, res, next) => {
     if(!await checkAuth(req, res)){
         return;
@@ -4389,11 +4419,12 @@ app.post('/api/asset-manifests/resolve', async (req, res, next) => {
         if (owners.length > 200 || names.length > 1000) {
             return res.status(413).json({ error: 'Too many asset manifest owners or names' });
         }
-        res.json({
-            resolved: assetManifestStore.resolveNames(owners, names, {
-                maxDistance: req.body?.maxDistance,
-            }),
+        const fuzzy = new Set();
+        const resolved = assetManifestStore.resolveNames(owners, names, {
+            maxDistance: req.body?.maxDistance,
+            fuzzyNamesOut: fuzzy,
         });
+        res.json({ resolved, fuzzy: [...fuzzy] });
     } catch (error) { next(error); }
 });
 
@@ -5830,6 +5861,25 @@ function collectPluginStorageAssetRefs() {
     return set;
 }
 
+// The persisted blob is currently hydrated for upstream compatibility, but
+// manifests are authoritative for the lazy client view and will remain so
+// after a future slim-database cutover. Union live manifest paths so a
+// partial/stripped object (the warm dbCache always is) can never make
+// referenced assets look orphaned. Throws when a manifest fails to verify —
+// callers must then refuse to purge / report the count as unavailable.
+function addLiveManifestRefs(uncleanable) {
+    for (const descriptor of assetManifestStore.listLiveDescriptors()) {
+        const verified = assetManifestStore.verifyManifest(descriptor.id);
+        if (!verified.ok) {
+            throw new Error(`Asset manifest verification failed: ${descriptor.id} (${verified.error})`);
+        }
+        for (const item of assetManifestStore.loadItems(descriptor.id) || []) {
+            const basename = statsBasename(item?.[1]);
+            if (basename) uncleanable.add(basename);
+        }
+    }
+}
+
 // Every asset reference reachable from the DB. Mirrors
 // src/ts/globalApi.svelte.ts:getUncleanables, plus the settings-level image-gen
 // references that walker misses (NAIImgConfig, wavespeedImage).
@@ -5932,21 +5982,8 @@ async function computeAssetSweep({ includeAssets, assetGraceMs = 0, includeRemot
     const uncleanable = buildUncleanableSet(dbObj);
     const assets = includeAssets ? kvListWithSizesAndUpdatedAt('assets/') : [];
 
-    // The persisted blob is currently hydrated for upstream compatibility, but
-    // manifests are authoritative for the lazy client view and will remain so
-    // after a future slim-database cutover. Union live manifest paths now so a
-    // partial/stripped blob can never make referenced assets look orphaned.
     try {
-        for (const descriptor of assetManifestStore.listLiveDescriptors()) {
-            const verified = assetManifestStore.verifyManifest(descriptor.id);
-            if (!verified.ok) {
-                throw new Error(`Asset manifest verification failed: ${descriptor.id} (${verified.error})`);
-            }
-            for (const item of assetManifestStore.loadItems(descriptor.id) || []) {
-                const basename = statsBasename(item?.[1]);
-                if (basename) uncleanable.add(basename);
-            }
-        }
+        addLiveManifestRefs(uncleanable);
     } catch (error) {
         return { error: `Manifest reference scan failed — refusing to purge: ${error?.message || error}` };
     }
@@ -6192,16 +6229,26 @@ app.get('/api/db/stats', async (req, res, next) => {
         // `characters` must be an array: a decode failure parks `{}` in dbCache,
         // and walking that yields an empty reference set — which would report
         // every stored asset as an orphan.
+        // dbCache holds the stripped (manifest-descriptor) shape, so the
+        // walker alone misses every lazy character/module asset — union the
+        // live manifests exactly like the purge path does, or the dashboard
+        // reports the whole library as orphaned while purge deletes nothing.
         if (stripped && Array.isArray(stripped.characters)) {
-            const uncleanable = buildUncleanableSet(stripped);
-            for (const bn of collectPluginStorageAssetRefs()) uncleanable.add(bn);
-            for (const it of kvListWithSizes('assets/')) {
-                if (!uncleanable.has(statsBasename(it.key))) {
-                    orphan.count++;
-                    orphan.totalSize += it.size;
+            try {
+                const uncleanable = buildUncleanableSet(stripped);
+                addLiveManifestRefs(uncleanable);
+                for (const bn of collectPluginStorageAssetRefs()) uncleanable.add(bn);
+                for (const it of kvListWithSizes('assets/')) {
+                    if (!uncleanable.has(statsBasename(it.key))) {
+                        orphan.count++;
+                        orphan.totalSize += it.size;
+                    }
                 }
+                orphan.available = true;
+            } catch (error) {
+                logger.warn(`[Stats] orphan scan skipped: ${error?.message || error}`);
+                orphan = { count: 0, totalSize: 0, available: false };
             }
-            orphan.available = true;
         }
 
         const estimatedBackupSize = await estimateServerBackupSize();
@@ -6309,6 +6356,7 @@ app.get('/api/db/stats/characters', async (req, res, next) => {
         }
 
         const uncleanable = buildUncleanableSet(dbObj);
+        addLiveManifestRefs(uncleanable);
         for (const bn of collectPluginStorageAssetRefs()) uncleanable.add(bn);
         let orphanCount = 0, orphanTotal = 0;
         for (const it of kvListWithSizes('assets/')) {

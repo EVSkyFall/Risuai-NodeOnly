@@ -117,8 +117,8 @@
             swapThreshold: 0.9,      // More sensitive drag response
             preventOnFilter: false, // Allow click events on filtered elements
             animation: 150, // Animation
-            chosenClass: "risu-chosen-item", // Class for the item being dragged
-            ghostClass: "risu-ghost-item",  // Class for the drop placeholder
+            chosenClass: "risu-lore-chosen-item", // Class for the item being dragged
+            ghostClass: "risu-lore-ghost-item",  // Class for the drop placeholder
 
             onEnd: async (evt) => {
                 

@@ -39,6 +39,7 @@ import {
     type RequestLogCategory, type RequestLogSource, type RequestLogRoute,
 } from "./requestLog";
 import { cacheFullAssetManifest } from './storage/assetManifestCache';
+import { createAssetNameResolver, type AssetNameHit } from './storage/assetNameResolver'
 
 export const forageStorage = new AutoStorage()
 
@@ -59,41 +60,20 @@ export async function loadAssetManifestItems(manifest?: AssetManifestDescriptor)
     return items
 }
 
-export async function resolveAssetManifestNames(
-    manifests: AssetManifestDescriptor[],
-    names: string[],
-    fuzzyManifestIds: ReadonlySet<string> = new Set(),
-): Promise<Record<string, string>> {
-    const owners = manifests
-        .filter((manifest) => manifest?.id)
-        .map((manifest) => ({
-            manifestId: manifest.id,
-            kind: manifest.ownerKind,
-            ownerId: manifest.ownerId,
-            fuzzy: fuzzyManifestIds.has(manifest.id),
-        }))
-    return forageStorage.resolveAssetManifestNames(owners, names, getDatabase().assetMaxDifference ?? 4)
-}
+// One call for character + modules, answers remembered per manifest set —
+// see assetNameResolver.ts for why (module names lost to character fuzzy
+// matches, and a round trip per parsed message).
+const resolveAssetNamesCached = createAssetNameResolver((owners, names, maxDistance) =>
+    forageStorage.resolveAssetManifestNames(owners, names, maxDistance),
+)
 
 export async function resolvePrioritizedAssetManifestNames(
     characterManifest: AssetManifestDescriptor | undefined,
     moduleManifests: AssetManifestDescriptor[],
     names: string[],
     { fuzzy = true }: { fuzzy?: boolean } = {},
-): Promise<{ character: Record<string, string>; modules: Record<string, string> }> {
-    const uniqueNames = [...new Set(names.map((name) => name.toLocaleLowerCase()))]
-    const character = characterManifest
-        ? await resolveAssetManifestNames(
-            [characterManifest],
-            uniqueNames,
-            fuzzy ? new Set([characterManifest.id]) : new Set(),
-        )
-        : {}
-    const remaining = uniqueNames.filter((name) => !Object.hasOwn(character, name))
-    const modules = moduleManifests.length > 0 && remaining.length > 0
-        ? await resolveAssetManifestNames(moduleManifests, remaining)
-        : {}
-    return { character, modules }
+): Promise<Record<string, AssetNameHit>> {
+    return resolveAssetNamesCached(characterManifest, moduleManifests, names, fuzzy, getDatabase().assetMaxDifference ?? 4)
 }
 
 export async function editAssetManifest(

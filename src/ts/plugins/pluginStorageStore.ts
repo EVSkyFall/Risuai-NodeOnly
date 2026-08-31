@@ -38,6 +38,34 @@ const decoder = new TextDecoder();
 interface CacheEntry {
     value: any;
     bytes: number;
+    // Content hash of the serialized value, so a rewrite of an unchanged value
+    // (V2 setDatabase() round trips re-send every key) is not uploaded again.
+    hash: string;
+}
+
+// Two independent FNV-1a passes over the serialized value.
+function contentHash(text: string): string {
+    let a = 0x811c9dc5, b = 0x01000193;
+    for (let i = 0; i < text.length; i++) {
+        const c = text.charCodeAt(i);
+        a = Math.imul(a ^ c, 0x01000193);
+        b = Math.imul(b ^ c, 0x2f0b4a3d) + 0x9e3779b9;
+    }
+    return `${text.length}:${(a >>> 0).toString(16)}:${(b >>> 0).toString(16)}`;
+}
+
+// Content hash of the value the server holds for each key we have seen this
+// session. Kept apart from the value LRU so unchanged-write detection still
+// works for values that were evicted or never fit the cap (a full-store
+// snapshot handed to a V3 plugin and written straight back).
+let knownHashes = new Map<string, string>();
+
+// True when the server already holds (or will hold, once the key's pending
+// writes drain) exactly this serialized value.
+function serverHasValue(key: string, hash: string): boolean {
+    const pending = pendingOp(key);
+    if (pending) return pending.op === "set" && pending.hash === hash;
+    return !tombstones.has(key) && knownHashes.get(key) === hash;
 }
 
 let index = new Map<string, number>();
@@ -67,7 +95,7 @@ let refreshing: Promise<void> | null = null;
 // and never sent) and settles all their promises together with the survivor.
 // Retries re-check the queue before each attempt so a superseded value is
 // never sent after a newer one arrived.
-type PendingOp = { op: "set"; bytes: Uint8Array } | { op: "remove" };
+type PendingOp = { op: "set"; bytes: Uint8Array; hash: string } | { op: "remove" };
 interface Intent {
     op: PendingOp;
     sync: boolean;
@@ -105,7 +133,8 @@ function evict() {
 }
 
 // `bytes` is the UTF-8 encoded size, matching the index/server sizes.
-function cacheSet(key: string, value: any, bytes: number) {
+function cacheSet(key: string, value: any, bytes: number, hash: string) {
+    knownHashes.set(key, hash);
     const existing = cache.get(key);
     if (existing) {
         cache.delete(key);
@@ -113,7 +142,7 @@ function cacheSet(key: string, value: any, bytes: number) {
     }
     // A single value over the cap would only be evicted again — skip caching it.
     if (!preloaded && bytes > cacheCap) return;
-    cache.set(key, { value, bytes });
+    cache.set(key, { value, bytes, hash });
     cacheBytes += bytes;
     evict();
 }
@@ -180,6 +209,9 @@ export async function refreshIndex(): Promise<void> {
         for (const key of [...cache.keys()]) {
             if (!index.has(key) && !pendingOp(key)) cacheDelete(key);
         }
+        for (const key of [...knownHashes.keys()]) {
+            if (!index.has(key) && !pendingOp(key)) knownHashes.delete(key);
+        }
         if (preloaded) {
             preloadPromise = null;
             await preloadAll();
@@ -199,6 +231,22 @@ function maybeRefreshInBackground() {
 export async function getItem(key: string): Promise<any | null> {
     await init();
     const hit = cacheGet(key);
+    // A write still on its way to the server is what the caller expects to
+    // read back (upstream's setItem was synchronous). Async setItem only
+    // updates the cache after the server confirms, so a cached copy may be
+    // older than the pending write; the sync path caches at once, and then
+    // the hashes match and the cached object is served as-is.
+    const pending = pendingOp(key);
+    if (pending) {
+        if (pending.op === "remove") return null;
+        if (hit && hit.hash === pending.hash) return hit.value;
+        try {
+            return JSON.parse(decoder.decode(pending.bytes));
+        } catch (e) {
+            console.warn(`[pluginStorage] unparseable pending value for "${key}"`, e);
+            return null;
+        }
+    }
     if (hit) return hit.value;
     // Removed by this store in this session → the server has nothing. Any
     // other index miss is read anyway: a miss is cheap and the key may have
@@ -207,18 +255,20 @@ export async function getItem(key: string): Promise<any | null> {
     const data = await forageStorage.getItem(kvKeyFor(key));
     if (!data || data.length === 0) {
         index.delete(key);
+        knownHashes.delete(key);
         return null;
     }
     let value: any;
+    const text = decoder.decode(data);
     try {
-        value = JSON.parse(decoder.decode(data));
+        value = JSON.parse(text);
     } catch (e) {
         console.warn(`[pluginStorage] unparseable value for "${key}" — treating as missing`, e);
         index.delete(key);
         return null;
     }
     index.set(key, data.length);
-    cacheSet(key, value, data.length);
+    cacheSet(key, value, data.length, contentHash(text));
     return value;
 }
 
@@ -294,12 +344,18 @@ export async function setItem(key: string, value: any): Promise<void> {
     await init();
     const json = JSON.stringify(value);
     const bytes = encoder.encode(json);
+    const hash = contentHash(json);
+    if (serverHasValue(key, hash)) {
+        // Unchanged content: refresh the cached object only, no upload.
+        cacheSet(key, value, bytes.length, hash);
+        return;
+    }
     // Server first: the cache must never claim a value the server never got.
-    const superseded = await enqueue(key, { op: "set", bytes }, false);
+    const superseded = await enqueue(key, { op: "set", bytes, hash }, false);
     if (superseded) return; // a newer write already owns cache/index
     index.set(key, bytes.length);
     tombstones.delete(key);
-    cacheSet(key, value, bytes.length);
+    cacheSet(key, value, bytes.length, hash);
 }
 
 export async function removeItem(key: string): Promise<void> {
@@ -311,6 +367,7 @@ export async function removeItem(key: string): Promise<void> {
     index.delete(key);
     tombstones.add(key);
     cacheDelete(key);
+    knownHashes.delete(key);
 }
 
 export async function clear(): Promise<void> {
@@ -334,6 +391,13 @@ export function length(): number {
     return index.size;
 }
 
+// Sum of every stored value's size (from the index; pending writes included).
+export function totalBytes(): number {
+    let total = 0;
+    for (const bytes of index.values()) total += bytes;
+    return total;
+}
+
 export function size(key: string): number | undefined {
     return index.get(key);
 }
@@ -349,11 +413,42 @@ export function isPreloaded(): boolean {
 // Load every value into the cache so the synchronous V2 API can be served.
 // This is the pre-lazy memory footprint (one copy), only paid when a V2
 // plugin is enabled.
+// One streamed response for the whole store; falls back to per-key reads if
+// the bulk endpoint fails (older server, transport error mid-stream).
+async function preloadBulk(): Promise<void> {
+    await forageStorage.getPluginStorageAll((key, text) => { ingestStreamed(key, text); });
+}
+
+// One entry of the streamed store into index/cache. Returns the parsed value,
+// or undefined when it was not taken: local state wins (a cached value, a
+// pending write or a removal made in this session is newer than what the
+// server streams), and unparseable text counts as missing.
+function ingestStreamed(key: string, text: string): any | undefined {
+    if (cache.has(key) || pendingOp(key) || tombstones.has(key)) return undefined;
+    let value: any;
+    try {
+        value = JSON.parse(text);
+    } catch (e) {
+        console.warn(`[pluginStorage] unparseable value for "${key}" — treating as missing`, e);
+        index.delete(key);
+        return undefined;
+    }
+    const bytes = encoder.encode(text).length;
+    index.set(key, bytes);
+    cacheSet(key, value, bytes, contentHash(text));
+    return value;
+}
+
 export function preloadAll(): Promise<void> {
     if (!preloadPromise) {
         preloadPromise = (async () => {
             await init();
             preloaded = true;
+            try {
+                await preloadBulk();
+            } catch (e) {
+                console.warn('[pluginStorage] bulk preload failed, reading keys one by one', e);
+            }
             const pending = [...index.keys()].filter((k) => !cache.has(k));
             const CONCURRENCY = 8;
             for (let i = 0; i < pending.length; i += CONCURRENCY) {
@@ -375,19 +470,28 @@ export function preloadAll(): Promise<void> {
 export async function snapshotAll(): Promise<Record<string, any>> {
     await refreshIndex();
     const out: Record<string, any> = {};
-    const all = [...index.keys()];
+    // defineProperty so a stored "__proto__" key stays an own property (same
+    // as the server's readAll).
+    const put = (k: string, v: any) => {
+        if (v === null || v === undefined) return;
+        Object.defineProperty(out, k, { value: v, enumerable: true, writable: true, configurable: true });
+    };
+    // One streamed response, like the V2 preload: thousands of keys over a
+    // remote link would otherwise mean thousands of round trips per snapshot.
+    try {
+        await forageStorage.getPluginStorageAll((key, text) => { put(key, ingestStreamed(key, text)); });
+    } catch (e) {
+        console.warn('[pluginStorage] bulk snapshot failed, reading keys one by one', e);
+    }
+    // Whatever the stream did not fill (values already cached, pending
+    // writes, or everything after a failed stream) comes through the normal
+    // read path.
+    const rest = [...index.keys()].filter((k) => !Object.prototype.hasOwnProperty.call(out, k));
     const CONCURRENCY = 8;
-    for (let i = 0; i < all.length; i += CONCURRENCY) {
-        const chunk = all.slice(i, i + CONCURRENCY);
+    for (let i = 0; i < rest.length; i += CONCURRENCY) {
+        const chunk = rest.slice(i, i + CONCURRENCY);
         const values = await Promise.all(chunk.map((k) => getItem(k)));
-        chunk.forEach((k, j) => {
-            if (values[j] === null || values[j] === undefined) return;
-            // defineProperty so a stored "__proto__" key stays an own property
-            // (same as the server's readAll).
-            Object.defineProperty(out, k, {
-                value: values[j], enumerable: true, writable: true, configurable: true,
-            });
-        });
+        chunk.forEach((k, j) => put(k, values[j]));
     }
     return out;
 }
@@ -412,15 +516,21 @@ export function setItemSync(key: string, value: any): void {
     if (value === undefined) return removeItemSync(key);
     const json = JSON.stringify(value);
     const bytes = encoder.encode(json);
+    const hash = contentHash(json);
+    if (serverHasValue(key, hash)) {
+        cacheSet(key, value, bytes.length, hash);
+        return;
+    }
     index.set(key, bytes.length);
     tombstones.delete(key);
-    cacheSet(key, value, bytes.length);
-    enqueueSync(key, { op: "set", bytes });
+    cacheSet(key, value, bytes.length, hash);
+    enqueueSync(key, { op: "set", bytes, hash });
 }
 
 export function removeItemSync(key: string): void {
     const existed = index.delete(key);
     cacheDelete(key);
+    knownHashes.delete(key);
     tombstones.add(key);
     if (existed || pendingOp(key)) {
         enqueueSync(key, { op: "remove" });
@@ -437,6 +547,7 @@ export function _resetForTests() {
     initPromise = null;
     cache = new Map();
     cacheBytes = 0;
+    knownHashes = new Map();
     cacheCap = DEFAULT_CACHE_CAP;
     preloaded = false;
     preloadPromise = null;

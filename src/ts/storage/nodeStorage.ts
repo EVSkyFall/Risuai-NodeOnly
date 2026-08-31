@@ -121,6 +121,8 @@ export interface SettingsBackupEstimate {
 
 export type AssetManifestTuple = [string, string] | [string, string, string]
 
+export type AssetNameResolution = { resolved: Record<string, string>; fuzzy: string[] }
+
 export interface AssetManifestDescriptor {
     id: string
     version: number
@@ -722,7 +724,7 @@ export class NodeStorage{
         owners: Array<{ kind?: string; ownerId?: string; manifestId?: string; fuzzy?: boolean }>,
         names: string[],
         maxDistance: number,
-    ): Promise<Record<string, string>> {
+    ): Promise<AssetNameResolution> {
         const da = await this.authFetch('/api/asset-manifests/resolve', {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
@@ -730,7 +732,9 @@ export class NodeStorage{
         })
         if (!da.ok) throw new Error(`asset manifest resolve error: ${da.status}`)
         const body = await da.json()
-        return body.resolved ?? {}
+        // `fuzzy` lists the names only the fuzzy fallback matched (older
+        // servers omit it: treat everything as exact, as before).
+        return { resolved: body.resolved ?? {}, fuzzy: Array.isArray(body.fuzzy) ? body.fuzzy : [] }
     }
 
     async editAssetManifest(
@@ -776,6 +780,32 @@ export class NodeStorage{
         const da = await this.authFetch('/api/plugin-storage/index', { method: 'GET' })
         if (da.status < 200 || da.status >= 300) throw await this.storageRequestError('pluginStorageIndex', da)
         return await da.json()
+    }
+
+    // Streams every plugin-storage value (NDJSON `[key, json]` per line).
+    async getPluginStorageAll(onEntry: (key: string, text: string) => void): Promise<void> {
+        const da = await this.authFetch('/api/plugin-storage/all', { method: 'GET' })
+        if (da.status < 200 || da.status >= 300) throw await this.storageRequestError('pluginStorageAll', da)
+        const reader = da.body!.getReader()
+        const decoder = new TextDecoder()
+        let buffer = ''
+        while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
+            buffer += decoder.decode(value, { stream: true })
+            const lines = buffer.split('\n')
+            buffer = lines.pop()!
+            for (const line of lines) {
+                if (!line) continue
+                const [key, text] = JSON.parse(line)
+                onEntry(key, text)
+            }
+        }
+        buffer += decoder.decode()
+        if (buffer.trim()) {
+            const [key, text] = JSON.parse(buffer)
+            onEntry(key, text)
+        }
     }
 
     async settingsBackupEstimate(): Promise<SettingsBackupEstimate> {

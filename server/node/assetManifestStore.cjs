@@ -354,7 +354,9 @@ function createAssetManifestStore(db, options = {}) {
         };
     }
 
-    function resolveNames(owners, names, { maxDistance = DEFAULT_FUZZY_DISTANCE } = {}) {
+    // `fuzzyNamesOut` (a Set) receives the names that only the fuzzy fallback
+    // matched, so a client can rank those below its own exact matches.
+    function resolveNames(owners, names, { maxDistance = DEFAULT_FUZZY_DISTANCE, fuzzyNamesOut = null } = {}) {
         const wanted = new Set((names || []).map((name) => String(name).toLocaleLowerCase()));
         // Asset names are imported data. A null-prototype result keeps names
         // such as "__proto__" and "constructor" as ordinary lookup keys.
@@ -404,7 +406,10 @@ function createAssetManifestStore(db, options = {}) {
                     }
                 }
             }
-            if (bestPath && bestDistance <= distanceCeiling) resolved[name] = bestPath;
+            if (bestPath && bestDistance <= distanceCeiling) {
+                resolved[name] = bestPath;
+                if (fuzzyNamesOut) fuzzyNamesOut.add(name);
+            }
         }
         return resolved;
     }
