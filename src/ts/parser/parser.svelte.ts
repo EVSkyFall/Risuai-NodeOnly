@@ -515,10 +515,7 @@ async function parseAdditionalAssets(data:string, char:simpleCharacterArgument|c
                     moduleManifests,
                     names,
                 )
-                for (const [name, path] of Object.entries(resolved.modules)) {
-                    assetPaths[name] ??= { srcPaths: [path] }
-                }
-                for (const [name, path] of Object.entries(resolved.character)) {
+                for (const [name, path] of Object.entries(resolved)) {
                     assetPaths[name] = { srcPaths: [path] }
                 }
             } catch (error) {

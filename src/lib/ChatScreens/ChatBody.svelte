@@ -330,10 +330,7 @@
             const requestedNames = [...imgs]
                 .map((img) => img.getAttribute('src')?.toLocaleLowerCase() || '')
                 .filter((name) => name.length >= 3 && name.length <= 200 && !name.includes(':'))
-            let manifestResolved = { character: {}, modules: {} } as {
-                character: Record<string, string>
-                modules: Record<string, string>
-            }
+            let manifestResolved: Record<string, string> = {}
             if ((moduleManifests.length > 0 || currentCharacter.additionalAssetManifest) && requestedNames.length > 0) {
                 try {
                     manifestResolved = await resolvePrioritizedAssetManifestNames(
@@ -357,7 +354,7 @@
                     return
                 }
                 
-                const foundAsset = manifestResolved.character[name] ?? exactAssets.get(name) ?? manifestResolved.modules[name]
+                const foundAsset = manifestResolved[name] ?? exactAssets.get(name)
                 if(foundAsset){
                     img.classList.add('root-loaded-image')
                     img.classList.add('root-loaded-image-' + styl)
