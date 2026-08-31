@@ -8,6 +8,7 @@
     import { updateColorScheme, updateTextThemeAndCSS } from "src/ts/gui/colorscheme";
     import { updateAnimationSpeed } from "src/ts/gui/animation";
     import { updateGuisize } from "src/ts/gui/guisize";
+    import { RISU_THEME_PRESET_DRAG_TYPE } from "src/ts/dragTypes";
 
     let editMode = $state(false)
     let isDragging = $state(false)
@@ -42,14 +43,27 @@
         DBState.db.themePresets = themePresets;
     }
 
-    function handlePresetDrop(targetIndex: number, e) {
+    // Typed drag per src/ts/dragTypes.ts: dragover must stopPropagation() and
+    // set dropEffect, or the event bubbles to <main>, whose file-import guard
+    // sets dropEffect='none' for app-internal drags and the drop never fires.
+    function isPresetDrag(e: DragEvent) {
+        return !!e.dataTransfer?.types.includes(RISU_THEME_PRESET_DRAG_TYPE)
+    }
+
+    function handlePresetDragOver(e: DragEvent) {
+        if (!isPresetDrag(e)) return false
+        e.preventDefault()
+        e.stopPropagation()
+        e.dataTransfer.dropEffect = 'move'
+        return true
+    }
+
+    function handlePresetDrop(targetIndex: number, e: DragEvent) {
+        if (!isPresetDrag(e)) return
         e.preventDefault();
         e.stopPropagation();
-        const data = e.dataTransfer?.getData('text');
-        if (data === 'themePreset') {
-            const sourceIndex = parseInt(e.dataTransfer?.getData('presetIndex') || '0');
-            movePreset(sourceIndex, targetIndex);
-        }
+        const sourceIndex = parseInt(e.dataTransfer?.getData(RISU_THEME_PRESET_DRAG_TYPE) || '0');
+        movePreset(sourceIndex, targetIndex);
     }
 
     function applyThemeVisuals() {
@@ -80,7 +94,7 @@
                 class:hover:bg-gray-600={!isDragging}
                 role="listitem"
                 ondragover={(e) => {
-                    e.preventDefault()
+                    if (!handlePresetDragOver(e)) return
                     dragOverIndex = i
                 }}
                 ondragleave={(e) => {
@@ -109,8 +123,7 @@
                     return
                 }
                 isDragging = true
-                e.dataTransfer?.setData('text', 'themePreset')
-                e.dataTransfer?.setData('presetIndex', i.toString())
+                e.dataTransfer?.setData(RISU_THEME_PRESET_DRAG_TYPE, i.toString())
 
                 const dragElement = document.createElement('div')
                 dragElement.textContent = preset?.name || 'Unnamed Theme'
@@ -127,7 +140,7 @@
                 dragOverIndex = -1
             }}
             ondragover={(e) => {
-                e.preventDefault()
+                if (!handlePresetDragOver(e)) return
                 const rect = e.currentTarget.getBoundingClientRect()
                 const mouseY = e.clientY
                 const elementCenter = rect.top + rect.height / 2

@@ -36,3 +36,6 @@ export const RISU_SIDEBAR_DRAG_TYPE = 'application/x-risu-sidebar-drag'
 
 /** TriggerV2 trigger reorder */
 export const RISU_TRIGGER_DRAG_TYPE = 'application/x-risu-trigger-drag'
+
+/** Theme preset reorder */
+export const RISU_THEME_PRESET_DRAG_TYPE = 'application/x-risu-theme-preset-drag'
