@@ -869,6 +869,11 @@
             fullwidth
             onkeydown={(e) => {
                 if (e.key === 'Enter' && !e.isComposing) {
+                    // Closing the popup returns focus to the button that opened
+                    // it before this key's keypress fires; without preventDefault
+                    // that keypress activates the button and reopens the popup
+                    // (a second "new folder" dialog, then a duplicate folder).
+                    e.preventDefault()
                     alertStore.set({ type: 'none', msg: input })
                 }
             }}
