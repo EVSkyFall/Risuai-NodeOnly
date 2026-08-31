@@ -1108,7 +1108,10 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         stageTimings.stage1Duration = Date.now() - stageTimings.stage1Start
         while(currentTokens > maxContextTokens){
             if(chats.length <= 1){
-                throwError(language.errors.toomuchtoken + "\n\nRequired Tokens: " + currentTokens)
+                // Spell out the budget: most reports of this error are a stray
+                // max-response (e.g. 65535 from an imported prompt preset) or
+                // a max-context far below the prompt, which the user can fix.
+                throwError(language.errors.toomuchtoken + "\n\nRequired Tokens: " + currentTokens + " / Max Context: " + maxContextTokens + " / Reserved Output: " + maxResponseTokens)
 
                 if (realChatId) clearPendingSend(realChatId)
                 return false
