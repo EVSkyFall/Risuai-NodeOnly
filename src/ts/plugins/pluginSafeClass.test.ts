@@ -14,7 +14,8 @@ vi.mock('../globalApi.svelte', () => ({
         getItem: async (key: string) => kv.get(key) ?? null,
         setItem: async (key: string, value: Uint8Array) => {
             if (failWrites) throw new Error('write rejected')
-            if (poison && new TextDecoder().decode(value).includes(poison)) throw new Error('write rejected')
+            // One-shot: the first matching write fails, later ones succeed.
+            if (poison && new TextDecoder().decode(value).includes(poison)) { poison = null; throw new Error('write rejected') }
             kv.set(key, value)
         },
         removeItem: async (key: string) => {
@@ -74,6 +75,16 @@ describe('SafeLocalPluginStorage write failure', () => {
         await storage.setItem('k', 'c')
         await expect(failing).rejects.toThrow()
         expect(await storage.getItem('k')).toBe('c')
+    })
+
+    test('rollback does not clobber a newer write of the same value', async () => {
+        const storage = new SafeLocalPluginStorage('p')
+        await storage.setItem('k', 'a')
+        poison = 'same'
+        const failing = storage.setItem('k', 'same')
+        await storage.setItem('k', 'same')
+        await expect(failing).rejects.toThrow()
+        expect(await storage.getItem('k')).toBe('same')
     })
 
     test('an owner-record failure after a successful write is not a write failure', async () => {

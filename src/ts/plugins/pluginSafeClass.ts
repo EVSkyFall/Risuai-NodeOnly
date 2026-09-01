@@ -4,6 +4,10 @@ import { recordOwner, removeOwner, clearOwners } from "./pluginStorageMeta";
 
 const pluginStorage = new Map<string, unknown>();
 const pluginStoragePrefix = 'cache/plugin-storage/';
+// Latest write per cache key, so a failed write only rolls back if no later
+// write (even of the same value) has taken the slot since.
+const latestWrite = new Map<string, number>();
+let writeSeq = 0;
 
 export class SafeLocalStorage {
     getItem(key: string): string | null {
@@ -78,12 +82,14 @@ export class SafeLocalPluginStorage {
         const cacheKey = `safe_plugin_${key}`;
         const had = pluginStorage.has(cacheKey);
         const previous = pluginStorage.get(cacheKey);
+        const token = ++writeSeq;
+        latestWrite.set(cacheKey, token);
         pluginStorage.set(cacheKey, value);
         try {
             await writePersistentJson(makeEncodedStorageKey(pluginStoragePrefix, key), value);
         } catch (e) {
-            // Only undo our own value; a newer write may already own the slot.
-            if (pluginStorage.get(cacheKey) === value) {
+            // Only undo our own write; a newer one may already own the slot.
+            if (latestWrite.get(cacheKey) === token) {
                 if (had) pluginStorage.set(cacheKey, previous);
                 else pluginStorage.delete(cacheKey);
             }
@@ -99,11 +105,13 @@ export class SafeLocalPluginStorage {
         const cacheKey = `safe_plugin_${key}`;
         const had = pluginStorage.has(cacheKey);
         const previous = pluginStorage.get(cacheKey);
+        const token = ++writeSeq;
+        latestWrite.set(cacheKey, token);
         pluginStorage.delete(cacheKey);
         try {
             await removePersistentKey(makeEncodedStorageKey(pluginStoragePrefix, key));
         } catch (e) {
-            if (had && !pluginStorage.has(cacheKey)) pluginStorage.set(cacheKey, previous);
+            if (had && latestWrite.get(cacheKey) === token) pluginStorage.set(cacheKey, previous);
             throw e;
         }
         if (this.owner) {
@@ -121,6 +129,8 @@ export class SafeLocalPluginStorage {
         return keys;
     }
     async clear(): Promise<void> {
+        // A write still in flight must not restore anything into the cleared cache.
+        latestWrite.clear();
         for (const key of [...pluginStorage.keys()]) {
             if (key.startsWith('safe_plugin_')) {
                 pluginStorage.delete(key);
