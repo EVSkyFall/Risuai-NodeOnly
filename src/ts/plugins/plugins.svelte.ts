@@ -138,6 +138,14 @@ export async function updatePlugin(plugin: RisuPlugin) {
     return false
 }
 
+// Argument declarations are 'int' | 'string' | string[] (option lists written
+// by plugin managers); two option lists are the same type when they list the
+// same options in the same order.
+function sameArgType(a: unknown, b: unknown): boolean {
+    if (Array.isArray(a) && Array.isArray(b)) return a.length === b.length && a.every((v, i) => v === b[i])
+    return a === b
+}
+
 export async function importPlugin(code:string|null = null, argu:{
     isUpdate?: boolean
     originalPluginName?: string
@@ -435,7 +443,7 @@ export async function importPlugin(code:string|null = null, argu:{
             // setArgument): every key the new code still declares with the
             // same type keeps its value; new or retyped keys start at default.
             for (const key of Object.keys(arg)) {
-                if (oldPlugin.arguments?.[key] === arg[key] && oldPlugin.realArg && key in oldPlugin.realArg) {
+                if (sameArgType(oldPlugin.arguments?.[key], arg[key]) && oldPlugin.realArg && key in oldPlugin.realArg) {
                     realArg[key] = oldPlugin.realArg[key]
                 }
             }
@@ -470,6 +478,8 @@ export async function importPlugin(code:string|null = null, argu:{
 
 let pluginTranslator = false
 
+let v2PreloadAlertShown = false
+
 export async function loadPlugins() {
     console.log('Loading plugins...')
     let db = getDatabase()
@@ -492,13 +502,19 @@ export async function loadPlugins() {
     }
 
     if (storageReady || pluginV2.length === 0) {
+        v2PreloadAlertShown = false
         await loadV2Plugin(pluginV2)
     } else {
         // Never run V2 plugins against an empty store: their sync reads would
         // all return null and a plugin that then writes its defaults overwrites
         // the real data on the server. Tear down any previous V2 state (unload
         // hooks, provider maps) and leave them off until the next loadPlugins().
-        alertError(language.pluginStorageV2PreloadFailed)
+        // loadPlugins() is re-run by settings toggles and plugin managers;
+        // one alert per outage, not one per call.
+        if (!v2PreloadAlertShown) {
+            v2PreloadAlertShown = true
+            alertError(language.pluginStorageV2PreloadFailed)
+        }
         await loadV2Plugin([])
     }
     await loadV3Plugins(pluginV3)
