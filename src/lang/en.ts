@@ -1697,6 +1697,7 @@ export const languageEnglish = {
     serverBackupSave: "Save Backup to Server",
     serverBackupManage: "Manage Server Backups",
     serverBackupSaving: "Saving backup to server...",
+    pluginStorageV2PreloadFailed: "Plugin storage could not be loaded, so V2 plugins were not started. Reload to try again.",
     serverBackupSaveSuccess: (filename: string, size: string) => `Backup saved: ${filename} (${size})`,
     serverBackupLoading: "Loading backup list...",
     serverBackupEmpty: "No server backups found.",

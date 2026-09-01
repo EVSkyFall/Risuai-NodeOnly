@@ -482,14 +482,25 @@ export async function loadPlugins() {
     // Plugin values live on the server, never in db.pluginCustomStorage. V3
     // reads on demand; the V2 API is synchronous, so any enabled V2 plugin
     // forces a full preload into the store's cache.
+    let storageReady = true
     try {
         await pluginStorageStore.init()
         if (pluginV2.length > 0) await pluginStorageStore.preloadAll()
     } catch (e) {
+        storageReady = false
         console.error('[pluginStorage] init failed', e)
     }
 
-    await loadV2Plugin(pluginV2)
+    if (storageReady || pluginV2.length === 0) {
+        await loadV2Plugin(pluginV2)
+    } else {
+        // Never run V2 plugins against an empty store: their sync reads would
+        // all return null and a plugin that then writes its defaults overwrites
+        // the real data on the server. Tear down any previous V2 state (unload
+        // hooks, provider maps) and leave them off until the next loadPlugins().
+        alertError(language.pluginStorageV2PreloadFailed)
+        await loadV2Plugin([])
+    }
     await loadV3Plugins(pluginV3)
 }
 
