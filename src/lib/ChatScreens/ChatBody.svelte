@@ -9,6 +9,8 @@
     import { getModuleAssets, getModules } from "src/ts/process/modules";
     import { getCurrentCharacter } from "src/ts/storage/database.svelte";
     import { getFileSrc, resolvePrioritizedAssetManifestNames } from "src/ts/globalApi.svelte";
+    import { get } from "svelte/store";
+    import { doingChat } from "src/ts/process/generationState";
 
     interface Props {
         character?: simpleCharacterArgument|string|null
@@ -150,7 +152,11 @@
         let finalResult = fallbackParsed
 
         translationFlight = (async () => {
-            if (DBState.db.showTranslationLoading && !hasRenderableResult(lastParsed)) {
+            // While a generation streams, every chunk re-parses; swapping the
+            // rendered text for the spinner each time is the flicker of #21,
+            // so the spinner then only fills an empty slot. A translation the
+            // user asked for, or one outside streaming, shows it as upstream.
+            if (DBState.db.showTranslationLoading && (!hasRenderableResult(lastParsed) || request.retranslate || !get(doingChat))) {
                 lastParsed = translationLoadingHTML
             }
             // Leave the $derived sync section before writing bound state (state_unsafe_mutation)
@@ -177,8 +183,9 @@
                 }
             }
             finally {
-                if(!hasRenderableResult(finalResult) && lastParsed === translationLoadingHTML){
-                    lastParsed = fallbackParsed
+                // A failed flight must never leave the spinner on screen.
+                if(lastParsed === translationLoadingHTML){
+                    lastParsed = hasRenderableResult(finalResult) ? finalResult : fallbackParsed
                 }
                 translating = false
                 translationActiveRequest = null
