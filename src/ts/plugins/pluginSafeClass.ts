@@ -68,16 +68,48 @@ export class SafeLocalPluginStorage {
         }
         return payload;
     }
+    // The cache is updated first so a plugin that reads straight back without
+    // awaiting sees its write (upstream's IndexedDB queue gave that ordering).
+    // If the server rejects the write (423 session lock, timeout) the cache is
+    // rolled back and the error reaches the plugin — otherwise the plugin, and
+    // the user, would believe a value is saved that a reload or another
+    // device will never see.
     async setItem<T>(key: string, value: T): Promise<void> {
         const cacheKey = `safe_plugin_${key}`;
+        const had = pluginStorage.has(cacheKey);
+        const previous = pluginStorage.get(cacheKey);
         pluginStorage.set(cacheKey, value);
-        await writePersistentJson(makeEncodedStorageKey(pluginStoragePrefix, key), value);
-        if (this.owner) await recordOwner('idb', key, this.owner);
+        try {
+            await writePersistentJson(makeEncodedStorageKey(pluginStoragePrefix, key), value);
+        } catch (e) {
+            // Only undo our own value; a newer write may already own the slot.
+            if (pluginStorage.get(cacheKey) === value) {
+                if (had) pluginStorage.set(cacheKey, previous);
+                else pluginStorage.delete(cacheKey);
+            }
+            throw e;
+        }
+        if (this.owner) {
+            // Sidecar metadata only; its failure must not read as a lost write.
+            try { await recordOwner('idb', key, this.owner); }
+            catch (e) { console.warn(`[plugin storage] owner record for "${key}" failed`, e); }
+        }
     }
     async removeItem(key: string): Promise<void> {
-        pluginStorage.delete(`safe_plugin_${key}`);
-        await removePersistentKey(makeEncodedStorageKey(pluginStoragePrefix, key));
-        if (this.owner) await removeOwner('idb', key);
+        const cacheKey = `safe_plugin_${key}`;
+        const had = pluginStorage.has(cacheKey);
+        const previous = pluginStorage.get(cacheKey);
+        pluginStorage.delete(cacheKey);
+        try {
+            await removePersistentKey(makeEncodedStorageKey(pluginStoragePrefix, key));
+        } catch (e) {
+            if (had && !pluginStorage.has(cacheKey)) pluginStorage.set(cacheKey, previous);
+            throw e;
+        }
+        if (this.owner) {
+            try { await removeOwner('idb', key); }
+            catch (e) { console.warn(`[plugin storage] owner record removal for "${key}" failed`, e); }
+        }
     }
     async keys(): Promise<string[]> {
         const keys: string[] = [];
