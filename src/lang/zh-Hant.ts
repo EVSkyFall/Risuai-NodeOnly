@@ -1428,7 +1428,7 @@ export const languageChineseTraditional = {
     "serverBackupSave": "儲存備份至伺服器",
     "serverBackupManage": "管理伺服器備份",
     "serverBackupSaving": "正在儲存備份至伺服器...",
-    "serverBackupSaveSuccess": (filename: string, size: string) => `備份已儲存：${filename}（${size}）`,
+    "serverBackupSaveSuccess": (filename: string, size: string, dir?: string) => `備份已儲存：${filename}（${size}）${dir ? `，位置：${dir}` : ''}`,
     "serverBackupLoading": "正在載入備份列表...",
     "serverBackupEmpty": "未找到伺服器備份。",
     "serverBackupRestore": "還原",

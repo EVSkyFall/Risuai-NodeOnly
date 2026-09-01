@@ -430,7 +430,7 @@ export async function SaveServerBackup() {
             const bytesStr = formatBytes(bytes)
             alertWait(`${language.serverBackupSaving} (${pct}% - ${bytesStr})`)
         })
-        notifySuccess(language.serverBackupSaveSuccess(result.filename, formatBytes(result.size)))
+        notifySuccess(language.serverBackupSaveSuccess(result.filename, formatBytes(result.size), result.dir))
     } catch (error) {
         console.error(error)
         alertError(error instanceof Error ? error.message : 'Server backup failed')

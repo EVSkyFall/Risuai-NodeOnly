@@ -917,7 +917,7 @@ export class NodeStorage{
 
     async saveServerBackup(
         onProgress?: (current: number, total: number, bytes: number, totalBytes: number) => void
-    ): Promise<{ok: boolean, filename: string, size: number}> {
+    ): Promise<{ok: boolean, filename: string, size: number, dir?: string}> {
         const da = await this.authFetch('/api/backup/server/save', {
             method: 'POST',
             headers: {
@@ -933,7 +933,7 @@ export class NodeStorage{
         const reader = da.body!.getReader()
         const decoder = new TextDecoder()
         let buffer = ''
-        let result: {ok: boolean, filename: string, size: number} | null = null
+        let result: {ok: boolean, filename: string, size: number, dir?: string} | null = null
 
         while (true) {
             const { done, value } = await reader.read()
