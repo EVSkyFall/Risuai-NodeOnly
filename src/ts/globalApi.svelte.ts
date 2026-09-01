@@ -38,7 +38,8 @@ import {
     extractLegacyUsage,
     type RequestLogCategory, type RequestLogSource, type RequestLogRoute,
 } from "./requestLog";
-import { cacheFullAssetManifest } from './storage/assetManifestCache';
+import { cacheFullAssetManifest, getCachedFullAssetManifest } from './storage/assetManifestCache';
+import { resolveNamesLocally } from './storage/assetNameLocalResolver';
 import { createAssetNameResolver, type AssetNameHit } from './storage/assetNameResolver'
 
 export const forageStorage = new AutoStorage()
@@ -63,9 +64,41 @@ export async function loadAssetManifestItems(manifest?: AssetManifestDescriptor)
 // One call for character + modules, answers remembered per manifest set —
 // see assetNameResolver.ts for why (module names lost to character fuzzy
 // matches, and a round trip per parsed message).
-const resolveAssetNamesCached = createAssetNameResolver((owners, names, maxDistance) =>
-    forageStorage.resolveAssetManifestNames(owners, names, maxDistance),
-)
+//
+// Local first: when every referenced manifest is in the full-manifest cache
+// (prefetched at chat entry), the names match client-side and the chat
+// render path touches no network — the v1.10 behavior. The server route is
+// only the cold-cache fallback.
+const resolveAssetNamesCached = createAssetNameResolver(async (owners, names, maxDistance) => {
+    const local = resolveNamesLocally(owners, names, maxDistance)
+    if (local) return local
+    return forageStorage.resolveAssetManifestNames(owners, names, maxDistance)
+})
+
+// Manifest ids (and descriptor objects — a 404 refresh rewrites the id in
+// place mid-load) already being fetched, so overlapping prefetch calls (chat
+// entry effect + every parse) never duplicate a download.
+const manifestPrefetchesInFlight = new Set<string>()
+const manifestDescriptorsInFlight = new WeakSet<AssetManifestDescriptor>()
+
+// Fire-and-forget: warm the full-manifest cache so name resolution and the
+// CBS list functions run locally. Ids are content-addressed, so a cached
+// manifest is never stale and a fetched one never needs refreshing.
+export function prefetchAssetManifests(manifests: Array<AssetManifestDescriptor | undefined>): void {
+    for (const manifest of manifests) {
+        const id = manifest?.id
+        if (!id) continue
+        if (getCachedFullAssetManifest(id) || manifestPrefetchesInFlight.has(id) || manifestDescriptorsInFlight.has(manifest)) continue
+        manifestPrefetchesInFlight.add(id)
+        manifestDescriptorsInFlight.add(manifest)
+        void loadAssetManifestItems(manifest)
+            .catch((error) => console.warn('[Assets] asset manifest prefetch failed', error))
+            .finally(() => {
+                manifestPrefetchesInFlight.delete(id)
+                manifestDescriptorsInFlight.delete(manifest)
+            })
+    }
+}
 
 export async function resolvePrioritizedAssetManifestNames(
     characterManifest: AssetManifestDescriptor | undefined,
@@ -73,7 +106,14 @@ export async function resolvePrioritizedAssetManifestNames(
     names: string[],
     { fuzzy = true }: { fuzzy?: boolean } = {},
 ): Promise<Record<string, AssetNameHit>> {
-    return resolveAssetNamesCached(characterManifest, moduleManifests, names, fuzzy, getDatabase().assetMaxDifference ?? 4)
+    // Start the resolve first: on a cold cache it falls back to the server,
+    // and that small POST must enter the connection queue ahead of the
+    // manifest page GETs the prefetch is about to fire — first paint is the
+    // thing this whole path exists to protect.
+    const result = resolveAssetNamesCached(characterManifest, moduleManifests, names, fuzzy, getDatabase().assetMaxDifference ?? 4)
+    // Then warm the cache so the next parse resolves locally.
+    prefetchAssetManifests([characterManifest, ...moduleManifests])
+    return result
 }
 
 export async function editAssetManifest(

@@ -1,6 +1,10 @@
 import type { AssetManifestTuple } from './nodeStorage'
 
-const MAX_ENTRIES = 8
+// Sized so a heavy setup (character + dozens of asset modules) fits without
+// thrashing: entries are name→path tuples (~1MB per 5,000 assets), and the
+// local name resolver serves the chat render path straight from this cache —
+// an evicted manifest costs a full re-download on the next parse.
+const MAX_ENTRIES = 64
 const MAX_BYTES = 32 * 1024 * 1024
 const fullManifestCache = new Map<string, { items: AssetManifestTuple[]; bytes: number }>()
 let fullManifestCacheBytes = 0

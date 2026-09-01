@@ -1330,6 +1330,8 @@ export const languageGerman = {
     "pluginFullStorageAccessDesc": "Übergibt diesem Plugin bei jedem Lesen der Datenbank die gespeicherten Daten aller Plugins. Der gesamte Plugin-Speicher ({} derzeit) wird bei jedem Lesen kopiert. Nur für Plugins aktivieren, die Daten anderer Plugins benötigen.",
     "pluginFullStorageAccessLarge": "Der Plugin-Speicher überschreitet 100 MB. Bei einem Plugin, das häufig liest, kann die App dadurch langsam werden oder einfrieren.",
     "pluginFullStorageAccessGuide": "Mehr erfahren",
+    "pluginStorageV2PreloadFailed": "Der Plugin-Speicher konnte nicht geladen werden, daher wurden V2-Plugins nicht gestartet. Laden Sie die Seite neu, um es erneut zu versuchen.",
+    "serverBackupSaveSuccess": (filename: string, size: string, dir?: string) => `Backup gespeichert: ${filename} (${size})${dir ? ` in ${dir}` : ''}`,
     "enableScrollToActiveChar": "Scrollen zum aktiven Charakter aktivieren",
     "newMessageButtonRightCenter": "Mitte rechts",
     "trimStartNewChat": "„Neuen Chat starten“-Nachrichten kürzen",

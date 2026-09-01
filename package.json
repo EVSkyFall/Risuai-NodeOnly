@@ -76,7 +76,7 @@
     "sucrase": "^3.35.1",
     "sv": "^0.11.0",
     "svelte-awesome-color-picker": "^4.1.0",
-    "svelte-sonner": "^1.1.0",
+    "svelte-sonner": "^1.2.1",
     "tailwind-merge": "^3.5.0",
     "three": "^0.154.0",
     "tippy.js": "^6.3.7",

@@ -6,7 +6,7 @@ const path = require('path');
 const net = require('net');
 const compression = require('compression');
 const htmlparser = require('node-html-parser');
-const { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, unlinkSync } = require('fs');
+const { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, unlinkSync, statSync } = require('fs');
 const fs = require('fs/promises')
 const nodeCrypto = require('crypto')
 const zlib = require('zlib')
@@ -1170,6 +1170,37 @@ if(!existsSync(backupsDir)){
 }
 writeBackupPathMarker(backupsDir);
 const BACKUP_FILENAME_REGEX = /^risu-backup-\d+\.bin$/;
+
+// A server restart mid-save (the update popup lets a user start a backup and
+// then update) leaves `risu-backup-<ts>.bin.tmp` behind: invisible in the
+// backup list, never cleaned. Sweep only stale ones — a fresh .tmp may belong
+// to a save still running in another instance.
+function sweepStaleBackupTmp() {
+    const STALE_MS = 60 * 60 * 1000;
+    try {
+        for (const name of readdirSync(backupsDir)) {
+            if (!/^risu-backup-\d+\.bin\.tmp$/.test(name)) continue;
+            const full = path.join(backupsDir, name);
+            try {
+                if (Date.now() - statSync(full).mtimeMs < STALE_MS) continue;
+                unlinkSync(full);
+                console.log(`[Server Backup] Removed stale temp file: ${name}`);
+            } catch { /* in use or already gone */ }
+        }
+    } catch { /* directory unreadable: nothing to sweep */ }
+}
+sweepStaleBackupTmp();
+
+// Top-level app-root entry holding a custom backup directory (null when the
+// directory is the default, outside the app root, or inside managed files),
+// so an in-app self-update preserves it exactly like scripts/updater.cjs does.
+function customBackupKeepEntry(rootDir) {
+    const rel = path.relative(rootDir, path.resolve(backupsDir));
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return null;
+    const top = rel.split(path.sep)[0];
+    if (!top || MANAGED_BACKUP_PATH_ROOTS.has(top)) return null;
+    return top;
+}
 
 const passwordPath = path.join(process.cwd(), 'save', '__password')
 if(existsSync(passwordPath)){
@@ -5112,7 +5143,7 @@ app.post('/api/backup/server/save', async (req, res, next) => {
 
             const stat = await fs.stat(finalPath);
             console.log(`[Server Backup] Saved: ${filename} (${(stat.size / 1024 / 1024).toFixed(1)} MB)`);
-            res.write(JSON.stringify({ type: 'done', ok: true, filename, size: stat.size }) + '\n');
+            res.write(JSON.stringify({ type: 'done', ok: true, filename, size: stat.size, dir: backupsDir }) + '\n');
             res.end();
         } catch (innerError) {
             // Clean up incomplete temp file
@@ -7062,6 +7093,11 @@ app.post('/api/self-update', async (req, res) => {
         // Keep set — matches updater.cjs + user data/config that must survive updates
         const keep = new Set(['save', 'backups', '.installed-version', '.installed-manifest', '.update-tmp', 'scripts', '.env', '.npmrc', '.portable']);
         if (isWin) keep.add('bin');
+        const customBackupKeep = customBackupKeepEntry(appDir);
+        if (customBackupKeep && !keep.has(customBackupKeep)) {
+            console.log(`[Self-Update] Preserving custom backup directory: ${customBackupKeep}/`);
+            keep.add(customBackupKeep);
+        }
 
         // Managed set — only entries the app shipped (new package contents ∪
         // previously recorded manifest) may be removed. Anything else in the

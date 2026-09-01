@@ -2,7 +2,7 @@ import DOMPurify from 'dompurify';
 import markdownit from 'markdown-it'
 import { appVer, getCurrentCharacter, getDatabase, type Database, type character, type customscript, type triggerscript } from '../storage/database.svelte';
 import { DBState, selIdState } from '../stores.svelte';
-import { aiWatermarkingLawApplies, getFileSrc, resolvePrioritizedAssetManifestNames } from '../globalApi.svelte';
+import { aiWatermarkingLawApplies, getFileSrc, prefetchAssetManifests, resolvePrioritizedAssetManifestNames } from '../globalApi.svelte';
 import { hydrateAssetListsForCbs } from './assetListHydration';
 import { isNodeServer } from "src/ts/platform"
 import { getChatVar, setChatVar, getGlobalChatVar } from './chatVar.svelte';
@@ -481,6 +481,14 @@ $effect.root(() => {
         const moduleAssets = getModuleAssets()
 
         resetAssetsCache(charAssets, emoAssets, moduleAssets, char.chaId)
+
+        // Warm the full-manifest cache the moment a chat opens, so message
+        // parses resolve {{img::}} names and CBS asset lists locally instead
+        // of waiting on the server mid-render.
+        prefetchAssetManifests([
+            char.additionalAssetManifest,
+            ...getModules().map((module) => module?.assetManifest),
+        ])
     })
 })
 

@@ -283,6 +283,48 @@ describe('preloadAll + sync ops (V2 mode)', () => {
         expect(store.getItemSync('k2')).toBe(2)
     })
 
+    // v1.11.1 regression: refreshIndex re-ran preloadAll from scratch, and
+    // preloadAll now starts with the bulk stream — so the background index
+    // refresh (fired by keys()/length() every INDEX_STALE_MS while a V2
+    // plugin runs) re-streamed the ENTIRE store over and over, saturating
+    // remote links for minutes at a time.
+    test('refreshIndex after preload fetches only missing keys, never the bulk stream again', async () => {
+        for (let i = 0; i < 3; i++) seed('k' + i, i)
+        await store.preloadAll()
+        expect(calls.filter((c) => c === 'all')).toHaveLength(1)
+
+        seed('newKey', 'from-another-device')
+        calls.length = 0
+        await store.refreshIndex()
+        expect(store.isPreloaded()).toBe(true)
+        // The bulk stream is not re-run...
+        expect(calls.filter((c) => c === 'all')).toHaveLength(0)
+        // ...cached keys are served without new reads, and only the key
+        // written by the other device was fetched, so sync reads see it.
+        expect(store.getItemSync('newKey')).toBe('from-another-device')
+        expect(calls.filter((c) => c.startsWith('get:'))).toEqual(['get:' + store.kvKeyFor('newKey')])
+        expect(store.getItemSync('k1')).toBe(1)
+    })
+
+    test('a corrupt row is fetched once, not on every index refresh', async () => {
+        seed('good', 1)
+        kv.set(store.kvKeyFor('bad'), new TextEncoder().encode('{not json'))
+        await store.preloadAll()
+        expect(store.getItemSync('bad')).toBeNull()
+
+        calls.length = 0
+        await store.refreshIndex()
+        await store.refreshIndex()
+        // The server index still lists the key; the top-up must not keep
+        // re-reading a value that will never parse.
+        expect(calls.filter((c) => c === 'get:' + store.kvKeyFor('bad'))).toHaveLength(0)
+        expect(store.getItemSync('good')).toBe(1)
+
+        // A rewrite makes the key readable again.
+        store.setItemSync('bad', { fixed: true })
+        expect(store.getItemSync('bad')).toEqual({ fixed: true })
+    })
+
     test('setItemSync updates cache/index at once and writes in the background', async () => {
         await store.preloadAll()
         store.setItemSync('s', { n: 1 })

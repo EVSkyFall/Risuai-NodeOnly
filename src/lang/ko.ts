@@ -1848,8 +1848,9 @@ export const languageKorean = {
   serverBackupSave: "서버에 백업 저장",
   serverBackupManage: "서버 백업 관리",
   serverBackupSaving: "서버에 백업 저장 중...",
-  serverBackupSaveSuccess: (filename: string, size: string) =>
-    `백업 저장 완료: ${filename} (${size})`,
+  pluginStorageV2PreloadFailed: "플러그인 저장소를 불러오지 못해 V2 플러그인을 실행하지 않았습니다. 새로고침하면 다시 시도합니다.",
+  serverBackupSaveSuccess: (filename: string, size: string, dir?: string) =>
+    `백업 저장 완료: ${filename} (${size})${dir ? ` — 저장 위치: ${dir}` : ''}`,
   serverBackupLoading: "백업 목록 불러오는 중...",
   serverBackupEmpty: "서버에 저장된 백업이 없습니다.",
   serverBackupRestore: "복원",

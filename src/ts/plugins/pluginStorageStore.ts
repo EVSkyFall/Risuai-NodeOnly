@@ -87,6 +87,9 @@ let tombstones = new Set<string>();
 // background once it is older than INDEX_STALE_MS.
 let indexFetchedAt = 0;
 let refreshing: Promise<void> | null = null;
+// Keys whose stored value did not parse. They stay in the server index, so
+// without this the preload top-up would re-fetch them on every refresh.
+let unparseable = new Set<string>();
 
 // Per-key write ordering: ONE mechanism for the async and the sync API.
 // Every write becomes an intent appended to the key's FIFO; a single worker
@@ -212,9 +215,17 @@ export async function refreshIndex(): Promise<void> {
         for (const key of [...knownHashes.keys()]) {
             if (!index.has(key) && !pendingOp(key)) knownHashes.delete(key);
         }
+        // A corrupt row removed (and possibly recreated) elsewhere gets read again.
+        for (const key of [...unparseable]) {
+            if (!index.has(key)) unparseable.delete(key);
+        }
         if (preloaded) {
-            preloadPromise = null;
-            await preloadAll();
+            // Top up only the keys the fresh index has that the cache does
+            // not (written by another device). Never re-run the bulk preload
+            // stream here: this refresh fires every INDEX_STALE_MS while a V2
+            // plugin enumerates keys, and re-streaming the whole store each
+            // time saturated remote links for minutes (v1.11.1 regression).
+            await topUpMissing();
         }
     })().finally(() => {
         refreshing = null;
@@ -265,8 +276,10 @@ export async function getItem(key: string): Promise<any | null> {
     } catch (e) {
         console.warn(`[pluginStorage] unparseable value for "${key}" — treating as missing`, e);
         index.delete(key);
+        unparseable.add(key);
         return null;
     }
+    unparseable.delete(key);
     index.set(key, data.length);
     cacheSet(key, value, data.length, contentHash(text));
     return value;
@@ -353,6 +366,7 @@ export async function setItem(key: string, value: any): Promise<void> {
     // Server first: the cache must never claim a value the server never got.
     const superseded = await enqueue(key, { op: "set", bytes, hash }, false);
     if (superseded) return; // a newer write already owns cache/index
+    unparseable.delete(key);
     index.set(key, bytes.length);
     tombstones.delete(key);
     cacheSet(key, value, bytes.length, hash);
@@ -431,12 +445,25 @@ function ingestStreamed(key: string, text: string): any | undefined {
     } catch (e) {
         console.warn(`[pluginStorage] unparseable value for "${key}" — treating as missing`, e);
         index.delete(key);
+        unparseable.add(key);
         return undefined;
     }
+    unparseable.delete(key);
     const bytes = encoder.encode(text).length;
     index.set(key, bytes);
     cacheSet(key, value, bytes, contentHash(text));
     return value;
+}
+
+// Fetch every indexed key the cache is missing, a few at a time. Used to
+// finish the first preload after the bulk stream and to top up after an
+// index refresh — both only ever pay for keys that are actually missing.
+async function topUpMissing(): Promise<void> {
+    const pending = [...index.keys()].filter((k) => !cache.has(k) && !unparseable.has(k));
+    const CONCURRENCY = 8;
+    for (let i = 0; i < pending.length; i += CONCURRENCY) {
+        await Promise.all(pending.slice(i, i + CONCURRENCY).map((k) => getItem(k)));
+    }
 }
 
 export function preloadAll(): Promise<void> {
@@ -449,11 +476,7 @@ export function preloadAll(): Promise<void> {
             } catch (e) {
                 console.warn('[pluginStorage] bulk preload failed, reading keys one by one', e);
             }
-            const pending = [...index.keys()].filter((k) => !cache.has(k));
-            const CONCURRENCY = 8;
-            for (let i = 0; i < pending.length; i += CONCURRENCY) {
-                await Promise.all(pending.slice(i, i + CONCURRENCY).map((k) => getItem(k)));
-            }
+            await topUpMissing();
         })().catch((e) => {
             preloadPromise = null;
             preloaded = false;
@@ -521,6 +544,7 @@ export function setItemSync(key: string, value: any): void {
         cacheSet(key, value, bytes.length, hash);
         return;
     }
+    unparseable.delete(key);
     index.set(key, bytes.length);
     tombstones.delete(key);
     cacheSet(key, value, bytes.length, hash);
@@ -552,6 +576,7 @@ export function _resetForTests() {
     preloaded = false;
     preloadPromise = null;
     tombstones = new Set();
+    unparseable = new Set();
     indexFetchedAt = 0;
     refreshing = null;
     queues = new Map();

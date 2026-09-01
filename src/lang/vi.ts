@@ -1330,6 +1330,8 @@ export const languageVietnamese = {
     "pluginFullStorageAccessDesc": "Chuyển dữ liệu đã lưu của mọi plugin cho plugin này mỗi khi nó đọc cơ sở dữ liệu. Toàn bộ kho lưu trữ plugin ({} hiện tại) được sao chép ở mỗi lần đọc, vì vậy chỉ bật cho plugin cần dữ liệu của plugin khác.",
     "pluginFullStorageAccessLarge": "Kho lưu trữ plugin đã vượt quá 100 MB. Bật cho plugin đọc thường xuyên có thể làm ứng dụng chậm hoặc treo.",
     "pluginFullStorageAccessGuide": "Tìm hiểu thêm",
+    "pluginStorageV2PreloadFailed": "Không thể tải bộ nhớ plugin nên các plugin V2 chưa được khởi động. Tải lại trang để thử lại.",
+    "serverBackupSaveSuccess": (filename: string, size: string, dir?: string) => `Đã lưu bản sao lưu: ${filename} (${size})${dir ? ` tại ${dir}` : ''}`,
     "enableScrollToActiveChar": "Bật cuộn đến nhân vật đang hoạt động",
     "trimStartNewChat": "Rút gọn các tin nhắn 'Bắt đầu đoạn chat mới'",
     "newMessageButtonRightCenter": "Trung tâm bên phải",

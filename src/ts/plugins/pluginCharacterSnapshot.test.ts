@@ -346,7 +346,7 @@ describe('restorePluginDbKey', () => {
 
 describe('write-back survives full-manifest cache eviction', () => {
     test('a list handed out through getDatabase() is restored even after the LRU dropped it', async () => {
-        const manifests = Array.from({ length: 10 }, (_, i) => ({ id: `evict-${i}`, ownerKind: 'module', ownerId: `m${i}` } as any))
+        const manifests = Array.from({ length: 70 }, (_, i) => ({ id: `evict-${i}`, ownerKind: 'module', ownerId: `m${i}` } as any))
         loadAssetManifestItems.mockImplementation(async (m: any) => {
             const list: [string, string, string][] = [[`a${m.id}`, 'k', 'png']]
             cacheMod.cacheFullAssetManifest(m.id, list)
@@ -354,12 +354,12 @@ describe('write-back survives full-manifest cache eviction', () => {
         })
         const subset: any = { modules: manifests.map((assetManifest, i) => ({ id: `m${i}`, assetManifest })) }
         await hydratePluginDatabaseSnapshot(subset)
-        // The first manifest is gone from the 8-entry LRU by now.
+        // The first manifest is gone from the 64-entry LRU by now.
         expect(cacheMod.getCachedFullAssetManifest('evict-0')).toBeUndefined()
 
         const current = { modules: manifests.map((assetManifest, i) => ({ id: `m${i}`, assetManifest })) }
         restorePluginDbKey('modules', subset.modules, current)
-        for (let i = 0; i < 10; i++) {
+        for (let i = 0; i < 70; i++) {
             expect(subset.modules[i].assetManifest).toBe(manifests[i])
             expect(subset.modules[i].assets).toBeUndefined()
         }
@@ -369,7 +369,7 @@ describe('write-back survives full-manifest cache eviction', () => {
         const manifest = { id: 'evict-edit', ownerKind: 'character', ownerId: 'c' } as any
         loadAssetManifestItems.mockResolvedValue([['a', 'k', 'png']])
         const snap: any = await hydratePluginCharacterSnapshot({ additionalAssetManifest: manifest } as any)
-        for (let i = 0; i < 9; i++) cacheMod.cacheFullAssetManifest(`filler-${i}`, [])
+        for (let i = 0; i < 64; i++) cacheMod.cacheFullAssetManifest(`filler-${i}`, [])
         snap.additionalAssets[0][0] = 'renamed'
         const out: any = restorePluginCharacterManifest(snap, { additionalAssetManifest: manifest } as any)
         expect(out.additionalAssetManifest).toBeUndefined()
