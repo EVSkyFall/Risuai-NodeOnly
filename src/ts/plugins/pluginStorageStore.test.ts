@@ -306,6 +306,25 @@ describe('preloadAll + sync ops (V2 mode)', () => {
         expect(store.getItemSync('k1')).toBe(1)
     })
 
+    test('a corrupt row is fetched once, not on every index refresh', async () => {
+        seed('good', 1)
+        kv.set(store.kvKeyFor('bad'), new TextEncoder().encode('{not json'))
+        await store.preloadAll()
+        expect(store.getItemSync('bad')).toBeNull()
+
+        calls.length = 0
+        await store.refreshIndex()
+        await store.refreshIndex()
+        // The server index still lists the key; the top-up must not keep
+        // re-reading a value that will never parse.
+        expect(calls.filter((c) => c === 'get:' + store.kvKeyFor('bad'))).toHaveLength(0)
+        expect(store.getItemSync('good')).toBe(1)
+
+        // A rewrite makes the key readable again.
+        store.setItemSync('bad', { fixed: true })
+        expect(store.getItemSync('bad')).toEqual({ fixed: true })
+    })
+
     test('setItemSync updates cache/index at once and writes in the background', async () => {
         await store.preloadAll()
         store.setItemSync('s', { n: 1 })
