@@ -1331,6 +1331,8 @@ export const languageChinese = {
     "pluginFullStorageAccessDesc": "此插件每次读取数据库时都会同时收到所有插件的存储数据。整个插件存储（当前 {}）在每次读取时都会被复制，请仅为需要其他插件数据的插件开启。",
     "pluginFullStorageAccessLarge": "插件存储已超过 100 MB。为频繁读取的插件开启此选项可能导致应用变慢或卡死。",
     "pluginFullStorageAccessGuide": "了解更多",
+    "pluginStorageV2PreloadFailed": "无法加载插件存储，因此未启动 V2 插件。刷新页面可重试。",
+    "serverBackupSaveSuccess": (filename: string, size: string, dir?: string) => `备份已保存：${filename}（${size}）${dir ? `，位置：${dir}` : ''}`,
     "enableScrollToActiveChar": "启用滚动至当前角色",
     "trimStartNewChat": "修剪“开始新对话”消息",
     "hamburgerButtonBottom": "将菜单按钮移至侧边栏底部",

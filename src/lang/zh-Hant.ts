@@ -677,6 +677,7 @@ export const languageChineseTraditional = {
     "pluginFullStorageAccessDesc": "此外掛每次讀取資料庫時都會一併收到所有外掛的儲存資料。整個外掛儲存空間（目前 {}）在每次讀取時都會被複製，請只為需要其他外掛資料的外掛開啟。",
     "pluginFullStorageAccessLarge": "外掛儲存空間已超過 100 MB。為頻繁讀取的外掛開啟此選項可能導致應用程式變慢或當機。",
     "pluginFullStorageAccessGuide": "了解更多",
+    "pluginStorageV2PreloadFailed": "無法載入外掛儲存空間，因此未啟動 V2 外掛。重新整理頁面可重試。",
     "altGreet": "備選問候語",
     "scripts": "指令碼",
     "settings": "設定",

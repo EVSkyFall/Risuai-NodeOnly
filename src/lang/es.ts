@@ -1332,6 +1332,8 @@ export const languageSpanish = {
     "pluginFullStorageAccessDesc": "Entrega a este plugin los datos guardados de todos los plugins cada vez que lee la base de datos. Todo el almacenamiento de plugins ({} ahora) se copia en cada lectura, así que actívalo solo para plugins que necesiten datos de otros plugins.",
     "pluginFullStorageAccessLarge": "El almacenamiento de plugins supera los 100 MB. Activarlo para un plugin que lee con frecuencia puede ralentizar o bloquear la aplicación.",
     "pluginFullStorageAccessGuide": "Más información",
+    "pluginStorageV2PreloadFailed": "No se pudo cargar el almacenamiento de plugins, por lo que no se iniciaron los plugins V2. Recarga la página para reintentar.",
+    "serverBackupSaveSuccess": (filename: string, size: string, dir?: string) => `Copia de seguridad guardada: ${filename} (${size})${dir ? ` en ${dir}` : ''}`,
     "disableAbove": "Mensajes cortados para la IA",
     "hamburgerButtonBottom": "Mover el botón de menú a la parte inferior de la barra lateral",
     "nanoGPTLoadingAccountInfo": "Cargando información de la cuenta…",
