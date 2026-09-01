@@ -431,6 +431,16 @@ export async function importPlugin(code:string|null = null, argu:{
             // User-owned settings on the entry survive an update/reinstall.
             pluginData.folderId = oldPlugin.folderId
             pluginData.nodeOnlyFullStorageAccess = oldPlugin.nodeOnlyFullStorageAccess
+            // Argument values too (plugins keep presets/API keys in them via
+            // setArgument): every key the new code still declares with the
+            // same type keeps its value; new or retyped keys start at default.
+            for (const key of Object.keys(arg)) {
+                if (oldPlugin.arguments?.[key] === arg[key] && oldPlugin.realArg && key in oldPlugin.realArg) {
+                    realArg[key] = oldPlugin.realArg[key]
+                }
+            }
+            // An automatic update must not flip a plugin the user turned off.
+            if (isUpdate) pluginData.enabled = oldPlugin.enabled ?? true
             db.plugins[oldPluginIndex] = pluginData;
         }
         else if(!isUpdate || argu.isHotReload){
