@@ -1,4 +1,10 @@
-import { afterEach, describe, expect, test, vi } from 'vitest'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test, vi } from 'vitest'
+import http from 'node:http'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import express from 'express'
+import modelJobs from '../../../../server/node/model-jobs.cjs'
 import { makeJobFetch, ModelJobBusyError, ModelJobConnectionLostError, type JobFetchOptions } from './jobFetch'
 
 vi.mock('src/ts/globalApi.svelte', () => ({
@@ -44,6 +50,7 @@ interface ServerBehavior {
     jobQueue?: { status: string, error?: string }[]
     jobReject?: Error
     claimResponseLost?: boolean
+    claimFetch?: typeof fetch
 }
 
 function setupServer(behavior: ServerBehavior) {
@@ -88,16 +95,18 @@ function setupServer(behavior: ServerBehavior) {
             }
             return new Response(JSON.stringify(job), { status: 200 })
         }
-        if (url === '/api/model-jobs/job-1/claim' && method === 'POST') {
-            const body = JSON.parse(String(init?.body ?? '{}'))
-            if (typeof body.claimToken !== 'string' || !body.claimToken) {
-                return new Response('{"error":"claimToken required"}', { status: 400 })
+        if (url === '/api/model-jobs/job-1/claim') {
+            if (behavior.claimFetch) return behavior.claimFetch(input, init)
+            if (method === 'POST') {
+                const body = JSON.parse(String(init?.body ?? '{}'))
+                if (typeof body.claimToken !== 'string' || !body.claimToken) {
+                    return new Response('{"error":"claimToken required"}', { status: 400 })
+                }
+                if (behavior.claimResponseLost) throw new TypeError('claim ACK lost')
+                return new Response('{"success":true}', { status: 200 })
             }
-            if (behavior.claimResponseLost) throw new TypeError('claim ACK lost')
-            return new Response('{"success":true}', { status: 200 })
-        }
-        if (url === '/api/model-jobs/job-1/claim' && method === 'GET') {
-            return new Response('{"owned":true}', { status: 200 })
+            if (method === 'GET') return new Response('{"owned":true}', { status: 200 })
+            throw new Error(`unexpected claim method: ${method}`)
         }
         throw new Error(`unexpected fetch: ${method} ${url}`)
     })
@@ -384,5 +393,173 @@ describe('makeJobFetch', () => {
             signal: controller.signal,
         })).rejects.toThrow('aborted')
         expect(opts.fallbackFetch).not.toHaveBeenCalled()
+    })
+})
+
+// Keep the claim boundary real: a permissive fetch stub hid the tokenless
+// live EOF request even after the server began requiring claim ownership.
+describe('live EOF against the model-jobs claim routes', () => {
+    let saveDir: string
+    let store: ReturnType<typeof modelJobs.createModelJobs>
+    let appServer: http.Server
+    let base: string
+    let directFetch: typeof fetch
+    let claimResponses: { method: string, status: number, body: Record<string, unknown> }[]
+
+    beforeAll(async () => {
+        directFetch = globalThis.fetch.bind(globalThis)
+        saveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'job-fetch-claim-test-'))
+        store = modelJobs.createModelJobs({ saveDir })
+        const app = express()
+        app.use((req, res, next) => {
+            res.set('access-control-allow-origin', '*')
+            res.set('access-control-allow-headers', 'content-type, risu-auth, x-model-job-claim-token')
+            res.set('access-control-allow-methods', 'GET, POST, DELETE')
+            if (req.method === 'OPTIONS') res.sendStatus(204)
+            else next()
+        })
+        app.use(express.json())
+        store.registerRoutes(app, {
+            auth: async (req: express.Request, res: express.Response) => {
+                if (req.get('risu-auth') === 'test-auth') return true
+                res.status(400).send({ error: 'No auth header' })
+                return false
+            },
+        })
+        appServer = http.createServer(app)
+        await new Promise<void>((resolve, reject) => {
+            appServer.once('error', reject)
+            appServer.listen(0, '127.0.0.1', resolve)
+        })
+        base = `http://127.0.0.1:${(appServer.address() as { port: number }).port}`
+    })
+
+    function seedJob(status = 'done') {
+        const Database = require('better-sqlite3')
+        const db = new Database(path.join(saveDir, 'model-jobs.db'))
+        try {
+            db.prepare('DELETE FROM model_jobs WHERE id = ?').run('job-1')
+            db.prepare(`
+                INSERT INTO model_jobs (id, chat_id, generation_id, status, created_at)
+                VALUES ('job-1', 'chat-1', 'gen-1', ?, ?)
+            `).run(status, Date.now())
+        } finally {
+            db.close()
+        }
+    }
+
+    beforeEach(() => {
+        seedJob()
+        claimResponses = []
+    })
+
+    afterAll(async () => {
+        await new Promise<void>((resolve, reject) => {
+            appServer.close((err) => err ? reject(err) : resolve())
+            appServer.closeAllConnections()
+        })
+        store.close()
+        fs.rmSync(saveDir, { recursive: true, force: true })
+    })
+
+    const routeClaim: typeof fetch = async (input, init) => {
+        const res = await directFetch(`${base}${input}`, init)
+        const body = await res.json()
+        claimResponses.push({ method: init?.method ?? 'GET', status: res.status, body })
+        return new Response(JSON.stringify(body), { status: res.status, headers: res.headers })
+    }
+
+    test('the real server rejects a tokenless POST with 400 and leaves the job recoverable', async () => {
+        const res = await routeClaim('/api/model-jobs/job-1/claim', {
+            method: 'POST', headers: { 'risu-auth': 'test-auth' },
+        })
+        expect(res.status).toBe(400)
+        expect(await res.json()).toEqual({ error: 'claimToken is required' })
+        expect(store.getJob('job-1')?.claimed).toBe(false)
+    })
+
+    test.each(['done', 'failed'])('live %s EOF claims with a token accepted by the real server', async (status) => {
+        seedJob(status)
+        const { calls } = setupServer({
+            streamChunks: ['hello world'], job: { status, error: 'upstream timeout' }, claimFetch: routeClaim,
+        })
+        let handle: import('./jobFetch').JobClaimHandle
+        const res = await makeJobFetch(makeOpts({ onJobCreated: (value) => { handle = value } }))('https://provider.example/v1/chat')
+        if (status === 'done') expect(await drain(res)).toBe('hello world')
+        else await expect(drain(res)).rejects.toThrow('upstream timeout')
+
+        // Main jobs claim only after the send has saved the chat; the handle
+        // stands in for that save ACK here.
+        expect(await handle.claim()).toBe(true)
+        await vi.waitFor(() => expect(claimResponses).toHaveLength(1))
+        expect(claimResponses[0]).toEqual({ method: 'POST', status: 200, body: { success: true } })
+        const [claim] = callsFor(calls, '/api/model-jobs/job-1/claim', 'POST')
+        expect(new Headers(claim.init?.headers).get('content-type')).toBe('application/json')
+        const { claimToken } = JSON.parse(claim.init?.body as string)
+        expect(claimToken).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i)
+        expect(store.getJob('job-1')?.claimed).toBe(true)
+        expect(store.ownsJobClaim('job-1', claimToken)).toBe(true)
+
+        // Repeating the same claim is idempotent; another owner cannot take
+        // or release it. Only the token holder can make it recoverable again.
+        expect(await (await routeClaim(claim.url, claim.init)).json()).toEqual({ success: true })
+        expect(await (await routeClaim(claim.url, {
+            ...claim.init, body: JSON.stringify({ claimToken: 'other-owner' }),
+        })).json()).toEqual({ success: false })
+        const ownerHeaders = { 'risu-auth': 'test-auth', 'x-model-job-claim-token': claimToken }
+        expect(await (await routeClaim(claim.url, { headers: ownerHeaders })).json()).toEqual({ owned: true })
+        expect(await (await routeClaim(claim.url, {
+            method: 'DELETE', headers: { ...ownerHeaders, 'x-model-job-claim-token': 'other-owner' },
+        })).json()).toEqual({ released: false })
+        expect(store.ownsJobClaim('job-1', claimToken)).toBe(true)
+        expect(await (await routeClaim(claim.url, { method: 'DELETE', headers: ownerHeaders })).json())
+            .toEqual({ released: true })
+        expect(store.getJob('job-1')?.claimed).toBe(false)
+    })
+
+    test.each(['lost response', 'HTTP error', 'invalid JSON'])(
+        'confirms the same token after a committed claim with %s, without releasing it', async (failure) => {
+            const { calls } = setupServer({
+                streamChunks: ['hello world'], job: { status: 'done' },
+                claimFetch: async (input, init) => {
+                    const res = await routeClaim(input, init)
+                    if (init?.method === 'POST') {
+                        if (failure === 'lost response') throw new TypeError('claim acknowledgment lost')
+                        if (failure === 'HTTP error') return new Response('', { status: 502 })
+                        return new Response('invalid JSON', { status: 200 })
+                    }
+                    return res
+                },
+            })
+            let handle: import('./jobFetch').JobClaimHandle
+            const res = await makeJobFetch(makeOpts({ onJobCreated: (value) => { handle = value } }))('https://provider.example/v1/chat')
+            expect(await drain(res)).toBe('hello world')
+            expect(await handle.claim()).toBe(true)
+            await vi.waitFor(() => expect(claimResponses).toHaveLength(2))
+            expect(claimResponses).toEqual([
+                { method: 'POST', status: 200, body: { success: true } },
+                { method: 'GET', status: 200, body: { owned: true } },
+            ])
+            const [post] = callsFor(calls, '/api/model-jobs/job-1/claim', 'POST')
+            const [probe] = callsFor(calls, '/api/model-jobs/job-1/claim')
+            const { claimToken } = JSON.parse(post.init?.body as string)
+            expect(new Headers(probe.init?.headers).get('x-model-job-claim-token')).toBe(claimToken)
+            expect(store.ownsJobClaim('job-1', claimToken)).toBe(true)
+            expect(callsFor(calls, '/api/model-jobs/job-1/claim', 'DELETE')).toHaveLength(0)
+        },
+    )
+
+    test('a live claim losing to another owner preserves both the output and the other claim', async () => {
+        expect(store.claimJob('job-1', 'recovery-owner')).toEqual({ success: true })
+        const { calls } = setupServer({ streamChunks: ['hello world'], claimFetch: routeClaim })
+        let handle: import('./jobFetch').JobClaimHandle
+        const res = await makeJobFetch(makeOpts({ onJobCreated: (value) => { handle = value } }))('https://provider.example/v1/chat')
+        expect(await drain(res)).toBe('hello world')
+        expect(await handle.claim()).toBe(false)
+        await vi.waitFor(() => expect(claimResponses).toHaveLength(1))
+        expect(claimResponses[0]).toEqual({ method: 'POST', status: 200, body: { success: false } })
+        expect(store.ownsJobClaim('job-1', 'recovery-owner')).toBe(true)
+        expect(callsFor(calls, '/api/model-jobs/job-1/claim')).toHaveLength(0)
+        expect(callsFor(calls, '/api/model-jobs/job-1/claim', 'DELETE')).toHaveLength(0)
     })
 })
