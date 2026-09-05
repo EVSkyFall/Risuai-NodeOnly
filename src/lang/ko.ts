@@ -42,6 +42,8 @@ export const languageKorean = {
     persistFailureTitle:
       "서버 저장 실패 — 변경사항이 디스크에 반영되지 않습니다",
     persistFailureAttemptedSize: "시도 크기",
+    storageRequestTooLarge:
+      "저장 요청이 너무 커서 실패했습니다 (HTTP 413). 서버 또는 리버스 프록시(Nginx 등)의 요청 본문 크기 제한을 확인하세요.",
     chatGuardTitle: "채팅 데이터 보호 작동 — 안전 저장 모드로 전환됨",
     chatGuardDesc:
       "비정상적인 저장 패턴이 차단되어 안전 저장(full-write)으로 전환됐어요. 변경사항은 그 경로로 디스크에 저장됩니다. 반복되면 브라우저 콘솔 로그와 함께 제보해주세요.",
@@ -53,6 +55,9 @@ export const languageKorean = {
       "이 채팅은 서버에서 아직 생성 중이에요. 완료되면 자동으로 채워지니 잠시 기다려주세요.",
     modelJobConnectionLost:
       "연결이 끊겼지만 서버에서 계속 생성 중이에요. 다시 돌아오면 자동으로 이어집니다 — 다시 보내지 않아도 돼요.",
+    assetManifestConflictTitle: "다른 세션에서 에셋 목록이 변경되었습니다",
+    assetManifestConflictDesc:
+      "최신 에셋 페이지를 다시 불러왔습니다. 내용을 확인한 뒤 편집을 다시 시도해주세요.",
   },
   showHelp: "도움말 보기",
   help: helpKo,
@@ -573,6 +578,8 @@ export const languageKorean = {
   value: "값",
   reroll: "재생성",
   rerollExactTooltip: "직전 생성과 동일한 요청으로 리롤 (프롬프트 캐시 히트)",
+  swipePrevTooltip: "이전 재생성 결과 (없으면 새로 생성합니다)",
+  swipeNextTooltip: "다음 재생성 결과 (마지막이면 새로 생성합니다)",
   deleteRerollMessage: "재생성된 메세지 삭제",
   deleteRerollMessageConfirm: "현재 선택된 재생성 메세지를 삭제할까요?",
   rerollConfirm: "재생성하여 신규 메세지를 목록에 추가 할까요?",
@@ -776,6 +783,7 @@ export const languageKorean = {
   chatNotes: "채팅 노트",
   showUnrecommended: "비권장 설정 보이기",
   allowV2Plugin: "비권장 V2.0 플러그인 허용",
+  allowV21Plugin: "비권장 V2.1 플러그인 설치 허용",
   altGreet: "추가 첫 메시지",
   scripts: "스크립트",
   settings: "설정",
@@ -798,11 +806,17 @@ export const languageKorean = {
   botSettingsLegacyDesc: "최신 모델 업데이트가 지연되거나 새 기능이 적용되지 않을 수 있습니다. 최신화된 모델과 기능을 사용하려면 [모델 프리셋]을 이용하세요.",
   botSettingsPresetMovedDesc: "프리셋은 [프롬프트] 메뉴로 이전되었습니다.",
   botSettingsParamScopeDesc: "이 페이지의 파라미터는 [채팅 봇]에서 선택한 모델에만 적용됩니다. 모델 프리셋을 사용 중이라면 해당 프리셋 안에서 파라미터를 수정하세요.",
+  botSettingsCustomFlagsScopeDesc: "커스텀 플래그 설정은 레거시 모델에서만 동작합니다. 모델 프리셋에는 모델 프로필에 맞게 자동으로 적용됩니다.",
   currentThemePreset: "현재 테마 프리셋",
   currentPromptPreset: "현재 프롬프트 프리셋",
   presetDuplicate: "복제하기",
   presetExport: "내보내기",
   presetImport: "불러오기",
+  presetNew: "새 프리셋",
+  presetManage: "프리셋 관리",
+  moduleManage: "모듈 관리",
+  pluginImport: "플러그인 임포트",
+  pluginDevTools: "개발자 도구",
   presetDelete: "삭제하기",
   presetDuplicated: "프리셋을 복제했습니다",
   presetExported: "프리셋을 내보냈습니다",
@@ -889,6 +903,27 @@ export const languageKorean = {
   officialDiscord: "공식 디스코드",
   officialDiscordDesc: "리스AI에 대해 자유롭게 대화하세요.",
   persona: "페르소나",
+  personaSearch: "이름 또는 메모로 검색",
+  personaManage: "페르소나 관리",
+  memoryPresetDefault: "기본 프리셋",
+  memoryBindingLabel: "장기기억 바인딩",
+  memoryPresetOff: "사용 안 함",
+  memoryPresetInherit: "기본값",
+  memoryPresetSetDefault: "기본으로 설정",
+  memoryPresetCreate: "새 프리셋",
+  memoryPresetSearch: "프리셋 이름으로 검색",
+  memoryPresetMethod: "방식",
+  memoryPresetName: "프리셋 이름",
+  memoryPresetManage: "장기기억 관리",
+  memoryPresetLastOne: "프리셋은 최소 하나 있어야 합니다.",
+  memoryPresetNoSettings: "이 프리셋에는 편집할 수 있는 메모리 설정이 없습니다.",
+  memoryPresetBound: "장기기억 프리셋이 변경되었습니다.",
+  folderUncategorized: "미분류",
+  folderNew: "새 폴더",
+  folderMoveTo: "폴더로 이동",
+  folderDeleteKeepItems: "이 폴더를 삭제할까요? 폴더 안의 항목은 미분류로 이동합니다.",
+  moveUp: "위로",
+  moveDown: "아래로",
   icon: "아이콘",
   account: "계정",
   remove: "삭제",
@@ -1066,13 +1101,17 @@ export const languageKorean = {
   edit: "수정",
   enableGlobal: "글로벌 활성화",
   chatModulesInfo:
-    "모듈을 이 채팅 한정으로 활성화/비활성화합니다. 우클릭 또는 길게 눌러 캐릭터 한정으로 활성화/비활성화할 수 있습니다.",
+    "모듈을 이 채팅 또는 이 캐릭터 한정으로 활성화/비활성화합니다. 말풍선 버튼은 채팅, 사람 버튼은 캐릭터입니다. 지구본이 표시된 모듈은 전역으로 켜져 있어 모든 채팅에 적용되며, 설정 > 모듈에서 바꿀 수 있습니다.",
+  moduleScopeChat: "이 채팅에서 사용",
+  moduleScopeCharacter: "이 캐릭터에서 사용",
+  moduleScopeGlobal: "전역 활성화됨. 설정 > 모듈에서 변경",
   sideMenuRerollButton: "사이드 메뉴 리롤 버튼",
   persistentStorage: "영구 저장소",
   persistentStorageSuccess: "저장소가 영구적으로 설정되었습니다.",
   persistentStorageFail:
     "저장소 설정에 실패했습니다. 브라우저에서 거부되었을 수 있습니다.",
   persistentStorageRecommended: "영구 저장소 권장됨",
+  unsupportedFileType: "지원하지 않는 파일 형식입니다",
   persistentStorageDesc:
     "당신의 브라우저는 영구 저장소를 지원합니다. 이 기능을 활성화하면, 데이터가 브라우저에 더 오래 남습니다.",
   enable: "활성화",
@@ -1510,6 +1549,7 @@ export const languageKorean = {
   showModelInSidebar: "사이드바에 모델 선택 표시",
   showPresetInSidebar: "사이드바에 프리셋 선택 표시",
   showPersonaInSidebar: "사이드바에 페르소나 바인딩 표시",
+  showMemoryInSidebar: "사이드바에 장기기억 바인딩 표시",
   disableMobileDragDrop: "모바일에서 캐릭터 드래그 앤 드롭 비활성화",
   disableToggleBinding: "채팅 토글 바인딩 비활성화",
   seperateModelsForAxModels: "보조 모델 분리",
@@ -1526,6 +1566,10 @@ export const languageKorean = {
   modelPresetSetDefaultConfirm:
     "현재 모델 바인딩을 새 채팅 기본값으로 지정할까요?",
   modelPresetBindedSuccess: "모델 프리셋이 성공적으로 바인드되었습니다.",
+  maxContextCapInfo: "모델 프로필 한도: {} 토큰. 비워 두거나 이 값을 넘게 입력하면 이 한도까지만 사용합니다.",
+  maxContextCapExceeded: "입력값이 모델 프로필 한도를 넘어 {} 토큰까지만 사용됩니다. 그대로 쓰려면 아래 \"모델 한도 무시\"를 켜세요.",
+  maxContextIgnoreCap: "모델 한도 무시",
+  maxContextIgnoreCapHelp: "프로필에 적힌 컨텍스트 한도가 실제와 다를 때 켭니다. 위에 입력한 값을 그대로 쓰며, 실제 한도를 넘기면 서비스 쪽에서 에러가 납니다. 값을 비워 두면 효과가 없습니다.",
   streamingOverride: "응답 스트리밍",
   streamingOverrideHelp: "이 프리셋이 응답을 스트리밍할지 여부.",
   decoupledStreaming: "디커플드 스트리밍 (한 번에 출력)",
@@ -1663,6 +1707,7 @@ export const languageKorean = {
   folderNameInput: "새 폴더 이름을 입력해주세요",
   folderRemoveLengthError: "폴더를 제거하려면 폴더가 비어 있어야 합니다.",
   personaNote: "페르소나 노트",
+  personaDuplicate: "복제",
   mcpAccessPrompt:
     '{{tool}}이(가) "{{action}}"을(를) 시도하고 있습니다. 허용하시겠습니까?',
   rememberToolUsage: "도구 사용 기억하기",
@@ -1736,6 +1781,9 @@ export const languageKorean = {
   autoScrollToNewMessage: "새 메시지로 자동 스크롤",
   alwaysScrollToNewMessage: "항상 새 메시지로 스크롤 (스크롤 위치 무시)",
   newMessage: "새 메시지",
+  addBlankMessage: "빈 메시지 추가",
+  pagePrevious: "이전 페이지",
+  pageNext: "다음 페이지",
   newMessageButtonStyle: "새 메시지 버튼 스타일",
   newMessageButtonBottomCenter: "하단 중앙 (기본값)",
   newMessageButtonBottomRight: "하단 우측",
@@ -1767,8 +1815,17 @@ export const languageKorean = {
     "플러그인 {} 이(가) 채팅 내용을 교체할 권한을 요청합니다. 대화 조작에 사용될 수 있습니다. 허용하시겠습니까?",
   providerPermissionConsent:
     "플러그인 {} 이(가) Provider 접근 권한을 요청합니다. 무단 API 호출이 발생할 수 있습니다. 허용하시겠습니까?",
+  inlayPermissionConsent:
+    "플러그인 {}이(가) 인레이에 접근할 권한을 요청하고 있습니다. 인레이 내용을 읽거나 쓰거나 수정할 수 있습니다. 허용하시겠습니까?",
   sendChatConsent:
     "플러그인 {} 이(가) 사용자 대신 채팅 메시지를 전송할 권한을 요청합니다. AI 응답이 트리거됩니다. 허용하시겠습니까?",
+  pluginPermissionDenyGuide:
+    '플러그인 "{}"의 권한 요청을 거부했습니다. 거부한 권한은 다시 묻지 않습니다.\n\n[설정] > [플러그인]에서 해당 플러그인의 "권한 사전 설정"을 열면 이 권한만 "허용"이나 "물어보기"로 되돌릴 수 있습니다. "권한 응답 초기화"는 저장된 응답을 한 번에 모두 지웁니다.',
+  pluginFullStorageAccess: "다른 플러그인 데이터 전체 제공 (원본 RisuAI 호환)",
+  pluginFullStorageAccessDesc:
+    "이 플러그인이 DB를 읽을 때 모든 플러그인의 저장 데이터를 함께 넘깁니다. 현재 플러그인 저장소 {} 전체가 읽을 때마다 복사되므로, 다른 플러그인 데이터가 필요한 플러그인에만 켜세요.",
+  pluginFullStorageAccessLarge: "플러그인 저장소가 100 MB를 넘습니다. 자주 읽는 플러그인에 켜면 앱이 느려지거나 멈출 수 있습니다.",
+  pluginFullStorageAccessGuide: "자세히 보기",
   resetPluginPermission: "권한 응답 초기화",
   resetPluginPermissionConfirm:
     '플러그인 "{}"의 저장된 권한 응답(허용/거부 이력)을 모두 삭제하시겠습니까?\n\n다음에 플러그인이 권한을 요청할 때 다시 묻게 됩니다.',
@@ -1820,8 +1877,9 @@ export const languageKorean = {
   serverBackupSave: "서버에 백업 저장",
   serverBackupManage: "서버 백업 관리",
   serverBackupSaving: "서버에 백업 저장 중...",
-  serverBackupSaveSuccess: (filename: string, size: string) =>
-    `백업 저장 완료: ${filename} (${size})`,
+  pluginStorageV2PreloadFailed: "플러그인 저장소를 모두 불러오지 못했습니다. V2 플러그인은 계속 실행되지만 일부 저장값을 읽지 못할 수 있습니다. 새로고침하면 저장소를 다시 불러옵니다.",
+  serverBackupSaveSuccess: (filename: string, size: string, dir?: string) =>
+    `백업 저장 완료: ${filename} (${size})${dir ? ` — 저장 위치: ${dir}` : ''}`,
   serverBackupLoading: "백업 목록 불러오는 중...",
   serverBackupEmpty: "서버에 저장된 백업이 없습니다.",
   serverBackupRestore: "복원",
@@ -1869,6 +1927,14 @@ export const languageKorean = {
   togglePinToChat: "채팅에 토글 바인드",
   togglePinLabel: "토글 바인드",
   togglePinSaved: "토글이 바인드 되었습니다.",
+  toggleSaveAsDefaultButton: "기본값으로 저장",
+  toggleSetDefaultConfirm: "현재 토글 상태를 새 채팅의 기본값으로 저장할까요? 새로 만드는 채팅은 이 상태로 바인드된 채 시작합니다.",
+  toggleDefaultSaved: "토글 기본값으로 저장됨",
+  toggleDefaultSavedButton: "기본값 저장됨",
+  toggleDefaultManage: "새 채팅의 토글 기본값이 저장되어 있습니다.",
+  toggleDefaultOverwrite: "현재 상태로 덮어쓰기",
+  toggleDefaultClear: "기본값 해제",
+  toggleDefaultCleared: "토글 기본값이 해제되었습니다. 새 채팅은 바인딩 없이 시작합니다.",
   toggleSaveAsPreset: "토글 프리셋으로 저장",
   toggleLoadPreset: "토글 프리셋에서 불러오기",
   togglePinUpdate: "토글 저장",
@@ -1974,6 +2040,7 @@ export const languageKorean = {
   nanoGPTSelectFromList: "목록에서 선택",
   nanoGPTManualInput: "수동 입력",
   nanoGPTManualModelSelect: "수동 모델 선택",
+  nodeOnlyRestoreLastChat: "시작 시 마지막 채팅 열기",
   nodeOnlyScrollButtonType: "스크롤 버튼 타입",
   scrollButtonTypeFour: "4버튼",
   scrollButtonTypeTwo: "2버튼",
@@ -2055,6 +2122,7 @@ export const languageKorean = {
   pluginStorageRefresh: "새로고침",
   pluginStorageEmpty: "항목이 없습니다.",
   pluginStorageLoadError: "저장소를 불러올 수 없습니다.",
+  pluginStorageNotLoaded: "열면 로드",
   pluginStorageSave: "저장",
   pluginStorageFormatJson: "JSON 정렬",
   pluginStorageMetaType: "타입",
@@ -2064,6 +2132,7 @@ export const languageKorean = {
   pluginStoragePreviewTruncatedUnknown: (limit: string) => `미리보기는 ${limit}로 제한됩니다. 전체 크기는 이보다 큽니다. 저장값 보호를 위해 편집할 수 없습니다.`,
   pluginStorageOwner: "출처(추정)",
   pluginStorageOwnerUnknown: "미상",
+  pluginStorageSizeUnknown: "항목을 열어야 크기를 알 수 있습니다.",
   pluginStorageDeleted: "삭제됨",
   pluginStorageJsonError: (msg: string) => `JSON 파싱 실패: ${msg}`,
   pluginStorageSaved: (key: string) => `"${key}" 저장됨`,
@@ -2087,7 +2156,7 @@ export const languageKorean = {
   // 리퀘스트 로그 / 사용량 (시스템 설정)
   requestLogsTab: "리퀘스트 로그",
   requestLogsDesc:
-    "프로바이더로 나간 요청의 본문·응답·소요 시간을 기록합니다. 기본 필터는 LLM 요청만 표시합니다.",
+    "프로바이더로 나간 요청의 본문·응답·소요 시간을 기록합니다.",
   requestLogsFilters: "필터",
   requestLogsFilterClear: "필터 초기화",
   requestLogsFilterActive: (count: number) =>
@@ -2264,6 +2333,31 @@ export const languageKorean = {
 
   storageCleanup: "SQLite 오버헤드 정리",
 
+  storageOrphan: "고아 미디어",
+  storageOrphanHeader: (count: number, size: number) =>
+    `${count}개 · ${(size / 1024 / 1024).toFixed(1)} MB`,
+  storageOrphanWhat:
+    "캐릭터·모듈·페르소나 어디에서도 참조하지 않는 이미지 파일입니다. 캐릭터를 지우거나 에셋을 교체할 때 남습니다.",
+  storageOrphanWhen:
+    "삭제된 파일은 복구할 수 없습니다. 중요한 데이터가 있다면 백업을 먼저 만드세요. 정리 후에는 위의 \"SQLite 오버헤드 정리\"까지 실행해야 파일 크기가 실제로 줄어듭니다.",
+  storageOrphanUnavailable:
+    "지금은 고아 미디어를 검사할 수 없습니다. 데이터베이스가 서버 메모리에 올라오지 않았거나, 참조 목록이 아직 완성되지 않은 상태입니다. 잠시 후 새로고침하세요.",
+  storageOrphanDisabled: (reason: string) =>
+    reason
+      ? `고아 미디어 정리는 아직 꺼져 있습니다(${reason}). 아무 파일도 지우지 않았으며, 참조 목록이 모든 에셋을 포함할 때까지 꺼진 상태로 둡니다.`
+      : "고아 미디어 정리는 아직 꺼져 있습니다. 아무 파일도 지우지 않았으며, 참조 목록이 모든 에셋을 포함할 때까지 꺼진 상태로 둡니다.",
+  storageOrphanAutoCleanPending: "준비 중",
+  storageOrphanPurge: "고아 미디어 정리",
+  storageOrphanPurging: "고아 미디어 정리 중...",
+  storageOrphanConfirm: (count: number, size: number) =>
+    `참조되지 않는 미디어 ${count}개(${(size / 1024 / 1024).toFixed(1)} MB)를 삭제할까요? 되돌릴 수 없습니다.`,
+  storageOrphanDone: (count: number, size: number) =>
+    `${count}개 삭제 (${(size / 1024 / 1024).toFixed(1)} MB).`,
+  storageOrphanFailed: "고아 미디어 정리 실패",
+  storageOrphanAutoClean: "부팅 시 자동 정리",
+  storageOrphanAutoCleanDesc:
+    "앱을 열 때마다 고아 미디어를 자동으로 지웁니다. 기본은 꺼짐 — 아직 알려지지 않은 참조까지 지울 수 있어 수동 정리를 권장합니다.",
+
   storageWalCleanup: "WAL 수동 정리",
   storageWalCleanupHeader: (walSize: number) =>
     `현재 WAL ${(walSize / 1024 / 1024).toFixed(1)} MB`,
@@ -2403,6 +2497,8 @@ export const languageKorean = {
     `디스크 사용량 ${pct.toFixed(0)}% — 정리가 필요합니다.`,
   backupServerInsufficient: "디스크 여유 부족 — 새 백업을 만들 수 없습니다.",
   updatePopupBackup: "백업",
+  updatePopupWaitingBackup: "백업 완료 대기 중",
+  updatePopupBackupFailedAbort: "백업에 실패해서 업데이트를 시작하지 않았습니다.",
 
   backupServerPath: "보관 위치",
   backupServerPathDefault: "기본 위치",

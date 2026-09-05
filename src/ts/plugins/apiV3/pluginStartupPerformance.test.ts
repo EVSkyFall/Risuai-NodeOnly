@@ -11,9 +11,9 @@ describe('plugin startup bridge contracts', () => {
         const v2 = read('../plugins.svelte.ts')
         const v3 = read('v3.svelte.ts')
 
-        expect(v2).toMatch(/getChar:\s*\(\)\s*=>\s*\{\s*return getCurrentCharacter\(\{\s*snapshot:\s*true\s*\}\)\s*\}/s)
-        expect(v3).toMatch(/getChar:\s*oldApis\.getChar/)
-        expect(v3).toMatch(/getCharacter:\s*oldApis\.getChar/)
+        expect(v2).toContain('hydratePluginCharacterSnapshotSync(getCurrentCharacter({ snapshot: true }))')
+        expect(v3).toMatch(/getChar:\s*getCharacterForPlugin/)
+        expect(v3).toMatch(/getCharacter:\s*getCharacterForPlugin/)
     })
 
     test('lite current context is a typed top-level root method, not an alias', () => {
@@ -36,7 +36,7 @@ describe('plugin startup bridge contracts', () => {
         const v3 = read('v3.svelte.ts')
         const dts = read('risuai.d.ts')
 
-        expect(v3).toMatch(/_getManyPluginStorage:\s*\(keys:\s*string\[\]\)\s*=>\s*keys\.map\(/)
+        expect(v3).toMatch(/_getManyPluginStorage:\s*\(keys:\s*string\[\]\)\s*=>\s*Promise\.all\(keys\.map\(/)
         expect(v3).toMatch(/'getMany':\s*'_getManyPluginStorage'/)
         expect(dts).toMatch(/getMany\(keys:\s*string\[\]\):\s*Promise<\(any \| null\)\[\]>/)
     })

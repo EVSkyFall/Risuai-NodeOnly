@@ -4,6 +4,7 @@ import express from 'express'
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
+import Database from 'better-sqlite3'
 import pkg from './model-jobs.cjs'
 
 const { createModelJobs } = pkg as {
@@ -30,6 +31,43 @@ function listen(server: http.Server): Promise<number> {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+it('reopens a populated legacy schema with main defaults, nullable metadata and token claim/release', () => {
+    const saveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'model-jobs-legacy-'))
+    const legacy = new Database(path.join(saveDir, 'model-jobs.db'))
+    legacy.exec(`CREATE TABLE model_jobs (
+        id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, generation_id TEXT, adapter_kind TEXT,
+        streaming INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, upstream_status INTEGER,
+        content_type TEXT, error TEXT, created_at INTEGER NOT NULL, ended_at INTEGER,
+        bytes INTEGER NOT NULL DEFAULT 0, claimed INTEGER NOT NULL DEFAULT 0
+    )`)
+    legacy.prepare(`INSERT INTO model_jobs (id, chat_id, generation_id, adapter_kind, status, created_at, ended_at)
+        VALUES ('legacy', 'chat', 'gen', 'openai-compatible', 'done', ?, ?)`).run(Date.now(), Date.now())
+    legacy.close()
+    const store = createModelJobs({ saveDir })
+    try {
+        expect(store.getJob('legacy')).toMatchObject({
+            id: 'legacy', kind: 'main', generationId: 'gen', model: undefined, modelLabel: undefined,
+            inputTokens: undefined, outputTokens: undefined, maxContext: undefined,
+        })
+        const migrated = new Database(path.join(saveDir, 'model-jobs.db'), { readonly: true })
+        try {
+            expect(migrated.prepare('SELECT kind, model, model_label, input_tokens, output_tokens, max_context, claim_token FROM model_jobs WHERE id = ?').get('legacy'))
+                .toEqual({ kind: 'main', model: null, model_label: null, input_tokens: null, output_tokens: null, max_context: null, claim_token: null })
+        } finally { migrated.close() }
+        expect(store.listJobs('unclaimed').map((job: any) => job.id)).toContain('legacy')
+        expect(store.claimJob('legacy', 'owner')).toEqual({ success: true })
+        expect(store.claimJob('legacy', 'owner')).toEqual({ success: true })
+        expect(store.claimJob('legacy', 'other')).toEqual({ success: false })
+        expect(store.ownsJobClaim('legacy', 'owner')).toBe(true)
+        expect(store.releaseJobClaim('legacy', 'other')).toEqual({ released: false })
+        expect(store.releaseJobClaim('legacy', 'owner')).toEqual({ released: true })
+        expect(store.listJobs('unclaimed').map((job: any) => job.id)).toContain('legacy')
+    } finally {
+        store.close()
+        fs.rmSync(saveDir, { recursive: true, force: true })
+    }
+})
 
 async function readAll(res: Response): Promise<Buffer> {
     const parts: Buffer[] = []
@@ -157,7 +195,13 @@ describe('model-jobs', () => {
         upstream.hang = false
         const expected = upstream.chunks.join('')
 
-        const { status, json } = await createJob()
+        const { status, json } = await createJob({
+            model: 'provider/model-id',
+            modelLabel: 'My Preset',
+            inputTokens: 1234,
+            outputTokens: 512,
+            maxContext: 32768,
+        })
         expect(status).toBe(200)
         const jobId = json.jobId as string
         expect(jobId).toBeTruthy()
@@ -173,6 +217,13 @@ describe('model-jobs', () => {
         expect(meta.upstreamStatus).toBe(200)
         expect(meta.contentType).toBe('text/event-stream')
         expect(meta.bytes).toBe(Buffer.byteLength(expected))
+        expect(meta).toMatchObject({
+            model: 'provider/model-id',
+            modelLabel: 'My Preset',
+            inputTokens: 1234,
+            outputTokens: 512,
+            maxContext: 32768,
+        })
 
         // Header capture: upstream status + content-type mirrored on the stream.
         expect(streamRes.headers.get('x-model-job-upstream-status')).toBe('200')

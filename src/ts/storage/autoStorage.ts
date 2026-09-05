@@ -1,4 +1,10 @@
-import { NodeStorage, type PatchItemResult, type ExportBackupOptions } from "./nodeStorage"
+import {
+    NodeStorage,
+    type PatchItemResult,
+    type ExportBackupOptions,
+    type AssetManifestDescriptor,
+    type AssetManifestOperation,
+} from "./nodeStorage"
 
 export class AutoStorage{
     isAccount:boolean = false
@@ -38,6 +44,7 @@ export class AutoStorage{
         return this.realStorage.createAuth()
     }
 
+
     async exportBackup(opts?: ExportBackupOptions) {
         await this.Init()
         return this.realStorage.exportBackup(opts)
@@ -72,6 +79,41 @@ export class AutoStorage{
     // ── Bulk asset operations ──────────────────────────────────────────────────
     async getItems(keys: string[]) { return this.realStorage.getItems(keys) }
     async setItems(entries: {key: string, value: Uint8Array}[]) { return this.realStorage.setItems(entries) }
+
+    // ── Plugin storage (server kv, per key) ───────────────────────────────────
+    async getPluginStorageIndex() { await this.Init(); return this.realStorage.getPluginStorageIndex() }
+    async getPluginStorageAll(onEntry: (key: string, text: string) => void) { await this.Init(); return this.realStorage.getPluginStorageAll(onEntry) }
+
+    // ── Lazy asset-reference manifests ────────────────────────────────────────
+    async getAssetManifestPage(manifest: string | AssetManifestDescriptor, options?: { offset?: number; limit?: number; search?: string }) {
+        await this.Init()
+        return this.realStorage.getAssetManifestPage(manifest, options)
+    }
+    async getAssetManifestOwner(ownerKind: string, ownerId: string) {
+        await this.Init()
+        return this.realStorage.getAssetManifestOwner(ownerKind, ownerId)
+    }
+    async getAllAssetManifestItems(manifest: AssetManifestDescriptor) {
+        await this.Init()
+        return this.realStorage.getAllAssetManifestItems(manifest)
+    }
+    async resolveAssetManifestNames(
+        owners: Array<{ kind?: string; ownerId?: string; manifestId?: string; fuzzy?: boolean }>,
+        names: string[],
+        maxDistance: number,
+    ) {
+        await this.Init()
+        return this.realStorage.resolveAssetManifestNames(owners, names, maxDistance)
+    }
+    async editAssetManifest(
+        ownerKind: string,
+        ownerId: string,
+        expectedManifestId: string,
+        operations: AssetManifestOperation[],
+    ) {
+        await this.Init()
+        return this.realStorage.editAssetManifest(ownerKind, ownerId, expectedManifestId, operations)
+    }
 
     // ── Server-side backup ─────────────────────────────────────────────────────
     async saveServerBackup(onProgress?: (current: number, total: number, bytes: number, totalBytes: number) => void) { await this.Init(); return this.realStorage.saveServerBackup(onProgress) }

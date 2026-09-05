@@ -195,9 +195,10 @@ describe('chunking lifecycle (real server, low threshold)', () => {
   })
 
   test('optimize reclaims orphan chunks left by re-imports', async () => {
-    const { client } = await boot() // default cooldown → 2nd import takes no snapshot
+    const { client } = await boot()
     await uploadZip(client, bigDbBlob('AAA')) // v1 chunked
-    await uploadZip(client, bigDbBlob('BBB')) // v2 chunked; v1's chunks now unreferenced
+    await uploadZip(client, bigDbBlob('BBB')) // v1 is retained by the first real snapshot
+    await uploadZip(client, bigDbBlob('CCC')) // cooldown: v2's chunks are now unreferenced
 
     const before = await getStats(client)
     expect(before.chunks.orphanBytes).toBeGreaterThan(0)

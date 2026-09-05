@@ -49,6 +49,23 @@ beforeEach(() => {
 })
 
 describe('character snapshot access', () => {
+    test('normalization backfills persona identities once and preserves the memory sidebar preference', () => {
+        const data = { characters: [], personas: [{ name: 'Legacy' }, { id: 'existing', name: 'Named' }] } as any
+        databaseModule.setDatabase(data)
+        const id = data.personas[0].id
+        expect(id).toMatch(/^[0-9a-f-]{36}$/i)
+        expect(data.personas[1].id).toBe('existing')
+        expect(data.showMemoryInSidebar).toBe(true)
+        const restored = JSON.parse(JSON.stringify(data))
+        restored.personas.reverse()
+        restored.personas[1].name = 'Renamed'
+        restored.showMemoryInSidebar = false
+        databaseModule.setDatabase(restored)
+        expect(restored.personas[1].id).toBe(id)
+        expect(restored.personas[0].id).toBe('existing')
+        expect(restored.showMemoryInSidebar).toBe(false)
+    })
+
     test('getCurrentCharacter snapshots only the selected character', () => {
         const selected = makeCharacter('Selected', 'selected-id')
         const other = makeCharacter('Other', 'other-id')

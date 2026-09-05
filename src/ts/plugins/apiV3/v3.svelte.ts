@@ -3,11 +3,12 @@ import { SandboxHost } from "./factory";
 import { getCurrentContextLite, getDatabase, normalizeChat } from "src/ts/storage/database.svelte";
 import { SafeLocalPluginStorage, tagWhitelist } from "../pluginSafeClass";
 import { recordOwner, removeOwner, clearOwners } from "../pluginStorageMeta";
+import * as pluginStorageStore from "../pluginStorageStore";
 import DOMPurify from 'dompurify';
 import { additionalChatMenu, additionalFloatingActionButtons, additionalHamburgerMenu, additionalSettingsMenu, bodyIntercepterStore, chatPanelStore, DBState, selectedCharID, type MenuDef } from "src/ts/stores.svelte";
 import { v4 } from "uuid";
 import { sleep } from "src/ts/util";
-import { alertConfirm, alertError, alertNormal } from "src/ts/alert";
+import { alertConfirm, alertError, alertNormal, alertNormalWait } from "src/ts/alert";
 import { language } from "src/lang";
 import { checkCharOrder, forageStorage, getFetchLogs } from "src/ts/globalApi.svelte";
 import { changeColorScheme, updateColorScheme, updateTextThemeAndCSS, type ColorScheme } from "src/ts/gui/colorscheme";
@@ -35,6 +36,8 @@ import { createDefaultComfySandboxApi } from "src/ts/process/pluginPrimitives/co
 import { createAuthorizedIllustrationV3HostBridge } from "src/ts/process/illustrationJobs/v3BridgeHost";
 import { tokenize as tokenizerTokenize, tokenizeAccurate as tokenizerTokenizeAccurate, encodeWithTokenizer, tokenizerList } from "src/ts/tokenizer";
 import { getModuleLorebooks } from "src/ts/process/modules";
+import { hydratePluginCharacterSnapshot, hydratePluginDatabaseSnapshot, restorePluginCharacterManifest } from "../pluginCharacterSnapshot";
+import { PLUGIN_CUSTOM_STORAGE_KEY, wantsFullPluginStorage } from "../pluginDbProxy";
 import {
     registerTTSPreprocessor,
     unregisterTTSPreprocessor,
@@ -75,17 +78,19 @@ export type { PluginPermissionDesc, PluginPermissionPresetState } from "./plugin
 */
 
 const pluginChannel = new Map<string, Function>();
-const documentEventListeners: Array<{type: string, listener: EventListenerOrEventListenerObject, options: any}> = [];
+const documentEventListeners: Array<{pluginName: string, type: string, listener: EventListenerOrEventListenerObject, options: any}> = [];
 
 class SafeElement {
     #element: HTMLElement;
+    protected readonly pluginName: string;
     __classType = 'REMOTE_REQUIRED' as const;
 
-    constructor(element: HTMLElement) {
+    constructor(element: HTMLElement, pluginName: string = '') {
         if(element.getAttribute('freezed')){
             throw new Error("This element cannot be accessed by SafeELement")
         }
         this.#element = element;
+        this.pluginName = pluginName;
     }
 
     public appendChild(child: SafeElement) {
@@ -106,7 +111,7 @@ class SafeElement {
 
     public cloneNode(deep: boolean = false): SafeElement {
         const cloned = this.#element.cloneNode(deep);
-        return new SafeElement(cloned as HTMLElement);
+        return new SafeElement(cloned as HTMLElement, this.pluginName);
     }
 
     public prepend(child: SafeElement) {
@@ -183,14 +188,14 @@ class SafeElement {
         const children: SafeElement[] = [];
         this.#element.childNodes.forEach(node => {
             if(node instanceof HTMLElement) {
-                children.push(new SafeElement(node));
+                children.push(new SafeElement(node, this.pluginName));
             }
         });
         return new SafeClassArray<SafeElement>(children);
     }
     public getParent(): SafeElement | null {
         if(this.#element.parentElement) {
-            return new SafeElement(this.#element.parentElement);
+            return new SafeElement(this.#element.parentElement, this.pluginName);
         }
         return null;
     }
@@ -223,7 +228,7 @@ class SafeElement {
         const elements: SafeElement[] = [];
         nodeList.forEach(node => {
             if(node instanceof HTMLElement) {
-                elements.push(new SafeElement(node));
+                elements.push(new SafeElement(node, this.pluginName));
             }
         });
         return new SafeClassArray<SafeElement>(elements);
@@ -231,7 +236,7 @@ class SafeElement {
     public querySelector(selector: string): SafeElement | null {
         const element = this.#element.querySelector(selector);
         if(element instanceof HTMLElement) {
-            return new SafeElement(element);
+            return new SafeElement(element, this.pluginName);
         }
         return null;
     }
@@ -358,7 +363,7 @@ class SafeElement {
                 }
             }
             this.#eventIdMap.set(id, modifiedListener)
-            documentEventListeners.push({type, listener: modifiedListener as EventListenerOrEventListenerObject, options: realOptions})
+            documentEventListeners.push({pluginName: this.pluginName, type, listener: modifiedListener as EventListenerOrEventListenerObject, options: realOptions})
             document.addEventListener(type, modifiedListener, realOptions)
             return id;
         }
@@ -388,7 +393,7 @@ class SafeElement {
                 }, delay);
             }
             this.#eventIdMap.set(id, modifiedListener)
-            documentEventListeners.push({type, listener: modifiedListener as EventListenerOrEventListenerObject, options: realOptions})
+            documentEventListeners.push({pluginName: this.pluginName, type, listener: modifiedListener as EventListenerOrEventListenerObject, options: realOptions})
             document.addEventListener(type, modifiedListener, realOptions);
             return id;
         }
@@ -415,8 +420,8 @@ class SafeElement {
 
 class SafeDocument extends SafeElement {
     __classType = 'REMOTE_REQUIRED' as const;
-    constructor(document: Document) {
-        super(document.documentElement);
+    constructor(document: Document, pluginName: string = '') {
+        super(document.documentElement, pluginName);
     }
     createElement(tagName: string): SafeElement {
         if(!tagWhitelist.includes(tagName.toLowerCase())) {
@@ -427,7 +432,7 @@ class SafeDocument extends SafeElement {
             console.warn(`<a> can be created but href attribute cannot be set directly for security reasons. Use .createAnchorElement(href: string) to create safe anchor elements.`);
         }
         const element = document.createElement(tagName);
-        return new SafeElement(element);
+        return new SafeElement(element, this.pluginName);
     }
     createAnchorElement(href: string): SafeElement {
         const anchor = document.createElement('a');
@@ -441,7 +446,7 @@ class SafeDocument extends SafeElement {
             console.warn(`Invalid URL provided for anchor element: ${href}. Setting href to '#' instead.`);
             anchor.setAttribute('href', '#');
         }
-        return new SafeElement(anchor);
+        return new SafeElement(anchor, this.pluginName);
     }
 }
 
@@ -494,7 +499,7 @@ type SafeMutationCallback = (mutations: SafeClassArray<SafeMutationRecord>) => v
 class SafeMutationObserver {
     #observer: MutationObserver;
     __classType = 'REMOTE_REQUIRED' as const;
-    constructor(callback: SafeMutationCallback) {
+    constructor(callback: SafeMutationCallback, pluginName: string = '') {
         this.#observer = new MutationObserver((mutations) => {
             const safeMutations: SafeMutationRecordObject[] = mutations.map(mutation => {
 
@@ -502,7 +507,7 @@ class SafeMutationObserver {
                     const elements: SafeElement[] = [];
                     nodeList.forEach(node => {
                         if(node instanceof HTMLElement) {
-                            elements.push(new SafeElement(node));
+                            elements.push(new SafeElement(node, pluginName));
                         }
                     })
                     return elements;
@@ -510,7 +515,7 @@ class SafeMutationObserver {
 
                 return {
                     type: mutation.type,
-                    target: new SafeElement(mutation.target as HTMLElement),
+                    target: new SafeElement(mutation.target as HTMLElement, pluginName),
                     addedNodes: elementMapHelper(mutation.addedNodes),
                     removedNodes: elementMapHelper(mutation.removedNodes)
                     
@@ -607,6 +612,12 @@ const unloadV3Plugin = async (pluginName: string) => {
             sleep(1000) //timeout after 1 second
         ]);
     }
+    for(let i = documentEventListeners.length - 1; i >= 0; i--){
+        const entry = documentEventListeners[i];
+        if(entry.pluginName !== pluginName) continue;
+        document.removeEventListener(entry.type, entry.listener, entry.options);
+        documentEventListeners.splice(i, 1);
+    }
     try {
         instance?.host?.terminate();        
     } catch (error) {
@@ -643,6 +654,9 @@ export async function setPluginPermissionPreset(
     state: PluginPermissionPresetState,
 ): Promise<void> {
     await pluginPermissionManager.setPreset(pluginName, desc, state)
+    if (state === 'denied') {
+        await alertNormalWait(language.pluginPermissionDenyGuide.replace('{}', pluginName))
+    }
 }
 
 type PluginV3ProviderOptions = PluginV2ProviderOptions & {
@@ -660,6 +674,7 @@ const getPluginPermission = async (pluginName: string, permissionDesc: PluginPer
             : permissionDesc === 'replacer' ? language.replacerPermissionConsent.replace("{}", pluginName)
             : permissionDesc === 'provider' ? language.providerPermissionConsent.replace("{}", pluginName)
             : permissionDesc === 'sendChat' ? language.sendChatConsent.replace("{}", pluginName)
+            : permissionDesc === 'inlay' ? language.inlayPermissionConsent.replace("{}", pluginName)
             : `Error`
         if(alertTitle === 'Error'){
             return false;
@@ -708,6 +723,19 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
     const pluginInlayMediaApi = createDefaultPluginInlayMediaApi();
     const comfyApi = createDefaultComfySandboxApi();
 
+    // Same character as oldApis.getChar/setChar, but with lazy assets filled
+    // on read and the manifest kept on an assets-unchanged write (#80).
+    const getCharacterForPlugin = async () => {
+        const char = DBState.db.characters?.[get(selectedCharID)]
+        return await hydratePluginCharacterSnapshot(char ? $state.snapshot(char) : char)
+    }
+    const setCharacterForPlugin = (char: any) => {
+        oldApis.setChar(restorePluginCharacterManifest(char, DBState.db.characters?.[get(selectedCharID)]))
+    }
+    const withPluginName = (options: any) => ({
+        ...(options ?? {}),
+        logPlugin: plugin.name,
+    })
     return {
 
         //Old APIs from v2.1
@@ -726,7 +754,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
                     console.warn(`Request contains potentially sensitive header '${headerName}'. handling of such headers may be changed to only work with nativeFetch.`);
                 }
             }
-            return oldApis.risuFetch(url, options);
+            return oldApis.risuFetch(url, withPluginName(options));
         },
         nativeFetch: (url, options) => {
             for(const blocked of urlBlacklist){
@@ -742,7 +770,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
                     console.warn(`Request contains potentially sensitive header '${headerName}'. handling of such headers may be changed to use server-side approch with write-only api access in the future for better security.`);
                 }
             }
-            return oldApis.nativeFetch(url, options);
+            return oldApis.nativeFetch(url, withPluginName(options));
         },
         tokenize: async (text: string, options?: { tokenizer?: string, accurate?: boolean }) => {
             if(typeof text !== 'string') throw new Error('tokenize: text must be a string');
@@ -757,22 +785,23 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
             return await tokenizerTokenize(text);
         },
         tokenizers: () => tokenizerList.map(([id, label]) => ({ id, label })),
-        getChar: oldApis.getChar,
-        setChar: oldApis.setChar,
+        getChar: getCharacterForPlugin,
+        setChar: setCharacterForPlugin,
         addProvider: (name: string, func: (arg: PluginV2ProviderArgument, abortSignal?: AbortSignal) => Promise<{ success: boolean, content: string | ReadableStream<string> }>, options?: PluginV3ProviderOptions) => {
             console.warn(`[WARN] addProvider is a powerful API that can potentially be unsafe if used incorrectly. addProvider's functionality might be limited or changed in future updates to ensure security. please use other APIs if possible.`);
             let provs = get(customProviderStore)
             provs.push(name)
-            pluginV2.providers.set(name, async (arg, abortSignal) => {
+            const provider = async (arg: PluginV2ProviderArgument, abortSignal?: AbortSignal) => {
                const conf = await getPluginPermission(plugin.name, 'provider', 'periodically');
                if(!conf){
-                   return { success: false, content: language.permissionDenied }
+                   return { success: false, content: language.permissionDenied };
                }
                //mode is overridden to v3, due to vulnerabilities using mode.
                //Alternative to mode will be added in future
                arg.mode = 'v3'
                return await func(arg, abortSignal);
-            }),
+            }
+            pluginV2.providers.set(name, provider)
             pluginV2.providerOptions.set(name, options ?? {})
             customProviderStore.set(provs)
 
@@ -789,6 +818,23 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
                 tokenizer:options?.model?.tokenizer ??  LLMTokenizer.Unknown
             }
             customV3ProviderMetaStore.push(modelData);
+            addPluginUnloadCallback(plugin.name, () => {
+                if(pluginV2.providers.get(name) !== provider) return;
+                pluginV2.providers.delete(name);
+                pluginV2.providerOptions.delete(name);
+
+                const currentProviders = get(customProviderStore);
+                const providerIndex = currentProviders.indexOf(name);
+                if(providerIndex !== -1){
+                    currentProviders.splice(providerIndex, 1);
+                    customProviderStore.set(currentProviders);
+                }
+
+                const metaIndex = customV3ProviderMetaStore.indexOf(modelData);
+                if(metaIndex !== -1){
+                    customV3ProviderMetaStore.splice(metaIndex, 1);
+                }
+            });
         },
         addTTSPreprocessor: async (
             func: TTSHookFn<BeforeTTSContext, BeforeTTSResult>,
@@ -818,11 +864,25 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
             console.warn(`[Plugins] ${plugin.name}: addRisuReplacer('${name}') registered`)
         },
         removeRisuReplacer: oldApis.removeRisuReplacer,
+        addRisuChatListener: async (mode:'output', func:Function) => {
+            //permission check, lets use same as replacer
+            const conf = await getPluginPermission(plugin.name, 'replacer', 'periodically');
+            if(!conf){
+                return;
+            }
+            oldApis.addRisuChatListener(mode, func as any);
+            addPluginUnloadCallback(plugin.name, () => oldApis.removeRisuChatListener(mode, func as any));
+        },
+        removeRisuChatListener: oldApis.removeRisuChatListener,
         setDatabaseLite: oldApis.setDatabaseLite,
         setDatabase: oldApis.setDatabase,
         loadPlugins: oldApis.loadPlugins,
         readImage: oldApis.readImage,
         readInlay: async (id: string) => {
+            const conf = await getPluginPermission(plugin.name, 'inlay', 'periodically');
+            if(!conf){
+                return null;
+            }
             return await getInlayAsset(id);
         },
         saveAsset: oldApis.saveAsset,
@@ -839,6 +899,24 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
                     continue;
                 }
                 (liteDB as any)[key] = $state.snapshot((db as any)[key]);
+            }
+            // Lazy asset manifests are filled here for modules, persona-embedded
+            // modules (#80 follow-up) and characters — a plugin reading the
+            // database instead of getCharacter* must see the same shape.
+            await hydratePluginDatabaseSnapshot(liteDB);
+            // Plugin values live on the server, so the DB field is always {}.
+            // Fill it with every stored value only when the user allowed it
+            // for this plugin (see wantsFullPluginStorage); otherwise say once
+            // why it is empty.
+            if (PLUGIN_CUSTOM_STORAGE_KEY in liteDB) {
+                const configuredPlugin = DBState.db.plugins.find(entry => plugin.installId
+                    ? entry.installId === plugin.installId : entry.name === plugin.name);
+                if (wantsFullPluginStorage(configuredPlugin)) {
+                    (liteDB as any)[PLUGIN_CUSTOM_STORAGE_KEY] = await pluginStorageStore.snapshotAll();
+                } else if (!fullStorageHintShown.has(plugin.name)) {
+                    fullStorageHintShown.add(plugin.name);
+                    console.warn(`[RisuAI Plugin: ${plugin.name}] getDatabase() returns an empty pluginCustomStorage on PocketRisu. Read other plugins' values with pluginStorage.getItem(key), or allow full storage access for this plugin in Settings > Plugins. See docs/en/plugin-storage.md.`);
+                }
             }
             return liteDB;
         },
@@ -931,12 +1009,12 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
             }
         },
         getCurrentContextLite: getCurrentContextLite,
-        getCharacterFromIndex: (index:number) => {
+        getCharacterFromIndex: async (index:number) => {
             const db = DBState.db
             const charIds = Object.keys(db.characters);
             const charId = charIds[index];
             if(charId){
-                return $state.snapshot(db.characters[charId]);
+                return await hydratePluginCharacterSnapshot($state.snapshot(db.characters[charId]));
             }
             return null;
         },
@@ -945,7 +1023,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
             const charIds = Object.keys(db.characters);
             const charId = charIds[index];
             if(charId){
-                DBState.db.characters[charId] = char
+                DBState.db.characters[charId] = restorePluginCharacterManifest(char, db.characters[charId])
             }
         },
         getChatFromIndex: (characterIndex:number, chatIndex:number) => {
@@ -992,8 +1070,8 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
             return $state.snapshot(characterLore.concat(chatLore).concat(moduleLore))
         },
         //New names for character APIs, to match API naming conventions
-        getCharacter: oldApis.getChar,
-        setCharacter: oldApis.setChar,
+        getCharacter: getCharacterForPlugin,
+        setCharacter: setCharacterForPlugin,
 
         showContainer: (
             //more types may be added in future
@@ -1031,7 +1109,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
             if(!conf){
                 return null;
             }
-            return new SafeDocument(document);
+            return new SafeDocument(document, plugin.name);
         },
         registerSetting: (
             name:string,
@@ -1228,7 +1306,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
             console.log(`[RisuAI Plugin: ${plugin.name}] ${message}`);
         },
         createMutationObserver(callback: SafeMutationCallback): SafeMutationObserver {
-            const observer = new SafeMutationObserver(callback)
+            const observer = new SafeMutationObserver(callback, plugin.name)
             addPluginUnloadCallback(plugin.name, () => {
                 observer.disconnect()
             })
@@ -1297,25 +1375,23 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
             
             return v;
         },
-        _getPluginStorage: oldApis.pluginStorage.getItem,
-        _getManyPluginStorage: (keys: string[]) => keys.map((key) => oldApis.pluginStorage.getItem(key)),
-        // Wrapped (not aliased) so we can record the originating plugin into the
-        // sidecar meta map. The value write is unchanged; reads stay aliased.
-        _setPluginStorage: (key: string, value: any) => {
-            oldApis.pluginStorage.setItem(key, value)
+        _getPluginStorage: (key: string) => pluginStorageStore.getItem(key),
+        _getManyPluginStorage: (keys: string[]) => Promise.all(keys.map((key) => pluginStorageStore.getItem(key))),
+        _setPluginStorage: async (key: string, value: any) => {
+            await pluginStorageStore.setItem(key, value)
             recordOwner('save', key, plugin.name)
         },
-        _removePluginStorage: (key: string) => {
-            oldApis.pluginStorage.removeItem(key)
+        _removePluginStorage: async (key: string) => {
+            await pluginStorageStore.removeItem(key)
             removeOwner('save', key)
         },
-        _clearPluginStorage: () => {
-            oldApis.pluginStorage.clear()
+        _clearPluginStorage: async () => {
+            await pluginStorageStore.clear()
             clearOwners('save')
         },
-        _keyPluginStorage: oldApis.pluginStorage.key,
-        _keysPluginStorage: oldApis.pluginStorage.keys,
-        _lengthPluginStorage: oldApis.pluginStorage.length,
+        _keyPluginStorage: pluginStorageStore.key,
+        _keysPluginStorage: pluginStorageStore.keys,
+        _lengthPluginStorage: pluginStorageStore.length,
         _getPluginBlobStorage: oldApis.pluginBlobStorage.getItem,
         _setPluginBlobStorage: oldApis.pluginBlobStorage.setItem,
         _removePluginBlobStorage: oldApis.pluginBlobStorage.removeItem,
@@ -1577,7 +1653,12 @@ type V3PluginInstance = {
 
 const v3PluginInstances: V3PluginInstance[] = [];
 const pendingV3PluginGenerations = new Map<string, number>();
+const pendingV3PluginTokens = new Map<string, symbol>();
+const requestedV3Reloads = new Map<string, symbol>();
 let v3LoadGeneration = 0;
+
+// Plugins already told (once per session) why pluginCustomStorage is empty.
+const fullStorageHintShown = new Set<string>()
 
 export async function loadV3Plugins(plugins:RisuPlugin[]){
     const loadGeneration = ++v3LoadGeneration;
@@ -1602,6 +1683,21 @@ export async function loadV3Plugins(plugins:RisuPlugin[]){
     await Promise.all(loadPromises);
 }
 
+export async function reloadV3Plugin(plugin:RisuPlugin){
+    const reloadToken = Symbol(plugin.name);
+    const loadGeneration = v3LoadGeneration;
+    requestedV3Reloads.set(plugin.name, reloadToken);
+    pendingV3PluginGenerations.delete(plugin.name);
+    pendingV3PluginTokens.delete(plugin.name);
+    try {
+        await unloadV3Plugin(plugin.name);
+        if (requestedV3Reloads.get(plugin.name) !== reloadToken || loadGeneration !== v3LoadGeneration) return;
+        if (plugin.enabled !== false) await executePluginV3(plugin, loadGeneration);
+    } finally {
+        if (requestedV3Reloads.get(plugin.name) === reloadToken) requestedV3Reloads.delete(plugin.name);
+    }
+}
+
 export async function executePluginV3(plugin:RisuPlugin, loadGeneration = v3LoadGeneration){
 
     const alreadyRunning = v3PluginInstances.find(p => p.name === plugin.name);
@@ -1611,6 +1707,8 @@ export async function executePluginV3(plugin:RisuPlugin, loadGeneration = v3Load
     }
 
     pendingV3PluginGenerations.set(plugin.name, loadGeneration);
+    const loadToken = Symbol(plugin.name);
+    pendingV3PluginTokens.set(plugin.name, loadToken);
     const pluginSnapshot = {
         ...plugin,
         name: plugin.name,
@@ -1629,6 +1727,7 @@ export async function executePluginV3(plugin:RisuPlugin, loadGeneration = v3Load
         if(
             loadGeneration !== v3LoadGeneration
             || pendingV3PluginGenerations.get(pluginSnapshot.name) !== loadGeneration
+            || pendingV3PluginTokens.get(pluginSnapshot.name) !== loadToken
             || v3PluginInstances.some(p => p.name === pluginSnapshot.name)
         ){
             return;
@@ -1650,8 +1749,9 @@ export async function executePluginV3(plugin:RisuPlugin, loadGeneration = v3Load
         host.run(iframe, pluginSnapshot.script);
         console.log(`[RisuAI Plugin: ${pluginSnapshot.name}] Loaded API V3 plugin.`);
     } finally {
-        if(pendingV3PluginGenerations.get(pluginSnapshot.name) === loadGeneration){
+        if(pendingV3PluginTokens.get(pluginSnapshot.name) === loadToken){
             pendingV3PluginGenerations.delete(pluginSnapshot.name);
+            pendingV3PluginTokens.delete(pluginSnapshot.name);
         }
     }
 }

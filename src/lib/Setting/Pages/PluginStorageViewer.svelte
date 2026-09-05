@@ -24,7 +24,7 @@
     import { alertConfirm, notifyError, notifySuccess } from 'src/ts/alert'
     import { SafeLocalStorage, SafeLocalPluginStorage } from 'src/ts/plugins/pluginSafeClass'
     import { getOwners, removeOwner } from 'src/ts/plugins/pluginStorageMeta'
-    import { pluginCustomKv } from 'src/ts/plugins/pluginKvStorage'
+    import * as pluginStorageStore from 'src/ts/plugins/pluginStorageStore'
     import {
         PLUGIN_STORAGE_PREVIEW_CHARS,
         canCommitDetailMutation,
@@ -62,7 +62,7 @@
     const safeLocal = new SafeLocalStorage()
     const idb = new SafeLocalPluginStorage()
     const storage = createPluginStorageBackendAdapter({
-        custom: pluginCustomKv,
+        custom: pluginStorageStore,
         local: safeLocal,
         idb,
         removeOwner,
@@ -198,6 +198,7 @@
         loadTotal = 0
         entries = []
         try {
+            if (requestedBackend === 'save') await pluginStorageStore.refreshIndex()
             const keys = await storage.keys(requestedBackend)
             if (!isCurrentStorageOperation(token, loadToken, requestedBackend, backend)) return
             loadTotal = keys.length
@@ -584,8 +585,14 @@
                 {#if entry.owner}
                     <ShBadge variant="secondary" className="max-w-[35%] overflow-hidden">{entry.owner}</ShBadge>
                 {/if}
-                <span class="text-textcolor2 text-[10px] uppercase tracking-wide shrink-0 opacity-70">{entry.type}</span>
-                <span class="text-textcolor2 text-xs shrink-0 tabular-nums">{formatSize(entry.size)}</span>
+                <!-- The index-backed backends report no type without reading the
+                     value, so a column of identical "UNKNOWN" labels carries no
+                     information — the real type is resolved in the detail dialog. -->
+                {#if entry.type && entry.type !== 'unknown'}
+                    <span class="text-textcolor2 text-[10px] uppercase tracking-wide shrink-0 opacity-70">{entry.type}</span>
+                {/if}
+                <span class="text-textcolor2 text-xs shrink-0 tabular-nums"
+                    title={entry.size === null ? language.pluginStorageSizeUnknown : undefined}>{formatSize(entry.size)}</span>
                 <button
                     class="shrink-0 text-textcolor2 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer p-1"
                     aria-label={language.remove}

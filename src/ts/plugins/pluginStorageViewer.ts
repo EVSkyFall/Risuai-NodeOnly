@@ -323,8 +323,9 @@ export function isCurrentStorageOperation(
 interface CustomStoragePort {
     keys(): string[]
     getItem(key: string): unknown
-    setItem(key: string, value: unknown): void
-    removeItem(key: string): void
+    size?(key: string): number | undefined
+    setItem(key: string, value: unknown): void | Promise<void>
+    removeItem(key: string): void | Promise<void>
     flushImmediate(): Promise<void>
 }
 
@@ -358,7 +359,9 @@ export function createPluginStorageBackendAdapter(deps: PluginStorageBackendDepe
         },
 
         summary(backend: PluginStorageViewerBackend, key: string): PluginStorageValueSummary {
-            if (backend === 'save') return summarizeStoredValue(deps.custom.getItem(key))
+            if (backend === 'save') return deps.custom.size
+                ? { type: 'unknown', size: deps.custom.size(key) ?? null }
+                : summarizeStoredValue(deps.custom.getItem(key))
             if (backend === 'local') return { type: 'string', size: null }
             return { type: 'unknown', size: null }
         },
@@ -371,7 +374,7 @@ export function createPluginStorageBackendAdapter(deps: PluginStorageBackendDepe
 
         async write(backend: PluginStorageViewerBackend, key: string, value: unknown): Promise<void> {
             if (backend === 'save') {
-                deps.custom.setItem(key, value)
+                await deps.custom.setItem(key, value)
                 await deps.custom.flushImmediate()
                 return
             }
@@ -384,7 +387,7 @@ export function createPluginStorageBackendAdapter(deps: PluginStorageBackendDepe
 
         async remove(backend: PluginStorageViewerBackend, key: string): Promise<void> {
             if (backend === 'save') {
-                deps.custom.removeItem(key)
+                await deps.custom.removeItem(key)
                 await deps.custom.flushImmediate()
             } else if (backend === 'local') {
                 deps.local.removeItem(key)
@@ -396,7 +399,7 @@ export function createPluginStorageBackendAdapter(deps: PluginStorageBackendDepe
 
         async removeMany(backend: PluginStorageViewerBackend, keys: string[]): Promise<void> {
             if (backend === 'save') {
-                for (const key of keys) deps.custom.removeItem(key)
+                for (const key of keys) await deps.custom.removeItem(key)
                 await deps.custom.flushImmediate()
             } else if (backend === 'local') {
                 for (const key of keys) deps.local.removeItem(key)

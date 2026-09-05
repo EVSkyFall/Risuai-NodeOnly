@@ -1,206 +1,29 @@
+import * as pluginStorageStore from "./pluginStorageStore"
 import {
-    clearPersistentPrefix,
     decodeStorageKeyComponent,
     listPersistentKeys,
     makeEncodedStorageKey,
-    readManyPersistentJson,
     readPersistentJson,
     removePersistentKey,
     writePersistentJson,
 } from "../storage/persistentKv"
 
-const CUSTOM_PREFIX = 'plugin-custom-storage/'
 const BLOB_PREFIX = 'plugin-blob-storage/'
-const FLUSH_DEBOUNCE_MS = 300
 
+// Compatibility facade: all custom values use the single lazy store and server namespace.
 export class PluginCustomKvStorage {
-    private cache = new Map<string, any>()
-    private dirtyKeys = new Set<string>()
-    private pendingDeletes = new Set<string>()
-    private flushTimer: ReturnType<typeof setTimeout> | null = null
-    private flushPromise: Promise<void> | null = null
-    private initialized = false
-
-    async init(legacyData?: Record<string, any>): Promise<void> {
-        const serverKeys = await listPersistentKeys(CUSTOM_PREFIX)
-
-        // One bulk round trip instead of N sequential /api/read calls — with
-        // many plugin keys (chat-scoped stores accumulate one per chat) the
-        // sequential form made boot storage init take N×RTT, so plugins came
-        // up seconds before their data on remote servers.
-        //
-        // Failure isolation: the bulk reader is fail-closed (it throws on any
-        // correlation anomaly or corrupt value), but ONE bad key must not cost
-        // every plugin its entire storage — fall back to per-key reads with
-        // per-key isolation, and surface what was skipped instead of dying.
-        let values: (any | null)[]
-        try {
-            values = await readManyPersistentJson<any>(serverKeys)
-        } catch (bulkError) {
-            console.warn('[PluginCustomKvStorage] bulk init read failed; falling back to per-key reads:', bulkError)
-            values = await Promise.all(serverKeys.map(async (fullKey) => {
-                try {
-                    return await readPersistentJson<any>(fullKey)
-                } catch (keyError) {
-                    console.warn(`[PluginCustomKvStorage] skipping unreadable key ${fullKey}:`, keyError)
-                    return null
-                }
-            }))
-        }
-        let skipped = 0
-        for (let i = 0; i < serverKeys.length; i++) {
-            const value = values[i]
-            if (value === null) {
-                skipped++
-                continue
-            }
-            const encoded = serverKeys[i].slice(CUSTOM_PREFIX.length, -'.json'.length)
-            const rawKey = decodeStorageKeyComponent(encoded)
-            this.cache.set(rawKey, value)
-        }
-        console.log(`[PluginCustomKvStorage] init: ${this.cache.size} keys loaded (${skipped} empty/skipped of ${serverKeys.length})`)
-
-        if (legacyData && typeof legacyData === 'object') {
-            const legacyKeys = Object.keys(legacyData)
-            if (legacyKeys.length > 0 && this.cache.size === 0) {
-                for (const key of legacyKeys) {
-                    this.cache.set(key, legacyData[key])
-                    this.dirtyKeys.add(key)
-                }
-                await this.flush()
-            }
-        }
-
-        this.initialized = true
-    }
-
-    getItem(key: string): any | null {
-        return this.cache.get(key) ?? null
-    }
-
-    hasItem(key: string): boolean {
-        return this.cache.has(key)
-    }
-
-    setItem(key: string, value: any): void {
-        this.cache.set(key, value)
-        this.dirtyKeys.add(key)
-        this.pendingDeletes.delete(key)
-        this.scheduleFlush()
-    }
-
-    removeItem(key: string): void {
-        this.cache.delete(key)
-        this.dirtyKeys.delete(key)
-        this.pendingDeletes.add(key)
-        this.scheduleFlush()
-    }
-
-    clear(): void {
-        const allKeys = [...this.cache.keys()]
-        this.cache.clear()
-        this.dirtyKeys.clear()
-        for (const key of allKeys) {
-            this.pendingDeletes.add(key)
-        }
-        this.scheduleFlush()
-    }
-
-    keys(): string[] {
-        return [...this.cache.keys()]
-    }
-
-    key(index: number): string | null {
-        return this.keys()[index] ?? null
-    }
-
-    get length(): number {
-        return this.cache.size
-    }
-
-    private scheduleFlush(): void {
-        if (this.flushTimer !== null) return
-        this.flushTimer = setTimeout(() => {
-            this.flushTimer = null
-            this.flush()
-        }, FLUSH_DEBOUNCE_MS)
-    }
-
-    async flush(): Promise<void> {
-        if (this.flushPromise) {
-            await this.flushPromise
-        }
-
-        if (this.dirtyKeys.size === 0 && this.pendingDeletes.size === 0) return
-
-        const keysToWrite = [...this.dirtyKeys]
-        const keysToDelete = [...this.pendingDeletes]
-        this.dirtyKeys.clear()
-        this.pendingDeletes.clear()
-
-        this.flushPromise = (async () => {
-            const results = await Promise.allSettled([
-                ...keysToWrite.map(async (key) => {
-                    const value = this.cache.get(key)
-                    if (value !== undefined) {
-                        await writePersistentJson(makeEncodedStorageKey(CUSTOM_PREFIX, key), value)
-                    }
-                    return { type: 'write' as const, key }
-                }),
-                ...keysToDelete.map(async (key) => {
-                    await removePersistentKey(makeEncodedStorageKey(CUSTOM_PREFIX, key))
-                    return { type: 'delete' as const, key }
-                }),
-            ])
-
-            for (const result of results) {
-                if (result.status === 'rejected') {
-                    const val = (result as PromiseRejectedResult)
-                    console.warn('[PluginCustomKvStorage] flush failed for key:', val.reason)
-                }
-                if (result.status === 'fulfilled') continue
-                // Can't recover key identity from rejected promise easily,
-                // so re-queue all failed ops in the next block
-            }
-
-            for (let i = 0; i < results.length; i++) {
-                if (results[i].status === 'rejected') {
-                    const idx = i
-                    if (idx < keysToWrite.length) {
-                        const key = keysToWrite[idx]
-                        if (this.cache.has(key) && !this.pendingDeletes.has(key)) {
-                            this.dirtyKeys.add(key)
-                        }
-                    } else {
-                        const key = keysToDelete[idx - keysToWrite.length]
-                        if (!this.cache.has(key) && !this.dirtyKeys.has(key)) {
-                            this.pendingDeletes.add(key)
-                        }
-                    }
-                }
-            }
-
-            if (this.dirtyKeys.size > 0 || this.pendingDeletes.size > 0) {
-                this.scheduleFlush()
-            }
-        })()
-
-        try {
-            await this.flushPromise
-        } finally {
-            this.flushPromise = null
-        }
-    }
-
-    async flushImmediate(): Promise<void> {
-        if (this.flushTimer !== null) {
-            clearTimeout(this.flushTimer)
-            this.flushTimer = null
-        }
-        await this.flush()
-    }
+    async init(_legacyData?: Record<string, any>): Promise<void> { await pluginStorageStore.init() }
+    getItem(key: string): any | null { return pluginStorageStore.getItemSync(key) }
+    hasItem(key: string): boolean { return pluginStorageStore.has(key) }
+    setItem(key: string, value: any): void { pluginStorageStore.setItemSync(key, value) }
+    removeItem(key: string): void { pluginStorageStore.removeItemSync(key) }
+    clear(): void { pluginStorageStore.clearSync() }
+    keys(): string[] { return pluginStorageStore.keys() }
+    key(index: number): string | null { return pluginStorageStore.key(index) }
+    get length(): number { return pluginStorageStore.length() }
+    async flush(): Promise<void> { await pluginStorageStore.flushImmediate() }
+    async flushImmediate(): Promise<void> { await pluginStorageStore.flushImmediate() }
 }
-
 
 export class PluginBlobKvStorage {
     private cache = new Map<string, string>()

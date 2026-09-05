@@ -11,6 +11,7 @@ import type { MultiModal } from "../index.svelte"
 import { extractJSON } from "../templates/jsonSchema"
 import { callTool, decodeToolCall, encodeToolCall } from "../mcp/mcp"
 import type { RequestDataArgumentExtended, requestDataResponse, StreamResponseChunk } from './request'
+import { toLogSource } from './logSource'
 import { applyAdditionalParameters, applyParameters, getAdditionalParameters } from './shared'
 import { submitClaudeBatch, registerBatchStream, unregisterBatchStream, cancelClaudeBatch } from './claudeBatchTracker'
 
@@ -511,7 +512,7 @@ export async function requestClaude(arg:RequestDataArgumentExtended):Promise<req
 
         const res = await globalFetch(url, {
             logCategory: 'llm',
-            logSource: 'main',
+            logSource: arg.logSource ?? toLogSource(arg.mode),
             method: "POST",
             body: params,
             headers: signed.headers,
@@ -760,7 +761,7 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
             try {
                 res = await fetchNative(replacerURL, {
                     logCategory: 'llm',
-                    logSource: 'main',
+                    logSource: arg.logSource ?? toLogSource(arg.mode),
                     body: JSON.stringify(body),
                     headers: headers,
                     method: "POST",
@@ -1252,7 +1253,7 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
     for(let attempt = 0; attempt < MAX_RETRIES; attempt++){
         res = await globalFetch(replacerURL, {
             logCategory: 'llm',
-            logSource: 'main',
+            logSource: arg.logSource ?? toLogSource(arg.mode),
             body: body,
             headers: headers,
             method: "POST",

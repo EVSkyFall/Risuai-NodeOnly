@@ -1247,7 +1247,8 @@ async function generateAIImageInternal(
         }
 
         const uri = model === 'core' ? 'core' : model === 'ultra' ? 'ultra' : 'sd3'
-        const da = await fetch("https://api.stability.ai/v2beta/stable-image/generate/" + uri, {
+        const url = "https://api.stability.ai/v2beta/stable-image/generate/" + uri
+        const da = await fetch(url, {
             body: formData,
             headers:{
                 "authorization": "Bearer " + db.stabilityKey,
@@ -1262,7 +1263,7 @@ async function generateAIImageInternal(
             return false
         }
 
-        if((da.headers["content-type"] ?? "").startsWith('application/json')){
+        if((da.headers.get("content-type") ?? "").startsWith('application/json')){
             notifyError(Buffer.from(res).toString())
             return false
         }

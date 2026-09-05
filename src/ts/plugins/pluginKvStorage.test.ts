@@ -23,6 +23,13 @@ vi.mock('../parser/parser.svelte', () => ({
 vi.mock('../globalApi.svelte', () => ({
     forageStorage: {
         Init: async () => {},
+        getPluginStorageIndex: async () => ({ entries: [...fake.storageMap.entries()].map(([key, value]) => ({
+            key: Buffer.from(key.slice('plugin-custom-storage/'.length, -5), 'base64url').toString('utf8'), size: value.length,
+        })) }),
+        getPluginStorageAll: async (onEntry: (key: string, text: string) => void) => {
+            fake.counters.bulkReads++
+            for (const [key, value] of fake.storageMap) onEntry(Buffer.from(key.slice('plugin-custom-storage/'.length, -5), 'base64url').toString('utf8'), new TextDecoder().decode(value))
+        },
         keys: async (prefix: string) =>
             [...fake.storageMap.keys()].filter((k) => k.startsWith(prefix)),
         getItem: async (key: string) => {
@@ -42,6 +49,9 @@ vi.mock('../globalApi.svelte', () => ({
     },
 }))
 
+vi.mock('../alert', () => ({ alertError: vi.fn() }))
+
+import * as lazyStore from './pluginStorageStore'
 import { PluginCustomKvStorage } from './pluginKvStorage'
 import { makeEncodedStorageKey } from '../storage/persistentKv'
 
@@ -56,13 +66,14 @@ function seed(rawKey: string, value: unknown) {
 }
 
 beforeEach(() => {
+    lazyStore._resetForTests()
     fake.storageMap.clear()
     fake.counters.bulkReads = 0
     fake.counters.perKeyReads = 0
 })
 
 describe('PluginCustomKvStorage.init', () => {
-    test('loads every stored key through a single bulk read, not N per-key reads', async () => {
+    test('initializes metadata only; an explicit V2 preload streams all values once', async () => {
         seed('omninode_config', { tier: 'heavy' })
         seed('provider/settings', { endpoint: 'https://example.invalid' })
         seed('한글 키', [1, 2, 3])
@@ -70,6 +81,9 @@ describe('PluginCustomKvStorage.init', () => {
         const store = new PluginCustomKvStorage()
         await store.init()
 
+        expect(fake.counters.bulkReads).toBe(0)
+        expect(fake.counters.perKeyReads).toBe(0)
+        await lazyStore.preloadAll()
         expect(store.getItem('omninode_config')).toEqual({ tier: 'heavy' })
         expect(store.getItem('provider/settings')).toEqual({ endpoint: 'https://example.invalid' })
         expect(store.getItem('한글 키')).toEqual([1, 2, 3])

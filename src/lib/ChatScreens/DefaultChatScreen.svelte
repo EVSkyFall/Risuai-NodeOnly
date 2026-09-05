@@ -1,4 +1,5 @@
 <script lang="ts">
+    import { getActiveHypaV3Preset } from "src/ts/process/memory/memoryPresets";
 
     import Suggestion from './Suggestion.svelte';
     import { CameraIcon, ChevronUpIcon, ChevronDownIcon, ChevronsUpIcon, ChevronsDownIcon, DatabaseIcon, GlobeIcon, ImagePlusIcon, LanguagesIcon, Laugh, MenuIcon, MicOffIcon, PackageIcon, Plus, RefreshCcwIcon, ReplyIcon, Send, StepForwardIcon, XIcon, BrainIcon, ArrowDown, ZapIcon, Maximize2, Minimize2 } from "@lucide/svelte";
@@ -1014,7 +1015,7 @@ import { isMobile } from 'src/ts/platform'
                                     <PluginDefinedIcon ico={menu} /><span>{menu.name}</span>
                                 </ShDropdownMenuItem>
                             {/each}
-                            {#if DBState.db.showMenuHypaMemoryModal && DBState.db.hypaV3}
+                            {#if DBState.db.showMenuHypaMemoryModal && getActiveHypaV3Preset(DBState.db, DBState.db.characters[$selectedCharID], DBState.db.characters[$selectedCharID]?.chats?.[DBState.db.characters[$selectedCharID]?.chatPage])}
                                 <ShDropdownMenuItem onSelect={() => { $hypaV3ModalOpen = true }}>
                                     <BrainIcon /><span>{language.hypaMemoryV3Modal}</span>
                                 </ShDropdownMenuItem>
@@ -1062,24 +1063,29 @@ import { isMobile } from 'src/ts/platform'
                         </ShDropdownMenuContent>
                     </ShDropdownMenu>
                 {:else}
-                    <div onclick={(e) => {
-                        DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message.push({
-                            role: 'char',
-                            data: ''
-                        })
-                        DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage] = DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage]
-                    }}
-                         class="shrink-0 flex justify-center items-center w-9 h-9 rounded-full text-textcolor hover:bg-primary/20 transition-colors cursor-pointer"
+                    <button
+                        onclick={() => {
+                            DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message.push({
+                                role: 'char',
+                                data: ''
+                            })
+                            DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage] = DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage]
+                        }}
+                        aria-label={language.addBlankMessage}
+                        class="shrink-0 flex justify-center items-center w-9 h-9 rounded-full text-textcolor hover:bg-primary/20 transition-colors cursor-pointer"
                     >
                         <Plus size={20} />
-                    </div>
+                    </button>
                 {/if}
 
                 {#if DBState.db.useChatSticker}
-                    <div onclick={()=>{toggleStickers = !toggleStickers}}
-                         class={"shrink-0 flex justify-center items-center w-9 h-9 rounded-full hover:bg-primary/20 transition-colors cursor-pointer "+(toggleStickers ? 'text-green-500':'text-textcolor')}>
+                    <button
+                        onclick={()=>{toggleStickers = !toggleStickers}}
+                        aria-label={language.useChatSticker}
+                        aria-pressed={toggleStickers}
+                        class={"shrink-0 flex justify-center items-center w-9 h-9 rounded-full hover:bg-primary/20 transition-colors cursor-pointer "+(toggleStickers ? 'text-green-500':'text-textcolor')}>
                         <Laugh size={20}/>
-                    </div>
+                    </button>
                 {/if}
 
                 <textarea class="text-input-area outline-hidden text-textcolor px-2 py-1.5 min-w-0 bg-transparent input-text text-base resize-none overflow-x-hidden max-w-full"

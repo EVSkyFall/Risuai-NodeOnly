@@ -28,6 +28,7 @@ import { applyChatTemplate } from "../../templates/chatTemplate"
 import { supportsInlayImage } from "../../files/inlays"
 import { callTool, decodeToolCall, encodeToolCall } from "../../mcp/mcp"
 import type { RequestDataArgumentExtended, requestDataResponse, StreamResponseChunk } from '../request'
+import { toLogSource } from '../logSource'
 import { applyAdditionalParameters, applyParameters, getAdditionalParameters } from '../shared'
 
 import type { Contents, OpenAIChatExtra, OpenAIChatFull, ResponseInputItem, ResponseItem, ResponseOutputItem, ToolCall } from './types'
@@ -464,7 +465,7 @@ export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<req
         }
     
         const mistralUrl = arg.customURL ?? "https://api.mistral.ai/v1/chat/completions"
-        const res = await globalFetch(mistralUrl, { ...targs, ...getLocalNetworkRequestOptions(mistralUrl), logCategory: 'llm', logSource: 'main', logModel: arg.modelInfo?.id })
+        const res = await globalFetch(mistralUrl, { ...targs, ...getLocalNetworkRequestOptions(mistralUrl), logCategory: 'llm', logSource: arg.logSource ?? toLogSource(arg.mode), logModel: arg.modelInfo?.id })
 
         const dat = res.data as any
         if(res.ok){
@@ -769,7 +770,7 @@ export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<req
             chatId: arg.chatId,
             interceptor: 'openai_streaming',
             logCategory: 'llm',
-            logSource: 'main',
+            logSource: arg.logSource ?? toLogSource(arg.mode),
             logModel: arg.modelInfo?.id,
             ...getLocalNetworkRequestOptions(replacerURL, arg.forceLocalNetwork),
         })
@@ -825,7 +826,7 @@ async function requestHTTPOpenAI(replacerURL:string,body:any, headers:Record<str
     const db = getDatabase()
     const res = await globalFetch(replacerURL, {
         logCategory: 'llm',
-        logSource: 'main',
+        logSource: arg.logSource ?? toLogSource(arg.mode),
         logModel: arg.modelInfo?.id,
         body: body,
         headers: headers,
@@ -1088,7 +1089,7 @@ export async function requestOpenAILegacyInstruct(arg:RequestDataArgumentExtende
     const completionsUrl = arg.customURL ?? "https://api.openai.com/v1/completions"
     const response = await globalFetch(completionsUrl, {
         logCategory: 'llm',
-        logSource: 'main',
+        logSource: arg.logSource ?? toLogSource(arg.mode),
         logModel: 'gpt-3.5-turbo-instruct',
         body: {
             model: "gpt-3.5-turbo-instruct",
@@ -1285,7 +1286,7 @@ export async function requestOpenAIResponseAPI(arg:RequestDataArgumentExtended):
 
     const response = await globalFetch(requestURL, {
         logCategory: 'llm',
-        logSource: 'main',
+        logSource: arg.logSource ?? toLogSource(arg.mode),
         logModel: arg.modelInfo?.id,
         body: body,
         headers: headers,

@@ -49,7 +49,7 @@ async function loadModules() {
 // --- fixtures ---------------------------------------------------------------
 
 function makeChat(overrides: Record<string, unknown> = {}) {
-    return { id: 'chat-1', name: 'chat one', message: [] as any[], ...overrides }
+    return { id: 'chat-1', name: 'chat one', note: '', localLore: [], message: [] as any[], ...overrides }
 }
 
 function makeChar(chat: any) {
@@ -101,6 +101,7 @@ interface ServerBehavior {
     jobStatusUnreachable?: boolean
     /** commit the first claim but drop its response */
     claimResponseLostOnce?: boolean
+    pendingClearFails?: boolean
 }
 
 function setupServer(behavior: ServerBehavior) {
@@ -121,6 +122,7 @@ function setupServer(behavior: ServerBehavior) {
             return new Response(JSON.stringify({ pendingSends: behavior.pendingSends ?? [] }), { status: 200 })
         }
         if (url.startsWith('/api/pending-sends/') && method === 'DELETE') {
+            if (behavior.pendingClearFails) return new Response('{}', { status: 503 })
             return new Response('{"success":true}', { status: 200 })
         }
         if (url.startsWith('/api/pending-sends/') && url.endsWith('/claim') && method === 'POST') {
@@ -178,6 +180,7 @@ function setupServer(behavior: ServerBehavior) {
 }
 
 beforeEach(() => {
+    vi.useFakeTimers()
     mocks.db = { characters: [], inlayErrorResponse: true, showRequestStatus: true }
     mocks.notifyError.mockReset()
     mocks.notifyInfo.mockReset()
@@ -190,6 +193,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+    vi.clearAllTimers()
     vi.unstubAllGlobals()
     vi.useRealTimers()
 })
@@ -279,6 +283,55 @@ describe('recoverTerminalJob', () => {
         expect(calls.some((call) => call.method === 'GET' && call.url === '/api/model-jobs/job-1/claim')).toBe(true)
     })
 
+    test('restores model and token metadata on a recovered message', async () => {
+        const { recovery } = await loadModules()
+        const chat = makeChat()
+        mocks.db.characters = [makeChar(chat)]
+        const journal = OPENAI_SSE.replace(
+            'data: [DONE]\n\n',
+            'data: {"choices":[],"usage":{"prompt_tokens":999,"completion_tokens":5}}\n\ndata: [DONE]\n\n',
+        )
+        setupServer({ journals: { 'job-1': journal } })
+
+        await recovery.recoverTerminalJob(makeJob({
+            model: 'provider/model-id',
+            modelLabel: 'My Preset',
+            inputTokens: 1234,
+            outputTokens: 512,
+            maxContext: 32768,
+        }) as any)
+
+        expect(chat.message[0].generationInfo).toEqual({
+            completed: true,
+            generationId: 'gen-1',
+            model: 'My Preset',
+            modelId: 'provider/model-id',
+            inputTokens: 1234,
+            outputTokens: 512,
+            maxContext: 32768,
+        })
+    })
+
+    test('uses provider usage for old jobs without persisted token estimates', async () => {
+        const { recovery } = await loadModules()
+        const chat = makeChat()
+        mocks.db.characters = [makeChar(chat)]
+        const journal = OPENAI_SSE.replace(
+            'data: [DONE]\n\n',
+            'data: {"choices":[],"usage":{"prompt_tokens":999,"completion_tokens":5}}\n\ndata: [DONE]\n\n',
+        )
+        setupServer({ journals: { 'job-1': journal } })
+
+        await recovery.recoverTerminalJob(makeJob({ model: 'provider/model-id' }) as any)
+
+        expect(chat.message[0].generationInfo).toMatchObject({
+            model: 'provider/model-id',
+            modelId: 'provider/model-id',
+            inputTokens: 999,
+            outputTokens: 5,
+        })
+    })
+
     test('idempotent: a complete message with this generationId is left untouched, claim only', async () => {
         const { recovery } = await loadModules()
         const chat = makeChat({ message: [{ role: 'char', data: 'Hello, and then some more', generationInfo: { generationId: 'gen-1' } }] })
@@ -290,6 +343,58 @@ describe('recoverTerminalJob', () => {
         expect(chat.message).toHaveLength(1)
         expect(chat.message[0].data).toBe('Hello, and then some more') // recovered 'Hello' is shorter
         expect(claims()).toEqual(['/api/model-jobs/job-1/claim'])
+    })
+
+    test('a completed edited message survives save-ACK-before-claim crash without raw refill or duplicate', async () => {
+        const { recovery } = await loadModules()
+        const chat = makeChat({ message: [{ role: 'char', data: 'Hi', chatId: 'original', generationInfo: { generationId: 'gen-1', completed: true } }] })
+        mocks.db.characters = [makeChar(chat)]
+        setupServer({ journals: { 'job-1': OPENAI_SSE } })
+        await recovery.recoverTerminalJob(makeJob() as any)
+        expect(chat.message).toHaveLength(1)
+        expect(chat.message[0].data).toBe('Hi')
+        expect(mocks.saveChatToServerStrict).toHaveBeenCalled()
+    })
+
+    test.each(['', 'Hel'])('a continue with a durable prefix fills the original slot (partial=%s)', async (partial) => {
+        const { recovery } = await loadModules()
+        const prefix = 'Earlier reply. '.repeat(20)
+        const chat = makeChat({ message: [{ role: 'char', data: prefix + partial, chatId: 'prior-generation', generationInfo: { generationId: 'gen-1', continuePrefix: prefix } }] })
+        mocks.db.characters = [makeChar(chat)]
+        setupServer({ journals: { 'job-1': OPENAI_SSE } })
+        await recovery.recoverTerminalJob(makeJob() as any)
+        expect(chat.message).toHaveLength(1)
+        expect(chat.message[0]).toMatchObject({ data: prefix + 'Hello', chatId: 'prior-generation', generationInfo: { generationId: 'gen-1', completed: true } })
+    })
+
+    test('an older unclaimed job cannot complete or overwrite a newer continuation on its stable slot', async () => {
+        const { recovery } = await loadModules()
+        const prefix = 'Earlier answer. '.repeat(20)
+        const chat = makeChat({ message: [{ role: 'char', data: prefix + 'Hel', chatId: 'original',
+            generationInfo: { generationId: 'continued', continuePrefix: prefix } }] })
+        mocks.db.characters = [makeChar(chat)]
+        setupServer({ journals: { 'old-job': OPENAI_SSE, 'new-job': OPENAI_SSE } })
+        await recovery.recoverTerminalJob(makeJob({ id: 'old-job', generationId: 'original' }) as any)
+        expect(chat.message[0].generationInfo.completed).toBeUndefined()
+        expect(chat.message[0].generationInfo.continuePrefix).toBe(prefix)
+        expect(chat.message[0].data).toBe(prefix + 'Hel')
+        await recovery.recoverTerminalJob(makeJob({ id: 'new-job', generationId: 'continued' }) as any)
+        expect(chat.message).toHaveLength(1)
+        expect(chat.message[0].data).toBe(prefix + 'Hello')
+        expect(chat.message[0].generationInfo.completed).toBe(true)
+        expect(chat.message[0].generationInfo.continuePrefix).toBeUndefined()
+    })
+
+    test('new incomplete messages restore the full journal even when partial editoutput expanded their length', async () => {
+        const { recovery } = await loadModules()
+        const chat = makeChat({ message: [{ role: 'char', data: '<wrapper class="long-decoration">Hel</wrapper>',
+            generationInfo: { generationId: 'gen-1', completed: false } }] })
+        mocks.db.characters = [makeChar(chat)]
+        setupServer({ journals: { 'job-1': OPENAI_SSE } })
+        await recovery.recoverTerminalJob(makeJob() as any)
+        expect(chat.message).toHaveLength(1)
+        expect(chat.message[0].data).toBe('Hello')
+        expect(chat.message[0].generationInfo.completed).toBe(true)
     })
 
     test('fills a partial message left by a client that died mid-stream', async () => {
@@ -305,6 +410,36 @@ describe('recoverTerminalJob', () => {
         expect(chat.message[0].data).toBe('Hello')
         expect(char.reloadKeys).toBe(1)
         expect(claims()).toEqual(['/api/model-jobs/job-1/claim'])
+    })
+
+    test('a LIVE send owning the chat is left to the live path — no slot-in, no claim', async () => {
+        const { recovery, genState } = await loadModules()
+        const chat = makeChat({ message: [{ role: 'char', data: 'Hel', generationInfo: { generationId: 'gen-1' } }] })
+        mocks.db.characters = [makeChar(chat)]
+        const { calls, claims } = setupServer({ journals: { 'job-1': OPENAI_SSE } })
+        genState.startGeneration('chat-1', 'gen-1', 'live')
+
+        await recovery.recoverTerminalJob(makeJob() as any)
+
+        expect(chat.message[0].data).toBe('Hel')
+        expect(claims()).toEqual([])
+        expect(calls.some((c) => c.url.endsWith('/stream'))).toBe(false)
+        expect(mocks.saveChatToServerStrict).not.toHaveBeenCalled()
+        genState.endGeneration('chat-1')
+    })
+
+    test('a BACKGROUND registration on the chat does not block the slot-in', async () => {
+        const { recovery, genState } = await loadModules()
+        const chat = makeChat()
+        mocks.db.characters = [makeChar(chat)]
+        const { claims } = setupServer({ journals: { 'job-1': OPENAI_SSE } })
+        genState.startGeneration('chat-1', 'gen-1', 'background')
+
+        await recovery.recoverTerminalJob(makeJob() as any)
+
+        expect(chat.message).toHaveLength(1)
+        expect(claims()).toEqual(['/api/model-jobs/job-1/claim'])
+        genState.endGeneration('chat-1')
     })
 
     test('failed job with the live message already present adds no error block', async () => {
@@ -487,13 +622,13 @@ describe('recovered chat is persisted', () => {
         expect(mocks.saveChatToServerStrict).not.toHaveBeenCalled()
     })
 
-    test('a failed strict save with an exact readback keeps the claim and records once', async () => {
+    test('a failed strict save with an exact readback requires a second strict ACK before retaining the claim', async () => {
         const { recovery } = await loadModules()
         const chat = makeChat()
         mocks.db.characters = [makeChar(chat)]
-        mocks.saveChatToServerStrict.mockRejectedValue(new Error('durable ACK lost'))
+        mocks.saveChatToServerStrict.mockRejectedValueOnce(new Error('durable ACK lost'))
         mocks.fetchChatFromServer.mockResolvedValue(makeChat({
-            message: [{ role: 'char', data: 'Hello', chatId: 'gen-1', generationInfo: { generationId: 'gen-1' } }],
+            message: [{ role: 'char', data: 'Hello', chatId: 'gen-1', generationInfo: { generationId: 'gen-1', completed: true } }],
         }))
         const { claims, releases } = setupServer({ journals: { 'job-1': OPENAI_SSE } })
 
@@ -502,7 +637,38 @@ describe('recovered chat is persisted', () => {
         expect(chat.message).toHaveLength(1)
         expect(claims()).toEqual(['/api/model-jobs/job-1/claim'])
         expect(releases()).toEqual([])
+        expect(mocks.saveChatToServerStrict).toHaveBeenCalledTimes(2)
         expect(mocks.recordRequestLog).toHaveBeenCalledTimes(1)
+    })
+
+    test('exact server memory readback with a failing disk flush releases the job for discovery', async () => {
+        const { recovery } = await loadModules()
+        const chat = makeChat()
+        mocks.db.characters = [makeChar(chat)]
+        mocks.saveChatToServerStrict.mockRejectedValue(new Error('disk flush failed'))
+        mocks.fetchChatFromServer.mockImplementation(async () => structuredClone(chat))
+        const { releases } = setupServer({ journals: { 'job-1': OPENAI_SSE } })
+        expect(await recovery.recoverTerminalJob(makeJob() as any)).toBe('retry')
+        expect(mocks.saveChatToServerStrict).toHaveBeenCalledTimes(2)
+        expect(releases()).toEqual(['/api/model-jobs/job-1/claim'])
+        expect(mocks.recordRequestLog).not.toHaveBeenCalled()
+    })
+
+    test('matching text with stale metadata is not a successful save readback', async () => {
+        const { recovery } = await loadModules()
+        const chat = makeChat({ message: [{ role: 'char', data: 'Hello', chatId: 'gen-1', generationInfo: { generationId: 'gen-1' } }] })
+        mocks.db.characters = [makeChar(chat)]
+        mocks.saveChatToServerStrict.mockRejectedValueOnce(new Error('ACK lost'))
+        mocks.fetchChatFromServer.mockResolvedValue(makeChat({
+            message: [{ role: 'char', data: 'Hello', chatId: 'gen-1', generationInfo: { generationId: 'gen-1' } }],
+        }))
+        const { releases } = setupServer({ journals: { 'job-1': OPENAI_SSE } })
+        const result = await recovery.recoverTerminalJob(makeJob({ model: 'wire-id', modelLabel: 'Preset', inputTokens: 42 }) as any)
+        expect(result).toBe('retry')
+        expect(releases()).toEqual(['/api/model-jobs/job-1/claim'])
+        expect(mocks.recordRequestLog).not.toHaveBeenCalled()
+        expect(chat.message).toHaveLength(1)
+        expect(chat.message[0].generationInfo).toMatchObject({ model: 'Preset', modelId: 'wire-id', inputTokens: 42 })
     })
 
     test('definite absence releases the claim and a retry saves without duplicating the log', async () => {
@@ -526,7 +692,7 @@ describe('recovered chat is persisted', () => {
         expect(mocks.recordRequestLog).toHaveBeenCalledTimes(1)
     })
 
-    test('ambiguous readback keeps the claim and does not log or retry the save', async () => {
+    test('ambiguous readback releases the claim and retries without duplicating the message', async () => {
         const { recovery } = await loadModules()
         const chat = makeChat()
         mocks.db.characters = [makeChar(chat)]
@@ -538,9 +704,9 @@ describe('recovered chat is persisted', () => {
         await recovery.recoverTerminalJob(makeJob() as any)
 
         expect(chat.message).toHaveLength(1)
-        expect(mocks.saveChatToServerStrict).toHaveBeenCalledTimes(1)
+        expect(mocks.saveChatToServerStrict).toHaveBeenCalledTimes(2)
         expect(claims()).toEqual(['/api/model-jobs/job-1/claim', '/api/model-jobs/job-1/claim'])
-        expect(releases()).toEqual([])
+        expect(releases()).toEqual(['/api/model-jobs/job-1/claim', '/api/model-jobs/job-1/claim'])
         expect(mocks.recordRequestLog).not.toHaveBeenCalled()
     })
 })
@@ -597,6 +763,83 @@ describe('recoverModelJobs', () => {
         const { recovery } = await loadModules()
         vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('Failed to fetch') }))
         await expect(recovery.recoverModelJobs()).resolves.toBeUndefined()
+    })
+
+    test('a failed pass retries with backoff and recovers once the network is back', async () => {
+        // The field failure this covers: visibilitychange fires the moment the
+        // tab resumes, but the radio needs a few more seconds — the pass dies
+        // on an unreachable job API and, without a retry, the finished job
+        // sits unclaimed until the NEXT return.
+        vi.useFakeTimers()
+        const { recovery } = await loadModules()
+        const chat = makeChat()
+        mocks.db.characters = [makeChar(chat)]
+        vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('Failed to fetch') }))
+        await recovery.recoverModelJobs()
+        expect(chat.message).toHaveLength(0)
+
+        // Network is back before the first retry fires.
+        setupServer({ unclaimed: [makeJob()], active: [], journals: { 'job-1': OPENAI_SSE } })
+        await vi.advanceTimersByTimeAsync(3000)
+        expect(chat.message).toHaveLength(1)
+        expect(chat.message[0].data).toBe('Hello')
+    })
+
+    test('a swallowed per-job failure still schedules a retry (list ok, journal down)', async () => {
+        // The list fetch can succeed while the journal read dies (network came
+        // back mid-pass). The per-job catch keeps the pass alive, but the
+        // failure must still count against the retry budget — otherwise the
+        // job sits unclaimed until the next return.
+        vi.useFakeTimers()
+        const { recovery } = await loadModules()
+        const chat = makeChat()
+        mocks.db.characters = [makeChar(chat)]
+        const behavior: ServerBehavior = {
+            unclaimed: [makeJob()],
+            active: [],
+            journals: { 'job-1': OPENAI_SSE },
+            streamStatus: { 'job-1': 503 },
+        }
+        setupServer(behavior)
+        await recovery.recoverModelJobs()
+        expect(chat.message).toHaveLength(0)
+
+        delete behavior.streamStatus!['job-1'] // journal reachable again
+        await vi.advanceTimersByTimeAsync(3000)
+        expect(chat.message).toHaveLength(1)
+        expect(chat.message[0].data).toBe('Hello')
+    })
+
+    test('a long live generation does not exhaust terminal discovery retries', async () => {
+        vi.useFakeTimers()
+        const { recovery, genState } = await loadModules()
+        const chat = makeChat()
+        mocks.db.characters = [makeChar(chat)]
+        const { calls } = setupServer({ unclaimed: [makeJob()], journals: { 'job-1': OPENAI_SSE } })
+        genState.startGeneration('chat-1', 'different-live-generation')
+        await recovery.recoverModelJobs()
+        await vi.advanceTimersByTimeAsync(60_000)
+        expect(chat.message).toHaveLength(0)
+        genState.endGeneration('chat-1')
+        await vi.advanceTimersByTimeAsync(3000)
+        expect(chat.message).toHaveLength(1)
+        expect(chat.message[0].data).toBe('Hello')
+        expect(mocks.saveChatToServerStrict).toHaveBeenCalledTimes(1)
+        const passes = calls.filter(c => c.url === '/api/model-jobs?unclaimed=1').length
+        await vi.advanceTimersByTimeAsync(60_000)
+        expect(calls.filter(c => c.url === '/api/model-jobs?unclaimed=1')).toHaveLength(passes)
+    })
+
+    test('discovery retries are bounded, not an open-ended poll', async () => {
+        vi.useFakeTimers()
+        const { recovery } = await loadModules()
+        const failing = vi.fn(async (..._args: unknown[]) => { throw new TypeError('Failed to fetch') })
+        vi.stubGlobal('fetch', failing)
+        await recovery.recoverModelJobs()
+        await vi.advanceTimersByTimeAsync(60 * 60 * 1000)
+        // Initial pass + 3 bounded retries, each listing the unclaimed jobs once.
+        const passes = failing.mock.calls.filter((c) => String(c[0]) === '/api/model-jobs?unclaimed=1')
+        expect(passes).toHaveLength(4)
     })
 })
 
@@ -660,13 +903,53 @@ describe('pending-send evaluation', () => {
         expect(get(pending.resumableSends).size).toBe(0)
     })
 
+    test.each([false, true])('incomplete generation tombstones survive discovery (job present=%s)', async (hasJob) => {
+        const { recovery } = await loadModules()
+        const chat = makeChat({ message: [{ role: 'char', data: 'partial', generationInfo: { generationId: 'gen-1' } }] })
+        mocks.db.characters = [makeChar(chat)]
+        mocks.fetchChatFromServer.mockResolvedValue(structuredClone(chat))
+        const { calls } = setupServer({})
+        await recovery.evaluatePendingSend(record(), new Set(hasJob ? ['chat-1'] : []))
+        expect(calls.some((c) => c.method === 'DELETE')).toBe(false)
+    })
+
+    test('server cache completion without a strict durability ACK keeps the tombstone', async () => {
+        const { recovery } = await loadModules()
+        const chat = makeChat({ message: [{ role: 'char', data: 'final', generationInfo: { generationId: 'gen-1', completed: true } }] })
+        mocks.db.characters = [makeChar(chat)]
+        mocks.fetchChatFromServer.mockResolvedValue(structuredClone(chat))
+        mocks.saveChatToServerStrict.mockRejectedValue(new Error('disk unavailable'))
+        const { calls } = setupServer({})
+        await recovery.evaluatePendingSend(record(), new Set())
+        expect(calls.some((c) => c.method === 'DELETE')).toBe(false)
+    })
+
+    test('completed direct sends with a failed pending DELETE conclude on discovery after strict ACK', async () => {
+        const { recovery } = await loadModules()
+        const { createMainJobCompletion } = await import('./mainJobCompletion')
+        const chat = makeChat({ message: [{ role: 'char', data: 'direct final', generationInfo: { generationId: 'gen-1', completed: false } }] })
+        mocks.db.characters = [makeChar(chat)]
+        const behavior: ServerBehavior = { pendingClearFails: true }
+        const { calls } = setupServer(behavior)
+        const complete = createMainJobCompletion({ chatId: 'chat-1', generationId: 'gen-1', handles: [],
+            locate: () => ({ chaId: 'cha-1', chatIndex: 0, chat }) })
+        expect(await complete()).toBe(false)
+        expect(chat.message[0].generationInfo.completed).toBe(true)
+        expect(mocks.saveChatToServerStrict).not.toHaveBeenCalled()
+        behavior.pendingClearFails = false
+        await recovery.evaluatePendingSend(record(), new Set())
+        expect(mocks.saveChatToServerStrict).toHaveBeenCalledTimes(1)
+        expect(calls.filter((c) => c.method === 'DELETE')).toHaveLength(2)
+    })
+
     test('concluded records are cleared server-side', async () => {
         const { recovery } = await loadModules()
         const chat = makeChat({ message: [
             { role: 'user', data: 'hello?' },
-            { role: 'char', data: 'answer', generationInfo: { generationId: 'gen-1' } },
+            { role: 'char', data: 'answer', generationInfo: { generationId: 'gen-1', completed: true } },
         ] })
         mocks.db.characters = [makeChar(chat)]
+        mocks.fetchChatFromServer.mockResolvedValue(structuredClone(chat))
         const { calls } = setupServer({})
 
         await recovery.evaluatePendingSend(record(), new Set())

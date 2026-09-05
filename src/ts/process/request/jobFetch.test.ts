@@ -33,11 +33,17 @@ interface ServerBehavior {
     streamHeaders?: Record<string, string>
     /** Body of the never-closing kind for abort tests. */
     streamNeverEnds?: boolean
+    /** Reject this many GET /stream fetches (network-level) before serving.
+     *  Infinity = reject every attach — for retry-exhaustion tests. */
+    streamRejectTimes?: number
+    /** HTTP status of the GET /stream response itself (default 200). */
+    streamHttpStatus?: number
     /** GET /api/model-jobs/:id after the stream ends. */
     job?: { status: string, error?: string }
     /** Successive GET /api/model-jobs/:id responses (last repeats). Overrides job. */
     jobQueue?: { status: string, error?: string }[]
     jobReject?: Error
+    claimResponseLost?: boolean
 }
 
 function setupServer(behavior: ServerBehavior) {
@@ -52,6 +58,10 @@ function setupServer(behavior: ServerBehavior) {
             return new Response(JSON.stringify(c.body ?? {}), { status: c.status })
         }
         if (url === '/api/model-jobs/job-1/stream') {
+            if (behavior.streamRejectTimes && behavior.streamRejectTimes > 0) {
+                behavior.streamRejectTimes -= 1
+                throw new TypeError('Failed to fetch')
+            }
             const headers = behavior.streamHeaders ?? {
                 'content-type': 'text/event-stream',
                 'x-model-job-upstream-status': '200',
@@ -65,7 +75,7 @@ function setupServer(behavior: ServerBehavior) {
             const body = behavior.streamNeverEnds
                 ? new ReadableStream<Uint8Array>({ start() { /* never closes */ } })
                 : streamOf(...chunks)
-            return new Response(body, { status: 200, headers })
+            return new Response(body, { status: behavior.streamHttpStatus ?? 200, headers })
         }
         if (url === '/api/model-jobs/job-1' && method === 'DELETE') {
             return new Response('{"success":true}', { status: 200 })
@@ -79,7 +89,15 @@ function setupServer(behavior: ServerBehavior) {
             return new Response(JSON.stringify(job), { status: 200 })
         }
         if (url === '/api/model-jobs/job-1/claim' && method === 'POST') {
+            const body = JSON.parse(String(init?.body ?? '{}'))
+            if (typeof body.claimToken !== 'string' || !body.claimToken) {
+                return new Response('{"error":"claimToken required"}', { status: 400 })
+            }
+            if (behavior.claimResponseLost) throw new TypeError('claim ACK lost')
             return new Response('{"success":true}', { status: 200 })
+        }
+        if (url === '/api/model-jobs/job-1/claim' && method === 'GET') {
+            return new Response('{"owned":true}', { status: 200 })
         }
         throw new Error(`unexpected fetch: ${method} ${url}`)
     })
@@ -92,6 +110,11 @@ function makeOpts(overrides: Partial<JobFetchOptions> = {}): JobFetchOptions {
         realChatId: 'chat-1',
         generationId: 'gen-1',
         adapterKind: 'openai-compatible',
+        model: 'provider/model-id',
+        modelLabel: 'My Preset',
+        inputTokens: 1234,
+        outputTokens: 512,
+        maxContext: 32768,
         streaming: true,
         timeoutMs: 60_000,
         fallbackFetch: vi.fn(async () => new Response('fallback')) as unknown as typeof fetch,
@@ -124,9 +147,35 @@ afterEach(() => {
 // --- tests ------------------------------------------------------------------
 
 describe('makeJobFetch', () => {
-    test('streams journal bytes through and claims after a clean done', async () => {
+    test('main EOF leaves the terminal job discoverable until the send saves it', async () => {
+        const { calls } = setupServer({ streamChunks: ['final tail'], job: { status: 'done' } })
+        const response = await makeJobFetch(makeOpts())('https://provider.example/v1/chat')
+        expect(await drain(response)).toBe('final tail')
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        expect(callsFor(calls, '/api/model-jobs/job-1/claim', 'POST')).toHaveLength(0)
+    })
+
+    test('plain HTTP can finish and reconfirm a lost claim ACK with the same UUID', async () => {
+        const getRandomValues = globalThis.crypto.getRandomValues.bind(globalThis.crypto)
+        vi.stubGlobal('crypto', { getRandomValues })
+        const { calls } = setupServer({ streamChunks: ['done'], claimResponseLost: true })
+        let handle: import('./jobFetch').JobClaimHandle
+        const response = await makeJobFetch(makeOpts({ onJobCreated: (value) => { handle = value } }))('https://provider.example/v1/chat', { method: 'POST' })
+        expect(await response.text()).toBe('done')
+        await handle.claim()
+        await vi.waitFor(() => expect(callsFor(calls, '/api/model-jobs/job-1/claim', 'GET')).toHaveLength(1))
+        const [claim] = callsFor(calls, '/api/model-jobs/job-1/claim', 'POST')
+        const [confirm] = callsFor(calls, '/api/model-jobs/job-1/claim', 'GET')
+        const token = JSON.parse(String(claim.init?.body)).claimToken
+        expect(token).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i)
+        expect(new Headers(confirm.init?.headers).get('x-model-job-claim-token')).toBe(token)
+        expect(callsFor(calls, '/api/model-jobs/job-1/claim', 'DELETE')).toHaveLength(0)
+    })
+
+    test('streams journal bytes through and exposes an explicit idempotent claim handle', async () => {
         const { calls } = setupServer({ streamChunks: ['hel', 'lo ', 'world'], job: { status: 'done' } })
-        const res = await makeJobFetch(makeOpts())('https://provider.example/v1/chat', {
+        let handle: import('./jobFetch').JobClaimHandle
+        const res = await makeJobFetch(makeOpts({ onJobCreated: (value) => { handle = value } }))('https://provider.example/v1/chat', {
             method: 'POST',
             headers: { authorization: 'Bearer sk-x' },
             body: '{"model":"m"}',
@@ -146,13 +195,23 @@ describe('makeJobFetch', () => {
             chatId: 'chat-1',
             generationId: 'gen-1',
             adapterKind: 'openai-compatible',
+            model: 'provider/model-id',
+            modelLabel: 'My Preset',
+            inputTokens: 1234,
+            outputTokens: 512,
+            maxContext: 32768,
             streaming: true,
             timeoutMs: 60_000,
         })
-        // Claim is fire-and-forget after the verified-done close.
+        // EOF alone cannot claim a main job.
         await vi.waitFor(() => {
-            expect(callsFor(calls, '/api/model-jobs/job-1/claim', 'POST')).toHaveLength(1)
+            expect(callsFor(calls, '/api/model-jobs/job-1/claim', 'POST')).toHaveLength(0)
         })
+        await Promise.all([handle.claim(), handle.claim()])
+        expect(callsFor(calls, '/api/model-jobs/job-1/claim', 'POST')).toHaveLength(1)
+        const [claim] = callsFor(calls, '/api/model-jobs/job-1/claim', 'POST')
+        expect(JSON.parse(String(claim.init?.body))).toEqual({ claimToken: expect.any(String) })
+        expect(JSON.parse(String(claim.init?.body)).claimToken.length).toBeGreaterThan(0)
     })
 
     test('mirrors the upstream status onto the returned Response', async () => {
@@ -173,6 +232,50 @@ describe('makeJobFetch', () => {
             .rejects.toThrow(TypeError)
     })
 
+    test('initial stream attach retries a rejected fetch and then delivers (send-then-background resume)', async () => {
+        // The tab froze right after job creation; on resume the in-flight
+        // attach rejects while the radio is still down. The retry must attach
+        // once the network is back — the job kept running server-side.
+        const { calls } = setupServer({
+            streamRejectTimes: 2,
+            streamChunks: ['hello world'],
+            job: { status: 'done' },
+        })
+        const res = await makeJobFetch(makeOpts({ reconnectBaseDelayMs: 1 }))('https://provider.example/v1/chat', { method: 'POST', body: '{}' })
+        expect(await res.text()).toBe('hello world')
+        expect(callsFor(calls, '/api/model-jobs/job-1/stream')).toHaveLength(3)
+        await vi.waitFor(() => {
+            expect(callsFor(calls, '/api/model-jobs/job-1/claim', 'POST')).toHaveLength(0)
+        })
+    })
+
+    test('initial stream attach exhaustion throws ModelJobConnectionLostError, never the raw TypeError or fallback', async () => {
+        const opts = makeOpts({ reconnectBaseDelayMs: 1 })
+        setupServer({ streamRejectTimes: Infinity })
+        await expect(makeJobFetch(opts)('https://provider.example/v1/chat', { method: 'POST', body: '{}' }))
+            .rejects.toThrow(ModelJobConnectionLostError)
+        expect(opts.fallbackFetch).not.toHaveBeenCalled()
+    })
+
+    test('an HTTP error from the stream endpoint is definitive — no attach retry', async () => {
+        // Only network-level rejections retry; a served response (even an
+        // error) is the server's answer and takes the existing path unchanged.
+        const { calls } = setupServer({ streamHttpStatus: 500 })
+        await expect(makeJobFetch(makeOpts({ reconnectBaseDelayMs: 1 }))('https://provider.example/v1/chat', { method: 'POST', body: '{}' }))
+            .rejects.toThrow(TypeError)
+        expect(callsFor(calls, '/api/model-jobs/job-1/stream')).toHaveLength(1)
+    })
+
+    test('abort during initial attach retry surfaces the abort', async () => {
+        setupServer({ streamRejectTimes: Infinity })
+        const controller = new AbortController()
+        const pending = makeJobFetch(makeOpts({ reconnectBaseDelayMs: 50 }))('https://provider.example/v1/chat', {
+            method: 'POST', body: '{}', signal: controller.signal,
+        })
+        setTimeout(() => controller.abort(), 5)
+        await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+    })
+
     test('reattaches after a dropped tail and resumes without duplicating bytes', async () => {
         const { calls } = setupServer({
             // First attach delivers a prefix then the connection "drops"; the
@@ -184,7 +287,7 @@ describe('makeJobFetch', () => {
         expect(await res.text()).toBe('hello world') // replayed prefix skipped, not duplicated
         expect(callsFor(calls, '/api/model-jobs/job-1/stream')).toHaveLength(2)
         await vi.waitFor(() => {
-            expect(callsFor(calls, '/api/model-jobs/job-1/claim', 'POST')).toHaveLength(1)
+            expect(callsFor(calls, '/api/model-jobs/job-1/claim', 'POST')).toHaveLength(0)
         })
     })
 
@@ -211,14 +314,14 @@ describe('makeJobFetch', () => {
         expect(JSON.parse(create.init?.body as string)).toMatchObject({ kind: 'aux', chatId: 'aux-gen-9' })
     })
 
-    test('stream end with failed job errors the body with the job error and claims it', async () => {
+    test('stream end with failed job errors the body and leaves the main job for recovery', async () => {
         const { calls } = setupServer({ streamChunks: ['par'], job: { status: 'failed', error: 'upstream timeout' } })
         const res = await makeJobFetch(makeOpts())('https://provider.example/v1/chat', { method: 'POST', body: '{}' })
         await expect(drain(res)).rejects.toThrow('upstream timeout')
         // The user saw this failure live — claim so the next boot's discovery
         // doesn't insert a duplicate error into the chat.
         await vi.waitFor(() => {
-            expect(callsFor(calls, '/api/model-jobs/job-1/claim', 'POST')).toHaveLength(1)
+            expect(callsFor(calls, '/api/model-jobs/job-1/claim', 'POST')).toHaveLength(0)
         })
     })
 

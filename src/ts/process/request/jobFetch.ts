@@ -1,5 +1,6 @@
 import { forageStorage } from 'src/ts/globalApi.svelte'
 import { language } from 'src/lang'
+import { v4 as uuidv4 } from 'uuid'
 
 // Server-side model-preset requests — job-based fetchImpl (Stage 3 of
 // .agent/notes/model-preset-server-side-requests.md).
@@ -43,6 +44,7 @@ export class ModelJobConnectionLostError extends Error {
 }
 
 export interface JobFetchOptions {
+    onJobCreated?: (handle: JobClaimHandle) => void
     /** Job key: the real chat.id for main generations (server enforces one
      *  running main job per chat on it). Aux side requests pass their unique
      *  per-request genId here instead — the guard never applies to them. */
@@ -53,6 +55,11 @@ export interface JobFetchOptions {
     /** Model id, persisted with the job so a recovered generation can be
      *  logged with the model it actually used. */
     model?: string
+    /** User-facing preset/model label stored for recovered message metadata. */
+    modelLabel?: string
+    inputTokens?: number
+    outputTokens?: number
+    maxContext?: number
     streaming: boolean
     /** 'main' = chat generation (recoverable at boot, per-chat guard).
      *  'aux' = pipeline side request (translate / memory / …) riding the job
@@ -67,6 +74,69 @@ export interface JobFetchOptions {
      *  5xx — older or misbehaving server): the request transparently falls
      *  back to the direct proxied path. NOT used after the job exists. */
     fallbackFetch: typeof fetch
+}
+
+export interface JobClaimHandle {
+    readonly jobId: string
+    readonly claimToken: string
+    terminal: boolean
+    claim(): Promise<boolean>
+    ownsClaim(): Promise<boolean>
+    release(): Promise<boolean>
+}
+
+function createClaimHandle(jobId: string, pollDelayMs: number): JobClaimHandle {
+    const claimToken = uuidv4()
+    let claiming: Promise<boolean> | undefined
+    const handle: JobClaimHandle = {
+        jobId, claimToken, terminal: false,
+        async ownsClaim() {
+            try {
+                const res = await fetch(`/api/model-jobs/${jobId}/claim`, {
+                    headers: { 'x-model-job-claim-token': claimToken, ...await authHeader() },
+                })
+                return res.ok && (await res.json())?.owned === true
+            } catch { return false }
+        },
+        claim() {
+            return claiming ??= (async () => {
+                try {
+                    // Adapters can stop at [DONE] before the journal's EOF.
+                    // The server consumes the remaining upstream independently.
+                    while (!handle.terminal) {
+                        const status = await fetch(`/api/model-jobs/${jobId}`, { headers: await authHeader() })
+                        if (!status.ok) return false
+                        const job = await status.json()
+                        if (job.status === 'done' || job.status === 'failed') handle.terminal = true
+                        else if (job.status !== 'running') return false
+                        else await new Promise((resolve) => setTimeout(resolve, pollDelayMs))
+                    }
+                    const res = await fetch(`/api/model-jobs/${jobId}/claim`, {
+                        method: 'POST',
+                        headers: { 'content-type': 'application/json', ...await authHeader() },
+                        body: JSON.stringify({ claimToken }),
+                    })
+                    if (res.ok) {
+                        const result = await res.json()
+                        if (typeof result?.success === 'boolean') return result.success
+                    }
+                } catch { /* Reconcile a lost ACK using the original token. */ }
+                return handle.ownsClaim()
+            })()
+        },
+        async release() {
+            try {
+                const res = await fetch(`/api/model-jobs/${jobId}/claim`, {
+                    method: 'DELETE',
+                    headers: { 'x-model-job-claim-token': claimToken, ...await authHeader() },
+                })
+                const released = res.ok && (await res.json())?.released === true
+                if (released) claiming = undefined
+                return released
+            } catch { return false }
+        },
+    }
+    return handle
 }
 
 // Reattach policy. Attempts are per reconnect cycle (reset once a stream is
@@ -103,6 +173,10 @@ export function makeJobFetch(opts: JobFetchOptions): typeof fetch {
                     generationId: opts.generationId,
                     adapterKind: opts.adapterKind,
                     model: opts.model,
+                    modelLabel: opts.modelLabel,
+                    inputTokens: opts.inputTokens,
+                    outputTokens: opts.outputTokens,
+                    maxContext: opts.maxContext,
                     kind: opts.jobKind ?? 'main',
                     streaming: opts.streaming,
                     timeoutMs: opts.timeoutMs,
@@ -122,6 +196,8 @@ export function makeJobFetch(opts: JobFetchOptions): typeof fetch {
             return opts.fallbackFetch(input, init)
         }
         const jobId: string = (await created.json()).jobId
+        const claimHandle = createClaimHandle(jobId, opts.reconnectBaseDelayMs ?? 1000)
+        opts.onJobCreated?.(claimHandle)
 
         // Abort propagation: aborting the request DELETEs the job (server
         // aborts the upstream) and cancels the local stream fetch (same
@@ -135,12 +211,49 @@ export function makeJobFetch(opts: JobFetchOptions): typeof fetch {
         const detach = () => signal?.removeEventListener('abort', abortJob)
 
         // 2. Attach to the journal stream (replay from byte 0 + live tail).
-        let streamRes: Response
-        try {
-            streamRes = await fetch(`/api/model-jobs/${jobId}/stream`, { headers: await authHeader(), signal })
-        } catch (err) {
+        //
+        // Retried with the same backoff policy as mid-stream reattach: the
+        // dominant mobile pattern is "send, then background the tab" — the tab
+        // freezes with this fetch in flight and it rejects the moment the tab
+        // resumes, while the radio may take several more seconds to come back.
+        // The job is already running server-side and the journal replays from
+        // byte 0 on every attach, so attaching late loses nothing. Only fetch
+        // REJECTIONS (network-level) retry; an HTTP response is the server's
+        // definitive answer and falls through unchanged. On exhaustion this is
+        // a lost connection, not a lost generation — surface the same
+        // ModelJobConnectionLostError the mid-stream path uses (recovery picks
+        // the job up at the next return), never the raw TypeError.
+        const baseDelay = opts.reconnectBaseDelayMs ?? 1000
+        const abortError = () => new DOMException('The operation was aborted.', 'AbortError')
+        const sleepAbortable = (ms: number) => new Promise<void>((resolve, reject) => {
+            const cleanup = () => {
+                clearTimeout(timer)
+                signal?.removeEventListener('abort', onAbort)
+            }
+            const onAbort = () => { cleanup(); reject(abortError()) }
+            const timer = setTimeout(() => { cleanup(); resolve() }, ms)
+            if (signal?.aborted) { onAbort(); return }
+            signal?.addEventListener('abort', onAbort)
+        })
+
+        let streamRes: Response | null = null
+        for (let attempt = 0; attempt < RECONNECT_MAX_ATTEMPTS; attempt++) {
+            try {
+                if (attempt > 0) {
+                    await sleepAbortable(baseDelay * 2 ** (attempt - 1))
+                }
+                streamRes = await fetch(`/api/model-jobs/${jobId}/stream`, { headers: await authHeader(), signal })
+                break
+            } catch (err) {
+                if (signal?.aborted) {
+                    detach()
+                    throw err
+                }
+            }
+        }
+        if (streamRes === null) {
             detach()
-            throw err
+            throw new ModelJobConnectionLostError()
         }
         const upstreamStatus = streamRes.headers.get('x-model-job-upstream-status')
         if (!streamRes.ok || upstreamStatus === null || !streamRes.body) {
@@ -169,19 +282,6 @@ export function makeJobFetch(opts: JobFetchOptions): typeof fetch {
         let skipRemaining = 0
         let progressSinceAttach = true // first attach counts as progress
         let noProgressCycles = 0
-        const baseDelay = opts.reconnectBaseDelayMs ?? 1000
-
-        const abortError = () => new DOMException('The operation was aborted.', 'AbortError')
-        const sleepAbortable = (ms: number) => new Promise<void>((resolve, reject) => {
-            const cleanup = () => {
-                clearTimeout(timer)
-                signal?.removeEventListener('abort', onAbort)
-            }
-            const onAbort = () => { cleanup(); reject(abortError()) }
-            const timer = setTimeout(() => { cleanup(); resolve() }, ms)
-            if (signal?.aborted) { onAbort(); return }
-            signal?.addEventListener('abort', onAbort)
-        })
 
         // Re-attach to the journal stream. True = a fresh reader is installed
         // (replay from 0; skip what was already delivered). False = job gone
@@ -207,12 +307,6 @@ export function makeJobFetch(opts: JobFetchOptions): typeof fetch {
                 }
             }
             return false
-        }
-
-        const claim = () => {
-            void (async () => {
-                await fetch(`/api/model-jobs/${jobId}/claim`, { method: 'POST', headers: await authHeader() })
-            })().catch(() => {})
         }
 
         const wrapped = new ReadableStream<Uint8Array>({
@@ -263,20 +357,16 @@ export function makeJobFetch(opts: JobFetchOptions): typeof fetch {
                     if (job?.status === 'done') {
                         detach()
                         controller.close()
-                        // Claim fire-and-forget: marks the job as collected so
-                        // Stage 4's discovery skips it. The tiny crash window
-                        // before the claim lands is covered by genId idempotency.
-                        claim()
+                        claimHandle.terminal = true
+                        // Main sends claim only after final chat durability.
+                        if (opts.jobKind === 'aux') void claimHandle.claim()
                         return
                     }
                     if (job?.status === 'failed' || job?.status === 'aborted') {
                         detach()
                         if (job.status === 'failed') {
-                            // The user sees this failure live — claim it so the
-                            // next boot's discovery doesn't insert a duplicate
-                            // error into the chat. ('aborted' is excluded from
-                            // the unclaimed list; nothing to do.)
-                            claim()
+                            claimHandle.terminal = true
+                            if (opts.jobKind === 'aux') void claimHandle.claim()
                         }
                         controller.error(new Error(job.error ?? `model job ${job.status}`))
                         return

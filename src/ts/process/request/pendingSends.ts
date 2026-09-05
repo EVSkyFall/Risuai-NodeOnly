@@ -57,7 +57,7 @@ export function registerPendingSend(chatId: string, generationId: string): void 
 /** Clear the tombstone (send concluded) and drop any local resume flag.
  *  NOT gated on the toggle: a record made before the toggle was switched off
  *  must still be clearable. */
-export function clearPendingSend(chatId: string, generationId?: string | null): void {
+export function clearPendingSend(chatId: string, generationId?: string | null): Promise<boolean> {
     resumableSends.update((m) => {
         const current = m.get(chatId)
         if (!current || (current.generationId ?? undefined) !== (generationId ?? undefined)) return m
@@ -65,13 +65,14 @@ export function clearPendingSend(chatId: string, generationId?: string | null): 
         next.delete(chatId)
         return next
     })
-    void chained(chatId, async () => {
-        await fetch(`/api/pending-sends/${encodeURIComponent(chatId)}`, {
+    return chained(chatId, async () => {
+        const res = await fetch(`/api/pending-sends/${encodeURIComponent(chatId)}`, {
             method: 'DELETE',
             headers: { 'content-type': 'application/json', ...await authHeader() },
             body: JSON.stringify({ generationId: generationId ?? null }),
         })
-    }, undefined)
+        return res.ok
+    }, false)
 }
 
 /** Atomically take the tombstone before resuming: the server deletes it and

@@ -244,6 +244,14 @@ export const accessibilitySettingsItems: SettingItem[] = [
         keywords: ['left', 'bar', 'collapse', 'toggle', 'mobile', 'sidebar', 'hide'],
     },
     {
+        id: 'acc.nodeOnlyRestoreLastChat',
+        type: 'check',
+        labelKey: 'nodeOnlyRestoreLastChat',
+        bindKey: 'nodeOnlyRestoreLastChat',
+        helpKey: 'nodeOnlyRestoreLastChat',
+        keywords: ['restore', 'last', 'chat', 'reload', 'start', 'resume', 'character'],
+    },
+    {
         id: 'acc.nodeOnlyScrollButtonType',
         type: 'select',
         labelKey: 'nodeOnlyScrollButtonType',
@@ -281,6 +289,15 @@ export const accessibilitySettingsItems: SettingItem[] = [
         bindKey: 'showPersonaInSidebar',
         helpKey: 'showPersonaInSidebar',
         keywords: ['sidebar', 'persona', 'binding', 'show'],
+    },
+    {
+        id: 'acc.showMemoryInSidebar',
+        type: 'check',
+        labelKey: 'showMemoryInSidebar',
+        helpKey: 'showMemoryInSidebar',
+        fallbackLabel: 'Show memory preset in sidebar',
+        bindKey: 'showMemoryInSidebar',
+        keywords: ['sidebar', 'memory', 'preset', 'binding', 'show'],
     },
     {
         id: 'acc.disableMobileDragDrop',
@@ -340,9 +357,11 @@ export const accessibilitySidebarItems = pick([
     'acc.showModelInSidebar',
     'acc.showPresetInSidebar',
     'acc.showPersonaInSidebar',
+    'acc.showMemoryInSidebar',
 ]);
 
 export const accessibilityOtherItems = pick([
+    'acc.nodeOnlyRestoreLastChat',
     'acc.botSettingAtStart',
     'acc.goCharacterOnImport',
     'acc.createFolderOnBranch',

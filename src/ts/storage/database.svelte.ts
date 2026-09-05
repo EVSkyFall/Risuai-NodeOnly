@@ -12,7 +12,8 @@ import { prebuiltNAIpresets, prebuiltPresets } from '../process/templates/templa
 import { defaultColorScheme, type ColorScheme } from '../gui/colorscheme';
 import type { PromptItem, PromptSettings } from '../process/prompt';
 import type { OobaChatCompletionRequestParams } from '../model/ooba';
-import { type HypaV3Settings, type HypaV3Preset, createHypaV3Preset } from '../process/memory/hypav3'
+import { type HypaV3Settings, type HypaV3Preset, createHypaV3Preset } from '../process/memory/hypav3Preset'
+import { migrateMemoryPresets, MEMORY_PRESET_DEFAULT, type MemoryPreset } from '../process/memory/memoryPresets'
 import { normalizeTranslatorPresetState, type TranslatorPreset } from '../translator/presets'
 import { safeStructuredClone } from '../polyfill';
 import { v4 as uuidv4 } from 'uuid';
@@ -121,6 +122,7 @@ export function setDatabase(data:Database){
     if(checkNullish(data.plugins)){
         data.plugins = []
     }
+    data.pluginFolders ??= []
     if(checkNullish(data.zoomsize)){
         data.zoomsize = 100
     }
@@ -260,6 +262,9 @@ export function setDatabase(data:Database){
     }
     if(checkNullish(data.allowV2Plugin)){
         data.allowV2Plugin = false
+    }
+    if(checkNullish(data.allowV21Plugin)){
+        data.allowV21Plugin = false
     }
     if(checkNullish(data.elevenLabKey)){
         data.elevenLabKey = ''
@@ -434,13 +439,22 @@ export function setDatabase(data:Database){
     }
     data.selectedPersona ??= 0
     data.personaPrompt ??= ''
-    data.personas ??= [{
-        name: data.username,
-        personaPrompt: "",
-        icon: data.userIcon,
-        note: data.userNote,
-        largePortrait: false
-    }]
+    // A corrupted/imported DB can carry `personas: []`, which ??= leaves alone —
+    // persona UI then derefs personas[0], so rebuild the default entry too.
+    if(!Array.isArray(data.personas) || data.personas.length === 0){
+        data.personas = [{
+            name: data.username,
+            personaPrompt: "",
+            icon: data.userIcon,
+            note: data.userNote,
+            largePortrait: false
+        }]
+    }
+    for (const persona of data.personas) {
+        persona.id ??= uuidv4()
+    }
+    data.personaFolders ??= []
+    data.promptPresetFolders ??= []
     data.classicMaxWidth ??= false
     data.ooba ??= safeStructuredClone(defaultOoba)
     data.ainconfig ??= safeStructuredClone(defaultAIN)
@@ -522,6 +536,7 @@ export function setDatabase(data:Database){
     data.openrouterMiddleOut ??= false
     data.memoryLimitThickness ??= 1
     data.modules ??= []
+    data.moduleFolders ??= []
     data.enabledModules ??= []
     data.additionalParams ??= []
     data.heightMode ??= 'normal'
@@ -657,6 +672,7 @@ export function setDatabase(data:Database){
         }
     }
     data.hypaV3PresetId ??= 0
+    migrateMemoryPresets(data, uuidv4)
     normalizeTranslatorPresetState(data)
     data.showDeprecatedTriggerV2 ??= false
     data.returnCSSError ??= true
@@ -724,6 +740,7 @@ export function setDatabase(data:Database){
     data.showModelInSidebar ??= true
     data.showPresetInSidebar ??= true
     data.showPersonaInSidebar ??= true
+    data.showMemoryInSidebar ??= true
     data.nodeOnlyModelModeLock ??= 'none'
     data.moduleModelBindingsEnabled ??= false
     data.moduleModelBindings ??= {}
@@ -762,6 +779,8 @@ export function setDatabase(data:Database){
     data.saveSignatures ??= false
     data.nodeOnlyScrollButtonType ??= 'four'
     data.nodeOnlyHideRecentChats ??= false
+    data.nodeOnlyRestoreLastChat ??= false
+    data.nodeOnlyAutoCleanAssets ??= false
     data.keepSessionAlive ??= 'off'
     data.localNetworkMode ??= false
     if (typeof data.localNetworkMode !== 'boolean') data.localNetworkMode = false
@@ -887,11 +906,19 @@ export function setCurrentChat(chat:Chat){
  * literals. Do NOT call for hydration placeholders or chats being restored with
  * their own mode.
  */
-export function newChatModelDefaults(): Partial<Pick<Chat, 'useModelPreset' | 'modelBinding'>> {
+export function newChatModelDefaults(): Partial<Pick<Chat, 'useModelPreset' | 'modelBinding' | 'memoryPresetId' | 'savedToggleValues'>> {
     const db = getDatabase()
-    if (!db.useModelPresetByDefault) return {}
+    // New chats follow the character / global memory preset; chats without a
+    // value are legacy and resolve from `supaMemory` instead (memoryPresets.ts).
+    // A saved toggle default starts the chat pinned to those values.
+    const memory: Partial<Pick<Chat, 'memoryPresetId' | 'savedToggleValues'>> = { memoryPresetId: MEMORY_PRESET_DEFAULT }
+    if (db.defaultToggleValues && !db.disableToggleBinding) {
+        memory.savedToggleValues = structuredClone($state.snapshot(db.defaultToggleValues))
+    }
+    if (!db.useModelPresetByDefault) return memory
     const def = db.defaultModelBinding
     return {
+        ...memory,
         useModelPreset: true,
         modelBinding: def ? structuredClone($state.snapshot(def)) : emptyModelBinding(),
     }
@@ -1035,7 +1062,15 @@ export interface RisuPersona {
     largePortrait?:boolean
     id?:string
     note?:string
+    /** Optional folder membership (see `personaFolders`). Missing means uncategorized. */
+    folderId?:string
     embeddedModule?:RisuModule
+}
+
+/** User-defined group for organizing list items (personas, presets, ...). */
+export interface PromptPresetFolder {
+    id: string
+    name: string
 }
 
 export interface Database{
@@ -1071,6 +1106,8 @@ export interface Database{
     language: string
     translator: string
     plugins: RisuPlugin[]
+    /** User-defined groups for organizing plugins. */
+    pluginFolders?: PromptPresetFolder[]
     currentPluginProvider: string
     zoomsize:number
     customBackground:string
@@ -1106,6 +1143,8 @@ export interface Database{
     waifuWidth:number
     waifuWidth2:number
     botPresets:botPreset[]
+    /** User-defined groups for organizing prompt presets. */
+    promptPresetFolders?:PromptPresetFolder[]
     /**
      * @deprecated New code: use getActiveBotPreset() / setActiveBotPresetById() helpers.
      * Kept as the physical store for upstream RisuAI .bin backup compatibility.
@@ -1146,6 +1185,7 @@ export interface Database{
     didFirstSetup: boolean
     showUnrecommended:boolean
     allowV2Plugin:boolean
+    allowV21Plugin:boolean
     elevenLabKey:string
     voicevoxUrl:string
     useExperimental:boolean
@@ -1229,6 +1269,8 @@ export interface Database{
     openrouterFallback:boolean
     selectedPersona:number
     personas:RisuPersona[]
+    /** User-defined groups for organizing personas. */
+    personaFolders?:PromptPresetFolder[]
     personaNote:boolean
     assetWidth:number
     animationSpeed:number
@@ -1289,6 +1331,8 @@ export interface Database{
     lastPatchNoteCheckVersion?:string,
     memoryLimitThickness?:number
     modules: RisuModule[]
+    /** User-defined groups for organizing modules. */
+    moduleFolders?: PromptPresetFolder[]
     enabledModules: string[]
     sideMenuRerollButton?:boolean
     requestInfoInsideChat?:boolean
@@ -1389,6 +1433,7 @@ export interface Database{
     showModelInSidebar:boolean
     showPresetInSidebar:boolean
     showPersonaInSidebar:boolean
+    showMemoryInSidebar:boolean
     disableMobileDragDrop:boolean
     disableToggleBinding:boolean
     menuSideBar:boolean
@@ -1401,6 +1446,11 @@ export interface Database{
     hypaV3Settings: HypaV3Settings // legacy
     hypaV3Presets: HypaV3Preset[]
     hypaV3PresetId: number
+    /** Long-term memory presets (truth). `hypaV3*` above are a mirror for upstream compatibility — see memoryPresets.ts. */
+    memoryPresets: MemoryPreset[]
+    /** Global default preset id, or 'off'. Chats without a binding inherit this. */
+    memoryPresetId: string
+    memoryPresetFolders?: PromptPresetFolder[]
     realmDirectOpen:boolean
     OaiCompAPIKeys: {[key:string]:string}
     inlayErrorResponse:boolean
@@ -1470,10 +1520,14 @@ export interface Database{
         flags: LLMFlags[]
     }[]
     modelPresets: ModelPreset[]
+    /** User-defined groups for organizing model presets. */
+    modelPresetFolders?: PromptPresetFolder[]
     // P4 dual-regime global default binding (plan v6 §7). Copied into new chats
     // (seeding); useModelPresetByDefault seeds the new-chat regime toggle.
     useModelPresetByDefault?: boolean
     defaultModelBinding?: ModelBindingSet
+    /** Toggle values (`toggle_*`) new chats start pinned to. Absent => new chats start unpinned as before. */
+    defaultToggleValues?: Record<string, string>
     // Global model-mode lock. 'legacy'/'preset' force every chat into that
     // regime (the per-chat dropdown is hidden); 'none' lets each chat decide,
     // falling back to useModelPresetByDefault for chats that never chose. Read
@@ -1597,6 +1651,15 @@ export interface Database{
     dynamicModelRegistry?:boolean
     nodeOnlyScrollButtonType?:'four'|'two'|'off'
     nodeOnlyHideRecentChats?:boolean
+    // Reopen the last active character on boot instead of landing on Home.
+    // Default OFF — an unexpected jump into a chat surprises users who open
+    // the app to browse. Toggled in accessibility settings (Others tab).
+    nodeOnlyRestoreLastChat?:boolean
+    // Delete unreferenced assets/* on boot (cleanChunks). Default OFF: the
+    // reference walker deleting an asset it simply didn't know about is
+    // unrecoverable, so orphan removal is a deliberate act from the storage
+    // dashboard instead. Remote-character caches are swept regardless.
+    nodeOnlyAutoCleanAssets?:boolean
     // Route main-chat model-preset requests through server-side jobs
     // (/api/model-jobs) so generation survives client disconnects.
     // Default OFF (undefined is falsy) — no migration needed. Toggled in
@@ -1752,7 +1815,10 @@ export interface character{
 
     }
     supaMemory?:boolean
+    /** Memory preset id, 'off' or 'default'. Absent => derived from `supaMemory`. */
+    memoryPresetId?:string
     additionalAssets?:[string, string, string][]
+    additionalAssetManifest?:import('./nodeStorage').AssetManifestDescriptor
     ttsReadOnlyQuoted?:boolean
     replaceGlobalNote:string
     backgroundHTML?:string
@@ -1813,6 +1879,7 @@ export interface character{
     prebuiltAssetStyle?:string
     prebuiltAssetExclude?:string[]
     modules?:string[]
+    moduleNamespace?:string
     coldstorage?:string
     coldStoragedChats?:string[]
     customModuleToggle?:string
@@ -1852,6 +1919,8 @@ export function purgeUnsupportedGroupChats(db: Database): number {
 export interface botPreset{
     id?: string
     name?:string
+    /** Optional folder membership (see `promptPresetFolders`). Missing means uncategorized. */
+    folderId?: string
     apiType?: string
     openAIKey?: string
     localNetworkMode?: boolean
@@ -2159,6 +2228,11 @@ export function normalizeChat(chat: Partial<Chat>): Chat {
     if (typeof c.note !== 'string') c.note = ''
     if (typeof c.name !== 'string') c.name = ''
     if (!Array.isArray(c.localLore)) c.localLore = []
+    // Every message needs a stable id: memory summaries, bookmarks and edit
+    // detection key on it. Imports and older saves may lack one.
+    for (const message of c.message) {
+        if (message && !message.chatId) message.chatId = uuidv4()
+    }
     return c
 }
 
@@ -2187,6 +2261,8 @@ export interface Chat{
     bookmarks?: string[];
     bookmarkNames?: { [chatId: string]: string };
     supaMemory?: boolean
+    /** Memory preset id, 'off' or 'default' (inherit). Absent => derived from `supaMemory`. */
+    memoryPresetId?: string
     savedToggleValues?: Record<string, string>
     // P4 dual-regime: per-chat model preset binding (plan v6 §7). useModelPreset
     // is the regime toggle; modelBinding (the bundle) persists across toggling so
@@ -2234,7 +2310,10 @@ export interface Message{
 }
 
 export interface MessageGenerationInfo{
+    completed?: boolean
+    continuePrefix?: string
     model?: string
+    modelId?: string
     generationId?: string
     copilotTurnId?: string
     batchId?: string
@@ -2615,6 +2694,9 @@ export function saveCurrentPreset(){
         enableCustomFlags: db.enableCustomFlags,
         regex: db.presetRegex,
         image: pres?.[db.botPresetsId]?.image ?? '',
+        // Folder membership lives only on the stored preset (not mirrored to
+        // top-level db fields), so carry it over or it is lost on every save.
+        folderId: pres?.[db.botPresetsId]?.folderId,
         reasonEffort: db.reasoningEffort ?? 0,
         thinkingTokens: db.thinkingTokens ?? null,
         thinkingType: db.thinkingType ?? 'budget',

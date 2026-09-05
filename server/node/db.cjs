@@ -13,6 +13,13 @@ if (!fs.existsSync(saveDir)) {
     fs.mkdirSync(saveDir, { recursive: true });
 }
 const dbPath = path.join(saveDir, 'risuai.db');
+// Route SQLite temp files (VACUUM's transient DB copy, spilled temp tables) to
+// the save dir. The default /tmp is absent on Termux and is RAM-backed tmpfs in
+// Docker, where a multi-GB vacuum copy turns into an OOM kill. Same-disk also
+// means the optimize endpoint's free-space check covers the temp file too.
+if (!process.env.SQLITE_TMPDIR) {
+    process.env.SQLITE_TMPDIR = saveDir;
+}
 const db = new Database(dbPath);
 
 // WAL mode: better concurrent read performance, single-writer
@@ -130,11 +137,14 @@ const comfyStore = createComfyStore(db, {
 // ─── KV operations ────────────────────────────────────────────────────────────
 // kv reads/writes for the DB blob route through chunkStore (get/put/size/copy);
 // the statements below serve the remaining direct-row keys.
-const stmtKvSet    = db.prepare(`INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)`);
+const stmtKvSet    = db.prepare(`INSERT INTO kv (key, value, updated_at) VALUES (?, ?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+    updated_at = MAX(excluded.updated_at, COALESCE(kv.updated_at, 0) + 1)`);
 const stmtKvDel    = db.prepare(`DELETE FROM kv WHERE key = ?`);
 const stmtKvList   = db.prepare(`SELECT key FROM kv`);
 const stmtKvPrefix = db.prepare(`SELECT key FROM kv WHERE key LIKE ? ESCAPE '\\'`);
 const stmtKvPrefixSizes = db.prepare(`SELECT key, LENGTH(value) as size FROM kv WHERE key LIKE ? ESCAPE '\\'`);
+const stmtKvPrefixSizesUpdatedAt = db.prepare(`SELECT key, LENGTH(value) as size, updated_at FROM kv WHERE key LIKE ? ESCAPE '\\'`);
 const stmtKvDelPrefix = db.prepare(`DELETE FROM kv WHERE key LIKE ? ESCAPE '\\'`);
 const stmtKvUpdatedAt = db.prepare(`SELECT updated_at FROM kv WHERE key = ?`);
 
@@ -194,6 +204,11 @@ function kvListWithSizes(prefix) {
     return stmtKvPrefixSizes.all(`${escaped}%`).map(r => ({ key: r.key, size: r.size }));
 }
 
+function kvListWithSizesAndUpdatedAt(prefix) {
+    const escaped = prefix.replace(/[\\%_]/g, '\\$&');
+    return stmtKvPrefixSizesUpdatedAt.all(`${escaped}%`).map(r => ({ key: r.key, size: r.size, updated_at: r.updated_at }));
+}
+
 function checkpointWal(mode = 'TRUNCATE') {
     return db.pragma(`wal_checkpoint(${mode})`);
 }
@@ -236,7 +251,7 @@ function clearEntities() {
 module.exports = {
     db,
     // KV
-    kvGet, kvSet, kvDel, kvList, kvDelPrefix, kvListWithSizes, kvSize, kvGetUpdatedAt, kvCopyValue,
+    kvGet, kvSet, kvDel, kvList, kvDelPrefix, kvListWithSizes, kvListWithSizesAndUpdatedAt, kvSize, kvGetUpdatedAt, kvCopyValue,
     clearEntities,
     checkpointWal,
     gcChunks,

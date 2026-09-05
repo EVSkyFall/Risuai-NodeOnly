@@ -8,7 +8,8 @@ const fake = vi.hoisted(() => {
         lastBulkKeys: [] as string[],
     }
     let bulkRows: ((keys: string[]) => { key: string; value: Uint8Array | null }[]) | null = null
-    return { storageMap, counters, get bulkRows() { return bulkRows }, set bulkRows(v) { bulkRows = v } }
+    const holds = { read: null as Promise<void> | null, bulk: null as Promise<void> | null }
+    return { storageMap, counters, holds, get bulkRows() { return bulkRows }, set bulkRows(v) { bulkRows = v } }
 })
 
 vi.mock('../parser/parser.svelte', () => ({
@@ -23,13 +24,20 @@ vi.mock('../globalApi.svelte', () => ({
             [...fake.storageMap.keys()].filter((key) => key.startsWith(prefix)),
         getItem: async (key: string) => {
             fake.counters.perKeyReads++
-            return fake.storageMap.get(key) ?? null
+            const value = fake.storageMap.get(key) ?? null
+            const hold = fake.holds.read
+            fake.holds.read = null
+            if (hold) await hold
+            return value
         },
         getItems: async (keys: string[]) => {
             fake.counters.bulkReads++
             fake.counters.lastBulkKeys = [...keys]
-            if (fake.bulkRows) return fake.bulkRows(keys)
-            return keys.map((key) => ({ key, value: fake.storageMap.get(key) ?? null }))
+            const rows = fake.bulkRows ? fake.bulkRows(keys) : keys.map((key) => ({ key, value: fake.storageMap.get(key) ?? null }))
+            const hold = fake.holds.bulk
+            fake.holds.bulk = null
+            if (hold) await hold
+            return rows
         },
         setItem: async (key: string, value: Uint8Array) => {
             fake.storageMap.set(key, value)
@@ -72,6 +80,8 @@ beforeEach(() => {
     fake.counters.perKeyReads = 0
     fake.counters.lastBulkKeys = []
     fake.bulkRows = null
+    fake.holds.read = null
+    fake.holds.bulk = null
 })
 
 describe('SafeLocalPluginStorage.getMany', () => {
@@ -161,5 +171,35 @@ describe('SafeLocalPluginStorage.getItemUncached', () => {
         await expect(store.getItemUncached(key)).resolves.toEqual({ version: 2 })
 
         expect(fake.counters.perKeyReads).toBe(2)
+    })
+})
+
+describe('late storage reads', () => {
+    test.each(['read', 'bulk'] as const)('a clear during %s cannot revive the removed cache value', async (kind) => {
+        const key = uniqueKey('cleared')
+        seed(key, 'old')
+        let release!: () => void
+        fake.holds[kind] = new Promise<void>(resolve => { release = resolve })
+        const store = new SafeLocalPluginStorage()
+        const pending = kind === 'read' ? store.getItem(key) : store.getMany([key])
+        await vi.waitFor(() => expect(fake.holds[kind]).toBeNull())
+        await store.clear()
+        release()
+        expect(await pending).toEqual(kind === 'read' ? null : [null])
+        expect(await store.getItem(key)).toBeNull()
+    })
+
+    test('a write during a bulk read keeps its newer value in the result and cache', async () => {
+        const key = uniqueKey('updated')
+        seed(key, 'old')
+        let release!: () => void
+        fake.holds.bulk = new Promise<void>(resolve => { release = resolve })
+        const store = new SafeLocalPluginStorage()
+        const pending = store.getMany([key, key])
+        await vi.waitFor(() => expect(fake.holds.bulk).toBeNull())
+        await store.setItem(key, 'new')
+        release()
+        expect(await pending).toEqual(['new', 'new'])
+        expect(await store.getItem(key)).toBe('new')
     })
 })

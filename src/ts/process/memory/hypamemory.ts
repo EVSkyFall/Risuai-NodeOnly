@@ -6,7 +6,7 @@ import { makeHashedStorageKey, readPersistentJson, writePersistentJson } from "s
 import { isContextModel, getContextProvider } from "./contextualEmbedding";
 import { isLocalNetworkUrl } from "src/ts/network/localNetwork";
 
-export type HypaModel = 'custom'|'ada'|'openai3small'|'openai3large'|'MiniLM'|'MiniLMGPU'|'nomic'|'nomicGPU'|'bgeSmallEn'|'bgeSmallEnGPU'|'bgem3'|'bgem3GPU'|'multiMiniLM'|'multiMiniLMGPU'|'bgeM3Ko'|'bgeM3KoGPU'|'voyageContext3'
+export type HypaModel = 'custom'|'ada'|'openai3small'|'openai3large'|'MiniLM'|'MiniLMGPU'|'nomic'|'nomicGPU'|'bgeSmallEn'|'bgeSmallEnGPU'|'bgem3'|'bgem3GPU'|'multiMiniLM'|'multiMiniLMGPU'|'bgeM3Ko'|'bgeM3KoGPU'|'voyageContext3'|'voyageContext4'
 
 // In a typical environment, bge-m3 is a heavy model.
 // If your GPU can't handle this model, you'll see errror below.
@@ -39,6 +39,18 @@ export const localModels = {
 // Shared embedding vector cache across all HypaProcesser instances
 export const hypaVectorCache = new Map<string, memoryVector>();
 const hypaVectorCachePrefix = 'cache/hypa-vector/';
+
+// Preserve the complete diagnostic body shown by the memory API.
+export function truncateErrorBody(data: unknown): string {
+    let text: string
+    try {
+        text = typeof data === 'string' ? data : JSON.stringify(data)
+    } catch {
+        text = String(data)
+    }
+    text = text ?? String(data)
+    return text
+}
 
 export async function getPersistedHypaVector(cacheKey: string): Promise<memoryVector | undefined> {
     if (hypaVectorCache.has(cacheKey)) {
@@ -163,7 +175,7 @@ export class HypaProcesser{
     
     
         if(!gf.ok){
-            throw JSON.stringify(gf.data)
+            throw new Error(truncateErrorBody(gf.data))
         }
     
         const result:number[][] = []

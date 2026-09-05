@@ -322,7 +322,7 @@ describe('v3 permission wiring', () => {
         expect(source).toContain('export async function setPluginPermissionPreset(')
         expect(source).toContain('export { pluginPermissionDescList }')
 
-        const providerStart = source.indexOf('pluginV2.providers.set(name')
+        const providerStart = source.indexOf('const provider = async')
         const providerEnd = source.indexOf('pluginV2.providerOptions.set(name', providerStart)
         const providerBlock = source.slice(providerStart, providerEnd)
         expect(providerBlock).toContain("const conf = await getPluginPermission(plugin.name, 'provider', 'periodically')")

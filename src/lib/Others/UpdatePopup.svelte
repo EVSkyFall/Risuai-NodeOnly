@@ -2,6 +2,7 @@
     import { updatePopupStore, dismissUpdatePopup, selfUpdateProgressStore, executeSelfUpdate, type UpdateInfo, type SelfUpdateProgress } from "src/ts/update";
     import { openURL } from "src/ts/globalApi.svelte";
     import { SaveServerBackup } from "src/ts/drive/backuplocal";
+    import { notifyError } from "src/ts/alert";
     import { language } from "src/lang";
     import { ArrowUpCircle, AlertTriangle, Download, Loader, CheckCircle, XCircle, SaveIcon } from "@lucide/svelte";
     import ShDialog from "src/lib/UI/GUI/ShDialog.svelte";
@@ -22,8 +23,38 @@
         return language.updatePopupTitle
     }
 
-    function handleSelfUpdate() {
+    let backingUp = $state(false)
+    let waitingForBackup = $state(false)
+    let backupPromise: Promise<boolean> | null = null
+
+    // Update joins an in-flight backup instead of racing it. The button has to
+    // say so: without a waiting state the click looks ignored for as long as the
+    // backup runs, and a failed backup aborts the update with no explanation.
+    async function handleSelfUpdate() {
+        if (backupPromise) {
+            waitingForBackup = true
+            try {
+                while (backupPromise) {
+                    if (!await backupPromise) {
+                        notifyError(language.updatePopupBackupFailedAbort)
+                        return
+                    }
+                }
+            } finally {
+                waitingForBackup = false
+            }
+        }
         executeSelfUpdate()
+    }
+
+    function handleBackup() {
+        if (backupPromise) return backupPromise
+        backingUp = true
+        backupPromise = SaveServerBackup().finally(() => {
+            backingUp = false
+            backupPromise = null
+        })
+        return backupPromise
     }
 
     function handleDone() {
@@ -145,17 +176,27 @@
         <ShButton variant="outline" onclick={dismissUpdatePopup}>
             {language.updatePopupLater}
         </ShButton>
-        <ShButton variant="outline" onclick={() => SaveServerBackup()}>
-            <SaveIcon size={14} />
+        <ShButton variant="outline" onclick={handleBackup} disabled={backingUp}>
+            {#if backingUp}
+                <Loader size={14} class="animate-spin" />
+            {:else}
+                <SaveIcon size={14} />
+            {/if}
             {language.updatePopupBackup}
         </ShButton>
         {#if info.canSelfUpdate}
             <ShButton
                 variant={info.severity === 'optional' ? 'success' : 'destructive'}
+                disabled={waitingForBackup}
                 onclick={handleSelfUpdate}
             >
-                <Download size={14} />
-                {language.selfUpdateNow}
+                {#if waitingForBackup}
+                    <Loader size={14} class="animate-spin" />
+                    {language.updatePopupWaitingBackup}
+                {:else}
+                    <Download size={14} />
+                    {language.selfUpdateNow}
+                {/if}
             </ShButton>
         {:else}
             <ShButton

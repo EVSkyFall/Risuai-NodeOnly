@@ -5,6 +5,7 @@ export const pluginPermissionDescList = [
     'replacer',
     'provider',
     'sendChat',
+    'inlay',
 ] as const
 
 export type PluginPermissionDesc = (typeof pluginPermissionDescList)[number]

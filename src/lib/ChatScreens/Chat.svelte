@@ -1,7 +1,9 @@
 <script lang="ts">
+    import { reissueMessageIds } from "src/ts/chatClone";
     import { ArrowLeft, ArrowLeftRightIcon, ArrowRight, BookmarkIcon, BotIcon, CopyIcon, PowerOff, GitBranch, HamburgerIcon, LanguagesIcon, MenuIcon, PencilIcon, RefreshCcwIcon, SplitIcon, TrashIcon, UserIcon, Volume2Icon, Scissors, EyeOff } from "@lucide/svelte"
     import { aiLawApplies, changeChatTo, foldChatToMessage, getFileSrc, createChatCopyName } from "src/ts/globalApi.svelte"
     import { ColorSchemeTypeStore } from "src/ts/gui/colorscheme"
+    import { MediaQuery } from "svelte/reactivity"
     import { getModelInfo } from "src/ts/model/modellist"
     import { runLuaButtonTrigger } from 'src/ts/process/scriptings'
     import { risuChatParser } from "src/ts/process/scripts"
@@ -25,6 +27,9 @@
     import PopupButton from "../UI/PopupButton.svelte";
     import PartialEditController from './PartialEditController.svelte';
 
+    // Reactive breakpoint: a raw window.innerWidth read here is evaluated once
+    // at mount and never follows a resize (#79).
+    const wide640 = new MediaQuery('(min-width: 640px)')
     let translating = $state(false)
     let editMode = $state(false)
     let statusMessage:string = $state('')
@@ -433,6 +438,7 @@
         >
             {#key `${totalLengthPointer}|${chatReloadPointer}`}
                 <ChatBody
+                    streaming={DBState.db.characters[selIdState.selId]?.chats[DBState.db.characters[selIdState.selId]?.chatPage]?.isStreaming === true}
                     {character}
                     {firstMessage}
                     {idx}
@@ -477,7 +483,7 @@
             <span class="text-xs">{statusMessage}</span>
             <div class="flex items-center ml-2 gap-2 flex-wrap justify-end">
                 {@render translationButton()}
-                {#if window.innerWidth >= 640}
+                {#if wide640.current}
                     {@render majorIconButtonsBody(false)}
                     {#if DBState.db.characters[selIdState.selId] && idx > -1}
                         <PopupButton>
@@ -758,7 +764,10 @@
             {/if}
         </button>
     {/if}
-    <button class="flex items-center hover:text-red-400 transition-colors button-icon-remove" onclick={rm}>
+    <button class="flex items-center hover:text-red-400 transition-colors button-icon-remove" onclick={async () => {
+        await sleep(1)
+        rm()
+    }}>
         <TrashIcon size={20}/>
 
         {#if showNames}
@@ -771,6 +780,7 @@
 {#snippet translationButton(showNames = false)}
     {#if DBState.db.translator !== '' && !blankMessage}
         <button class={"flex items-center cursor-pointer hover:text-primary transition-colors button-icon-translate " + (translated ? 'text-blue-400':'')} class:translating={translating} onclick={async () => {
+            await sleep(1)
             translated = !translated
         }}>
             <LanguagesIcon />
@@ -802,18 +812,29 @@
     {#if (rerollIcon || altGreeting) && role !== 'user'}
         {#if altGreeting}
             <!-- First message: ← counter → -->
-            <button class="flex items-center shrink-0 hover:text-primary transition-colors button-icon-unreroll" onclick={unReroll}>
+            <button class="flex items-center shrink-0 hover:text-primary transition-colors button-icon-unreroll" onclick={async () => {
+                await sleep(1)
+                unReroll()
+            }}>
                 <ArrowLeft size={22}/>
             </button>
             {#if !DBState.db.hideMessagePageCount}
                 <span class="flex items-center text-xs text-textcolor2 shrink overflow-hidden whitespace-nowrap min-w-0">{currentPage}/{totalPages}</span>
             {/if}
-            <button class="flex items-center shrink-0 hover:text-primary transition-colors button-icon-reroll" onclick={() => onReroll()}>
+            <button class="flex items-center shrink-0 hover:text-primary transition-colors button-icon-reroll" onclick={async () => {
+                await sleep(1)
+                onReroll()
+            }}>
                 <ArrowRight size={22}/>
             </button>
         {:else}
-            <!-- Normal messages: ← counter → ↻ -->
-            <button class="flex items-center shrink-0 hover:text-primary transition-colors button-icon-unreroll" class:dyna-icon={rerollIcon === 'dynamic' || rerollIcon === 'force'} class:force-show={rerollIcon === 'force'} onclick={async () => {
+            <!-- Normal messages: ← counter → | ↻
+                 The arrows walk the swipe list (and generate a fresh one at
+                 either end); ↻ replays the last request verbatim. Two different
+                 kinds of action sat flush against each other with no cue, so the
+                 arrows are tooltipped and a hairline splits the replay off. -->
+            <button class="flex items-center shrink-0 hover:text-primary transition-colors button-icon-unreroll" class:dyna-icon={rerollIcon === 'dynamic' || rerollIcon === 'force'} class:force-show={rerollIcon === 'force'} title={language.swipePrevTooltip} onclick={async () => {
+                await sleep(1)
                 if (totalPages <= 1) {
                     if (!DBState.db.confirmReroll || await alertConfirm(language.noSwipesRerollConfirm)) onReroll()
                 } else {
@@ -825,7 +846,7 @@
             {#if !DBState.db.hideMessagePageCount}
                 <span class="flex items-center text-xs text-textcolor2 shrink overflow-hidden whitespace-nowrap min-w-0" class:dyna-icon={rerollIcon === 'dynamic' || rerollIcon === 'force'} class:force-show={rerollIcon === 'force'}>{currentPage}/{totalPages}</span>
             {/if}
-            <button class="flex items-center shrink-0 hover:text-primary transition-colors button-icon-reroll" class:dyna-icon={rerollIcon === 'dynamic' || rerollIcon === 'force'} class:force-show={rerollIcon === 'force'} onclick={async () => {
+            <button class="flex items-center shrink-0 hover:text-primary transition-colors button-icon-reroll" class:dyna-icon={rerollIcon === 'dynamic' || rerollIcon === 'force'} class:force-show={rerollIcon === 'force'} title={language.swipeNextTooltip} onclick={async () => {
                 if (currentPage >= totalPages) {
                     // At the end of the swipe list the arrow generates a fresh
                     // swipe (upstream behavior) instead of wrapping to the first.
@@ -836,6 +857,7 @@
             }}>
                 <ArrowRight size={22}/>
             </button>
+            <span aria-hidden="true" class="shrink-0 self-stretch my-1 border-l border-darkborderc" class:dyna-icon={rerollIcon === 'dynamic' || rerollIcon === 'force'} class:force-show={rerollIcon === 'force'}></span>
             <button class="flex items-center shrink-0 hover:text-primary transition-colors button-icon-reroll" class:dyna-icon={rerollIcon === 'dynamic' || rerollIcon === 'force'} class:force-show={rerollIcon === 'force'} title={language.rerollExactTooltip} onclick={async () => {
                 if (!DBState.db.confirmReroll || await alertConfirm(language.rerollConfirm)) onReroll(true)
             }}>
@@ -893,6 +915,8 @@
         newChat.name = createChatCopyName(newChat.name, 'Branch')
         newChat.id = v4()
         newChat.message = newChat.message.slice(0, idx + 1)
+        // Own message ids for the branch; drops summaries/bookmarks that point past the cut
+        reissueMessageIds(newChat, currentChat.message.map(m => m.chatId))
         newChat.message.push({
             role: 'char',
             data: '{{specialcomment::branchedfrom::' + currentChat.id + '::' + currentChat.name + '::' + currentMessage.chatId + '::}}',
@@ -1151,6 +1175,15 @@
                         {@render iconButtons()}
                     </div>
                 </div>
+            </div>
+        {:else if isComment}
+            <!-- Comment messages (e.g. branch-point markers) are blankMessage,
+                 but must still render their text and delete button. -->
+            <div class="flex flex-col w-full min-w-0 max-w-3xl mx-auto px-4 sm:px-8">
+                <div class="flexium items-center">
+                    {@render iconButtons()}
+                </div>
+                {@render textBox()}
             </div>
         {/if}
     </div>

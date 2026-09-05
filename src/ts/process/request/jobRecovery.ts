@@ -7,6 +7,7 @@ import { addLog } from 'src/ts/log'
 import { recordRequestLog } from 'src/ts/requestLog'
 import { language } from 'src/lang'
 import { chatGenKey, endGeneration, generationStates, registerAbort, startGeneration } from 'src/ts/process/generationState'
+import { getGenerationModelString } from 'src/ts/process/models/modelString'
 import { clearStatus, endStatus, startStatus } from 'src/ts/status/requestStatus'
 import { authHeader } from './jobFetch'
 import { clearPendingSend, listPendingSends, markResumable, resumableSends, type PendingSendRecord } from './pendingSends'
@@ -50,6 +51,11 @@ export interface ModelJobRecord {
     adapterKind?: string | null
     /** Model id, recorded at job creation (absent on jobs from older builds). */
     model?: string | null
+    /** User-facing preset label and live generation token estimates. */
+    modelLabel?: string | null
+    inputTokens?: number | null
+    outputTokens?: number | null
+    maxContext?: number | null
     /** origin+pathname of the provider endpoint — never the query string. */
     targetOrigin?: string | null
     createdAt?: number
@@ -251,8 +257,8 @@ function findRecoveryMessage(chat: Chat, generationId: string): Message | undefi
 }
 
 // A strict durable ACK is definitive. If that ACK is lost, a fresh server read
-// distinguishes an already-landed write from a definite miss; an unavailable
-// or unmatchable readback remains ambiguous and keeps the CAS claim fail-closed.
+// identifies whether a retry can confirm the same write. GET alone is not a
+// durability proof; any unconfirmed save releases this token for rediscovery.
 async function persistRecoveredChat(loc: LocatedChat, job: ModelJobRecord): Promise<PersistRecoveredChatResult> {
     const chaId = loc.char.chaId
     if (!chaId) {
@@ -272,6 +278,12 @@ async function persistRecoveredChat(loc: LocatedChat, job: ModelJobRecord): Prom
         return 'not-saved'
     }
 
+    const completedMessage = job.generationId ? findRecoveryMessage(chat, job.generationId) : undefined
+    if (completedMessage && (!completedMessage.generationInfo?.generationId
+        || completedMessage.generationInfo.generationId === job.generationId)) {
+        completedMessage.generationInfo = { ...completedMessage.generationInfo, completed: true }
+        delete completedMessage.generationInfo.continuePrefix
+    }
     try {
         await saveChatToServerStrict(chaId, index, job.chatId, chat)
         diag(`recover ${job.id.slice(0, 8)}: chat saved idx=${index}`)
@@ -295,8 +307,12 @@ async function persistRecoveredChat(loc: LocatedChat, job: ModelJobRecord): Prom
                 return 'not-saved'
             }
             const landed = findRecoveryMessage(remote, generationId)
-            if (landed?.data === expected.data) {
-                diag(`recover ${job.id.slice(0, 8)}: save confirmed by exact readback`)
+            if (landed?.data === expected.data
+                && JSON.stringify(landed?.generationInfo) === JSON.stringify(expected.generationInfo)) {
+                // GET may expose fullChatStore before its disk flush. Retry
+                // the strict save; only its ACK confirms durability.
+                await saveChatToServerStrict(chaId, index, job.chatId, chat)
+                diag(`recover ${job.id.slice(0, 8)}: readback followed by strict save ACK`)
                 return 'saved'
             }
             diag(`recover ${job.id.slice(0, 8)}: save readback target absent/different`)
@@ -352,20 +368,51 @@ async function releaseJobClaim(jobId: string, claimToken: string): Promise<boole
     }
 }
 
-async function releaseDefinitelyUnsavedClaim(job: ModelJobRecord, claimToken: string): Promise<void> {
+async function releaseUnpersistedClaim(job: ModelJobRecord, claimToken: string): Promise<void> {
     const released = await releaseJobClaim(job.id, claimToken)
-    diag(`recover ${job.id.slice(0, 8)}: definite save miss, claim release=${released}`)
+    diag(`recover ${job.id.slice(0, 8)}: unconfirmed save, claim release=${released}`)
 }
 
 // Message shape mirrors the live write path (index.svelte.ts streaming push):
 // data/saying/time/generationInfo, message-level chatId = generationId.
-function insertRecoveredMessage(loc: LocatedChat, job: ModelJobRecord, text: string): void {
+// generationInfo.model prefers the preset label persisted with the job, then
+// falls back to the same formatter as the live path
+// (generationInfo.model = getGenerationModelString(req.model)) so a recovered
+// message shows the same model string a live one would, not "unknown".
+// Jobs from older builds have neither recorded — leave the fields unset.
+// Token counts fall back to provider-reported usage parsed from the journal.
+function recoveredGenerationInfo(job: ModelJobRecord, usage?: AdapterUsage): Message['generationInfo'] {
+    return {
+        generationId: job.generationId ?? undefined,
+        model: job.modelLabel ?? (job.model ? getGenerationModelString(job.model) : undefined),
+        modelId: job.model ?? undefined,
+        inputTokens: job.inputTokens ?? usage?.promptTokens,
+        outputTokens: job.outputTokens ?? usage?.completionTokens,
+        maxContext: job.maxContext ?? undefined,
+    }
+}
+
+function mergeRecoveredGenerationInfo(message: Message, job: ModelJobRecord, usage?: AdapterUsage): boolean {
+    const recovered = recoveredGenerationInfo(job, usage)
+    const current = message.generationInfo ?? {}
+    let changed = false
+    for (const [key, value] of Object.entries(recovered)) {
+        if (value !== undefined && current[key as keyof typeof current] === undefined) {
+            Object.assign(current, { [key]: value })
+            changed = true
+        }
+    }
+    if (changed) message.generationInfo = current
+    return changed
+}
+
+function insertRecoveredMessage(loc: LocatedChat, job: ModelJobRecord, text: string, usage?: AdapterUsage): void {
     const message: Message = {
         role: 'char',
         data: text,
         time: Date.now(),
         chatId: job.generationId ?? uuidv4(),
-        generationInfo: { generationId: job.generationId ?? undefined },
+        generationInfo: recoveredGenerationInfo(job, usage),
     }
     if (loc.char.chaId) message.saying = loc.char.chaId
     loc.chat.message.push(message)
@@ -394,7 +441,7 @@ function insertJobError(loc: LocatedChat, job: ModelJobRecord, error: string): b
         time: Date.now(),
     }
     if (loc.char.chaId) message.saying = loc.char.chaId
-    if (job.generationId) message.generationInfo = { generationId: job.generationId }
+    if (job.generationId || job.model || job.modelLabel) message.generationInfo = recoveredGenerationInfo(job)
     loc.chat.message.push(message)
     bumpReload(loc)
     return true
@@ -478,20 +525,20 @@ async function readJobResult(job: ModelJobRecord): Promise<{ ok: true, text: str
 // case this feature exists for, so a plain "message exists → skip" would drop
 // the recovered text on the floor.
 //
-// Shorter-or-equal recovered text means the live path had already finished and
-// saved the message (only its claim was lost) — possibly after editoutput
-// scripts / removeIncompleteResponse trimmed it — so it is left untouched.
-// Length is the discriminator because per-chunk post-processing makes a prefix
-// test unreliable; the residual trade-off is that a completed message whose
-// claim was lost AND which post-processing shortened could be restored to raw
-// text. That window is far smaller than the partial-response loss it prevents.
-//
-// Returns whether the message was actually filled (false on the leave-alone
-// path, which needs no save).
+// Explicit completion preserves the final edited result. New continuations
+// carry their durable start prefix, so the journal extends that prefix rather
+// than competing with the entire old reply's length. Legacy messages without
+// either marker retain the previous length heuristic.
+// Returns whether the text changed; existing slots still require a strict save.
 function fillPartialMessage(loc: LocatedChat, index: number, text: string): boolean {
     const message = loc.chat.message[index]
-    if (!message || (message.data?.length ?? 0) >= text.length) return false
-    message.data = text
+    if (!message || message.generationInfo?.completed === true) return false
+    const prefix = message.generationInfo?.continuePrefix
+    const recovered = prefix === undefined ? text : prefix + text
+    if (prefix === undefined && message.generationInfo?.completed !== false
+        && (message.data?.length ?? 0) >= recovered.length) return false
+    if (message.data === recovered) return false
+    message.data = recovered
     bumpReload(loc)
     return true
 }
@@ -499,8 +546,20 @@ function fillPartialMessage(loc: LocatedChat, index: number, text: string): bool
 // Slot one terminal job into its chat. Idempotent (design §4 safety rule 2):
 // an existing message with this generationId is never duplicated — it is either
 // left alone or filled in from the journal (see fillPartialMessage).
-export async function recoverTerminalJob(job: ModelJobRecord): Promise<void> {
-    const loc = await locateChat(job.chatId)
+export async function recoverTerminalJob(job: ModelJobRecord): Promise<void | 'retry' | 'live'> {
+    // A LIVE send still owns this chat: the job finished server-side while the
+    // tab was frozen and its stream is still replaying/reattaching (discovery
+    // fires on tab-return mid-send). The live path fills the message, runs the
+    // full post-processing and claims the job itself — slotting in here would
+    // race it with a raw fill, a redundant save and a duplicate request-log
+    // entry. Same guard as attachRunningJob / evaluatePendingSend; if the live
+    // send dies instead, its guard is released and the next pass recovers.
+    if (get(generationStates).get(chatGenKey(job.chatId))?.kind === 'live') {
+        diag(`recover ${job.id.slice(0, 8)}: live send owns chat -> skipped`)
+        return 'live'
+    }
+    let loc = await locateChat(job.chatId)
+    if (get(generationStates).get(chatGenKey(job.chatId))?.kind === 'live') return 'live'
     if (!loc) {
         // Chat was deleted while the job ran — nothing to slot into.
         console.warn('[ModelJobRecovery] chat missing for job', job.id, '- claiming without slot-in')
@@ -513,20 +572,27 @@ export async function recoverTerminalJob(job: ModelJobRecord): Promise<void> {
     // generationInfo to the NEW generation, which would otherwise orphan an
     // unclaimed job of the ORIGINAL one and insert its full response as a
     // duplicate message.
-    const existingIdx = job.generationId
+    let existingIdx = job.generationId
         ? loc.chat.message.findIndex((m) => m?.generationInfo?.generationId === job.generationId
             || m?.chatId === job.generationId)
         : -1
     if (job.status === 'failed') {
         const claimToken = await claimJob(job.id)
         if (!claimToken) return
+        if (get(generationStates).get(chatGenKey(job.chatId))?.kind === 'live') {
+            await releaseUnpersistedClaim(job, claimToken)
+            return 'live'
+        }
         // With the live message already in the chat the user saw this failure as
         // it happened; an error block on top would only duplicate it.
         diag(`recover ${job.id.slice(0, 8)}: failed job, existingIdx=${existingIdx}`)
         const mutated = existingIdx === -1 && insertJobError(loc, job, job.error ?? 'Model request failed')
         if (needsSave(mutated, existingIdx)) {
             const persistence = await persistRecoveredChat(loc, job)
-            if (persistence === 'not-saved') await releaseDefinitelyUnsavedClaim(job, claimToken)
+            if (persistence !== 'saved') {
+                await releaseUnpersistedClaim(job, claimToken)
+                return 'retry'
+            }
         }
         return
     }
@@ -534,17 +600,30 @@ export async function recoverTerminalJob(job: ModelJobRecord): Promise<void> {
     const result = await readJobResult(job)
     // Claim before mutating the chat: multiple browsers can discover the same
     // terminal row, but only the CAS winner may slot it in or persist it.
+    if (get(generationStates).get(chatGenKey(job.chatId))?.kind === 'live') return 'live'
     const claimToken = await claimJob(job.id)
     if (!claimToken) return
+    loc = await locateChat(job.chatId)
+    if (!loc || get(generationStates).get(chatGenKey(job.chatId))?.kind === 'live') {
+        await releaseUnpersistedClaim(job, claimToken)
+        return loc ? 'live' : 'retry'
+    }
+    existingIdx = job.generationId
+        ? loc.chat.message.findIndex((m) => m?.generationInfo?.generationId === job.generationId || m?.chatId === job.generationId)
+        : -1
     let mutated = false
     if (result.ok === true) {
         if (existingIdx === -1) {
-            insertRecoveredMessage(loc, job, result.text)
+            insertRecoveredMessage(loc, job, result.text, result.usage)
             mutated = true
             diag(`recover ${job.id.slice(0, 8)}: inserted len=${result.text.length}`)
         } else {
             const before = loc.chat.message[existingIdx]?.data?.length ?? 0
-            mutated = fillPartialMessage(loc, existingIdx, result.text)
+            const currentGeneration = loc.chat.message[existingIdx]?.generationInfo?.generationId
+            const superseded = currentGeneration && currentGeneration !== job.generationId
+            const metadataChanged = !superseded && mergeRecoveredGenerationInfo(loc.chat.message[existingIdx], job, result.usage)
+            const textChanged = !superseded && fillPartialMessage(loc, existingIdx, result.text)
+            mutated = metadataChanged || textChanged
             const after = loc.chat.message[existingIdx]?.data?.length ?? 0
             // Independent read-back through a FRESH proxied lookup: proves the
             // write is visible to the reactive graph, not only to our local
@@ -566,8 +645,9 @@ export async function recoverTerminalJob(job: ModelJobRecord): Promise<void> {
         const persistence = await persistRecoveredChat(loc, job)
         if (persistence === 'saved') {
             recordJobRecoveryLog(job, result)
-        } else if (persistence === 'not-saved') {
-            await releaseDefinitelyUnsavedClaim(job, claimToken)
+        } else {
+            await releaseUnpersistedClaim(job, claimToken)
+            return 'retry'
         }
     } else {
         // No durable chat write is required (for example, a complete existing
@@ -739,24 +819,31 @@ export async function evaluatePendingSend(
         return null // possibly still running (maybe on another device) — let it age
     }
     const loc = await locateChat(record.chatId)
+    if (get(generationStates).get(chatGenKey(record.chatId))?.kind === 'live') return null
     if (!loc) {
         clearPendingSend(record.chatId, record.generationId) // chat deleted — nothing to resume
         return null
     }
-    // Concluded: the send's message made it into the chat (live save or job
-    // recovery slot-in — the fill path also stamps this generationId; the
-    // message-level chatId covers a continue that restamped generationInfo).
-    if (record.generationId
-        && loc.chat.message.some((m) => m?.generationInfo?.generationId === record.generationId
-            || m?.chatId === record.generationId)) {
-        clearPendingSend(record.chatId, record.generationId)
-        return null
+    if (record.generationId) {
+        const message = findRecoveryMessage(loc.chat, record.generationId)
+        if (message) {
+            if (message.generationInfo?.completed === true) {
+                try {
+                    const index = loc.char.chats.findIndex((c) => c.id === record.chatId)
+                    // A completion marker alone (even from GET) is not a
+                    // durability ACK. Persist the current chat, preserving
+                    // any edits since hydration, before concluding the send.
+                    await saveChatToServerStrict(loc.char.chaId, index, record.chatId, loc.chat)
+                } catch { return null }
+                await clearPendingSend(record.chatId, record.generationId)
+            }
+            return null
+        }
     }
     // A job for this chat exists (running or awaiting recovery): the main
     // request DID fire, so job recovery owns the outcome — a re-run here would
     // double-generate.
     if (jobChatIds.has(record.chatId)) {
-        clearPendingSend(record.chatId, record.generationId)
         return null
     }
     // Resumable only while the chat still ends with the user's turn. Anything
@@ -776,6 +863,11 @@ export async function evaluatePendingSend(
 // A record deferred by the min-age gate gets exactly one scheduled re-check
 // when it comes of age — without this, a desktop tab that stays visible would
 // never re-run discovery and the resume would be missed for the session.
+//
+// Deliberately a SEPARATE timer from the failure-retry backoff below: sharing
+// one slot would let a retry schedule erase the pending-send "comes of age"
+// guarantee (or vice versa). Both timers just re-run discovery, so an extra
+// firing is harmless; a lost one is not.
 let deferredDiscoveryTimer: ReturnType<typeof setTimeout> | null = null
 function scheduleDeferredDiscovery(delayMs: number): void {
     if (deferredDiscoveryTimer !== null) clearTimeout(deferredDiscoveryTimer)
@@ -783,6 +875,19 @@ function scheduleDeferredDiscovery(delayMs: number): void {
         deferredDiscoveryTimer = null
         void recoverModelJobs()
     }, delayMs)
+}
+
+let retryDiscoveryTimer: ReturnType<typeof setTimeout> | null = null
+function scheduleDiscoveryRetry(delayMs: number): void {
+    if (retryDiscoveryTimer !== null) clearTimeout(retryDiscoveryTimer)
+    retryDiscoveryTimer = setTimeout(() => {
+        retryDiscoveryTimer = null
+        void recoverModelJobs()
+    }, delayMs)
+}
+function clearDiscoveryRetry(): void {
+    if (retryDiscoveryTimer !== null) clearTimeout(retryDiscoveryTimer)
+    retryDiscoveryTimer = null
 }
 
 async function discoverPendingSends(jobChatIds: Set<string>): Promise<string[]> {
@@ -811,6 +916,17 @@ async function discoverPendingSends(jobChatIds: Set<string>): Promise<string[]> 
 
 let recoveryInFlight: Promise<void> | null = null
 
+// Discovery retry policy: a return-triggered pass often races the radio coming
+// back up — visibilitychange fires the moment the tab resumes, while the
+// network needs a few more seconds. A silent give-up there strands finished
+// jobs until the NEXT return (the exact failure observed in the field: the
+// resume-time pass died on an unreachable job API and the response sat
+// unclaimed while the user regenerated). Bounded backoff, reset on any
+// successful pass. Live ownership deferrals do not consume this failure budget.
+const DISCOVERY_RETRY_MAX = 3
+const DISCOVERY_RETRY_BASE_MS = 3000
+let discoveryRetries = 0
+
 // Discovery pass. Never throws, and is a no-op when the job API is unreachable
 // or returns nothing. NOT gated on the nodeOnlyServerSideRequests toggle: jobs
 // created before the toggle was switched off must still be recovered.
@@ -831,11 +947,20 @@ async function runDiscovery(): Promise<void> {
             diag(`discovery: unclaimed=${unclaimedJobs.length} active=${activeJobs.length}`)
         }
         // Sequential on purpose: slot-ins mutate the DB and a failure on one
-        // job must not stop the rest.
+        // job must not stop the rest. A swallowed per-job failure still counts
+        // against the pass for retry purposes: the list fetch succeeding while
+        // the journal read dies (network came back mid-pass) must not strand
+        // the job until the next return — the exact failure mode the retry
+        // exists for. Genuinely broken jobs cannot loop: the budget is bounded.
+        let jobFailures = false
+        let livePending = false
         for (const job of unclaimedJobs) {
             try {
-                await recoverTerminalJob(job)
+                const result = await recoverTerminalJob(job)
+                if (result === 'retry') jobFailures = true
+                if (result === 'live') livePending = true
             } catch (err) {
+                jobFailures = true
                 console.warn('[ModelJobRecovery] recovery failed for job', job?.id, err)
             }
         }
@@ -843,6 +968,7 @@ async function runDiscovery(): Promise<void> {
             try {
                 attachRunningJob(job)
             } catch (err) {
+                jobFailures = true
                 console.warn('[ModelJobRecovery] reattach failed for job', job?.id, err)
             }
         }
@@ -860,9 +986,25 @@ async function runDiscovery(): Promise<void> {
             safeStatus(() => notifyInfo(
                 language.pendingSendNotice.replace('{chars}', newNames.join(', '))))
         }
+        if (jobFailures) {
+            scheduleRetryIfBudgeted()
+            if (livePending && retryDiscoveryTimer === null) scheduleDiscoveryRetry(DISCOVERY_RETRY_BASE_MS)
+        } else if (livePending) {
+            scheduleDiscoveryRetry(DISCOVERY_RETRY_BASE_MS)
+        } else {
+            discoveryRetries = 0
+            clearDiscoveryRetry()
+        }
     } catch (err) {
         console.warn('[ModelJobRecovery] discovery failed', err)
+        scheduleRetryIfBudgeted()
     }
+}
+
+function scheduleRetryIfBudgeted(): void {
+    if (discoveryRetries >= DISCOVERY_RETRY_MAX) return
+    scheduleDiscoveryRetry(DISCOVERY_RETRY_BASE_MS * 2 ** discoveryRetries)
+    discoveryRetries += 1
 }
 
 let triggersInstalled = false
@@ -879,9 +1021,17 @@ let triggersInstalled = false
 export function initModelJobRecovery(): void {
     if (triggersInstalled) return
     triggersInstalled = true
+    // Each real return grants a fresh retry budget: an earlier exhausted
+    // backoff (network stayed down) must not mute the retries of a later,
+    // unrelated return.
     document.addEventListener('visibilitychange', () => {
-        if (document.visibilityState === 'visible') void recoverModelJobs()
+        if (document.visibilityState !== 'visible') return
+        discoveryRetries = 0
+        void recoverModelJobs()
     })
-    window.addEventListener('online', () => { void recoverModelJobs() })
+    window.addEventListener('online', () => {
+        discoveryRetries = 0
+        void recoverModelJobs()
+    })
     void recoverModelJobs()
 }
