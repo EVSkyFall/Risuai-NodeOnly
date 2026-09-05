@@ -1,5 +1,6 @@
 import { forageStorage } from 'src/ts/globalApi.svelte'
 import { language } from 'src/lang'
+import { v4 as uuidv4 } from 'uuid'
 
 // Server-side model-preset requests — job-based fetchImpl (Stage 3 of
 // .agent/notes/model-preset-server-side-requests.md).
@@ -211,7 +212,26 @@ export function makeJobFetch(opts: JobFetchOptions): typeof fetch {
 
         const claim = () => {
             void (async () => {
-                await fetch(`/api/model-jobs/${jobId}/claim`, { method: 'POST', headers: await authHeader() })
+                const claimToken = uuidv4()
+                try {
+                    const res = await fetch(`/api/model-jobs/${jobId}/claim`, {
+                        method: 'POST',
+                        headers: { 'content-type': 'application/json', ...await authHeader() },
+                        body: JSON.stringify({ claimToken }),
+                    })
+                    if (res.ok) {
+                        const result = await res.json()
+                        if (result?.success === true || result?.success === false) return result.success
+                    }
+                } catch {
+                    // The server may have committed the claim before its ACK was lost.
+                }
+                const res = await fetch(`/api/model-jobs/${jobId}/claim`, {
+                    headers: { 'x-model-job-claim-token': claimToken, ...await authHeader() },
+                })
+                // Transport completion cannot establish a definite save miss;
+                // an ambiguous claim must not be released here.
+                return res.ok && (await res.json())?.owned === true
             })().catch(() => {})
         }
 
