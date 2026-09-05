@@ -810,7 +810,7 @@ async function requestGoogle(url:string, body:any, headers:{[key:string]:string}
 
                 if(part.inlineData){
                     const imgHTML = new Image()
-                    const id = crypto.randomUUID()
+                    const id = v4()
 
                     if(part.inlineData.mimeType.startsWith('image/')){
 
