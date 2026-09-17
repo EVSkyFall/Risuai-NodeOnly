@@ -673,6 +673,17 @@ export function setDatabase(data:Database){
     }
     data.hypaV3PresetId ??= 0
     migrateMemoryPresets(data, uuidv4)
+    // The Anthropic count_tokens tokenizer mode was removed. Drop its stored
+    // API key, model and toggle, and the persisted count cache it wrote, once.
+    const legacy = data as unknown as Record<string, unknown>
+    if ('claudeTokenizerAPIEnabled' in legacy || 'claudeTokenizerAPIKey' in legacy || 'claudeTokenizerAPIModel' in legacy) {
+        delete legacy.claudeTokenizerAPIEnabled
+        delete legacy.claudeTokenizerAPIKey
+        delete legacy.claudeTokenizerAPIModel
+        void import('./persistentKv')
+            .then(({ removePersistentKey }) => removePersistentKey('claude_token_cache.json'))
+            .catch(() => {})
+    }
     normalizeTranslatorPresetState(data)
     data.showDeprecatedTriggerV2 ??= false
     data.returnCSSError ??= true
@@ -1568,9 +1579,6 @@ export interface Database{
     igpPrompt:string
     useTokenizerCaching:boolean
     claudeAdaptiveDisplaySummarized:boolean
-    claudeTokenizerAPIEnabled:boolean
-    claudeTokenizerAPIKey:string
-    claudeTokenizerAPIModel:string
     claudeTokenizerFactorKO:number
     claudeTokenizerFactorEN:number
     claudeTokenizerFactorJP:number

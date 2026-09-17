@@ -2146,10 +2146,9 @@ interface RisuaiPluginAPI {
     /**
      * Count tokens for a text using Risuai's internal tokenizer pipeline.
      *
-     * Defaults to the tokenizer of the user's currently active model. For Claude
-     * models with API mode enabled, transparently uses the Anthropic count_tokens
-     * API (with persistent cache + per-language fallback). All caching and rate-
-     * limit handling is shared with the host.
+     * Defaults to the tokenizer of the user's currently active model. Counting is
+     * local; Claude models use the bundled tokenizer scaled by the host's
+     * per-language correction factors.
      *
      * @param text - Text to tokenize
      * @param options - Optional overrides

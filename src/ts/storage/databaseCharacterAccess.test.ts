@@ -25,6 +25,9 @@ vi.mock('../../lang', () => ({
     changeLanguage: () => {},
 }))
 
+const { removePersistentKey } = vi.hoisted(() => ({ removePersistentKey: vi.fn(() => Promise.resolve()) }))
+vi.mock('./persistentKv', () => ({ removePersistentKey }))
+
 const databaseModule = await import('./database.svelte')
 const storesModule = await import('../stores.svelte')
 const { getCharacterByIndex, getCurrentCharacter, getCurrentContextLite } = databaseModule
@@ -208,5 +211,30 @@ describe('lite current context', () => {
             chatId: null,
             chatName: null,
         })
+    })
+})
+
+describe('removed Anthropic count_tokens tokenizer mode', () => {
+    test('normalization drops the stored API key, model and toggle once and keeps the correction factors', async () => {
+        const data = {
+            characters: [],
+            claudeTokenizerAPIEnabled: true,
+            claudeTokenizerAPIKey: 'sk-ant-secret',
+            claudeTokenizerAPIModel: 'claude-opus-4-7',
+            claudeTokenizerFactorEN: 1.2794,
+            claudeTokenizerFactorSamplesEN: 7026,
+        } as any
+        databaseModule.setDatabase(data)
+        expect('claudeTokenizerAPIEnabled' in data).toBe(false)
+        expect('claudeTokenizerAPIKey' in data).toBe(false)
+        expect('claudeTokenizerAPIModel' in data).toBe(false)
+        expect(data.claudeTokenizerFactorEN).toBe(1.2794)
+        expect(data.claudeTokenizerFactorSamplesEN).toBe(7026)
+        await vi.waitFor(() => expect(removePersistentKey).toHaveBeenCalledWith('claude_token_cache.json'))
+
+        removePersistentKey.mockClear()
+        databaseModule.setDatabase(data)
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        expect(removePersistentKey).not.toHaveBeenCalled()
     })
 })

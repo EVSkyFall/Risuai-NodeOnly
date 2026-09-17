@@ -1117,7 +1117,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 DBState.db.characters[selectedChar].chats[selectedChat].hypaV3Data = currentChat.hypaV3Data
             }
             console.log(sp)
-            throwError(sp.error + "\n\nMax context source: " + maxContextSource)
+            throwError(sp.error + "\n\nReserved Output: " + maxResponseTokens + "\nMax context source: " + maxContextSource)
             if (realChatId) clearPendingSend(realChatId, generationId)
             return false
         }

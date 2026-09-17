@@ -5,7 +5,7 @@ import type { MultiModal, OpenAIChat } from "./process/index.svelte";
 import { supportsInlayImage } from "./process/files/inlays";
 import { risuChatParser } from "./parser/parser.svelte";
 import { tokenizeGGUFModel } from "./process/models/local";
-import { globalFetch, fetchViaProxy2 } from "./globalApi.svelte";
+import { globalFetch } from "./globalApi.svelte";
 import { getModelInfo, LLMTokenizer, type LLMModel } from "./model/modellist";
 import { pluginV2 } from "./plugins/plugins.svelte";
 import type { GemmaTokenizer } from "@huggingface/transformers";
@@ -16,29 +16,18 @@ const MAX_CACHE_SIZE = 1500;
 
 const encodeCache = new LRUMap<string, number[] | Uint32Array | Int32Array>(MAX_CACHE_SIZE);
 
-// ─── Claude tokenizer: API-backed with per-language adaptive fallback ───────
+// ─── Claude tokenizer: bundled claude.json scaled per language ──────────────
 //
-// Strategy:
-//  1. text < MIN_API_LEN → use bundled claude.json directly (overhead not worth API call)
-//  2. persistent cache hit → return stored API count
-//  3. API call → cache, learn per-language factor, return
-//  4. on rate-limit / network failure → use claude.json × per-language factor
+// claude.json predates the Claude 3+/4.x vocabularies and under-counts them by
+// a margin that depends on the script. The per-language factors carry that
+// correction. They were calibrated against Anthropic's count_tokens API while
+// that mode existed and are fixed values now; counting never touches the
+// network, so the same text always yields the same count within a send.
 //
 // Languages detected: 'ko' (hangul ≥15%), 'jp' (kana ≥5%), 'en' (default).
 // CJK-only ambiguous text falls into 'en' since Han alone can't disambiguate JP/ZH.
 
 type ClaudeLang = 'ko' | 'en' | 'jp'
-
-const MIN_API_LEN = 50
-const PERSISTENT_KEY = 'claude_token_cache.json'
-const PERSISTENT_FLUSH_DELAY_MS = 5000
-// Tier-2 Anthropic limit is 2000 RPM (~33 RPS). With ~0.5–1.5s per call this
-// supports 30 concurrent without saturating. If you upgrade tiers, raise this.
-const MAX_API_CONCURRENT = 30
-// How long an over-the-limit call should wait for a free slot before giving
-// up and falling back to the local tokenizer estimate.
-const SLOT_WAIT_TIMEOUT_MS = 30_000
-const MESSAGE_OVERHEAD = 12 // tokens contributed by `[{role:user, content:""}]` wrapping
 
 function detectLang(text: string): ClaudeLang {
     let hangul = 0, kana = 0, total = 0
@@ -63,220 +52,22 @@ function getLangFactor(db: any, lang: ClaudeLang): number {
     return f
 }
 
-function setLangFactor(db: any, lang: ClaudeLang, value: number, samplesIncrement: number): void {
-    const v = Number(value.toFixed(4))
-    if (lang === 'ko') {
-        db.claudeTokenizerFactorKO = v
-        db.claudeTokenizerFactorSamplesKO = (db.claudeTokenizerFactorSamplesKO ?? 0) + samplesIncrement
-    } else if (lang === 'jp') {
-        db.claudeTokenizerFactorJP = v
-        db.claudeTokenizerFactorSamplesJP = (db.claudeTokenizerFactorSamplesJP ?? 0) + samplesIncrement
-    } else {
-        db.claudeTokenizerFactorEN = v
-        db.claudeTokenizerFactorSamplesEN = (db.claudeTokenizerFactorSamplesEN ?? 0) + samplesIncrement
-    }
-}
-
-function updateLangFactorEMA(db: any, lang: ClaudeLang, observedRatio: number): void {
-    const samples = (lang === 'ko' ? db.claudeTokenizerFactorSamplesKO
-        : lang === 'jp' ? db.claudeTokenizerFactorSamplesJP
-        : db.claudeTokenizerFactorSamplesEN) ?? 0
-    const oldFactor = getLangFactor(db, lang)
-    const clamped = Math.max(0.3, Math.min(3.0, observedRatio))
-    // First 5 samples: replace (fast convergence). After: EMA weight 0.2.
-    const newFactor = samples < 5 ? clamped : (oldFactor * 0.8 + clamped * 0.2)
-    setLangFactor(db, lang, newFactor, 1)
-}
-
-// ─── Persistent cache (text hash → API count) ──────────────────────────────
-const persistentCache = new Map<string, number>()
-let persistentCacheLoaded = false
-let persistentCacheLoadPromise: Promise<void> | null = null
-let persistentCacheDirty = false
-let persistentSaveTimer: ReturnType<typeof setTimeout> | null = null
-
-async function loadPersistentCache(): Promise<void> {
-    if (persistentCacheLoaded) return
-    if (!persistentCacheLoadPromise) {
-        persistentCacheLoadPromise = (async () => {
-            try {
-                const data = await readPersistentJson<Record<string, number>>(PERSISTENT_KEY)
-                if (data) {
-                    for (const [k, v] of Object.entries(data)) persistentCache.set(k, v)
-                }
-            } catch (_e) { /* silent */ }
-            persistentCacheLoaded = true
-        })()
-    }
-    return persistentCacheLoadPromise
-}
-
-function schedulePersistentSave(): void {
-    persistentCacheDirty = true
-    if (persistentSaveTimer) return
-    persistentSaveTimer = setTimeout(async () => {
-        persistentSaveTimer = null
-        if (!persistentCacheDirty) return
-        persistentCacheDirty = false
-        try {
-            const obj: Record<string, number> = {}
-            for (const [k, v] of persistentCache) obj[k] = v
-            await writePersistentJson(PERSISTENT_KEY, obj)
-        } catch (_e) { /* silent */ }
-    }, PERSISTENT_FLUSH_DELAY_MS)
-}
-
-function persistentKey(text: string): string {
-    // djb2 + length suffix; cheap collision-resistant for small store
-    let h = 5381
-    for (let i = 0; i < text.length; i++) h = ((h * 33) ^ text.charCodeAt(i)) | 0
-    return `${text.length}:${(h >>> 0).toString(36)}`
-}
-
-export async function clearClaudeTokenizerPersistentCache(): Promise<void> {
-    persistentCache.clear()
-    persistentCacheDirty = true
-    schedulePersistentSave()
-}
-
-export function getClaudeTokenizerPersistentCacheSize(): number {
-    return persistentCache.size
-}
-
-// ─── API call layer with concurrency + rate-limit handling ─────────────────
-let rateLimitedUntil = 0
-let inflightCount = 0
-
-// FIFO slot queue: when we exceed MAX_API_CONCURRENT, callers wait for a
-// running call to release. This lets large cold-start bursts (re-tokenizing
-// 1000+ messages after a cache invalidation) saturate the API instead of
-// falling through to the local estimate after the first 30 calls.
-type SlotWaiter = (granted: boolean) => void
-const slotWaiters: SlotWaiter[] = []
-
-async function acquireSlot(timeoutMs: number): Promise<boolean> {
-    if (inflightCount < MAX_API_CONCURRENT) {
-        inflightCount++
-        return true
-    }
-    return new Promise<boolean>((resolve) => {
-        let done = false
-        const w: SlotWaiter = (granted) => {
-            if (done) return
-            done = true
-            clearTimeout(timer)
-            if (granted) inflightCount++
-            resolve(granted)
-        }
-        const timer = setTimeout(() => {
-            if (done) return
-            done = true
-            const idx = slotWaiters.indexOf(w)
-            if (idx >= 0) slotWaiters.splice(idx, 1)
-            resolve(false)
-        }, timeoutMs)
-        slotWaiters.push(w)
-    })
-}
-
-function releaseSlot(): void {
-    if (slotWaiters.length > 0) {
-        const w = slotWaiters.shift()!
-        // Transfer the slot directly to the next waiter — w() will increment
-        // inflightCount itself, so we skip the decrement on this release.
-        w(true)
-    } else {
-        inflightCount--
-    }
-}
-
-async function callCountTokensAPI(text: string, db: any): Promise<number | null> {
-    if (Date.now() < rateLimitedUntil) return null
-    const key = (db.claudeTokenizerAPIKey || '').trim()
-    if (!key) return null
-    // Normalize model id for Anthropic API: Copilot accepts "claude-opus-4.7" but
-    // Anthropic only accepts "claude-opus-4-7" (hyphen). Convert version dots to dashes.
-    const model = (db.claudeTokenizerAPIModel || 'claude-opus-4-7').replace(/(opus|sonnet|haiku)-(\d+)\.(\d+)/g, '$1-$2-$3')
-
-    if (!(await acquireSlot(SLOT_WAIT_TIMEOUT_MS))) return null
-    try {
-        // Route through proxy2 — browser-direct fetch to api.anthropic.com fails CORS preflight.
-        const bodyBytes = new TextEncoder().encode(JSON.stringify({
-            model,
-            messages: [{ role: 'user', content: text }],
-        }))
-        const resp = await fetchViaProxy2(
-            'https://api.anthropic.com/v1/messages/count_tokens',
-            {
-                'x-api-key': key,
-                'anthropic-version': '2023-06-01',
-                'content-type': 'application/json',
-            },
-            bodyBytes,
-            { method: 'POST' }
-        )
-        if (resp.status === 429) {
-            const retryAfter = parseInt(resp.headers.get('retry-after') || '60', 10) || 60
-            rateLimitedUntil = Date.now() + retryAfter * 1000
-            console.warn(`[ClaudeTokAPI] 429 rate limit; backing off ${retryAfter}s`)
-            return null
-        }
-        if (!resp.ok) return null
-        const data = await resp.json()
-        const real = (data?.input_tokens ?? 0) - MESSAGE_OVERHEAD
-        return real > 0 ? real : null
-    } catch (_e) {
-        return null
-    } finally {
-        releaseSlot()
-    }
+function claudeFactorsCacheKey(db: any): string {
+    return `${getLangFactor(db, 'ko')}/${getLangFactor(db, 'en')}/${getLangFactor(db, 'jp')}`
 }
 
 /**
- * Main entry: tokenize text using Claude tokenizer, with API/cache/fallback layers.
- * Returns a Uint32Array whose `length` equals the estimated token count.
+ * Returns token ids when no correction applies; otherwise an array whose
+ * `length` is the corrected count (the ids of a scaled count do not exist).
  */
-async function tokenizeClaudeWithAPI(text: string): Promise<Uint32Array> {
-    const db = getDatabase()
+async function tokenizeClaude(text: string): Promise<Uint32Array | number[] | Int32Array> {
     if (!text) return new Uint32Array(0)
-
-    if (text.length < MIN_API_LEN) {
-        return new Uint32Array((await tokenizeWebTokenizers(text, 'claude')).length)
-    }
-
-    if (!db.claudeTokenizerAPIEnabled || !(db.claudeTokenizerAPIKey || '').trim()) {
-        // API mode off → local + per-language factor
-        const local = await tokenizeWebTokenizers(text, 'claude')
-        const lang = detectLang(text)
-        const factor = getLangFactor(db, lang)
-        return new Uint32Array(Math.max(0, Math.round(local.length * factor)))
-    }
-
-    await loadPersistentCache()
-    const pKey = persistentKey(text)
-    const cached = persistentCache.get(pKey)
-    if (cached !== undefined) return new Uint32Array(cached)
-
-    const apiCount = await callCountTokensAPI(text, db)
-    if (apiCount !== null) {
-        persistentCache.set(pKey, apiCount)
-        schedulePersistentSave()
-        // Update per-language factor for offline/rate-limited fallback
-        try {
-            const local = await tokenizeWebTokenizers(text, 'claude')
-            const lang = detectLang(text)
-            if (local.length >= 30) {
-                updateLangFactorEMA(db, lang, apiCount / local.length)
-            }
-        } catch (_e) { /* ignore */ }
-        return new Uint32Array(apiCount)
-    }
-
-    // API rate-limited or failed → local + factor
+    // Read before awaiting so the count matches the factors in encode()'s cache key.
+    const factor = getLangFactor(getDatabase(), detectLang(text))
     const local = await tokenizeWebTokenizers(text, 'claude')
-    const lang = detectLang(text)
-    const factor = getLangFactor(db, lang)
-    return new Uint32Array(Math.max(0, Math.round(local.length * factor)))
+    if (factor === 1) return local
+    const scaled = Math.round(local.length * factor)
+    return new Uint32Array(local.length > 0 ? Math.max(1, scaled) : 0)
 }
 
 function getHash(
@@ -287,9 +78,9 @@ function getHash(
     googleClaudeTokenizing: boolean,
     modelInfo: LLMModel,
     pluginTokenizer: string,
-    claudeAPIMode: string
+    claudeFactors: string
 ): string {
-    const combined = `${data}::${aiModel}::${customTokenizer}::${currentPluginProvider}::${googleClaudeTokenizing ? '1' : '0'}::${modelInfo.tokenizer}::${pluginTokenizer}::${claudeAPIMode}`;
+    const combined = `${data}::${aiModel}::${customTokenizer}::${currentPluginProvider}::${googleClaudeTokenizing ? '1' : '0'}::${modelInfo.tokenizer}::${pluginTokenizer}::${claudeFactors}`;
     return combined;
 }
 
@@ -316,7 +107,7 @@ export async function encodeWithTokenizer(data: string, tokenizerType: string): 
         case 'novelai':
             return await tokenizeWebTokenizers(data, 'novelai');
         case 'claude':
-            return await tokenizeClaudeWithAPI(data);
+            return await tokenizeClaude(data);
         case 'llama':
             return await tokenizeWebTokenizers(data, 'llama');
         case 'llama3':
@@ -349,7 +140,7 @@ export async function encode(data:string):Promise<(number[]|Uint32Array|Int32Arr
             db.googleClaudeTokenizing,
             modelInfo,
             pluginTokenizer,
-            db.claudeTokenizerAPIEnabled ? 'api' : 'local'
+            claudeFactorsCacheKey(db)
         );
         const cachedResult = encodeCache.get(cacheKey);
         if (cachedResult !== undefined) {
@@ -368,7 +159,7 @@ export async function encode(data:string):Promise<(number[]|Uint32Array|Int32Arr
             case 'novelai':
                 result = await tokenizeWebTokenizers(data, 'novelai'); break;
             case 'claude':
-                result = await tokenizeClaudeWithAPI(data); break;
+                result = await tokenizeClaude(data); break;
             case 'novellist':
                 result = await tokenizeWebTokenizers(data, 'novellist'); break;
             case 'llama3':
@@ -391,7 +182,7 @@ export async function encode(data:string):Promise<(number[]|Uint32Array|Int32Arr
             case 'novelai':
                 result = await tokenizeWebTokenizers(data, 'novelai'); break;
             case 'claude':
-                result = await tokenizeClaudeWithAPI(data); break;
+                result = await tokenizeClaude(data); break;
             case 'novellist':
                 result = await tokenizeWebTokenizers(data, 'novellist'); break;
             case 'llama3':
@@ -416,7 +207,7 @@ export async function encode(data:string):Promise<(number[]|Uint32Array|Int32Arr
         if(modelInfo.tokenizer === LLMTokenizer.NovelList){
             result = await tokenizeWebTokenizers(data, 'novellist');
         } else if(modelInfo.tokenizer === LLMTokenizer.Claude){
-            result = await tokenizeClaudeWithAPI(data);
+            result = await tokenizeClaude(data);
         } else if(modelInfo.tokenizer === LLMTokenizer.NovelAI){
             result = await tokenizeWebTokenizers(data, 'novelai');
         } else if(modelInfo.tokenizer === LLMTokenizer.Mistral){
