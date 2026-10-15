@@ -3862,8 +3862,21 @@ const reverseProxyFunc = async (req, res, next) => {
     }
     const timeoutMs = getRequestTimeoutMs(req.headers['risu-timeout-ms']);
     const timeout = createTimeoutController(timeoutMs);
+    const downstreamController = new AbortController();
+    let downstreamDisconnected = false;
+    const onDownstreamClose = () => {
+        if (res.writableFinished) return;
+        downstreamDisconnected = true;
+        downstreamController.abort(new Error('Downstream client disconnected'));
+    };
+    res.once('close', onDownstreamClose);
+    if (res.destroyed && !res.writableFinished) onDownstreamClose();
+    const signals = [downstreamController.signal];
+    if (timeout.signal) signals.push(timeout.signal);
+    const signal = signals.length === 1 ? signals[0] : AbortSignal.any(signals);
     let originalResponse;
     try {
+    if (downstreamDisconnected) return;
     const header = req.headers['risu-header'] ? JSON.parse(decodeURIComponent(req.headers['risu-header'])) : req.headers;
     if (req.headers['x-risu-tk'] && !header['x-risu-tk']) {
         header['x-risu-tk'] = req.headers['x-risu-tk'];
@@ -3903,7 +3916,7 @@ const reverseProxyFunc = async (req, res, next) => {
             method: req.method,
             headers: header,
             body: requestBody,
-            signal: timeout.signal
+            signal
         });
 
         if (!originalResponse.ok && isCopilotURL(urlParam)) {
@@ -3935,11 +3948,12 @@ const reverseProxyFunc = async (req, res, next) => {
         }
         res.header(headObj);
         res.status(originalResponse.status);
-        await pipeline(originalResponse.body, res);
+        await pipeline(originalResponse.body, res, { signal });
 
 
     }
     catch (err) {
+        if (downstreamDisconnected || res.destroyed) return;
         if (err?.name === 'AbortError') {
             if (!res.headersSent) {
                 res.status(504).send({
@@ -3956,6 +3970,7 @@ const reverseProxyFunc = async (req, res, next) => {
         next(err);
         return;
     } finally {
+        res.removeListener('close', onDownstreamClose);
         timeout.cleanup();
     }
 }
@@ -7731,7 +7746,7 @@ app.post('/api/db/optimize', async (req, res, next) => {
                 sqliteDb.pragma('temp_store = MEMORY');
             }
             // VACUUM streams the whole DB through the WAL; without this checkpoint the
-            // -wal file stays inflated until the next 5-min background TRUNCATE.
+            // -wal file stays inflated until a later complete checkpoint lets a writer reset it.
             try { checkpointWal('TRUNCATE'); } catch (e) { logger.warn('[Optimize] post-VACUUM checkpoint failed:', e?.message || e); }
             const elapsed = Date.now() - t0;
             const postDbSize = statSafe(dbFilePath)?.size ?? 0;
@@ -9954,11 +9969,11 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
 
     await startServer();
 
-    // Periodically checkpoint WAL to reclaim disk space.
-    // TRUNCATE (vs RESTART) shrinks the -wal file on disk, not just the writer
-    // pointer — required for journal_size_limit to actually take effect.
+    // Periodically checkpoint WAL without waiting for readers via the busy handler.
+    // journal_size_limit shrinks the -wal file when a writer resets the WAL
+    // after a complete checkpoint.
     setInterval(() => {
-        try { checkpointWal('TRUNCATE'); }
+        try { checkpointWal('PASSIVE'); }
         catch { /* non-fatal */ }
     }, 5 * 60 * 1000); // every 5 minutes
 
