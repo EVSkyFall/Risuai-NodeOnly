@@ -426,3 +426,162 @@ describe('strict durable chat-content flush', { timeout: 30_000 }, () => {
         expect(cleanupResponse.status).toBe(200)
     })
 })
+
+describe('save durability brief endpoint regressions', () => {
+    it.each(['chat', 'patch'])('cause1: deferred %s ACK survives a failed disk write and retries', async kind => {
+        const context = await boot()
+        const key = Buffer.from('database/database.bin').toString('hex')
+        const read = await context.client.fetch('/api/read', { headers: { 'file-path': key } })
+        const current = await decodeRisuSave(Buffer.from(await read.arrayBuffer()))
+        installFailureTrigger(context.server, 'save_retry', "NEW.key = 'database/database.bin'", 'SQLITE_FULL injected')
+        if (kind === 'chat') {
+            expect((await postChat(context, makeChat('survives deferred failure'))).status).toBe(200)
+        } else {
+            const patched = await context.client.fetch('/api/patch', {
+                method: 'POST', headers: { 'content-type': 'application/json', 'file-path': key },
+                body: JSON.stringify({ expectedHash: (utils as any).calculateHash((utils as any).normalizeJSON(current)).toString(16),
+                    patch: [{ op: 'replace', path: '/characters/0/chats/0/name', value: 'survives deferred failure' }] }),
+            })
+            expect(patched.status).toBe(200)
+        }
+        await new Promise(r => setTimeout(r, 5500))
+        expect(context.server.getOutput().stderr + context.server.getOutput().stdout).toContain('SQLITE_FULL injected')
+        dropTrigger(context.server, 'save_retry')
+        await new Promise(r => setTimeout(r, 5500))
+        const persisted = await readPersistedChat(context.server)
+        expect(kind === 'chat' ? persisted.message[0].data : persisted.name).toBe('survives deferred failure')
+    }, 30000)
+
+    it('cause2: full-write repairs metadata-only chat while preserving submitted metadata', async () => {
+        const context = await boot()
+        const key = Buffer.from('database/database.bin').toString('hex')
+        const read = await context.client.fetch('/api/read', { headers: { 'file-path': key } })
+        const db = await decodeRisuSave(Buffer.from(await read.arrayBuffer()))
+        db.characters[0].chats[0] = { id: 'chat-0-0', name: 'repaired rename' }
+        const write = await context.client.fetch('/api/write', {
+            method: 'POST', headers: { 'file-path': key, 'content-type': 'application/octet-stream' },
+            body: new Uint8Array(encodeRisuSaveLegacy(db)),
+        })
+        expect(write.status).toBe(200)
+        const persisted = await readPersistedChat(context.server)
+        expect(persisted.name).toBe('repaired rename')
+        expect(persisted.message[0].data).toBe('Message 0 in chat 0 of char 0')
+    })
+
+    it('cause7e/cause9: session cookie refreshes missing/invalid JWT and test_auth checks it first', async () => {
+        const context = await boot()
+        const session = await context.client.fetch('/api/session', { method: 'POST' })
+        const cookie = session.headers.get('set-cookie')!.split(';')[0]
+        for (const auth of ['', 'synthetic-invalid']) {
+            const refresh = await fetch(`http://127.0.0.1:${context.server.port}/api/token/refresh`, {
+                method: 'POST', headers: { cookie, ...(auth ? { 'risu-auth': auth } : {}) },
+            })
+            expect(refresh.status).toBe(200)
+            const { token } = await refresh.json()
+            expect(JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString()).exp).toBeGreaterThan(Date.now() / 1000)
+        }
+        const before = context.server.getOutput().stdout
+        const probe = await fetch(`http://127.0.0.1:${context.server.port}/api/test_auth`, { headers: { cookie } })
+        expect(await probe.json()).toMatchObject({ status: 'success', token: expect.any(String) })
+        await new Promise(r => setTimeout(r, 30))
+        expect(context.server.getOutput().stdout.slice(before.length)).not.toContain('No auth header')
+        const denied = await fetch(`http://127.0.0.1:${context.server.port}/api/token/refresh`, { method: 'POST' })
+        expect(denied.status).toBe(400)
+    })
+})
+
+it('cause1: rejected cloned patch does not erase previously acknowledged dirty metadata', async () => {
+    const context = await boot()
+    const key = Buffer.from('database/database.bin').toString('hex')
+    const read = async () => {
+        const r = await context.client.fetch('/api/read', { headers: { 'file-path': key } })
+        return (utils as any).normalizeJSON(await decodeRisuSave(Buffer.from(await r.arrayBuffer())))
+    }
+    const current = await read()
+    const patch = async (ops: any[]) => context.client.fetch('/api/patch', {
+        method: 'POST', headers: { 'file-path': key, 'content-type': 'application/json' },
+        body: JSON.stringify({ expectedHash: (utils as any).calculateHash(current).toString(16), patch: ops }),
+    })
+    expect((await patch([{ op: 'replace', path: '/characters/0/name', value: 'pending rename' }])).status).toBe(200)
+    current.characters[0].name = 'pending rename'
+    expect((await patch([{ op: 'replace', path: '/characters/0/nonexistent/value', value: 1 }])).status).toBe(500)
+    expect((await postChat(context, makeChat('strict content'), { strict: true })).status).toBe(200)
+    const disk = new Database(databasePath(context.server), { readonly: true })
+    let raw: Buffer
+    try { raw = (disk.prepare("SELECT value FROM kv WHERE key = 'database/database.bin'").get() as { value: Buffer }).value }
+    finally { disk.close() }
+    expect((await decodeRisuSave(raw)).characters[0].name).toBe('pending rename')
+})
+
+it('round2-A: disk write failure keeps RAM reads and backup export available', async () => {
+    const context = await boot()
+    const key = Buffer.from('database/database.bin').toString('hex')
+    const read = await context.client.fetch('/api/read', { headers: { 'file-path': key } })
+    const current = (utils as any).normalizeJSON(await decodeRisuSave(Buffer.from(await read.arrayBuffer())))
+    installFailureTrigger(context.server, 'round2_read_failure', "NEW.key = 'database/database.bin'", 'SQLITE_FULL round2')
+    try {
+        const patched = await context.client.fetch('/api/patch', {
+            method: 'POST', headers: { 'content-type': 'application/json', 'file-path': key },
+            body: JSON.stringify({ expectedHash: (utils as any).calculateHash(current).toString(16),
+                patch: [{ op: 'replace', path: '/characters/0/name', value: 'ACKed RAM name' }] }),
+        })
+        expect(patched.status).toBe(200)
+        const pendingRead = await context.client.fetch('/api/read', { headers: { 'file-path': key } })
+        expect(pendingRead.status).toBe(200)
+        const fromRam = await decodeRisuSave(Buffer.from(await pendingRead.arrayBuffer()))
+        expect(fromRam.characters[0].name).toBe('ACKed RAM name')
+        const exported = await context.client.exportBackup()
+        expect(exported.length).toBeGreaterThan(0)
+        expect(context.server.getOutput().stderr + context.server.getOutput().stdout).toContain('SQLITE_FULL round2')
+    } finally {
+        dropTrigger(context.server, 'round2_read_failure')
+    }
+})
+
+it('round2-B: full-write resync keeps an ACKed payload whose stub arrives later', async () => {
+    const context = await boot()
+    const key = Buffer.from('database/database.bin').toString('hex')
+    const read = await context.client.fetch('/api/read', { headers: { 'file-path': key } })
+    const current = await decodeRisuSave(Buffer.from(await read.arrayBuffer()))
+    expect((await postChat(context, makeChat('new ACKed payload', 'late-stub'), { chatId: 'late-stub', chatIndex: 1 })).status).toBe(200)
+    const write = async () => context.client.fetch('/api/write', {
+        method: 'POST', headers: { 'file-path': key, 'content-type': 'application/octet-stream' },
+        body: new Uint8Array(encodeRisuSaveLegacy(current)),
+    })
+    expect((await write()).status).toBe(200)
+    current.characters[0].chats.push({ id: 'late-stub', _stub: true, name: 'new' })
+    expect((await write()).status).toBe(200)
+    const db = new Database(databasePath(context.server), { readonly: true })
+    let raw: Buffer
+    try { raw = (db.prepare("SELECT value FROM kv WHERE key = 'database/database.bin'").get() as { value: Buffer }).value }
+    finally { db.close() }
+    expect((await decodeRisuSave(raw)).characters[0].chats[1].message[0].data).toBe('new ACKed payload')
+})
+
+it.each(['new-read', 'new-patch', 'existing-patch'])('round2-B-cold: %s preserves ACKed chat through cache reload', async kind => {
+    const context = await boot()
+    const key = Buffer.from('database/database.bin').toString('hex')
+    const read = () => context.client.fetch('/api/read', { headers: { 'file-path': key } })
+    const current = (utils as any).normalizeJSON(await decodeRisuSave(Buffer.from(await (await read()).arrayBuffer())))
+    const newChat = kind !== 'existing-patch'
+    if (newChat) expect((await postChat(context, makeChat('late ACK', 'late-stub'), { chatId: 'late-stub', chatIndex: 1 })).status).toBe(200)
+    expect((await context.client.fetch('/api/write', {
+        method: 'POST', headers: { 'file-path': key, 'content-type': 'application/octet-stream' },
+        body: new Uint8Array(encodeRisuSaveLegacy(current)),
+    })).status).toBe(200)
+    if (!newChat) expect((await postChat(context, makeChat('late ACK'))).status).toBe(200)
+    if (kind === 'new-read') expect((await read()).status).toBe(200)
+    const patch = newChat
+        ? [{ op: 'add', path: '/characters/0/chats/-', value: { id: 'late-stub', _stub: true, name: 'late' } }]
+        : [{ op: 'replace', path: '/characters/0/name', value: 'edited metadata' }]
+    expect((await context.client.fetch('/api/patch', {
+        method: 'POST', headers: { 'file-path': key, 'content-type': 'application/json' },
+        body: JSON.stringify({ expectedHash: (utils as any).calculateHash(current).toString(16), patch }),
+    })).status).toBe(200)
+    expect((await read()).status).toBe(200)
+    const db = new Database(databasePath(context.server), { readonly: true })
+    let raw: Buffer
+    try { raw = (db.prepare("SELECT value FROM kv WHERE key = 'database/database.bin'").get() as { value: Buffer }).value }
+    finally { db.close() }
+    expect((await decodeRisuSave(raw)).characters[0].chats[newChat ? 1 : 0].message?.[0]?.data).toBe('late ACK')
+})

@@ -10,9 +10,9 @@ import path from 'node:path'
 import Database from 'better-sqlite3'
 import modelJobs from '../../../../server/node/model-jobs.cjs'
 
-const mocks = vi.hoisted(() => ({ save: vi.fn() }))
+const mocks = vi.hoisted(() => ({ save: vi.fn(), requeue: vi.fn() }))
 vi.mock('src/ts/storage/chatStorage', () => ({ saveChatToServerStrict: mocks.save }))
-vi.mock('src/ts/globalApi.svelte', () => ({ forageStorage: { createAuth: async () => 'test' } }))
+vi.mock('src/ts/globalApi.svelte', () => ({ forageStorage: { createAuth: async () => 'test' }, requeueChatSave: mocks.requeue }))
 vi.mock('src/ts/storage/database.svelte', () => ({ getDatabase: () => ({ nodeOnlyServerSideRequests: true }) }))
 
 function deferred() {
@@ -251,4 +251,14 @@ test('a real job database reopened after live EOF still discovers the journal be
         store.close()
         fs.rmSync(dir, { recursive: true, force: true })
     }
+})
+
+test('cause6: strict completion failure requeues the exact chat and returns false', async () => {
+    const { complete, state } = await fixture()
+    mocks.requeue.mockClear()
+    mocks.save.mockRejectedValueOnce(new Error('disk full'))
+    expect(await complete()).toBe(false)
+    expect(mocks.requeue).toHaveBeenCalledWith('char', 'chat')
+    expect(state.pending).toBe(true)
+    expect(state.claimCalls).toBe(0)
 })

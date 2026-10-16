@@ -161,19 +161,48 @@ export class NodeStorage{
     private static sessionInitialized = false
     private static sessionPending: Promise<void> | null = null
     private refreshPending: Promise<string> | null = null
+    private refreshTimer: ReturnType<typeof setTimeout> | undefined
+    private refreshRetryDelay = 5000
 
     constructor(
         private readonly fetchFn: StorageFetch = defaultStorageFetch,
         private readonly retryOptions: Partial<AuthFetchRetryOptions> = {}
     ) {}
 
-    async createAuth(){
-        const now = Date.now()
-        if (this.cachedJwt && this.cachedJwt.expiresAt - now > 30_000) {
+    async createAuth(forceRefresh = false){
+        if (!forceRefresh && this.cachedJwt && this.cachedJwt.expiresAt > Date.now()) {
             return this.cachedJwt.token
         }
-        const token = await this._refreshToken()
-        return token
+        return this._refreshToken()
+    }
+
+    private cacheToken(token: string) {
+        const payload = JSON.parse(Buffer.from(token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf-8'))
+        const receiptTime = Date.now()
+        const remaining = Number.isFinite(payload.exp) && Number.isFinite(payload.iat)
+            ? (payload.exp - payload.iat) * 1000
+            : 5 * 60 * 1000
+        this.cachedJwt = { token, expiresAt: receiptTime + remaining }
+        if (Number.isFinite(remaining) && remaining > 0) {
+            this.refreshRetryDelay = 5000
+            this.scheduleTokenRefresh(remaining / 2)
+        } else {
+            this.scheduleTokenRefresh(this.refreshRetryDelay)
+            this.refreshRetryDelay = Math.min(this.refreshRetryDelay * 2, 60000)
+        }
+    }
+
+    private scheduleTokenRefresh(delay: number) {
+        if (this.refreshTimer) clearTimeout(this.refreshTimer)
+        this.refreshTimer = setTimeout(() => {
+            this.refreshTimer = undefined
+            void this._refreshToken().catch((error) => {
+                console.error('[Auth] Background refresh failed:', error)
+                this.scheduleTokenRefresh(this.refreshRetryDelay)
+                this.refreshRetryDelay = Math.min(this.refreshRetryDelay * 2, 60000)
+            })
+        }, delay)
+        ;(this.refreshTimer as any).unref?.()
     }
 
     // Called once after JWT auth is confirmed. Issues a session cookie so that
@@ -212,16 +241,25 @@ export class NodeStorage{
     }
 
     private async _doRefreshToken(): Promise<string> {
-        const res = await fetch('/api/token/refresh', {
-            method: 'POST',
-            headers: { 'risu-auth': this.cachedJwt?.token ?? '' }
-        })
-        if (res.ok) {
+        try {
+            const res = await fetch('/api/token/refresh', {
+                method: 'POST',
+                headers: { 'risu-auth': this.cachedJwt?.token ?? '' }
+            })
+            if (!res.ok) throw new Error(`Token refresh failed with HTTP ${res.status}`)
             const data = await res.json()
-            this.cachedJwt = { token: data.token, expiresAt: Date.now() + 5 * 60 * 1000 }
+            this.cacheToken(data.token)
             return data.token
+        } catch {
+            this.authChecked = false
+            // Do not wait for session initialization inside the refresh it uses.
+            await this.checkAuth(false)
+            if (!this.cachedJwt || this.cachedJwt.expiresAt <= Date.now()) {
+                this.authChecked = false
+                throw new Error('Authentication did not issue an unexpired token')
+            }
+            return this.cachedJwt.token
         }
-        return this.cachedJwt?.token ?? ''
     }
 
     private async loginWithPassword(password: string) {
@@ -252,7 +290,7 @@ export class NodeStorage{
 
         const data = await response.json()
         if (data.token) {
-            this.cachedJwt = { token: data.token, expiresAt: Date.now() + 5 * 60 * 1000 }
+            this.cacheToken(data.token)
         }
         this.authChecked = true
     }
@@ -476,7 +514,7 @@ export class NodeStorage{
         }
     }
 
-    private async checkAuth(){
+    private async checkAuth(initializeSession = true){
 
         if(!this.authChecked){
             const data = await (await fetch('/api/test_auth',{
@@ -502,23 +540,26 @@ export class NodeStorage{
                 }
 
                 await this.loginWithPassword(input)
-                await this.initSession()
+                if (initializeSession) await this.initSession()
                 return
             }
             else if(data.status === 'incorrect'){
                 const input = await digestPassword(await alertInput(language.inputNodePassword))
                 await this.loginWithPassword(input)
-                await this.initSession()
+                if (initializeSession) await this.initSession()
                 return
             }
             else{
+                if (data.status !== 'success' || !data.token) {
+                    throw new Error('Authentication did not issue a token')
+                }
                 if (data.token) {
-                    this.cachedJwt = { token: data.token, expiresAt: Date.now() + 5 * 60 * 1000 }
+                    this.cacheToken(data.token)
                 }
                 this.authChecked = true
             }
         }
-        await this.initSession()
+        if (initializeSession) await this.initSession()
     }
 
     listItem = this.keys
@@ -541,9 +582,6 @@ export class NodeStorage{
         if (da.status === 409) {
             const data = await da.json()
             const currentEtag = data.currentEtag as string | undefined
-            if (key === 'database/database.bin' && currentEtag) {
-                this._lastDbEtag = currentEtag
-            }
             // Server signals chat-guard rejection via explicit fields. The
             // error string fallback is kept for forward-compat with deployed
             // servers that haven't shipped the explicit fields yet.

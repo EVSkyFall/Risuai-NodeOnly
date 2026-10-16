@@ -984,6 +984,42 @@ export class RisuSavePatcher {
         return true
     }
 
+    async prepare(data: any, toSave: toSaveType) {
+        // Diff against a private candidate; network failure leaves every baseline intact.
+        const baseline = this.lastSyncedDb
+        const candidate = new RisuSavePatcher()
+        candidate.lastSyncedDb = {
+            ...this.lastSyncedDb,
+            characters: [...this.lastSyncedDb.characters],
+            modules: Array.isArray(this.lastSyncedDb.modules) ? [...this.lastSyncedDb.modules] : this.lastSyncedDb.modules,
+        }
+        candidate.hashBlocks = { ...this.hashBlocks }
+        candidate.lastRootKeyJsons = new Map(this.lastRootKeyJsons)
+        candidate.lastCharJsons = new Map(this.lastCharJsons)
+        candidate.lastModuleJsons = new Map(this.lastModuleJsons)
+        candidate.moduleItemHashes = new Map(this.moduleItemHashes)
+        const patchData = await candidate.set(data, toSave)
+        return { patchData, commit: () => {
+            // Preserve out-of-band acknowledgements received while this patch was in flight.
+            // Replay by owner identity because the patch may have reordered arrays.
+            const owners = [
+                ['module', 'modules', (owner: any) => owner?.id ?? owner?.assetManifest?.ownerId, (owner: any) => owner?.assetManifest],
+                ['character', 'characters', (owner: any) => owner?.chaId ?? owner?.additionalAssetManifest?.ownerId, (owner: any) => owner?.additionalAssetManifest],
+                ['persona-module', 'personas', (owner: any) => owner?.id ?? owner?.personaId ?? owner?.embeddedModule?.assetManifest?.ownerId, (owner: any) => owner?.embeddedModule?.assetManifest],
+            ] as const
+            for (const [kind, key, identity, descriptor] of owners) {
+                if (baseline[key] === this.lastSyncedDb[key]) continue
+                const previous = new Map((baseline[key] ?? []).map(owner => [identity(owner), descriptor(owner)]))
+                for (const owner of this.lastSyncedDb[key] ?? []) {
+                    const id = identity(owner)
+                    const latest = descriptor(owner)
+                    if (latest && latest !== previous.get(id)) candidate.updateAssetManifestBaseline(kind, id, latest)
+                }
+            }
+            Object.assign(this, candidate)
+        } }
+    }
+
     async set(data: any, toSave: toSaveType): Promise<{ patch: any[]; expectedHash: string }> {
         const { compare } = await import('fast-json-patch')
         const expectedHash: string = this.hash();

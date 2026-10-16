@@ -527,9 +527,18 @@ export function setPatchSyncBaseline(data: Database | null) {
     patchSyncBaseline = data ? safeStructuredClone(data) as Database : null
 }
 
+const pendingChatSaveRetries: [string, string][] = []
+let requeueChatSaveImpl = (chaId: string, chatId: string) => { pendingChatSaveRetries.push([chaId, chatId]) }
+
+export function requeueChatSave(chaId: string, chatId: string) {
+    requeueChatSaveImpl(chaId, chatId)
+}
+
 export async function saveDb() {
     let changed = false
     let saveInFlight: Promise<void> | null = null
+    let savetrys = 0
+    let saveRetryDelay = 500
     const knownChatIdsByCharacter = new Map<string, Set<string>>(
         (getDatabase()?.characters ?? [])
             .filter(character => character?.chaId)
@@ -554,6 +563,14 @@ export async function saveDb() {
         modules: false,
         plugins: false,
     }
+
+    requeueChatSaveImpl = (chaId, chatId) => {
+        if (!changeTracker.chat.some(([c, id]) => c === chaId && id === chatId)) {
+            changeTracker.chat.push([chaId, chatId])
+        }
+        changed = true
+    }
+    for (const [chaId, chatId] of pendingChatSaveRetries.splice(0)) requeueChatSave(chaId, chatId)
 
     let encoder = new RisuSaveEncoder()
     await encoder.init(getDatabase(), {
@@ -582,8 +599,8 @@ export async function saveDb() {
 
     function takeTrackedChanges() {
         const toSave = safeStructuredClone(changeTracker)
-        changeTracker.character = changeTracker.character.length === 0 ? [] : [changeTracker.character[0]]
-        changeTracker.chat = changeTracker.chat.length === 0 ? [] : [changeTracker.chat[0]]
+        changeTracker.character = []
+        changeTracker.chat = []
         changeTracker.root = false
         changeTracker.botPreset = false
         changeTracker.modules = false
@@ -732,7 +749,6 @@ export async function saveDb() {
             if (!didInitGeneralEffect) {
                 didInitGeneralEffect = true
                 changeTracker.character = []
-                changeTracker.chat = []
                 return
             }
             saveTimeoutExecute()
@@ -881,6 +897,11 @@ export async function saveDb() {
                 if (localChar) {
                     const clonedLocalChar = safeStructuredClone(localChar)
                     if (mergedIndex >= 0) {
+                        const knownIds = knownChatIdsByCharacter.get(charId) ?? new Set<string>()
+                        const localIds = new Set((clonedLocalChar.chats ?? []).map(chat => chat?.id))
+                        const remoteNewChats = (mergedCharacters[mergedIndex].chats ?? [])
+                            .filter(chat => chat?.id && !knownIds.has(chat.id) && !localIds.has(chat.id))
+                        clonedLocalChar.chats = [...(clonedLocalChar.chats ?? []), ...remoteNewChats]
                         mergedCharacters[mergedIndex] = clonedLocalChar
                     }
                     else {
@@ -995,7 +1016,8 @@ export async function saveDb() {
         let newEtag: string | undefined
 
         if (supportsPatchSync && !options?.forceFullWrite) {
-            const patchData = await patcher.set(db, safeStructuredClone(toSave))
+            const preparedPatch = await patcher.prepare(db, safeStructuredClone(toSave))
+            const patchData = preparedPatch.patchData
             // Refuse to send patches that would corrupt server-side lazy chats.
             // chatToStub strips chats to metadata before diffing, so the only
             // way these ops appear is a baseline desync. Falling through to a
@@ -1158,7 +1180,8 @@ export async function saveDb() {
             } else {
                 const patchResult = await forageStorage.patchItem('database/database.bin', patchData)
                 saved = patchResult.success
-                if (patchResult.etag) {
+                if (saved) preparedPatch.commit()
+                if (saved && patchResult.etag) {
                     newEtag = patchResult.etag
                     forageStorage.setDbEtag(patchResult.etag)
                 }
@@ -1185,7 +1208,6 @@ export async function saveDb() {
                 if (conflictErr instanceof ConflictError) {
                     console.warn('[Save] Full-write conflict detected, rebasing tracked local changes on latest server DB...')
                     await rebaseTrackedLocalChangesOnLatestServerDb(conflictErr.currentEtag ?? null, db, toSave)
-                    await sleep(Math.min(500 * (savetrys + 1), 3000))
                     return 'retry'
                 }
                 throw conflictErr
@@ -1223,16 +1245,22 @@ export async function saveDb() {
 
         saveInFlight = (async () => {
             saving.state = true
+            let retry = false
             try {
                 const result = await persistTrackedChanges(toSave, options)
                 if (result === 'saved') {
                     savetrys = 0
+                    saveRetryDelay = 500
+                } else if (result === 'retry') {
+                    retry = true
                 } else if (result === 'noop' && hasTrackedChanges(toSave)) {
                     requeueTrackedChanges(toSave)
                     changed = true
                 }
             } catch (error) {
                 requeueTrackedChanges(toSave)
+                changed = true
+                retry = true
                 savetrys += 1
                 if (savetrys > 4) {
                     alertError(error)
@@ -1240,12 +1268,17 @@ export async function saveDb() {
                 }
                 else {
                     console.error(error)
-                    await sleep(Math.min(500 * savetrys, 3000))
-                    changed = true
                 }
             } finally {
+                if (retry) {
+                    const delay = saveRetryDelay
+                    saveRetryDelay = Math.min(saveRetryDelay * 2, 30000)
+                    await sleep(delay)
+                }
                 saving.state = false
                 saveInFlight = null
+                // A joining main-loop iteration may have consumed changed while saving.
+                if (retry || hasTrackedChanges(changeTracker)) changed = true
             }
         })()
 
@@ -1260,7 +1293,6 @@ export async function saveDb() {
         })
     }
 
-    let savetrys = 0
     while (true) {
         if (!changed) {
             await sleep(200)
@@ -1613,12 +1645,19 @@ async function fetchWithUSFetch(url: string, arg: GlobalFetchArgs): Promise<Glob
  * @param {GlobalFetchArgs} arg - The arguments for the fetch request.
  * @returns {Promise<GlobalFetchResult>} - The result of the fetch request.
  */
+async function fetchProxyWithAuthRetry(init: RequestInit, path = '/proxy2'): Promise<Response> {
+    const response = await fetch(path, init)
+    if (response.status !== 400 || response.headers.get('x-risu-auth-error') !== 'token-expired') return response
+    const headers = new Headers(init.headers)
+    headers.set('risu-auth', await forageStorage.createAuth(true))
+    return fetch(path, { ...init, headers })
+}
+
 async function fetchWithProxy(url: string, arg: GlobalFetchArgs): Promise<GlobalFetchResult> {
     const started = Date.now();
     let response: Response
     let dispatched = false
     try {
-        const furl = `/proxy2`;
         arg.headers!["Content-Type"] ??= arg.body instanceof URLSearchParams ? "application/x-www-form-urlencoded" : "application/json";
         const turnId = getEffectiveTurnId()
         const headers = {
@@ -1638,7 +1677,7 @@ async function fetchWithProxy(url: string, arg: GlobalFetchArgs): Promise<Global
 
         throwIfGlobalFetchAbortedBeforeDispatch(arg)
         dispatched = true
-        response = await fetch(furl, { body, headers, method: arg.method ?? "POST", signal: arg.abortSignal });
+        response = await fetchProxyWithAuthRetry({ body, headers, method: arg.method ?? "POST", signal: arg.abortSignal });
     } catch (error) {
         return handleGlobalFetchTransportFailure(error, arg, dispatched)
     }
@@ -2480,7 +2519,7 @@ export async function fetchViaProxy2(
         proxyHeaders["Content-Type"] = headers["Content-Type"] ?? headers["content-type"] ?? "application/json"
     }
 
-    const r = await fetch(`/proxy2`, {
+    const r = await fetchProxyWithAuthRetry({
         body: realBody as any,
         headers: proxyHeaders,
         method: arg.method,
@@ -2500,10 +2539,10 @@ async function fetchViaProxyJobWs(url: string, arg: {
     signal?: AbortSignal,
     requestTimeoutMs?: number,
 }): Promise<Response> {
-    const auth = await forageStorage.createAuth()
+    let auth = await forageStorage.createAuth()
     const bodyBase64 = arg.body ? Buffer.from(arg.body).toString('base64') : ''
 
-    const jobRes = await fetch('/proxy-stream-jobs', {
+    const jobRes = await fetchProxyWithAuthRetry({
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
@@ -2518,12 +2557,13 @@ async function fetchViaProxyJobWs(url: string, arg: {
             heartbeatSec: defaultProxyJobHeartbeatSec,
         }),
         signal: arg.signal,
-    })
+    }, '/proxy-stream-jobs')
 
     if (!jobRes.ok) {
         throw new Error(`Failed to create proxy stream job: ${jobRes.status} ${await jobRes.text()}`)
     }
 
+    auth = await forageStorage.createAuth()
     const { jobId } = await jobRes.json() as { jobId: string }
     const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
     const wsUrl = `${wsProtocol}//${location.host}/proxy-stream-jobs/${encodeURIComponent(jobId)}/ws?risu-auth=${encodeURIComponent(auth)}`

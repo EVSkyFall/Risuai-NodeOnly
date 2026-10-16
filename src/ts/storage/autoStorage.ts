@@ -37,11 +37,11 @@ export class AutoStorage{
         }
     }
 
-    async createAuth(): Promise<string> {
+    async createAuth(forceRefresh = false): Promise<string> {
         if (!this.realStorage) {
             this.realStorage = new NodeStorage()
         }
-        return this.realStorage.createAuth()
+        return this.realStorage.createAuth(forceRefresh)
     }
 
 

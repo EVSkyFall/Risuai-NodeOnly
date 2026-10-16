@@ -1185,3 +1185,47 @@ describe('RisuSavePatcher — pluginCustomStorage excluded', () => {
         expect(patch).toEqual([])
     })
 })
+
+describe('cause5: speculative patch baseline', () => {
+    test('a failed send preserves all diff baselines until a successful commit', async () => {
+        const patcher = new RisuSavePatcher()
+        const original = { characters: [{ chaId: 'c', name: 'old', chats: [] }], botPresets: [], modules: [{ id: 'm', name: 'old' }], rootValue: 'old' }
+        const changes = { character: ['c'], chat: [], root: true, botPreset: false, modules: true, plugins: false }
+        await patcher.init(original)
+        const hash = patcher.hash()
+        const next = { ...original, characters: [{ ...original.characters[0], name: 'new' }], modules: [{ id: 'm', name: 'new' }], rootValue: 'new' }
+        const attempt = await patcher.prepare(next, changes)
+        expect(attempt.patchData.patch.length).toBeGreaterThan(0)
+        expect(patcher.hash()).toBe(hash)
+        // No commit: network rejected both patch and full-write fallback.
+        const retry = await patcher.prepare(next, changes)
+        expect(retry.patchData).toEqual(attempt.patchData)
+        retry.commit()
+        expect(patcher.hash()).not.toBe(hash)
+        expect((await patcher.prepare(next, changes)).patchData.patch).toEqual([])
+    })
+})
+
+test.each(['module', 'character', 'persona-module'] as const)('cause5: commit preserves a concurrent %s acknowledgement by identity', async kind => {
+    const old = { id: 'old', ownerId: 'owner', count: 1 }
+    const latest = { id: 'new', ownerId: 'owner', count: 2 }
+    const original = {
+        characters: [{ chaId: 'owner', name: 'original', chats: [], additionalAssetManifest: old }],
+        modules: [{ id: 'owner', name: 'original', assetManifest: old }, { id: 'other', name: 'other' }],
+        personas: [{ id: 'owner', embeddedModule: { assetManifest: old } }], botPresets: [], rootValue: 'old',
+    }
+    const patcher = new RisuSavePatcher()
+    await patcher.init(original)
+    const next = structuredClone(original)
+    next.rootValue = 'new'
+    next.modules.reverse()
+    const changes = { character: [], chat: [], root: true, modules: true, botPreset: false, plugins: false }
+    const prepared = await patcher.prepare(next, changes)
+    expect(patcher.updateAssetManifestBaseline(kind, 'owner', latest)).toBe(true)
+    prepared.commit()
+    const expected = new RisuSavePatcher()
+    await expected.init(next)
+    expect(expected.updateAssetManifestBaseline(kind, 'owner', latest)).toBe(true)
+    expect(patcher.hash()).toBe(expected.hash())
+    expect((patcher as any).lastSyncedDb).toEqual((expected as any).lastSyncedDb)
+})

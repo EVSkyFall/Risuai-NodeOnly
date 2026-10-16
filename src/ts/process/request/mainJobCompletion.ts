@@ -1,3 +1,4 @@
+import { requeueChatSave } from 'src/ts/globalApi.svelte'
 import type { Chat } from 'src/ts/storage/database.svelte'
 import { saveChatToServerStrict } from 'src/ts/storage/chatStorage'
 import type { JobClaimHandle } from './jobFetch'
@@ -40,6 +41,7 @@ export function createMainJobCompletion(context: MainJobCompletionContext): () =
         try {
             await saveChatToServerStrict(target.chaId, target.chatIndex, context.chatId, target.chat)
         } catch {
+            requeueChatSave(target.chaId, context.chatId)
             for (const handle of context.handles) {
                 if (await handle.ownsClaim()) await handle.release()
             }

@@ -9,6 +9,7 @@ const htmlparser = require('node-html-parser');
 const { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, unlinkSync, statSync } = require('fs');
 const fs = require('fs/promises')
 const nodeCrypto = require('crypto')
+const { AsyncLocalStorage } = require('node:async_hooks');
 const zlib = require('zlib')
 const rateLimit = require('express-rate-limit')
 const { WebSocketServer } = require('ws')
@@ -186,6 +187,8 @@ function markCopilotTurnSuccess(_turnId) {}
 let dbCache = {};
 let saveTimers = {};
 const SAVE_INTERVAL = 5000;
+let dbDirty = false;
+let dbRetryDelay = 5000;
 let fullChatStore = null; // Map<chaId, Map<chatId, chatObject>> — lazy-initialized
 
 // ETag for database.bin
@@ -200,8 +203,20 @@ function computeDatabaseEtagFromObject(databaseObject) {
 }
 
 let storageOperationQueue = Promise.resolve();
+const storageOperationContext = new AsyncLocalStorage();
 function queueStorageOperation(operation) {
-    const operationRun = storageOperationQueue.then(operation, operation);
+    const run = () => {
+        const context = { active: true };
+        return storageOperationContext.run(context, async () => {
+            try {
+                return await operation();
+            } finally {
+                // Detached timers inherit the context, but no longer own this queue slot.
+                context.active = false;
+            }
+        });
+    };
+    const operationRun = storageOperationQueue.then(run, run);
     storageOperationQueue = operationRun.catch(() => {});
     return operationRun;
 }
@@ -407,17 +422,20 @@ const CHAT_CONTENT_PERSIST_SOURCE = 'chat-content';
 const CHAT_CONTENT_BACKUP_SOURCE = 'chat-content-backup';
 
 async function persistChatContentNow() {
+    if (!storageOperationContext.getStore()?.active) {
+        return queueStorageOperation(persistChatContentNow);
+    }
     let didPersist = false;
 
     // If dbCache has stripped DB, persist with merged chats
     if (dbCache[DB_HEX_KEY]) {
-        await persistDbCacheWithChats(DB_HEX_KEY, 'database/database.bin');
-        didPersist = true;
+        didPersist = await persistDbCacheWithChats(DB_HEX_KEY, 'database/database.bin');
     } else {
         // No stripped cache — load, merge, save
         const raw = kvGet('database/database.bin');
         if (raw) {
             const dbObj = normalizeJSON(await decodeRisuSave(raw));
+            if (dbCache[DB_HEX_KEY]) return persistChatContentNow();
             const fullDb = hydrateDatabaseForDisk(stripDatabaseForClient(dbObj, { reconcileManifests: true }));
             const encoded = Buffer.from(encodeRisuSaveLegacy(fullDb));
             try {
@@ -434,7 +452,11 @@ async function persistChatContentNow() {
 
     // Persist succeeded — clear before backup so a backup-only failure isn't
     // attributed to data loss.
-    clearPersistFailure();
+    if (didPersist) {
+        dbDirty = false;
+        dbRetryDelay = 5000;
+        clearPersistFailure();
+    }
     let backupWarning;
     try {
         createBackupAndRotate();
@@ -454,47 +476,32 @@ function recordChatContentPersistError(error) {
 }
 
 function scheduleChatContentPersist() {
-    if (saveTimers[DB_HEX_KEY]) {
-        clearTimeout(saveTimers[DB_HEX_KEY]);
-    }
-    const timer = setTimeout(() => {
-        void queueStorageOperation(async () => {
-            if (saveTimers[DB_HEX_KEY] !== timer) return;
-            try {
-                await persistChatContentNow();
-            } catch (error) {
-                recordChatContentPersistError(error);
-            } finally {
-                if (saveTimers[DB_HEX_KEY] === timer) {
-                    delete saveTimers[DB_HEX_KEY];
-                }
-            }
-        }).catch((error) => {
-            if (saveTimers[DB_HEX_KEY] === timer) {
-                delete saveTimers[DB_HEX_KEY];
-            }
-            recordChatContentPersistError(error);
-        });
-    }, SAVE_INTERVAL);
-    saveTimers[DB_HEX_KEY] = timer;
+    scheduleDatabasePersist(CHAT_CONTENT_PERSIST_SOURCE);
+}
+
+function retryDatabasePersist(error, source) {
+    dbDirty = true;
+    logger.error(`[${source}] Error persisting database.bin:`, error);
+    recordPersistFailure(error, source);
+    const delay = dbRetryDelay;
+    dbRetryDelay = Math.min(dbRetryDelay * 2, 60000);
+    scheduleDatabasePersist(source, delay);
 }
 
 async function flushPendingDb() {
+    if (!storageOperationContext.getStore()?.active) {
+        return queueStorageOperation(flushPendingDb);
+    }
     if (saveTimers[DB_HEX_KEY]) {
         clearTimeout(saveTimers[DB_HEX_KEY]);
         delete saveTimers[DB_HEX_KEY];
-        if (dbCache[DB_HEX_KEY]) {
-            await persistDbCacheWithChats(DB_HEX_KEY, 'database/database.bin');
-        } else if (fullChatStore && fullChatStore.size > 0) {
-            // No stripped cache but chat store has data — merge and persist directly
-            const raw = kvGet('database/database.bin');
-            if (raw) {
-                const dbObj = normalizeJSON(await decodeRisuSave(raw));
-                const fullDb = hydrateDatabaseForDisk(stripDatabaseForClient(dbObj, { reconcileManifests: true }));
-                kvSet('database/database.bin', Buffer.from(encodeRisuSaveLegacy(fullDb)));
-            }
-        }
-        createBackupAndRotate();
+    }
+    if (!dbDirty) return;
+    try {
+        const { didPersist } = await persistChatContentNow();
+        if (!didPersist) throw new Error('Database not found; dirty chat content was not persisted');
+    } catch (error) {
+        retryDatabasePersist(error, 'flush');
     }
 }
 
@@ -548,7 +555,8 @@ async function loadDbCacheIfMissing({ createBackup = false } = {}) {
     const raw = kvGet('database/database.bin');
     if (!raw) return false;
     const dbObj = await decodeDatabaseWithPersistentChatIds(raw, { createBackup });
-    initChatStore(dbObj);
+    // A full write clears dbCache; the live store may already hold newer ACKed chats.
+    if (!fullChatStore) initChatStore(dbObj);
     dbCache[DB_HEX_KEY] = normalizeJSON(stripDatabaseForClient(dbObj, { reconcileManifests: true }));
     return true;
 }
@@ -727,12 +735,12 @@ function chatToStub(chat) {
  * Strip the `_stub` flag in place so subsequent reassemble passes don't
  * reproduce the hybrid on disk.
  */
-function initChatStore(dbObj) {
-    fullChatStore = new Map();
+function initChatStore(dbObj, { preserveMissing = false } = {}) {
+    if (!preserveMissing || !fullChatStore) fullChatStore = new Map();
     if (!dbObj?.characters) return;
     for (const char of dbObj.characters) {
         if (!char?.chaId || !char.chats) continue;
-        const charChats = new Map();
+        const charChats = preserveMissing ? (fullChatStore.get(char.chaId) || new Map()) : new Map();
         for (const chat of char.chats) {
             if (!chat) continue;
             const isStub = chat._stub === true;
@@ -1203,33 +1211,67 @@ function findStubFlagLossChats(fullDb) {
     return losses;
 }
 
+async function repairStubFlagLossChats(db) {
+    const losses = findStubFlagLossChats(db);
+    let diskDb;
+    let diskLoaded = false;
+    for (const loss of losses) {
+        const chat = db.characters[loss.charIndex].chats[loss.chatIndex];
+        let payload = fullChatStore?.get(loss.chaId)?.get(loss.chatId);
+        let source = 'chat store';
+        if (!Array.isArray(payload?.message)) {
+            if (!diskLoaded) {
+                const raw = kvGet('database/database.bin');
+                diskDb = raw ? normalizeJSON(await decodeRisuSave(raw)) : null;
+                diskLoaded = true;
+            }
+            // A chat-content POST may have landed while disk decoding yielded.
+            payload = fullChatStore?.get(loss.chaId)?.get(loss.chatId);
+            if (!Array.isArray(payload?.message)) {
+                const diskChats = diskDb?.characters?.find(c => c?.chaId === loss.chaId)?.chats;
+                payload = diskChats?.find(c => loss.chatId && c?.id === loss.chatId);
+                const positional = diskChats?.[loss.chatIndex];
+                if (!payload && !loss.chatId && !positional?.id) payload = positional;
+                if (!Array.isArray(payload?.message) && !loss.chatId && positional?.message?.length > 0) {
+                    payload = positional;
+                }
+                source = 'disk';
+            }
+        }
+        const chatId = loss.chatId || payload?.id || nodeCrypto.randomUUID();
+        // A positional disk match can identify a payload already newer in RAM.
+        const stored = fullChatStore?.get(loss.chaId)?.get(chatId);
+        if (Array.isArray(stored?.message)) {
+            payload = stored;
+            source = 'chat store';
+        }
+        if (!Array.isArray(payload?.message)) {
+            payload = { message: [] };
+            source = 'empty chat';
+        }
+        const fullChat = { ...payload, ...chat, id: chatId, message: payload.message };
+        delete fullChat._stub;
+        if (!fullChatStore) fullChatStore = new Map();
+        if (!fullChatStore.has(loss.chaId)) fullChatStore.set(loss.chaId, new Map());
+        fullChatStore.get(loss.chaId).set(chatId, fullChat);
+        db.characters[loss.charIndex].chats[loss.chatIndex] = chatToStub(fullChat);
+        logger.warn(`[Save] Repaired chat ${loss.chaId}/${loss.chatId ?? loss.chatIndex} from ${source}`);
+    }
+}
+
 /**
  * Persist dbCache to disk with full chats merged back in.
  */
 async function persistDbCacheWithChats(filePath, decodedKey) {
-    const strippedDb = dbCache[filePath];
-    if (!strippedDb) return;
     await ensureChatStore();
+    let strippedDb;
+    do {
+        strippedDb = dbCache[filePath];
+        if (!strippedDb) return false;
+        if (decodedKey === 'database/database.bin') await repairStubFlagLossChats(strippedDb);
+        // Disk repair can yield while PATCH replaces the cache root.
+    } while (strippedDb !== dbCache[filePath]);
     const fullDb = hydrateDatabaseForDisk(strippedDb);
-
-    // Disk protection guard: abort persist when reassemble produced metadata-only
-    // chats. Writing them would lock the loss in (next /api/read returns the
-    // stripped chat with no `_stub`, so hydration never re-merges fullChatStore).
-    // Invalidate dbCache so the next request re-reads from disk and rebuilds a
-    // consistent stub view; client receives 409 on next /api/patch via hash mismatch.
-    if (decodedKey === 'database/database.bin') {
-        const losses = findStubFlagLossChats(fullDb);
-        if (losses.length > 0) {
-            const sample = losses.slice(0, 3).map(l => `${l.chaId}/${l.chatId ?? l.chatIndex}`).join(', ');
-            const err = new Error(
-                `persist aborted: ${losses.length} chat(s) lost _stub flag without upgrade — `
-                + `would silently strip messages on disk. sample=[${sample}]`
-            );
-            recordPersistFailure(err, 'persistDbCacheWithChats:stub-flag-loss');
-            delete dbCache[filePath];
-            throw err;
-        }
-    }
 
     const data = Buffer.from(encodeRisuSaveLegacy(fullDb));
     try {
@@ -1248,28 +1290,27 @@ async function persistDbCacheWithChats(filePath, decodedKey) {
     // leave fullChatStore holding stale fullChat objects, and hydration
     // would resurrect the cleared values until the next /api/read.
     if (decodedKey === 'database/database.bin') {
-        initChatStore(fullDb);
+        dbDirty = false;
+        dbRetryDelay = 5000;
+        initChatStore(fullDb, { preserveMissing: true });
     }
+    return true;
 }
 
-function scheduleDatabasePersist(source = 'database') {
+function scheduleDatabasePersist(source = 'database', delay) {
+    dbDirty = true;
+    // New edits join an outstanding retry rather than postponing it forever.
+    if (saveTimers[DB_HEX_KEY] && delay === undefined && dbRetryDelay > 5000) return;
     if (saveTimers[DB_HEX_KEY]) clearTimeout(saveTimers[DB_HEX_KEY]);
     const timer = setTimeout(() => {
-        queueStorageOperation(async () => {
+        void queueStorageOperation(async () => {
             if (saveTimers[DB_HEX_KEY] !== timer) return;
-            try {
-                await persistDbCacheWithChats(DB_HEX_KEY, 'database/database.bin');
-                clearPersistFailure();
-                try { createBackupAndRotate(); }
-                catch (backupError) { logger.warn(`[${source}] Backup rotation failed:`, backupError); }
-            } catch (error) {
-                logger.error(`[${source}] Error saving database.bin:`, error);
-                recordPersistFailure(error, source);
-            } finally {
-                if (saveTimers[DB_HEX_KEY] === timer) delete saveTimers[DB_HEX_KEY];
-            }
-        }).catch((error) => logger.error(`[${source}] Storage queue failed:`, error));
-    }, SAVE_INTERVAL);
+            delete saveTimers[DB_HEX_KEY];
+            if (!dbDirty) return;
+            const { didPersist } = await persistChatContentNow();
+            if (!didPersist) throw new Error('Database not found; dirty chat content was not persisted');
+        }).catch((error) => retryDatabasePersist(error, source));
+    }, delay ?? SAVE_INTERVAL);
     saveTimers[DB_HEX_KEY] = timer;
 }
 
@@ -2129,9 +2170,21 @@ function loadSessions() {
     } catch { /* file missing or corrupt – start fresh */ }
 }
 
+let sessionSaveTimer;
+let sessionRetryDelay = 5000;
+
 function saveSessions() {
-    try { writeFileSync(SESSION_FILE, JSON.stringify([...sessions])) }
-    catch { /* non-critical */ }
+    if (sessionSaveTimer) clearTimeout(sessionSaveTimer);
+    sessionSaveTimer = undefined;
+    try {
+        writeFileSync(SESSION_FILE, JSON.stringify([...sessions]));
+        sessionRetryDelay = 5000;
+    } catch (error) {
+        logger.error('[Session] Failed to persist sessions:', error);
+        sessionSaveTimer = setTimeout(saveSessions, sessionRetryDelay);
+        sessionSaveTimer.unref?.();
+        sessionRetryDelay = Math.min(sessionRetryDelay * 2, 60000);
+    }
 }
 
 loadSessions()
@@ -2144,6 +2197,11 @@ function parseSessionCookie(req) {
         if (part.slice(0, eq).trim() === 'risu-session') return part.slice(eq + 1).trim()
     }
     return null
+}
+
+function hasValidSession(req) {
+    const token = parseSessionCookie(req);
+    return !!token && (sessions.get(token) ?? 0) > Date.now();
 }
 
 function sessionAuthMiddleware(req, res, next) {
@@ -3237,10 +3295,10 @@ async function checkAuth(req, res, returnOnlyStatus = false, {allowExpired = fal
         const authHeader = req.headers['risu-auth'];
 
         if(!authHeader){
-            console.log('No auth header')
             if(returnOnlyStatus){
                 return false;
             }
+            console.log('No auth header')
             res.status(400).send({
                 error:'No auth header'
             });
@@ -3270,6 +3328,7 @@ async function checkAuth(req, res, returnOnlyStatus = false, {allowExpired = fal
                 if(returnOnlyStatus){
                     return false;
                 }
+                res.setHeader('x-risu-auth-error', 'token-expired');
                 res.status(400).send({
                     error:'Token Expired'
                 });
@@ -4337,17 +4396,11 @@ app.get('/api/test_auth', async(req, res) => {
     if(!password){
         res.send({status: 'unset'})
     }
-    else if(!await checkAuth(req, res, true)){
-        // JWT missing/invalid – fall back to session cookie (survives page refresh)
-        const sessionToken = parseSessionCookie(req)
-        if (sessionToken && (sessions.get(sessionToken) ?? 0) > Date.now()) {
-            res.send({status: 'success', token: createServerJwt()})
-        } else {
-            res.send({status: 'incorrect'})
-        }
-    }
-    else{
+    else if (hasValidSession(req) || await checkAuth(req, res, true)) {
         res.send({status: 'success', token: createServerJwt()})
+    }
+    else {
+        res.send({status: 'incorrect'})
     }
 })
 
@@ -4366,7 +4419,7 @@ app.post('/api/login', loginRouteLimiter, async (req, res) => {
 
 // NodeOnly: token refresh endpoint (pairs with server-side JWT)
 app.post('/api/token/refresh', async (req, res) => {
-    if (!await checkAuth(req, res, false, {allowExpired: true})) return
+    if (!hasValidSession(req) && !await checkAuth(req, res, false, {allowExpired: true})) return
     res.json({ token: createServerJwt() })
 })
 
@@ -4645,7 +4698,7 @@ app.get('/api/read', async (req, res, next) => {
         if (key === 'database/database.bin') {
             await flushPendingDb();
         }
-        let value = null;
+        let value = key === 'database/database.bin' ? (dbCache[filePath] ?? null) : null;
         if (key.startsWith('inlay/')) {
             value = await readInlayAssetPayload(key.slice('inlay/'.length));
         } else if (key.startsWith('inlay_info/')) {
@@ -4946,30 +4999,8 @@ app.post('/api/write', async (req, res, next) => {
                         });
                         return;
                     }
+                    await repairStubFlagLossChats(incomingDb);
                     const fullDb = hydrateDatabaseForDisk(incomingDb);
-
-                    // Mirror the patch-persist guard (persistDbCacheWithChats):
-                    // a malformed full-write payload could carry chats with
-                    // neither `_stub` nor `message` (the v1.4.x metadata-only
-                    // pattern). reassembleFullDb passes them through unchanged
-                    // because there's no fullChat lookup to merge in, so they
-                    // would land on disk and silently strip user messages.
-                    // Normal clients are safe (RisuSaveEncoder runs chatToStub
-                    // on every chat first), but external tools / future
-                    // regressions could bypass that — keep the guard at the
-                    // disk boundary for defense in depth.
-                    const losses = findStubFlagLossChats(fullDb);
-                    if (losses.length > 0) {
-                        const sample = losses.slice(0, 3).map(l => `${l.chaId}/${l.chatId ?? l.chatIndex}`).join(', ');
-                        const err = new Error(
-                            `write aborted: ${losses.length} chat(s) lost _stub flag without upgrade — `
-                            + `would silently strip messages on disk. sample=[${sample}]`
-                        );
-                        recordPersistFailure(err, '/api/write:stub-flag-loss');
-                        logger.error(`[Write] ${err.message}`);
-                        res.status(500).json({ error: 'Write aborted: chat data integrity check failed' });
-                        return;
-                    }
 
                     // Same boundary for lazy asset manifests (see
                     // findAssetManifestLossOwners). Compared against the
@@ -5010,9 +5041,11 @@ app.post('/api/write', async (req, res, next) => {
                     }
 
                     const mergedContent = Buffer.from(encodeRisuSaveLegacy(fullDb));
-                    // Re-init chat store from merged result
-                    initChatStore(fullDb);
                     kvSet(key, mergedContent);
+                    dbDirty = false;
+                    dbRetryDelay = 5000;
+                    // Re-init only after the write succeeds.
+                    initChatStore(fullDb, { preserveMissing: true });
                     // ETag of what the next /api/read will serve: the
                     // PERSISTED DB, stripped. Not the request bytes — the
                     // split above may have emptied pluginCustomStorage, so
@@ -5443,8 +5476,7 @@ app.post('/api/patch', async (req, res, next) => {
             try {
                 result = applyPatch(snapshot, patch, true);
             } catch (patchErr) {
-                // Invalidate corrupted cache entry to force reload on next request
-                delete dbCache[filePath];
+                // applyPatch touched only the clone; retain acknowledged dirty work.
                 throw patchErr;
             }
             // Root-level ops (path "") replace the document instead of mutating
@@ -5487,18 +5519,14 @@ app.post('/api/patch', async (req, res, next) => {
                 }
             }
             dbCache[filePath] = next;
+            if (decodedKey === 'database/database.bin') scheduleDatabasePersist('patch:database/database.bin');
             // DB patch is in; now the kv half (see ordering note above).
             applyPluginKvOps();
 
-            // Schedule save to KV (debounced) — merge full chats back for database.bin
-            if (saveTimers[filePath]) {
-                clearTimeout(saveTimers[filePath]);
-            }
-            saveTimers[filePath] = setTimeout(async () => {
-                try {
-                    if (decodedKey === 'database/database.bin') {
-                        await persistDbCacheWithChats(filePath, decodedKey);
-                    } else {
+            if (decodedKey !== 'database/database.bin') {
+                if (saveTimers[filePath]) clearTimeout(saveTimers[filePath]);
+                saveTimers[filePath] = setTimeout(() => {
+                    try {
                         const data = Buffer.from(encodeRisuSaveLegacy(dbCache[filePath]));
                         try {
                             kvSet(decodedKey, data);
@@ -5508,24 +5536,15 @@ app.post('/api/patch', async (req, res, next) => {
                             }
                             throw err;
                         }
+                        clearPersistFailure();
+                    } catch (error) {
+                        logger.error(`[Patch] Error saving ${decodedKey}:`, error);
+                        recordPersistFailure(error, `patch:${decodedKey}`);
+                    } finally {
+                        delete saveTimers[filePath];
                     }
-                    // Persist succeeded — clear before backup so a backup-only
-                    // failure isn't attributed to data loss.
-                    clearPersistFailure();
-                    if (decodedKey === 'database/database.bin') {
-                        try {
-                            createBackupAndRotate();
-                        } catch (backupErr) {
-                            logger.warn(`[Patch] Backup rotation failed for ${decodedKey}:`, backupErr);
-                        }
-                    }
-                } catch (error) {
-                    logger.error(`[Patch] Error saving ${decodedKey}:`, error);
-                    recordPersistFailure(error, `patch:${decodedKey}`);
-                } finally {
-                    delete saveTimers[filePath];
-                }
-            }, SAVE_INTERVAL);
+                }, SAVE_INTERVAL);
+            }
 
             // Update ETag after successful patch (based on stripped version)
             patchStage = 'etag';
@@ -6699,6 +6718,7 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
                 fullChatStore.set(chaId, new Map());
             }
             fullChatStore.get(chaId).set(expectedChatId, chatData);
+            dbDirty = true;
 
             if (strictFlush) {
                 const pendingTimer = saveTimers[DB_HEX_KEY];
@@ -6719,8 +6739,7 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
                         ...(backupWarning ? { backupWarning } : {}),
                     });
                 } catch (error) {
-                    recordChatContentPersistError(error);
-                    scheduleChatContentPersist();
+                    retryDatabasePersist(error, CHAT_CONTENT_PERSIST_SOURCE);
                     return res.status(500).json({
                         success: false,
                         error: String(error?.message || error || 'unknown error'),
@@ -9383,28 +9402,10 @@ async function loadDatabase() {
 
 /** Persist database changes with debounce (same pattern as /api/patch) */
 function scheduleDatabaseSave() {
-    if (saveTimers[DB_HEX_KEY]) clearTimeout(saveTimers[DB_HEX_KEY])
-    saveTimers[DB_HEX_KEY] = setTimeout(async () => {
-        try {
-            if (dbCache[DB_HEX_KEY]) {
-                // dbCache[DB_HEX_KEY] is SHARED with /api/read and /api/patch,
-                // which store the STRIPPED (stub-only) view of the DB. A raw
-                // encode here would flatten every chat to a message-less stub on
-                // disk — and poison the backup — permanently destroying full
-                // chat data. Route through persistDbCacheWithChats so full chats
-                // are reassembled from fullChatStore and the findStubFlagLossChats
-                // guard runs, identical to the /api/patch persist contract.
-                await persistDbCacheWithChats(DB_HEX_KEY, 'database/database.bin')
-                const persisted = kvGet('database/database.bin')
-                if (persisted) dbEtag = computeBufferEtag(persisted)
-                createBackupAndRotate()
-            }
-        } catch (e) {
-            console.error('[MCP-Access] Save error:', e)
-        } finally {
-            delete saveTimers[DB_HEX_KEY]
-        }
-    }, SAVE_INTERVAL)
+    scheduleDatabasePersist('MCP-Access');
+    if (dbCache[DB_HEX_KEY]) {
+        dbEtag = computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(dbCache[DB_HEX_KEY])));
+    }
 }
 
 /** Find character by chaId or name */
