@@ -29,6 +29,7 @@ function createAssetFileStore(db, options) {
         INSERT INTO asset_file_timestamps SELECT key, max(updated_at) FROM (
             SELECT key, updated_at FROM asset_file_generations UNION ALL
             SELECT key, updated_at FROM kv WHERE substr(key, 1, 7) = 'assets/'
+                AND key NOT IN (SELECT key FROM asset_file_timestamps)
         ) GROUP BY key HAVING 1 ON CONFLICT(key) DO UPDATE SET updated_at = max(updated_at, excluded.updated_at);
         CREATE TABLE IF NOT EXISTS asset_file_revisions (key TEXT PRIMARY KEY, revision TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS asset_file_retries (
@@ -56,7 +57,10 @@ function createAssetFileStore(db, options) {
             END;`);
     }
     const live = db.prepare('SELECT * FROM asset_file_generations WHERE key = ? AND retired = 0');
-    const legacy = db.prepare('SELECT key, length(value) size, updated_at FROM kv WHERE key = ?');
+    // kv.updated_at sits after the BLOB, so reading it walks the whole overflow chain; the
+    // trigger-maintained timestamp avoids that, and length() is answered from the record header.
+    const legacy = db.prepare(`SELECT kv.key, length(kv.value) size, COALESCE(t.updated_at, kv.updated_at) updated_at
+        FROM kv LEFT JOIN asset_file_timestamps t ON t.key = kv.key WHERE kv.key = ?`);
     const readLegacy = db.prepare('SELECT value FROM kv WHERE key = ?');
     const retire = db.prepare('UPDATE asset_file_generations SET retired = 1 WHERE key = ? AND retired = 0');
     const erase = db.prepare('DELETE FROM kv WHERE key = ?');
@@ -195,8 +199,9 @@ function createAssetFileStore(db, options) {
         const escaped = prefix.replace(/[\\%_]/g, '\\$&');
         const rows = db.prepare(`SELECT key, size, updated_at, generationId FROM asset_file_generations
             WHERE retired = 0 AND key LIKE ? ESCAPE '\\'
-            UNION ALL SELECT key, length(value) size, updated_at, NULL generationId FROM kv
-            WHERE substr(key, 1, 7) = 'assets/' AND key LIKE ? ESCAPE '\\' AND key NOT IN
+            UNION ALL SELECT kv.key, length(kv.value) size, COALESCE(t.updated_at, kv.updated_at) updated_at, NULL generationId
+            FROM kv LEFT JOIN asset_file_timestamps t ON t.key = kv.key
+            WHERE substr(kv.key, 1, 7) = 'assets/' AND kv.key LIKE ? ESCAPE '\\' AND kv.key NOT IN
                 (SELECT key FROM asset_file_generations WHERE retired = 0)`).all(`${escaped}%`, `${escaped}%`);
         return rows;
     }
