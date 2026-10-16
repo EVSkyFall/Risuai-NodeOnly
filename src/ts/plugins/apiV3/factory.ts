@@ -5,7 +5,8 @@ type MsgType =
     | 'CALLBACK_RETURN'
     | 'RESPONSE'
     | 'RELEASE_INSTANCE'
-    | 'ABORT_SIGNAL';
+    | 'ABORT_SIGNAL'
+    | 'SANDBOX_TERMINATED';
 
 interface RpcMessage {
     type: MsgType;
@@ -35,13 +36,364 @@ interface AbortSignalRef {
 }
 
 
-const GUEST_BRIDGE_SCRIPT = `
+interface StreamRelay {
+    start(): void;
+    abandon(cancel?: boolean): void;
+    finished: Promise<void>;
+}
+
+// Keep this factory self-contained: the same compiled implementation runs in
+// the opaque-origin guest, without transferring native ReadableStreams.
+export function createStreamRelayBridge() {
+    const active = new Set<(error: Error) => void>();
+    let terminated: Error | undefined;
+    function register(stop: (error: Error) => void) {
+        active.add(stop);
+        if (terminated) stop(terminated);
+        return () => active.delete(stop);
+    }
+    function terminate() {
+        terminated ??= new Error('plugin sandbox terminated');
+        for (const stop of active) stop(terminated);
+        active.clear();
+    }
+
+    // Marks a container whose children are still being mapped; meeting it again
+    // means a cycle, which forces that container to be copied.
+    const IN_PROGRESS = {};
+    function emptyLike(obj: any) {
+        return Array.isArray(obj) ? new Array(obj.length) : obj instanceof Map ? new Map() : obj instanceof Set ? new Set() : {};
+    }
+    function put(out: any, key: any, value: any) {
+        if (out instanceof Map) out.set(key, value);
+        else if (out instanceof Set) out.add(value);
+        else Object.defineProperty(out, key, { value, enumerable: true, writable: true, configurable: true });
+    }
+    function mapValue(obj: any, replace: (value: any) => any, seen = new Map<any, any>()): any {
+        if (!obj || (typeof obj !== 'object' && typeof obj !== 'function')) return obj;
+        if (seen.has(obj)) {
+            const known = seen.get(obj);
+            if (known !== IN_PROGRESS) return known;
+            const placeholder = emptyLike(obj);
+            seen.set(obj, placeholder);
+            return placeholder;
+        }
+        const replacement = replace(obj);
+        if (replacement !== obj) {
+            seen.set(obj, replacement);
+            return replacement;
+        }
+        if (!Array.isArray(obj) && !(obj instanceof Map) && !(obj instanceof Set) &&
+            Object.prototype.toString.call(obj) !== '[object Object]') return obj;
+        seen.set(obj, IN_PROGRESS);
+        let out: any;
+        let visited = 0;
+        const append = (key: any, value: any, changed: boolean) => {
+            if (!out && (changed || seen.get(obj) !== IN_PROGRESS)) {
+                const pending = seen.get(obj);
+                out = pending === IN_PROGRESS ? emptyLike(obj) : pending;
+                seen.set(obj, out);
+                // Earlier children are unchanged. Backfill only when a copy
+                // becomes necessary, preserving any cycle placeholder.
+                let count = 0;
+                if (obj instanceof Map) {
+                    for (const [k, v] of obj) {
+                        if (count++ === visited) break;
+                        put(out, k, v);
+                    }
+                } else if (obj instanceof Set) {
+                    for (const v of obj) {
+                        if (count++ === visited) break;
+                        put(out, v, v);
+                    }
+                } else {
+                    for (const k in obj) {
+                        if (!Object.prototype.hasOwnProperty.call(obj, k)) continue;
+                        if (count++ === visited) break;
+                        put(out, k, obj[k]);
+                    }
+                }
+            }
+            if (out) put(out, key, value);
+            visited++;
+        };
+        if (obj instanceof Map) {
+            obj.forEach((value: any, key: any) => {
+                const k = mapValue(key, replace, seen), v = mapValue(value, replace, seen);
+                append(k, v, k !== key || v !== value);
+            });
+        } else if (obj instanceof Set) {
+            for (const value of obj) {
+                const v = mapValue(value, replace, seen);
+                append(v, v, v !== value);
+            }
+        } else {
+            for (const key in obj) {
+                if (!Object.prototype.hasOwnProperty.call(obj, key)) continue;
+                const value = obj[key];
+                const v = mapValue(value, replace, seen);
+                append(key, v, v !== value);
+            }
+        }
+        seen.set(obj, out || obj);
+        return out || obj;
+    }
+
+    function collectTransfer(value: any, values: Set<Transferable>) {
+        if (value instanceof ArrayBuffer || value instanceof MessagePort ||
+            value instanceof WritableStream || value instanceof TransformStream ||
+            (typeof ImageBitmap !== 'undefined' && value instanceof ImageBitmap) ||
+            (typeof OffscreenCanvas !== 'undefined' && value instanceof OffscreenCanvas)) values.add(value);
+        else if (ArrayBuffer.isView(value) && value.buffer instanceof ArrayBuffer) values.add(value.buffer);
+    }
+
+    function portifyStreams(obj: any, relays: StreamRelay[], transfers = new Set<Transferable>()) {
+        return mapValue(obj, (value) => {
+            if (!(value instanceof ReadableStream)) {
+                collectTransfer(value, transfers);
+                return value;
+            }
+            const channel = new MessageChannel();
+            let reader: ReadableStreamDefaultReader;
+            try {
+                reader = value.getReader();
+            } catch (error) {
+                channel.port1.close();
+                channel.port2.close();
+                throw error;
+            }
+            const port = channel.port1;
+            let ended = false;
+            let started = false;
+            let unregister = () => {};
+            let settle: () => void;
+            const finished = new Promise<void>((resolve) => { settle = resolve; });
+            const finish = (cancel = false, reason?: any) => {
+                if (ended) return;
+                ended = true;
+                port.onmessage = null;
+                port.onmessageerror = null;
+                // After a normal end the receiver closes its side once it has
+                // read {d}; closing here first could reach it as an early close.
+                if (cancel) port.close();
+                if (cancel) void reader.cancel(reason).catch(() => {});
+                reader.releaseLock();
+                unregister();
+                settle();
+            };
+            const fail = (error: any) => {
+                if (ended) return;
+                try { port.postMessage({ e: error?.message || String(error), n: error?.name || 'Error' }); } catch (_) {}
+                finish(true, error);
+            };
+            const readOne = async () => {
+                if (ended) return;
+                try {
+                    const chunk = await reader.read();
+                    if (ended) return;
+                    if (chunk.done) {
+                        port.postMessage({ d: 1 });
+                        finish();
+                        return;
+                    }
+                    let value = chunk.value;
+                    const transfer: Transferable[] = [];
+                    // Producers may reuse or retain chunk buffers. Transfer a
+                    // copy so the relay never detaches their storage.
+                    if (value instanceof ArrayBuffer) {
+                        value = value.slice(0);
+                        transfer.push(value);
+                    } else if (ArrayBuffer.isView(value) && value.buffer instanceof ArrayBuffer) {
+                        const buffer = value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+                        value = value instanceof DataView ? new DataView(buffer) : new (value.constructor as any)(buffer);
+                        transfer.push(buffer);
+                    }
+                    port.postMessage({ v: value }, transfer);
+                } catch (error) {
+                    fail(error);
+                }
+            };
+            unregister = register(fail);
+            if (ended) unregister();
+            // A source that errors while no pull is pending would otherwise go
+            // unnoticed until the receiver reads again. releaseLock() in finish()
+            // also rejects this, after ended is set.
+            reader.closed.catch((error) => fail(error));
+            port.addEventListener('close', () => finish(true, new Error('Stream relay receiver closed')));
+            port.onmessageerror = () => fail(new Error('Stream relay message could not be deserialized'));
+            relays.push({
+                finished,
+                abandon(cancel = false) {
+                    finish(cancel);
+                    channel.port2.close();
+                },
+                start() {
+                    if (started || ended) return;
+                    started = true;
+                    let reads = Promise.resolve();
+                    port.onmessage = (event) => {
+                        if (event.data?.c) finish(true, event.data.reason);
+                        else if (event.data?.p) reads = reads.then(readOne);
+                    };
+                }
+            });
+            transfers.add(channel.port2);
+            return { __type: 'STREAM_PORT', port: channel.port2 };
+        });
+    }
+
+    function reviveStreamPorts(obj: any) {
+        return mapValue(obj, (value) => {
+            if (value.__type !== 'STREAM_PORT' || !(value.port instanceof MessagePort)) return value;
+            const port = value.port as MessagePort;
+            let ended = false;
+            let completePull: (() => void) | undefined;
+            let unregister = () => {};
+            let fail: (error: Error) => void;
+            const close = () => {
+                ended = true;
+                port.onmessage = null;
+                port.onmessageerror = null;
+                port.close();
+                unregister();
+                completePull?.();
+                completePull = undefined;
+            };
+            const cancel = (reason?: any) => {
+                if (ended) return;
+                try { port.postMessage({ c: 1, reason: reason === undefined ? undefined : String(reason) }); } catch (_) {}
+                close();
+            };
+            return new ReadableStream({
+                start(controller) {
+                    fail = (error: Error) => {
+                        if (ended) return;
+                        controller.error(error);
+                        cancel(error.message);
+                    };
+                    port.onmessageerror = () => fail(new Error('Stream relay message could not be deserialized'));
+                    port.addEventListener('close', () => fail(new Error('Stream relay closed before the body ended')));
+                    port.onmessage = (event) => {
+                        if (ended || !event.data) return;
+                        const message = event.data;
+                        try {
+                            if (message.e !== undefined) {
+                                const error = new Error(String(message.e));
+                                error.name = message.n || 'Error';
+                                fail(error);
+                            } else if (message.d) {
+                                controller.close();
+                                close();
+                            } else {
+                                controller.enqueue(message.v);
+                                completePull?.();
+                                completePull = undefined;
+                            }
+                        } catch (error) {
+                            fail(error as Error);
+                        }
+                    };
+                    unregister = register(fail);
+                    if (ended) unregister();
+                },
+                pull() {
+                    if (ended) return;
+                    return new Promise<void>((resolve) => {
+                        completePull = resolve;
+                        try { port.postMessage({ p: 1 }); }
+                        catch (error) { fail(error as Error); }
+                    });
+                },
+                cancel
+            });
+        });
+    }
+
+    async function bufferStreams(obj: any, textStream?: ReadableStream) {
+        const buffers = new Map<ReadableStream, ArrayBuffer | string>();
+        const readers = new Map<ReadableStream, ReadableStreamDefaultReader>();
+        let stopped: Error | undefined;
+        const stop = (error: Error) => {
+            stopped = error;
+            for (const reader of readers.values()) {
+                void reader.cancel(error).catch(() => {});
+                reader.releaseLock();
+            }
+            readers.clear();
+        };
+        const unregister = register(stop);
+        try {
+            mapValue(obj, (value) => {
+                if (value instanceof ReadableStream && !readers.has(value)) readers.set(value, value.getReader());
+                return value;
+            });
+            if (stopped) throw stopped;
+            await Promise.all([...readers].map(async ([stream, reader]) => {
+                const chunks: Uint8Array[] = [];
+                const decoder = stream === textStream ? new TextDecoder() : undefined;
+                let text = '', length = 0;
+                while (true) {
+                    const chunk = await reader.read();
+                    if (stopped) throw stopped;
+                    if (chunk.done) break;
+                    if (decoder) text += typeof chunk.value === 'string' ? chunk.value : decoder.decode(chunk.value, { stream: true });
+                    else {
+                        if (!(chunk.value instanceof Uint8Array)) throw new TypeError('Body stream chunk must be a Uint8Array');
+                        const bytes = chunk.value.slice();
+                        chunks.push(bytes);
+                        length += bytes.byteLength;
+                    }
+                }
+                if (decoder) buffers.set(stream, text + decoder.decode());
+                else {
+                    const bytes = new Uint8Array(length);
+                    let offset = 0;
+                    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+                    buffers.set(stream, bytes.buffer);
+                }
+                reader.releaseLock();
+                readers.delete(stream);
+            }));
+            return mapValue(obj, (value) => buffers.has(value) ? buffers.get(value) : value);
+        } catch (error) {
+            stop(error as Error);
+            throw error;
+        } finally {
+            unregister();
+        }
+    }
+
+    function transferables(obj: any): Transferable[] {
+        const values = new Set<Transferable>();
+        mapValue(obj, (value) => {
+            collectTransfer(value, values);
+            return value;
+        });
+        return [...values];
+    }
+
+    return { mapValue, portifyStreams, reviveStreamPorts, bufferStreams, transferables, terminate };
+}
+
+export const GUEST_BRIDGE_SCRIPT = `
 await (async function() {
+    const { portifyStreams, reviveStreamPorts, bufferStreams, transferables: getTransferables, terminate } = (${createStreamRelayBridge.toString()})();
     const pendingRequests = new Map();
     const callbackRegistry = new Map();
     const callbackIdByFunction = new WeakMap();
     const proxyRefRegistry = new Map();
     const abortControllers = new Map();
+
+    function teardown() {
+        terminate();
+        for (const controller of abortControllers.values()) controller.abort();
+        abortControllers.clear();
+        for (const request of pendingRequests.values()) request.reject(new Error('plugin sandbox terminated'));
+        pendingRequests.clear();
+    }
+    // Teardown is driven only by the host's SANDBOX_TERMINATED. pagehide also
+    // fires when the page enters the back/forward cache or is backgrounded on
+    // mobile, and must not kill a plugin that will be resumed.
 
     function serializeArg(arg) {
         if (typeof arg === 'function') {
@@ -117,72 +469,13 @@ await (async function() {
         // ReadableStream check must precede the first "return transferables" —
         // guest-source sniffers (e.g. CPM) lazily match up to that point to
         // decide whether transferable-stream bridging is supported.
-        if (obj instanceof ReadableStream ||
-            obj instanceof WritableStream ||
-            obj instanceof TransformStream) {
-            transferables.push(obj);
-            return transferables;
-        }
-        if (!obj || typeof obj !== 'object') return transferables;
-
-        if (obj instanceof ArrayBuffer ||
-            obj instanceof MessagePort ||
-            obj instanceof ImageBitmap ||
-            (typeof OffscreenCanvas !== 'undefined' && obj instanceof OffscreenCanvas)) {
-            transferables.push(obj);
-        }
-        else if (ArrayBuffer.isView(obj) && obj.buffer instanceof ArrayBuffer) {
-            transferables.push(obj.buffer);
-        }
-        else if (Array.isArray(obj)) {
-            obj.forEach(item => collectTransferables(item, transferables));
-        }
-        else if (obj.constructor === Object) {
-            Object.values(obj).forEach(value => collectTransferables(value, transferables));
-        }
-
+        if (obj instanceof ReadableStream) return transferables;
+        for (const value of getTransferables(obj)) transferables.push(value);
         return transferables;
     }
 
     function send(payload, transferables = []) {
         window.parent.postMessage(payload, '*', transferables);
-    }
-
-    // Chromium cannot deserialize a ReadableStream transferred out of a
-    // sandboxed (opaque-origin) iframe — the parent receives event.data === null.
-    // Relay streams through a MessagePort instead: ports cross the origin
-    // boundary reliably, and the host rebuilds a ReadableStream on its side.
-    function portifyStreams(obj) {
-        if (obj instanceof ReadableStream) {
-            const channel = new MessageChannel();
-            const reader = obj.getReader();
-            const port = channel.port1;
-            port.onmessage = function(ev) {
-                if (ev.data && ev.data.c) { try { reader.cancel(); } catch (e) {} }
-            };
-            (async function() {
-                try {
-                    while (true) {
-                        const r = await reader.read();
-                        if (r.done) { port.postMessage({ d: 1 }); break; }
-                        port.postMessage({ v: r.value });
-                    }
-                } catch (err) {
-                    try { port.postMessage({ e: (err && err.message) || String(err) }); } catch (e2) {}
-                }
-            })();
-            return { __type: 'STREAM_PORT', port: channel.port2 };
-        }
-        if (!obj || typeof obj !== 'object') return obj;
-        if (Array.isArray(obj)) {
-            for (let i = 0; i < obj.length; i++) obj[i] = portifyStreams(obj[i]);
-            return obj;
-        }
-        if (obj.constructor === Object) {
-            for (const key of Object.keys(obj)) obj[key] = portifyStreams(obj[key]);
-            return obj;
-        }
-        return obj;
     }
 
     function sendRequest(type, payload) {
@@ -191,13 +484,18 @@ await (async function() {
             pendingRequests.set(reqId, { resolve, reject });
 
 
-            if (payload.args) {
-                payload.args = payload.args.map(serializeArg);
+            const relays = [];
+            try {
+                if (payload.args) payload.args = payload.args.map(serializeArg);
+                const transfers = new Set();
+                const message = portifyStreams({ type, reqId, ...payload }, relays, transfers);
+                send(message, [...transfers]);
+                for (const relay of relays) relay.start();
+            } catch (error) {
+                for (const relay of relays) relay.abandon(true);
+                pendingRequests.delete(reqId);
+                reject(error);
             }
-
-            const message = { type: type, reqId: reqId, ...payload };
-            const transferables = collectTransferables(message);
-            send(message, transferables);
         });
     }
 
@@ -209,11 +507,16 @@ await (async function() {
         if (!data) return;
 
 
+        if (data.type === 'SANDBOX_TERMINATED') { teardown(); return; }
+
         if (data.type === 'RESPONSE' && data.reqId) {
             const req = pendingRequests.get(data.reqId);
             if (req) {
                 if (data.error) req.reject(new Error(data.error));
-                else req.resolve(deserializeResult(data.result));
+                else {
+                    try { req.resolve(deserializeResult(reviveStreamPorts(data.result))); }
+                    catch (error) { req.reject(error); }
+                }
                 pendingRequests.delete(data.reqId);
             }
         }
@@ -233,7 +536,6 @@ await (async function() {
             const controller = abortControllers.get(data.abortId);
             if (controller) {
                 controller.abort();
-                abortControllers.delete(data.abortId);
             }
         }
 
@@ -243,7 +545,7 @@ await (async function() {
             const usedAbortIds = [];
             try {
                 if (!fn) throw new Error("Callback not found or released");
-                const deserializedArgs = (data.args || []).map(function(a) {
+                const deserializedArgs = reviveStreamPorts(data.args || []).map(function(a) {
                     if (a && typeof a === 'object' && a.__type === 'ABORT_SIGNAL_REF') {
                         const controller = new AbortController();
                         abortControllers.set(a.abortId, controller);
@@ -258,35 +560,33 @@ await (async function() {
             } catch (e) {
                 response.error = e.message || "Guest callback error";
             }
-            // Clean up abort controllers after callback completes
-            for (const id of usedAbortIds) {
-                abortControllers.delete(id);
-            }
-            if (response.result) response.result = portifyStreams(response.result);
-            // If posting fails (e.g. DataCloneError), the host would await this
-            // reqId forever — degrade instead of hanging: drain a stream result
-            // to text, and as a last resort send an error.
+            const cleanup = () => {
+                for (const id of usedAbortIds) abortControllers.delete(id);
+            };
+            const original = response.result;
+            const relays = [];
+            let relayed = false;
             try {
-                send(response, collectTransferables(response));
+                const transfers = new Set();
+                response.result = portifyStreams(original, relays, transfers);
+                send(response, [...transfers]);
+                if (relays.length) {
+                    relayed = true;
+                    void Promise.all(relays.map((relay) => relay.finished)).then(cleanup);
+                    for (const relay of relays) relay.start();
+                }
             } catch (err) {
-                console.error('[RisuBridge] CALLBACK_RETURN transfer failed, buffering result:', err);
+                for (const relay of relays) relay.abandon();
                 try {
-                    const r = response.result;
-                    if (r && typeof r === 'object' && r.content instanceof ReadableStream) {
-                        let text = '';
-                        const reader = r.content.getReader();
-                        const decoder = new TextDecoder();
-                        while (true) {
-                            const chunk = await reader.read();
-                            if (chunk.done) break;
-                            text += typeof chunk.value === 'string' ? chunk.value : decoder.decode(chunk.value, { stream: true });
-                        }
-                        response.result = Object.assign({}, r, { content: text });
-                    }
+                    // Provider callbacks consume content as text when it is
+                    // not a stream; keep that existing fallback contract.
+                    response.result = await bufferStreams(original, original && original.content);
                     send(response, collectTransferables(response));
                 } catch (err2) {
                     send({ type: 'CALLBACK_RETURN', reqId: data.reqId, error: 'plugin bridge transfer failed: ' + (err2 && err2.message || err2) });
                 }
+            } finally {
+                if (!relayed) cleanup();
             }
         }
     });
@@ -363,12 +663,14 @@ export class SandboxHost {
     private nonce = crypto.randomUUID();
     private csp = `connect-src 'none'; script-src 'nonce-${this.nonce}' 'wasm-unsafe-eval'; frame-src 'none'; object-src 'none'; style-src * 'unsafe-inline'; default-src 'none'; img-src * data: blob:; font-src * data: blob:; media-src * data: blob:; base-uri 'none';`;
 
+    private streamBridge = createStreamRelayBridge();
     private instanceRegistry = new Map<string, any>();
     private abortControllers = new Map<string, AbortController>();
     private messageHandlerRef: ((event: MessageEvent) => void) | null = null;
     private callbackWrapperCache = new Map<string, Function>();
 
     private pendingCallbacks = new Map<string, { resolve: Function, reject: Function }>();
+    private pendingExecutions = new Set<(error: Error) => void>();
 
     constructor(apiFactory: any) {
         this.apiFactory = apiFactory;
@@ -378,12 +680,18 @@ export class SandboxHost {
         return new Promise((resolve, reject) => {
             const reqId = 'exec_' + Math.random().toString(36).substring(2);
 
+            const abandon = (error: Error) => {
+                window.removeEventListener('message', handler);
+                this.pendingExecutions.delete(abandon);
+                reject(error);
+            };
             const handler = (event: MessageEvent) => {
                 if (event.source !== this.iframe.contentWindow) return;
                 const data = event.data;
 
-                if (data.type === 'EXEC_RESULT' && data.reqId === reqId) {
+                if (data?.type === 'EXEC_RESULT' && data.reqId === reqId) {
                     window.removeEventListener('message', handler);
+                    this.pendingExecutions.delete(abandon);
                     if (data.error) {
                         reject(new Error(data.error));
                     } else {
@@ -393,6 +701,7 @@ export class SandboxHost {
             };
 
             window.addEventListener('message', handler);
+            this.pendingExecutions.add(abandon);
 
             this.iframe.contentWindow?.postMessage({
                 type: 'EXECUTE_CODE',
@@ -402,66 +711,9 @@ export class SandboxHost {
         });
     }
 
-    private collectTransferables(obj: any, transferables: Transferable[] = []): Transferable[] {
-        if (!obj || typeof obj !== 'object') return transferables;
-
-        if (obj instanceof ArrayBuffer ||
-            obj instanceof MessagePort ||
-            obj instanceof ImageBitmap ||
-            obj instanceof ReadableStream ||
-            obj instanceof WritableStream ||
-            obj instanceof TransformStream ||
-            (typeof OffscreenCanvas !== 'undefined' && obj instanceof OffscreenCanvas)) {
-            transferables.push(obj);
-        }
-        else if (ArrayBuffer.isView(obj) && obj.buffer instanceof ArrayBuffer) {
-            transferables.push(obj.buffer);
-        }
-        else if (Array.isArray(obj)) {
-            obj.forEach(item => this.collectTransferables(item, transferables));
-        }
-        else if (obj.constructor === Object) {
-            Object.values(obj).forEach(value => this.collectTransferables(value, transferables));
-        }
-
-        return transferables;
+    private collectTransferables(obj: any): Transferable[] {
+        return this.streamBridge.transferables(obj);
     }
-
-    // Counterpart of the guest's portifyStreams(): a stream sent out of the
-    // sandboxed iframe arrives as {__type:'STREAM_PORT', port} because Chromium
-    // fails to deserialize a ReadableStream transferred across the opaque-origin
-    // boundary (event.data arrives null). Rebuild a host-realm stream from the port.
-    private reviveStreamPorts(obj: any): any {
-        if (!obj || typeof obj !== 'object') return obj;
-        if (obj.__type === 'STREAM_PORT' && obj.port instanceof MessagePort) {
-            const port = obj.port as MessagePort;
-            return new ReadableStream({
-                start(controller) {
-                    port.onmessage = (ev) => {
-                        const m = ev.data;
-                        if (!m) return;
-                        if (m.d) { try { controller.close(); } catch (_) {} port.close(); }
-                        else if (m.e !== undefined) { try { controller.error(new Error(String(m.e))); } catch (_) {} port.close(); }
-                        else { try { controller.enqueue(m.v); } catch (_) {} }
-                    };
-                },
-                cancel() {
-                    try { port.postMessage({ c: 1 }); } catch (_) {}
-                    try { port.close(); } catch (_) {}
-                }
-            });
-        }
-        if (Array.isArray(obj)) {
-            for (let i = 0; i < obj.length; i++) obj[i] = this.reviveStreamPorts(obj[i]);
-            return obj;
-        }
-        if (obj.constructor === Object) {
-            for (const key of Object.keys(obj)) obj[key] = this.reviveStreamPorts(obj[key]);
-            return obj;
-        }
-        return obj;
-    }
-
 
     private serialize(val: any): any {
         if (
@@ -563,10 +815,14 @@ export class SandboxHost {
                         // A postMessage throw (e.g. DataCloneError on the args) must
                         // reject AND release the pending slot — an executor throw
                         // rejects the promise but would leak the pendingCallbacks entry.
+                        const relays: StreamRelay[] = [];
                         try {
-                            const transferables = this.collectTransferables(message);
-                            this.iframe.contentWindow.postMessage(message, '*', transferables);
+                            const transfers = new Set<Transferable>();
+                            const prepared = this.streamBridge.portifyStreams(message, relays, transfers);
+                            this.iframe.contentWindow.postMessage(prepared, '*', [...transfers]);
+                            for (const relay of relays) relay.start();
                         } catch (e) {
+                            for (const relay of relays) relay.abandon(true);
                             this.pendingCallbacks.delete(reqId);
                             reject(e);
                         }
@@ -635,11 +891,19 @@ export class SandboxHost {
             // iframe) — guard instead of crashing the whole RPC handler.
             if (!data || typeof data.type !== 'string') return;
 
+            if (data.type === 'SANDBOX_TERMINATED') {
+                this.terminate();
+                return;
+            }
+
             if (data.type === 'CALLBACK_RETURN') {
                 const req = this.pendingCallbacks.get(data.reqId!);
                 if (req) {
                     if (data.error) req.reject(new Error(data.error));
-                    else req.resolve(this.reviveStreamPorts(data.result));
+                    else {
+                        try { req.resolve(this.streamBridge.reviveStreamPorts(data.result)); }
+                        catch (error) { req.reject(error); }
+                    }
                     this.pendingCallbacks.delete(data.reqId!);
                 }
                 return;
@@ -649,7 +913,6 @@ export class SandboxHost {
                 const controller = this.abortControllers.get(data.abortId!);
                 if (controller) {
                     controller.abort();
-                    this.abortControllers.delete(data.abortId!);
                 }
                 return;
             }
@@ -664,9 +927,14 @@ export class SandboxHost {
             if (data.type === 'CALL_ROOT' || data.type === 'CALL_INSTANCE') {
                 const response: RpcMessage = { type: 'RESPONSE', reqId: data.reqId };
                 const usedAbortIds: string[] = [];
+                const relays: StreamRelay[] = [];
+                let relayed = false;
+                const cleanup = () => {
+                    for (const id of usedAbortIds) this.abortControllers.delete(id);
+                };
                 try {
 
-                    const args = this.deserializeArgs(data.args || [], usedAbortIds);
+                    const args = this.deserializeArgs(this.streamBridge.reviveStreamPorts(data.args || []), usedAbortIds);
                     let result: any;
 
 
@@ -682,46 +950,41 @@ export class SandboxHost {
                     }
 
 
-                    // WebKit on iOS fails when Response.body (ReadableStream)
-                    // is transferred through postMessage. Pre-read into an
-                    // ArrayBuffer (preserves binary data) and send that instead.
-                    const isWebKit = /Safari/.test(navigator.userAgent) && !/Chrome|Chromium/.test(navigator.userAgent);
-                    if (isWebKit && result instanceof Response && result.body) {
-                        try {
-                            const buf = await result.arrayBuffer();
-                            response.result = {
-                                __type: 'CALLBACK_STREAMS',
-                                __specialType: 'Response',
-                                value: buf,
-                                init: {
-                                    status: result.status,
-                                    statusText: result.statusText,
-                                    headers: Array.from(result.headers.entries())
-                                }
-                            };
-                        } catch (_) {
-                            response.result = this.serialize(result);
-                        }
-                    } else {
-                        response.result = this.serialize(result);
-                    }
-
+                    // MessagePorts and ArrayBuffer chunks also work on WebKit;
+                    // no native ReadableStream crosses the iframe boundary.
+                    response.result = this.serialize(result);
                 } catch (err: any) {
                     response.error = err.message || "Host execution error";
-                } finally {
-                    for (const id of usedAbortIds) this.abortControllers.delete(id);
                 }
 
-                const transferables = this.collectTransferables(response);
+                const original = response.result;
                 try {
-                    this.iframe.contentWindow?.postMessage(response, '*', transferables);                    
+                    try {
+                        const transfers = new Set<Transferable>();
+                        response.result = this.streamBridge.portifyStreams(original, relays, transfers);
+                        this.iframe.contentWindow!.postMessage(response, '*', [...transfers]);
+                    } catch (error) {
+                        // Pumps have not started: release the readers before
+                        // buffering, so fallback cannot lose any body bytes.
+                        for (const relay of relays) relay.abandon();
+                        response.result = await this.streamBridge.bufferStreams(original);
+                        this.iframe.contentWindow!.postMessage(response, '*', this.collectTransferables(response));
+                        return;
+                    }
+                    if (relays.length) {
+                        relayed = true;
+                        void Promise.all(relays.map((relay) => relay.finished)).then(cleanup);
+                        for (const relay of relays) relay.start();
+                    }
                 } catch (error) {
+                    console.error('Failed to post message to iframe:', error);
                     this.iframe.contentWindow?.postMessage({
                         type: 'RESPONSE',
                         reqId: data.reqId,
                         error: 'Failed to post message to iframe: ' + (error as Error).message
                     }, '*');
-                    console.error('Failed to post message to iframe:', error);
+                } finally {
+                    if (!relayed) cleanup();
                 }
             }
         };
@@ -775,6 +1038,9 @@ export class SandboxHost {
     }
 
     public terminate() {
+        this.streamBridge.terminate();
+        for (const controller of this.abortControllers.values()) controller.abort();
+        try { this.iframe?.contentWindow?.postMessage({ type: 'SANDBOX_TERMINATED' }, '*'); } catch (_) {}
         if (this.messageHandlerRef) {
             window.removeEventListener('message', this.messageHandlerRef);
             this.messageHandlerRef = null;
@@ -783,7 +1049,8 @@ export class SandboxHost {
             this.iframe.remove();
         }
         this.instanceRegistry.clear();
-        this.rejectPendingCallbacks('plugin unloaded');
+        this.rejectPendingCallbacks('plugin sandbox terminated');
+        for (const abandon of [...this.pendingExecutions]) abandon(new Error('plugin sandbox terminated'));
         this.abortControllers.clear();
         this.callbackWrapperCache.clear();
     }
