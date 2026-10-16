@@ -36,7 +36,7 @@ function fixture() {
         let fullChatStore = new Map(), dbEtag;
         const computeBufferEtag = () => 'synthetic-etag';
         const sessions = new Map(); let sessionSaveTimer, sessionRetryDelay = 5000;
-        ${functions(['queueStorageOperation', 'chatToStub', 'scheduleChatContentPersist', 'retryDatabasePersist', 'flushPendingDb', 'scheduleDatabasePersist',
+        ${functions(['queueStorageOperation', 'writeStorageValue', 'chatToStub', 'scheduleChatContentPersist', 'retryDatabasePersist', 'flushPendingDb', 'scheduleDatabasePersist',
             'persistChatContentNow', 'persistDbCacheWithChats', 'recordChatContentPersistError', 'scheduleDatabaseSave',
             'initChatStore', 'findStubFlagLossChats', 'repairStubFlagLossChats', 'reassembleFullDb', 'mergeChatStubWithFullChat', 'saveSessions', 'checkAuth'])}
         function hydrateDatabaseForDisk(db) { return reassembleFullDb(db); }

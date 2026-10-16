@@ -3,6 +3,7 @@
 const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
+const { createAssetFileStore } = require('./assetFileStore.cjs');
 const { createChunkStore } = require('./chunkStore.cjs');
 const { createIllustrationAtomicStore } = require('./illustrationAtomicStore.cjs');
 const { createPluginAtomicStore } = require('./pluginAtomicStore.cjs');
@@ -53,7 +54,7 @@ db.exec(`
 const savePath = path.join(process.cwd(), 'save');
 const migrationMarker = path.join(process.cwd(), 'save', '.migrated_to_sqlite');
 
-function migrateFromSaveDir() {
+function migrateFromSaveDir(assetWriter) {
     if (!fs.existsSync(savePath)) return;
     if (fs.existsSync(migrationMarker)) return;
 
@@ -85,6 +86,7 @@ function migrateFromSaveDir() {
             // Route the DB blob through chunking so an oversized legacy
             // database.bin migrates instead of hitting the BLOB bind limit.
             if (key === DB_BLOB_KEY) chunkStore.putValue(key, value);
+            else if (key.startsWith('assets/')) assetWriter.put(key, value, { ignoreExisting: true, updated_at: now });
             else insert.run(key, value, now);
         }
     });
@@ -107,7 +109,9 @@ const chunkThreshold = process.env.POCKETRISU_CHUNK_THRESHOLD
     : undefined;
 const chunkStore = createChunkStore(db, { threshold: chunkThreshold });
 
-migrateFromSaveDir();
+const assetFileStore = createAssetFileStore(db, { saveDir, dbPath });
+const storageReady = assetFileStore.withMigrationPaused(() =>
+    assetFileStore.legacyBatch(migrateFromSaveDir));
 
 // ─── Illustration atomic storage (Gate 1a) ────────────────────────────────────
 // Server-authoritative per-key CAS + guarded mutation + durable operation
@@ -249,7 +253,7 @@ function clearEntities() {
 }
 
 module.exports = {
-    db,
+    db, assetFileStore, storageReady,
     // KV
     kvGet, kvSet, kvDel, kvList, kvDelPrefix, kvListWithSizes, kvListWithSizesAndUpdatedAt, kvSize, kvGetUpdatedAt, kvCopyValue,
     clearEntities,

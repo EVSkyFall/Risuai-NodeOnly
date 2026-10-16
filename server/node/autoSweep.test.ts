@@ -152,12 +152,14 @@ function withDb<T>(fn: (db: any) => T): T {
 function setUpdatedAt(key: string, updatedAt: number) {
     withDb((db) => {
         db.prepare('UPDATE kv SET updated_at = ? WHERE key = ?').run(updatedAt, key)
+        if (key.startsWith('assets/')) db.prepare('UPDATE asset_file_generations SET updated_at = ? WHERE key = ? AND retired = 0').run(updatedAt, key)
     })
 }
 
 function hasKey(key: string) {
     return withDb((db) => {
         const row = db.prepare('SELECT 1 AS ok FROM kv WHERE key = ?').get(key)
+            || (key.startsWith('assets/') && db.prepare('SELECT 1 AS ok FROM asset_file_generations WHERE key = ? AND retired = 0').get(key))
         return Boolean(row)
     })
 }

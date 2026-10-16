@@ -28,7 +28,7 @@
     import { language, getCurrentLocale } from 'src/lang'
 
     // ── Types ────────────────────────────────────────────────────────────────
-    interface PrefixInfo { totalSize: number; count: number }
+    interface PrefixInfo { totalSize: number; count: number; fileSize?: number }
     interface Stats {
         files: { db: number; wal: number; shm: number }
         disk: { free: number | null; total: number | null }
@@ -41,6 +41,7 @@
         prefixes: Record<string, PrefixInfo>
         kvRows: number
         kvTotalBytes: number
+        assetFileBytes?: number
         inlayFsBytes?: number
         backups: {
             kv: { count: number; totalSize: number; oldest: number | null; newest: number | null }
@@ -305,8 +306,10 @@
         // Known kv prefixes I track explicitly — kv-side only. If anything
         // else lives in kv (test keys, migration leftovers), it shows up
         // under "uncategorized" so the bar always sums correctly.
+        const assetKvBytes = get('assets/') - (p['assets/']?.fileSize ?? 0)
+        const assetTotal = assetKvBytes + (stats.assetFileBytes ?? 0)
         const knownKv =
-            get('assets/') + inlayKvTotal + get('remotes/') + get('coldstorage/') + rawDbBlob
+            assetKvBytes + inlayKvTotal + get('remotes/') + get('coldstorage/') + rawDbBlob
         const uncategorizedKv = Math.max(0, stats.kvTotalBytes - knownKv)
         // SQLite overhead splits into "structural" (always present — indexes,
         // page headers, alignment) and "reclaimable" (the freelist, removable
@@ -316,7 +319,7 @@
         const structuralOverhead = Math.max(0, stats.files.db - stats.kvTotalBytes - chunkedDbBytes - reclaimable)
         const rows: DiskRow[] = [
             { id: 'kv-database',     label: language.storageRowKvDatabase,     desc: language.storageRowKvDatabaseDesc,     size: dbRowSize,                     color: 'bg-rose-500' },
-            { id: 'kv-assets',       label: language.storageRowKvAssets,       desc: language.storageRowKvAssetsDesc,       size: get('assets/'),                color: 'bg-amber-500' },
+            { id: 'kv-assets',       label: language.storageRowKvAssets,       desc: language.storageRowKvAssetsDesc,       size: assetTotal,                color: 'bg-amber-500' },
             { id: 'kv-inlay',        label: language.storageRowKvInlay,        desc: language.storageRowKvInlayDesc,        size: inlayTotal,                    color: 'bg-emerald-500' },
             { id: 'kv-remotes',      label: language.storageRowKvRemotes,      desc: language.storageRowKvRemotesDesc,      size: get('remotes/'),               color: 'bg-cyan-500' },
             { id: 'kv-cold',         label: language.storageRowKvColdStorage,  desc: language.storageRowKvColdStorageDesc,  size: get('coldstorage/'),           color: 'bg-stone-500' },
@@ -343,7 +346,7 @@
         stats
             ? stats.files.db + stats.files.wal + stats.files.shm
               + (stats.backupDisk?.sameAsSaveDir !== false ? stats.backups.file.totalSize : 0)
-              + (stats.inlayFsBytes ?? 0)
+              + (stats.inlayFsBytes ?? 0) + (stats.assetFileBytes ?? 0)
             : 0
     )
 

@@ -27,7 +27,7 @@ const getVips = () => {
 const { kvGet, kvSet, kvDel, kvList,
         kvDelPrefix, kvListWithSizes, kvListWithSizesAndUpdatedAt, kvSize, kvGetUpdatedAt, kvCopyValue, clearEntities, checkpointWal,
         gcChunks, reclaimableChunkBytes, isDbBlobChunked, snapshotFootprint, illustrationAtomic,
-        pluginAtomic, comfyStore,
+        pluginAtomic, comfyStore, assetFileStore, storageReady,
         db: sqliteDb } = require('./db.cjs');
 const { MUTATING_OPS: ILLUSTRATION_ATOMIC_MUTATING_OPS } = require('./illustrationAtomicStore.cjs');
 const {
@@ -57,6 +57,7 @@ const {
 const { spawn, execSync } = require('child_process');
 const os = require('os');
 const { Readable, Transform } = require('stream');
+const { backupEntryChunks, sendAsset, writeChunk } = require('./assetFileTransport.cjs');
 
 // Install process-level error handlers before any other init so early crashes get logged.
 installProcessHandlers();
@@ -219,6 +220,19 @@ function queueStorageOperation(operation) {
     const operationRun = storageOperationQueue.then(run, run);
     storageOperationQueue = operationRun.catch(() => {});
     return operationRun;
+}
+
+function withComfyWorldReplacementGate(action) {
+    return assetFileStore.withMigrationPaused(() => comfyWorldReplacementGate.withWorldReplacement(() => queueStorageOperation(action)));
+}
+
+async function readStorageValue(key) {
+    return key.startsWith('assets/') ? assetFileStore.get(key) : kvGet(key);
+}
+
+async function writeStorageValue(key, value) {
+    if (key.startsWith('assets/')) await assetFileStore.put(key, value);
+    else kvSet(key, value);
 }
 
 const DB_HEX_KEY = Buffer.from('database/database.bin', 'utf-8').toString('hex');
@@ -1275,7 +1289,7 @@ async function persistDbCacheWithChats(filePath, decodedKey) {
 
     const data = Buffer.from(encodeRisuSaveLegacy(fullDb));
     try {
-        kvSet(decodedKey, data);
+        await writeStorageValue(decodedKey, data);
     } catch (err) {
         // Tag with BLOB size so the visibility layer can surface it to the user.
         // The dominant failure mode (better-sqlite3 INT_MAX) is size-driven.
@@ -2941,7 +2955,7 @@ async function parseBackupChunk(buffer, onEntry) {
 // ─── Shared backup import logic ─────────────────────────────────────────────
 // Accepts any async iterable of Buffer chunks (HTTP request body, file stream, etc.)
 async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0, onProgress = null } = {}) {
-    return comfyWorldReplacementGate.withWorldReplacement(() => importBackupFromSourceUnlocked(
+    return withComfyWorldReplacementGate(() => importBackupFromSourceUnlocked(
         dataSource,
         { maxBytes, totalBytes, onProgress },
     ))
@@ -3008,7 +3022,7 @@ async function importBackupFromSourceUnlocked(dataSource, { maxBytes = 0, totalB
     sqliteDb.pragma('synchronous = OFF');
 
     sqliteDb.exec('BEGIN');
-    kvDelPrefix('assets/');
+    await assetFileStore.legacyBatch(writer => writer.clear());
     kvDelPrefix('inlay/');
     kvDelPrefix('inlay_thumb/');
     kvDelPrefix('inlay_meta/');
@@ -3161,7 +3175,9 @@ async function importBackupFromSourceUnlocked(dataSource, { maxBytes = 0, totalB
                             storageValue = Buffer.from(encodeRisuSaveLegacy(incomingDb));
                         }
                     }
-                    kvSet(storageKey, storageValue);
+                    if (storageKey.startsWith('assets/')) {
+                        await assetFileStore.legacyBatch(writer => writer.put(storageKey, storageValue));
+                    } else kvSet(storageKey, storageValue);
                     if (storageKey === 'database/database.bin') {
                         hasDatabase = true;
                     } else {
@@ -4544,6 +4560,18 @@ app.get('/api/asset/:hexKey', sessionAuthMiddleware, async (req, res) => {
             return res.send(thumb)
         }
 
+        if (key.startsWith('assets/')) {
+            const meta = await assetFileStore.stat(key);
+            if (!meta) return res.status(404).set('Cache-Control', 'no-store').end();
+            if (req.headers['if-none-match'] === `"${meta.updated_at}"`) {
+                return res.status(304).set({ 'Cache-Control': 'public, max-age=31536000, immutable', 'ETag': `"${meta.updated_at}"` }).end();
+            }
+            const entry = await assetFileStore.open(key);
+            if (!entry) return res.status(404).set('Cache-Control', 'no-store').end();
+            return await sendAsset(res, entry, first => resolveAssetPayload(key, first).contentType,
+                { 'Cache-Control': 'public, max-age=31536000, immutable', 'ETag': `"${entry.updated_at}"` });
+        }
+
         // Fast-path 304: check updated_at BEFORE loading the blob.
         const updatedAt = kvGetUpdatedAt(key)
         if (updatedAt === null) return res.status(404).set('Cache-Control', 'no-store').end()
@@ -4565,7 +4593,8 @@ app.get('/api/asset/:hexKey', sessionAuthMiddleware, async (req, res) => {
         res.send(binary)
     } catch (error) {
         logger.error('[Asset] Failed to serve asset:', error);
-        res.status(500).end()
+        if (res.headersSent) res.destroy(error);
+        else res.status(500).end()
     }
 })
 
@@ -4694,6 +4723,11 @@ app.get('/api/read', async (req, res, next) => {
     }
     try {
         const key = Buffer.from(filePath, 'hex').toString('utf-8');
+        if (key.startsWith('assets/')) {
+            const entry = await assetFileStore.open(key);
+            if (!entry) return res.send();
+            return await sendAsset(res, entry, 'application/octet-stream');
+        }
         // Flush pending patches before reading database.bin
         if (key === 'database/database.bin') {
             await flushPendingDb();
@@ -4843,7 +4877,7 @@ app.get('/api/list', async (req, res, next) => {
                 ...kvList('inlay/'),
             ])];
         } else {
-            data = kvList(keyPrefix || undefined);
+            data = [...new Set([...kvList(keyPrefix || undefined), ...(await assetFileStore.list(keyPrefix || '')).map(entry => entry.key)])];
         }
         res.send({ success: true, content: data });
     } catch (error) {
@@ -5061,7 +5095,7 @@ app.post('/api/write', async (req, res, next) => {
                     return;
                 }
             } else {
-                kvSet(key, fileContent);
+                await writeStorageValue(key, fileContent);
             }
 
             // Update ETag, backup, and invalidate cache after database.bin write
@@ -5330,6 +5364,11 @@ app.post('/api/patch', async (req, res, next) => {
     try {
         await queueStorageOperation(async () => {
             const decodedKey = Buffer.from(filePath, 'hex').toString('utf-8');
+            if (decodedKey.startsWith('assets/')) {
+                clearTimeout(saveTimers[filePath]);
+                delete saveTimers[filePath];
+                delete dbCache[filePath];
+            }
 
             // Load database into memory if not already cached
             // For database.bin, cache holds the STRIPPED version (stubs only)
@@ -5337,7 +5376,7 @@ app.post('/api/patch', async (req, res, next) => {
                 if (decodedKey === 'database/database.bin') {
                     if (!(await loadDbCacheIfMissing())) dbCache[filePath] = {};
                 } else {
-                    const fileContent = kvGet(decodedKey);
+                    const fileContent = await readStorageValue(decodedKey);
                     dbCache[filePath] = fileContent
                         ? normalizeJSON(await decodeRisuSave(fileContent))
                         : {};
@@ -5459,6 +5498,7 @@ app.post('/api/patch', async (req, res, next) => {
                 };
                 const emptyWarning = currentPersistWarning();
                 if (emptyWarning) emptyPayload.persistWarning = emptyWarning;
+                if (decodedKey.startsWith('assets/')) delete dbCache[filePath];
                 res.send(emptyPayload);
                 return;
             }
@@ -5523,13 +5563,19 @@ app.post('/api/patch', async (req, res, next) => {
             // DB patch is in; now the kv half (see ordering note above).
             applyPluginKvOps();
 
-            if (decodedKey !== 'database/database.bin') {
+            if (decodedKey.startsWith('assets/')) {
+                try {
+                    await assetFileStore.put(decodedKey, Buffer.from(encodeRisuSaveLegacy(next)));
+                } finally {
+                    delete dbCache[filePath];
+                }
+            } else if (decodedKey !== 'database/database.bin') {
                 if (saveTimers[filePath]) clearTimeout(saveTimers[filePath]);
-                saveTimers[filePath] = setTimeout(() => {
+                saveTimers[filePath] = setTimeout(() => queueStorageOperation(async () => {
                     try {
                         const data = Buffer.from(encodeRisuSaveLegacy(dbCache[filePath]));
                         try {
-                            kvSet(decodedKey, data);
+                            await writeStorageValue(decodedKey, data);
                         } catch (err) {
                             if (err && typeof err === 'object') {
                                 try { err.attemptedSize = data.length; } catch {}
@@ -5543,7 +5589,7 @@ app.post('/api/patch', async (req, res, next) => {
                     } finally {
                         delete saveTimers[filePath];
                     }
-                }, SAVE_INTERVAL);
+                }), SAVE_INTERVAL);
             }
 
             // Update ETag after successful patch (based on stripped version)
@@ -5714,7 +5760,7 @@ app.post('/api/assets/bulk-read', async (req, res, next) => {
                         value = await readInlayInfoPayload(key.slice('inlay_info/'.length));
                     }
                     if (value === null) {
-                        value = kvGet(key);
+                        value = await readStorageValue(key);
                     }
                     if (value !== null) {
                         const keyBuf = Buffer.from(key, 'utf-8');
@@ -5746,7 +5792,7 @@ app.post('/api/assets/bulk-read', async (req, res, next) => {
                         value = await readInlayInfoPayload(key.slice('inlay_info/'.length));
                     }
                     if (value === null) {
-                        value = kvGet(key);
+                        value = await readStorageValue(key);
                     }
                     if (value !== null) {
                         results.push({ key, value: Buffer.from(value).toString('base64') });
@@ -5765,15 +5811,20 @@ app.post('/api/assets/bulk-write', async (req, res, next) => {
             res.status(400).send({ error: 'Body must be a JSON array of {key, value}' });
             return;
         }
-        for(let i = 0; i < entries.length; i += BULK_BATCH){
-            const batch = entries.slice(i, i + BULK_BATCH);
-            const writeBatch = sqliteDb.transaction(() => {
-                for(const { key, value } of batch){
-                    kvSet(key, Buffer.from(value, 'base64'));
+        await queueStorageOperation(() => assetFileStore.withMigrationPaused(async () => {
+            for(let i = 0; i < entries.length; i += BULK_BATCH){
+                const batch = entries.slice(i, i + BULK_BATCH);
+                const prepared = [];
+                for (const { key, value } of batch) {
+                    if (key.startsWith('assets/')) prepared.push(await assetFileStore.prepare(key, Buffer.from(value, 'base64')));
                 }
-            });
-            writeBatch();
-        }
+                await assetFileStore.publishBatch(prepared, () => {
+                    for (const { key, value } of batch) {
+                        if (!key.startsWith('assets/')) kvSet(key, Buffer.from(value, 'base64'));
+                    }
+                });
+            }
+        }));
         res.json({ success: true, count: entries.length });
     } catch(error){ next(error); }
 });
@@ -5831,7 +5882,7 @@ async function buildSettingsOnlyPlan({ includeModuleAssets = true } = {}) {
     const keepNames = includeModuleAssets ? withModules : withoutModules;
 
     let baseCount = 0, baseBytes = 0, moduleCount = 0, moduleBytes = 0;
-    for (const entry of kvListWithSizes('assets/')) {
+    for (const entry of (await assetFileStore.list())) {
         const name = path.basename(entry.key);
         if (withoutModules.has(name)) {
             baseCount++;
@@ -5897,6 +5948,7 @@ app.get('/api/backup/export/settings-estimate', async (req, res, next) => {
 
 app.get('/api/backup/export', async (req, res, next) => {
     if(!await checkAuth(req, res)){ return; }
+    let capturedAssets, capturedEntries;
     try {
         // ?target=upstream excludes NodeOnly-only inlay namespaces (inlay/,
         // inlay_sidecar/, inlay_meta/). Their entry names contain a slash,
@@ -5995,16 +6047,15 @@ app.get('/api/backup/export', async (req, res, next) => {
                 size: buffer.length,
             }];
         })();
-        const namespacedEntries = [
-            ...kvListWithSizes('assets/')
+        const namespacedEntries = capturedEntries = await assetFileStore.captureEntries([
+            ...(capturedAssets = await assetFileStore.capture('assets/', key => !settingsAssetNames || settingsAssetNames.has(path.basename(key))))
                 // Settings-only keeps just the assets the trimmed DB still
                 // points at — persona icons, theme background, notification
                 // sounds, module assets. Character art falls out here, which is
                 // what actually shrinks the file.
                 .filter((entry) => !settingsAssetNames || settingsAssetNames.has(path.basename(entry.key)))
                 .map((entry) => ({
-                    kind: 'kv',
-                    key: entry.key,
+                    ...entry,
                     backupName: path.basename(entry.key),
                     sortKey: entry.key,
                     size: entry.size,
@@ -6022,7 +6073,7 @@ app.get('/api/backup/export', async (req, res, next) => {
             ...inlayMetaEntries,
             ...inlayEntries,
             ...sidecarEntries.filter(Boolean),
-        ].sort((a, b) => a.sortKey.localeCompare(b.sortKey));
+        ].sort((a, b) => a.sortKey.localeCompare(b.sortKey)));
         const dbSize = exportDbValue ? exportDbValue.length : 0;
         const totalBytes = namespacedEntries.reduce((sum, entry) => {
             return sum + 8 + Buffer.byteLength(entry.backupName, 'utf-8') + entry.size;
@@ -6056,18 +6107,9 @@ app.get('/api/backup/export', async (req, res, next) => {
 
         for (const entry of namespacedEntries) {
             if (closed) break;
-            const value = entry.kind === 'kv'
-                ? kvGet(entry.key)
-                : entry.kind === 'buffer'
-                    ? entry.buffer
-                    : await fs.readFile(entry.sourcePath);
-            if (closed) break;
-            if (value) {
-                const ok = res.write(encodeBackupEntry(entry.backupName, value));
-                if (!ok) {
-                    await waitForDrain();
-                    if (closed) break;
-                }
+            for await (const chunk of backupEntryChunks(entry)) {
+                if (closed) break;
+                await writeChunk(res, chunk);
             }
         }
 
@@ -6082,7 +6124,10 @@ app.get('/api/backup/export', async (req, res, next) => {
         }
         if (!closed) res.end();
     } catch (error) {
-        next(error);
+        if (!res.destroyed) next(error);
+    } finally {
+        await capturedEntries?.dispose();
+        await capturedAssets?.dispose();
     }
 });
 
@@ -6125,6 +6170,7 @@ app.post('/api/backup/import', async (req, res, next) => {
         return;
     }
     importInProgress = true;
+    const resumeAssetMigration = assetFileStore.pauseMigration();
 
     // Disable timeouts for large backup uploads
     const prevRequestTimeout = req.socket.server?.requestTimeout;
@@ -6204,6 +6250,7 @@ app.post('/api/backup/import', async (req, res, next) => {
     } finally {
         if (heartbeatTimer) clearInterval(heartbeatTimer);
         importInProgress = false;
+        resumeAssetMigration();
         if (req.socket.server && prevRequestTimeout !== undefined) {
             req.socket.server.requestTimeout = prevRequestTimeout;
         }
@@ -6214,7 +6261,9 @@ app.post('/api/backup/import', async (req, res, next) => {
 
 // Save current data as a .bin backup file on the server
 app.post('/api/backup/server/save', async (req, res, next) => {
-    if (!await checkAuth(req, res)) { return; }    try {
+    if (!await checkAuth(req, res)) { return; }
+    let capturedAssets, capturedEntries;
+    try {
         await flushPendingDb();
 
         // Pre-flight disk check — bail before streaming if the target dir
@@ -6251,15 +6300,15 @@ app.post('/api/backup/server/save', async (req, res, next) => {
             } catch { return null; }
         }))).filter(Boolean);
 
-        const namespacedEntries = [
-            ...kvListWithSizes('assets/').map((e) => ({ kind: 'kv', key: e.key, backupName: path.basename(e.key), size: e.size })),
+        const namespacedEntries = capturedEntries = await assetFileStore.captureEntries([
+            ...(capturedAssets = await assetFileStore.capture()).map((e) => ({ ...e, backupName: path.basename(e.key) })),
             ...listColdStorageBackupEntries(),
             ...kvListWithSizes('plugin-custom-storage/').map((e) => ({ kind: 'kv', key: e.key, backupName: e.key, size: e.size })),
             ...kvListWithSizes('plugin-blob-storage/').map((e) => ({ kind: 'kv', key: e.key, backupName: e.key, size: e.size })),
             ...kvListWithSizes('inlay_meta/').map((e) => ({ kind: 'kv', key: e.key, backupName: e.key, size: e.size })),
             ...inlayEntries,
             ...sidecarEntries,
-        ];
+        ]);
 
         const totalEntries = namespacedEntries.length + 1; // +1 for database
         const totalBytes = namespacedEntries.reduce((sum, e) => sum + e.size, 0);
@@ -6287,16 +6336,10 @@ app.post('/api/backup/server/save', async (req, res, next) => {
                     let bytesWritten = 0;
                     for (const entry of namespacedEntries) {
                         if (closed) break;
-                        const value = entry.kind === 'kv'
-                            ? kvGet(entry.key)
-                            : entry.kind === 'buffer'
-                                ? entry.buffer
-                                : await fs.readFile(entry.sourcePath);
-                        if (value) {
-                            const ok = writeStream.write(encodeBackupEntry(entry.backupName, value));
-                            if (!ok) await new Promise(r => writeStream.once('drain', r));
-                            bytesWritten += value.length;
+                        for await (const chunk of backupEntryChunks(entry)) {
+                            await writeChunk(writeStream, chunk);
                         }
+                        bytesWritten += entry.size;
                         written++;
                         if (written % 50 === 0 || written === namespacedEntries.length) {
                             res.write(JSON.stringify({ type: 'progress', current: written, total: totalEntries, bytes: bytesWritten, totalBytes }) + '\n');
@@ -6337,6 +6380,9 @@ app.post('/api/backup/server/save', async (req, res, next) => {
             res.write(JSON.stringify({ type: 'error', message: error.message }) + '\n');
             res.end();
         }
+    } finally {
+        await capturedEntries?.dispose();
+        await capturedAssets?.dispose();
     }
 });
 
@@ -6377,6 +6423,7 @@ app.post('/api/backup/server/restore', async (req, res, next) => {
         return;
     }
     importInProgress = true;
+    const resumeAssetMigration = assetFileStore.pauseMigration();
 
     try {
         const filename = req.body?.filename;
@@ -6434,6 +6481,7 @@ app.post('/api/backup/server/restore', async (req, res, next) => {
         }
     } finally {
         importInProgress = false;
+        resumeAssetMigration();
     }
 });
 
@@ -6782,8 +6830,8 @@ function scanHexFilesInDir(dirPath) {
     return { hexFiles, count: hexFiles.length, totalSize, hasDatabase };
 }
 
-function clearExistingData() {
-    kvDelPrefix('assets/');
+function clearExistingData(writer) {
+    writer.clear();
     kvDelPrefix('inlay/');
     kvDelPrefix('inlay_thumb/');
     kvDelPrefix('inlay_meta/');
@@ -6842,6 +6890,34 @@ function finishImportedPluginStorage(database) {
     }
 }
 
+async function publishSaveFolderEntries(entries, importedDb, pluginReplacement) {
+    assetFileStore.cleanupImportStaging();
+    const staging = `asset_import_${nodeCrypto.randomBytes(16).toString('hex')}`;
+    sqliteDb.exec(`CREATE TABLE ${staging}(key TEXT PRIMARY KEY, value BLOB NOT NULL)`);
+    const prepared = [];
+    let databaseValue;
+    try {
+        const stage = sqliteDb.prepare(`INSERT OR REPLACE INTO ${staging} VALUES (?, ?)`);
+        for await (const { key, value } of entries) {
+            if (key === DB_BLOB_KEY) databaseValue = value;
+            else if (key.startsWith('assets/')) prepared.push(await assetFileStore.prepare(key, value));
+            else stage.run(key, value);
+        }
+        await assetFileStore.publishBatch(prepared, () => {
+            sqliteDb.prepare(`INSERT OR REPLACE INTO kv(key, value, updated_at)
+                SELECT key, value, ? FROM ${staging}`).run(Date.now());
+            kvSet(DB_BLOB_KEY, databaseValue);
+            if (pluginReplacement) finishImportedPluginStorage(importedDb);
+        }, () => {
+            assetFileStore.legacyBatchSync(clearExistingData);
+            if (pluginReplacement) clearImportedPluginStorage();
+        });
+    } finally {
+        invalidateDbCache();
+        sqliteDb.exec(`DROP TABLE ${staging}`);
+    }
+}
+
 async function importHexFilesFromDir(dirPath) {
     const { hexFiles, hasDatabase } = scanHexFilesInDir(dirPath);
     if (hexFiles.length === 0) return { imported: 0 };
@@ -6855,25 +6931,12 @@ async function importHexFilesFromDir(dirPath) {
     const importedDb = await decodeRisuSave(readFileSync(path.join(dirPath, Buffer.from(DB_BLOB_KEY).toString('hex'))), { extractPluginStorage: true });
     const pluginReplacement = await prepareSaveFolderPluginReplacement(importedKeys, importedDb);
 
-    const insert = sqliteDb.prepare(
-        `INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)`
-    );
-    const now = Date.now();
-
-    const run = sqliteDb.transaction(() => {
-        clearExistingData();
-        if (pluginReplacement) clearImportedPluginStorage();
+    async function* entries() {
         for (const hexFile of hexFiles) {
-            const key = Buffer.from(hexFile, 'hex').toString('utf-8');
-            const value = readFileSync(path.join(dirPath, hexFile));
-            // Chunk the DB blob so an oversized database.bin imports instead of
-            // failing the BLOB bind limit; other keys keep the bulk fast path.
-            if (key === DB_BLOB_KEY) { kvSet(key, value); continue; }
-            insert.run(key, value, now);
+            yield { key: Buffer.from(hexFile, 'hex').toString('utf-8'), value: await fs.readFile(path.join(dirPath, hexFile)) };
         }
-        if (pluginReplacement) finishImportedPluginStorage(importedDb);
-    });
-    run();
+    }
+    await publishSaveFolderEntries(entries(), importedDb, pluginReplacement);
 
     writeFileSync(migrationMarkerPath, new Date().toISOString(), 'utf-8');
     return { imported: hexFiles.length };
@@ -6891,23 +6954,7 @@ async function importHexEntries(entries) {
     const importedDb = await decodeRisuSave(entries.find(entry => entry.key === DB_BLOB_KEY).value, { extractPluginStorage: true });
     const pluginReplacement = await prepareSaveFolderPluginReplacement(entries.map(entry => entry.key), importedDb);
 
-    const insert = sqliteDb.prepare(
-        `INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)`
-    );
-    const now = Date.now();
-
-    const run = sqliteDb.transaction(() => {
-        clearExistingData();
-        if (pluginReplacement) clearImportedPluginStorage();
-        for (const { key, value } of entries) {
-            // Chunk the DB blob so an oversized database.bin imports instead of
-            // failing the BLOB bind limit; other keys keep the bulk fast path.
-            if (key === DB_BLOB_KEY) { kvSet(key, value); continue; }
-            insert.run(key, value, now);
-        }
-        if (pluginReplacement) finishImportedPluginStorage(importedDb);
-    });
-    run();
+    await publishSaveFolderEntries(entries, importedDb, pluginReplacement);
 
     writeFileSync(migrationMarkerPath, new Date().toISOString(), 'utf-8');
     return { imported: entries.length };
@@ -6940,6 +6987,7 @@ app.post('/api/migrate/save-folder/execute', async (req, res, next) => {
         return;
     }
     importInProgress = true;
+    const resumeAssetMigration = assetFileStore.pauseMigration();
     try {
         const folderPath = req.body?.path || savePath;
         const resolved = path.resolve(folderPath);
@@ -6953,7 +7001,7 @@ app.post('/api/migrate/save-folder/execute', async (req, res, next) => {
             res.status(400).json({ error: 'Cannot access directory' });
             return;
         }
-        const result = await comfyWorldReplacementGate.withWorldReplacement(
+        const result = await withComfyWorldReplacementGate(
             () => importHexFilesFromDir(resolved),
         );
         res.json({ ok: true, imported: result.imported });
@@ -6961,6 +7009,7 @@ app.post('/api/migrate/save-folder/execute', async (req, res, next) => {
         res.status(400).json({ error: error.message || 'Import failed' });
     } finally {
         importInProgress = false;
+        resumeAssetMigration();
     }
 });
 
@@ -6970,6 +7019,7 @@ app.post('/api/migrate/save-folder/upload', async (req, res, next) => {
         return;
     }
     importInProgress = true;
+    const resumeAssetMigration = assetFileStore.pauseMigration();
 
     req.socket.setTimeout(0);
     req.socket.setKeepAlive(true);
@@ -7014,7 +7064,7 @@ app.post('/api/migrate/save-folder/upload', async (req, res, next) => {
             return;
         }
 
-        const result = await comfyWorldReplacementGate.withWorldReplacement(
+        const result = await withComfyWorldReplacementGate(
             () => importHexEntries(entries),
         );
         res.json({ ok: true, imported: result.imported });
@@ -7022,6 +7072,7 @@ app.post('/api/migrate/save-folder/upload', async (req, res, next) => {
         res.status(400).json({ error: error.message || 'Import failed' });
     } finally {
         importInProgress = false;
+        resumeAssetMigration();
         if (req.socket.server && prevRequestTimeout !== undefined) {
             req.socket.server.requestTimeout = prevRequestTimeout;
         }
@@ -7238,7 +7289,7 @@ async function computeAssetSweep({ includeAssets, assetGraceMs = 0, includeRemot
     if (!dbObj || !Array.isArray(dbObj.characters)) return { error: 'Database decode failed' };
 
     const uncleanable = buildUncleanableSet(dbObj);
-    const assets = includeAssets ? kvListWithSizesAndUpdatedAt('assets/') : [];
+    const assets = includeAssets ? (await assetFileStore.list()) : [];
 
     try {
         addLiveManifestRefs(uncleanable);
@@ -7303,12 +7354,15 @@ async function computeAssetSweep({ includeAssets, assetGraceMs = 0, includeRemot
     }
 
     const victims = [...assetVictims, ...remoteVictims];
-    sqliteDb.transaction(() => {
+    await assetFileStore.legacyBatch(writer => {
         for (const key of remoteMetaCreates) {
             kvSet(key, Buffer.from(JSON.stringify({ lastUsed: now })));
         }
-        for (const it of victims) kvDel(it.key);
-    })();
+        for (const it of victims) {
+            if (it.key.startsWith('assets/')) writer.remove(it.key);
+            else kvDel(it.key);
+        }
+    });
 
     const deleted = victims.length;
     const bytes = victims.reduce((sum, it) => sum + it.size, 0);
@@ -7363,10 +7417,10 @@ async function sumInlayFsBytes() {
 // /api/backup/server/save without writing anything. Inlay files live on the
 // filesystem (post-migration), so we have to fs.stat them rather than read
 // kvSize. Cost: ~5-50 ms typical, ~200 ms for users with thousands of inlays.
-async function estimateServerBackupSize() {
+async function estimateServerBackupSize(assets) {
     let total = 0;
     total += kvSize(DB_BLOB_KEY) || 0;
-    for (const it of kvListWithSizes('assets/')) total += it.size;
+    for (const it of (assets || await assetFileStore.list())) total += it.size;
     for (const it of kvListWithSizes('inlay_meta/')) total += it.size;
     for (const it of kvListWithSizes('plugin-custom-storage/')) total += it.size;
     for (const it of kvListWithSizes('plugin-blob-storage/')) total += it.size;
@@ -7445,8 +7499,12 @@ app.get('/api/db/stats', async (req, res, next) => {
             }
         }
         prefixes[DB_BACKUP_PREFIX] = { totalSize: backupTotal, count: backupKeys.length };
+        const assetsPromise = assetFileStore.list();
+        const assetStatsPromise = assetFileStore.stats();
+        const assets = await assetsPromise;
+        const { assetFileBytes, fileSize } = await assetStatsPromise;
         for (const p of ASSET_PREFIXES) {
-            const items = kvListWithSizes(p);
+            const items = p === 'assets/' ? assets : kvListWithSizes(p);
             let total = 0;
             for (const it of items) total += it.size;
             prefixes[p] = { totalSize: total, count: items.length };
@@ -7496,7 +7554,7 @@ app.get('/api/db/stats', async (req, res, next) => {
                 const uncleanable = buildUncleanableSet(stripped);
                 addLiveManifestRefs(uncleanable);
                 for (const bn of collectPluginStorageAssetRefs()) uncleanable.add(bn);
-                for (const it of kvListWithSizes('assets/')) {
+                for (const it of assets) {
                     if (!uncleanable.has(statsBasename(it.key))) {
                         orphan.count++;
                         orphan.totalSize += it.size;
@@ -7509,11 +7567,12 @@ app.get('/api/db/stats', async (req, res, next) => {
             }
         }
 
-        const estimatedBackupSize = await estimateServerBackupSize();
+        const estimatedBackupSize = await estimateServerBackupSize(assets);
         // Inlay payload now lives on the filesystem (post-migration) rather
         // than in kv `inlay/*` prefixes. Surface explicitly so the dashboard
         // chart can include it in the inlay slice instead of underreporting.
         const inlayFsBytes = await sumInlayFsBytes();
+        prefixes['assets/'].fileSize = fileSize;
 
         res.json({
             files,
@@ -7526,6 +7585,7 @@ app.get('/api/db/stats', async (req, res, next) => {
             kvTotalBytes,
             estimatedBackupSize,
             inlayFsBytes,
+            assetFileBytes,
             backups: {
                 kv: { count: backupKeys.length, totalSize: backupTotal, oldest: backupOldest, newest: backupNewest },
                 file: fileBackups,
@@ -7549,7 +7609,7 @@ app.get('/api/db/stats/characters', async (req, res, next) => {
         const dbObj = await decodeRisuSave(raw);
 
         const assetSize = new Map();
-        for (const it of kvListWithSizes('assets/')) {
+        for (const it of (await assetFileStore.list())) {
             assetSize.set(statsBasename(it.key), it.size);
         }
         // remotes/<chaId>.local.bin (+ optional .meta sidecar) → bucket by chaId.
@@ -7617,7 +7677,7 @@ app.get('/api/db/stats/characters', async (req, res, next) => {
         addLiveManifestRefs(uncleanable);
         for (const bn of collectPluginStorageAssetRefs()) uncleanable.add(bn);
         let orphanCount = 0, orphanTotal = 0;
-        for (const it of kvListWithSizes('assets/')) {
+        for (const it of (await assetFileStore.list())) {
             if (!uncleanable.has(statsBasename(it.key))) {
                 orphanCount++;
                 orphanTotal += it.size;
@@ -7650,7 +7710,7 @@ app.get('/api/db/stats/modules', async (req, res, next) => {
         const list = Array.isArray(dbObj.modules) ? dbObj.modules : [];
 
         const assetSize = new Map();
-        for (const it of kvListWithSizes('assets/')) {
+        for (const it of (await assetFileStore.list())) {
             assetSize.set(statsBasename(it.key), it.size);
         }
 
@@ -7904,7 +7964,7 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
         if (!blob) {
             return res.status(404).json({ error: 'Snapshot not found' });
         }
-        await comfyWorldReplacementGate.withWorldReplacement(() => queueStorageOperation(async () => {
+        await withComfyWorldReplacementGate(async () => {
             // Drain any pending debounced persist first — same pattern as
             // /api/db/optimize. Without this, an in-flight save could land
             // after kvCopyValue and overwrite the restored snapshot.
@@ -7949,7 +8009,7 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
             } catch (e) {
                 logger.warn('[Snapshot restore] post-restore decode failed:', e?.message || e);
             }
-        }));
+        });
         res.json({ ok: true });
     } catch (err) { next(err); }
 });
@@ -9901,6 +9961,7 @@ app.post('/api/mcp/modules/lua/set', mcpAuthMiddleware, async (req, res) => {
 
 async function startServer() {
     try {
+        await storageReady;
         await migrateInlaysToFilesystem();
         await migrateRemoteBlocksIfNeeded();
         try {
@@ -9919,6 +9980,7 @@ async function startServer() {
             setupProxyStreamWebSocket(server);
             setupLLMWorkerWebSocket(server);
             server.listen(port, () => {
+                assetFileStore.start();
                 console.log("[Server] HTTPS server is running.");
                 console.log(`[Server] https://localhost:${port}/`);
             });
@@ -9928,6 +9990,7 @@ async function startServer() {
             setupProxyStreamWebSocket(server);
             setupLLMWorkerWebSocket(server);
             server.listen(port, () => {
+                assetFileStore.start();
                 console.log("[Server] HTTP server is running.");
                 console.log(`[Server] http://localhost:${port}/`);
             });
@@ -9945,6 +10008,7 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
         stopTunnel();
         try { await comfyOrchestrator.stop(); } catch (e) { logger.error('[Server] Comfy stop error:', e); }
         try { await flushPendingDb(); } catch (e) { logger.error('[Server] Flush error:', e); }
+        try { await assetFileStore.close(); } catch (e) { logger.error('[Asset files] shutdown:', e); }
         try { checkpointWal('TRUNCATE'); } catch { /* non-fatal */ }
         process.exit(0);
     });
