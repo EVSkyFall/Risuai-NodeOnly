@@ -158,8 +158,6 @@ export class NodeStorage{
     _lastDbEtag: string | null = null
     authChecked = false
     private cachedJwt: { token: string; expiresAt: number } | null = null
-    private static sessionInitialized = false
-    private static sessionPending: Promise<void> | null = null
     private refreshPending: Promise<string> | null = null
     private refreshTimer: ReturnType<typeof setTimeout> | undefined
     private refreshRetryDelay = 5000
@@ -205,31 +203,16 @@ export class NodeStorage{
         ;(this.refreshTimer as any).unref?.()
     }
 
-    // Called once after JWT auth is confirmed. Issues a session cookie so that
-    // <img src="/api/asset/..."> can be served without JS-injected headers.
-    private async initSession() {
-        if (NodeStorage.sessionInitialized) return
-        if (NodeStorage.sessionPending) return NodeStorage.sessionPending
-        NodeStorage.sessionPending = this._doInitSession()
-        return NodeStorage.sessionPending
-    }
-
-    private async _doInitSession() {
+    // Issue at boot and renew after JWT refresh for headerless asset requests.
+    private async initSession(token: string) {
         try {
             const res = await fetch('/api/session', {
                 method: 'POST',
-                headers: {
-                    'risu-auth': await this.createAuth(),
-                },
+                headers: { 'risu-auth': token },
             })
-            if (res.ok) {
-                NodeStorage.sessionInitialized = true
-            }
-            // Non-ok (400/401/500): will retry on next checkAuth() call.
-        } catch {
-            // Network error: will retry on next checkAuth() call.
-        } finally {
-            NodeStorage.sessionPending = null
+            if (!res.ok) throw new Error(`Session renewal failed with HTTP ${res.status}`)
+        } catch (error) {
+            console.warn('[Auth] Session renewal failed:', error)
         }
     }
 
@@ -249,15 +232,17 @@ export class NodeStorage{
             if (!res.ok) throw new Error(`Token refresh failed with HTTP ${res.status}`)
             const data = await res.json()
             this.cacheToken(data.token)
+            void this.initSession(data.token)
             return data.token
         } catch {
             this.authChecked = false
-            // Do not wait for session initialization inside the refresh it uses.
+            // Renew the session after recovery so token refresh never waits for it.
             await this.checkAuth(false)
             if (!this.cachedJwt || this.cachedJwt.expiresAt <= Date.now()) {
                 this.authChecked = false
                 throw new Error('Authentication did not issue an unexpired token')
             }
+            void this.initSession(this.cachedJwt.token)
             return this.cachedJwt.token
         }
     }
@@ -540,13 +525,13 @@ export class NodeStorage{
                 }
 
                 await this.loginWithPassword(input)
-                if (initializeSession) await this.initSession()
+                if (initializeSession && this.cachedJwt) await this.initSession(this.cachedJwt.token)
                 return
             }
             else if(data.status === 'incorrect'){
                 const input = await digestPassword(await alertInput(language.inputNodePassword))
                 await this.loginWithPassword(input)
-                if (initializeSession) await this.initSession()
+                if (initializeSession && this.cachedJwt) await this.initSession(this.cachedJwt.token)
                 return
             }
             else{
@@ -558,8 +543,8 @@ export class NodeStorage{
                 }
                 this.authChecked = true
             }
+            if (initializeSession && this.cachedJwt) await this.initSession(this.cachedJwt.token)
         }
-        if (initializeSession) await this.initSession()
     }
 
     listItem = this.keys

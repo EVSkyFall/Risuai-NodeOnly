@@ -6,9 +6,9 @@ const { NodeStorage, ConflictError } = await import('./nodeStorage')
 const json = (status: number, body: any) => new Response(JSON.stringify(body), { status })
 const token = (exp: number, iat = 100) => `synthetic.${Buffer.from(JSON.stringify({ exp, iat })).toString('base64url')}.synthetic`
 function storage() {
-    ;(NodeStorage as any).sessionInitialized = true
-    ;(NodeStorage as any).sessionPending = null
-    return new NodeStorage()
+    const s = new NodeStorage()
+    vi.spyOn(s as any, 'initSession').mockResolvedValue(undefined)
+    return s
 }
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks() })
 
@@ -84,18 +84,17 @@ test('cause7d: apparent auth success without a token does not latch authChecked'
 test('cause7: background recovery failure retries and session initialization never joins itself', async () => {
     vi.useFakeTimers(); vi.setSystemTime(100000)
     const s = storage() as any
-    ;(NodeStorage as any).sessionInitialized = false
+    s.initSession.mockRestore()
+    const session = vi.fn(async () => json(200, {}))
     const fetch = vi.fn().mockResolvedValueOnce(json(200, { token: token(200) }))
         .mockResolvedValueOnce(json(503, {})).mockRejectedValueOnce(new Error('offline'))
         .mockResolvedValueOnce(json(503, {})).mockResolvedValueOnce(json(200, { status: 'success', token: token(400) }))
-        .mockResolvedValueOnce(json(200, {}))
-    vi.stubGlobal('fetch', fetch)
+    vi.stubGlobal('fetch', (url: string, init?: RequestInit) => url === '/api/session' ? session() : fetch(url, init))
     await s.createAuth()
     await vi.advanceTimersByTimeAsync(55000)
     expect(s.cachedJwt.token).toBe(token(400))
     await s.checkAuth()
-    expect((NodeStorage as any).sessionInitialized).toBe(true)
-    expect(fetch.mock.calls.at(-1)[0]).toBe('/api/session')
+    expect(session).toHaveBeenCalledTimes(2)
 })
 
 test('cause7a-browser: JWT payload decodes with the shipped browser Buffer polyfill', async () => {

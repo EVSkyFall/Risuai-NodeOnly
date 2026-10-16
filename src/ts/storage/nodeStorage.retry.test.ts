@@ -25,9 +25,6 @@ function jsonResponse(status: number, body: any = {}) {
 }
 
 function setUpStorage(fetchMock: ReturnType<typeof vi.fn>) {
-    ;(NodeStorage as any).sessionInitialized = true
-    ;(NodeStorage as any).sessionPending = null
-
     const delay = vi.fn(async () => {})
     const storage = new NodeStorage(fetchMock as any, {
         baseDelayMs: 0,

@@ -4440,12 +4440,16 @@ app.post('/api/token/refresh', async (req, res) => {
 })
 
 // ── Session cookie issuance (F-0) ──────────────────────────────────────────
-// Called once after JWT auth succeeds. Issues a long-lived cookie so that
+// Issued at boot and renewed after JWT refresh so that
 // <img src="/api/asset/..."> requests can be authenticated without JS.
 app.post('/api/session', async (req, res) => {
     if (!await checkAuth(req, res)) return
-    const token = nodeCrypto.randomBytes(32).toString('hex')
-    const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000
+    const now = Date.now()
+    const existingToken = parseSessionCookie(req)
+    const token = existingToken && (sessions.get(existingToken) ?? 0) > now
+        ? existingToken
+        : nodeCrypto.randomBytes(32).toString('hex')
+    const expiresAt = now + 7 * 24 * 60 * 60 * 1000
     sessions.set(token, expiresAt)
     // Prune stale sessions (bounded by single-user usage, safe to do inline)
     for (const [t, exp] of sessions) {
