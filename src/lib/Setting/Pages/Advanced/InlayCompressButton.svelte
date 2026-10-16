@@ -22,7 +22,10 @@
         try {
             const res = await fetch('/api/inlays/compress', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: {
+                    'Content-Type': 'application/json',
+                    'risu-auth': await (await import('src/ts/globalApi.svelte')).forageStorage.createAuth(),
+                },
                 body: JSON.stringify({ quality: 85 }),
             });
 

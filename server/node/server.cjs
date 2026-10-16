@@ -4517,7 +4517,7 @@ async function generateThumbnail(buffer) {
     }
 }
 
-app.get('/api/asset/:hexKey', sessionAuthMiddleware, async (req, res) => {
+app.get('/api/asset/:hexKey', async (req, res) => {
     try {
         const key = Buffer.from(req.params.hexKey, 'hex').toString('utf-8')
 
@@ -5323,7 +5323,7 @@ app.post('/api/comfy/orchestrator', async (req, res, next) => {
     }
 });
 
-app.post('/api/db/flush', sessionAuthMiddleware, async (req, res, next) => {    try {
+app.post('/api/db/flush', async (req, res, next) => {    try {
         await queueStorageOperation(async () => {
             await flushPendingDb();
             res.send({
@@ -8094,7 +8094,9 @@ app.put('/api/backup/server/path', async (req, res, next) => {
 // ── Inlay bulk compression endpoint ──────────────────────────────────────────
 const COMPRESS_IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'bmp']);
 
-app.post('/api/inlays/compress', sessionAuthMiddleware, async (req, res) => {    const quality = typeof req.body?.quality === 'number' ? req.body.quality : 85;
+app.post('/api/inlays/compress', async (req, res) => {
+    if (!await checkAuth(req, res)) return;
+    const quality = typeof req.body?.quality === 'number' ? req.body.quality : 85;
 
     res.writeHead(200, {
         'Content-Type': 'text/event-stream',
