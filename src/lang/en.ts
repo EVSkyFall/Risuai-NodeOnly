@@ -2489,6 +2489,17 @@ export const languageEnglish = {
     advSectionResponse: "Response Correction",
     advSectionDevTools: "Developer Tools",
     advSectionExperimental: "Experimental",
+    risuTosTitle: "RisuAI Terms of Service",
+    risuTosDesc: "This feature uses servers operated by RisuAI.\nPocketRisu is an independent project separate from RisuAI, and the terms below are RisuAI's own terms, not PocketRisu's. Declining does not affect the rest of PocketRisu.",
+    risuTosScope: "These terms apply only to:",
+    risuTosScopeRealm: "RisuRealm (browsing, searching, downloading and reporting characters)",
+    risuTosScopeMcp: "MCP server OAuth login (relayed through RisuAI's account server)",
+    risuTosTerms: "RisuAI Terms of Service",
+    risuTosPrivacy: "RisuAI Privacy Policy",
+    risuTosAccept: "Accept",
+    risuTosDecline: "Do not Accept",
+    risuTosGate: "RisuRealm uses servers operated by RisuAI. Accept RisuAI's Terms of Service to use it.",
+    risuTosGateButton: "Review terms",
 } satisfies I18nTranslation;
 
 type I18nTranslationFunction = (...args: any[]) => string;

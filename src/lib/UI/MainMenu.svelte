@@ -9,6 +9,8 @@
     import { language } from "src/lang";
     import { getRisuHub, hubAdditionalHTML } from "src/ts/characterCards";
     import RisuHubIcon from "./Realm/RealmHubIcon.svelte";
+    import RealmTosGate from "./Realm/RealmTosGate.svelte";
+    import { risuTosAccepted } from "src/ts/alert";
     import Title from "./Title.svelte";
     import { updateInfoStore, updatePopupStore } from "src/ts/update";
     import { publicStatsStore } from "src/ts/publicStats";
@@ -137,7 +139,9 @@
         aria-hidden={!realmOpen}
         inert={!realmOpen}
       >
-        {#if realmOpen && hubReady}
+        {#if realmOpen && !$risuTosAccepted}
+          <RealmTosGate />
+        {:else if realmOpen && hubReady}
           {#await getRisuHub({
                 search: '',
                 page: 0,
@@ -227,7 +231,11 @@
             <ArrowLeft/>
           </button>
         </div>
-        <Hub />
+        {#if $risuTosAccepted}
+          <Hub />
+        {:else}
+          <RealmTosGate />
+        {/if}
       {/if}
   </div>
 </div>

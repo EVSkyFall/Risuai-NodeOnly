@@ -919,16 +919,26 @@
         }
     }}
 >
+    {#snippet title()}{language.risuTosTitle}{/snippet}
     <!-- svelte-ignore a11y_missing_attribute -->
     <!-- svelte-ignore a11y_click_events_have_key_events -->
-    <div class="text-textcolor">
-        You should accept
-        <a role="button" tabindex="0" class="text-borderc hover:underline cursor-pointer" onclick={() => openURL('https://sv.risuai.xyz/hub/tos')}>Terms of Service</a>
-        to continue.
+    <div class="text-textcolor flex flex-col gap-3">
+        <p class="whitespace-pre-wrap">{language.risuTosDesc}</p>
+        <div>
+            <p class="text-textcolor2">{language.risuTosScope}</p>
+            <ul class="list-disc pl-5">
+                <li>{language.risuTosScopeRealm}</li>
+                <li>{language.risuTosScopeMcp}</li>
+            </ul>
+        </div>
+        <div class="flex flex-wrap gap-x-4 gap-y-1">
+            <a role="button" tabindex="0" class="text-borderc hover:underline cursor-pointer" onclick={() => openURL('https://account.sionyw.com/terms')}>{language.risuTosTerms}</a>
+            <a role="button" tabindex="0" class="text-borderc hover:underline cursor-pointer" onclick={() => openURL('https://account.sionyw.com/privacy')}>{language.risuTosPrivacy}</a>
+        </div>
     </div>
     {#snippet footer()}
-        <ShButton variant="outline" onclick={() => alertStore.set({ type: 'none', msg: 'no' })}>Do not Accept</ShButton>
-        <ShButton onclick={() => alertStore.set({ type: 'none', msg: 'yes' })}>Accept</ShButton>
+        <ShButton variant="outline" onclick={() => alertStore.set({ type: 'none', msg: 'no' })}>{language.risuTosDecline}</ShButton>
+        <ShButton onclick={() => alertStore.set({ type: 'none', msg: 'yes' })}>{language.risuTosAccept}</ShButton>
     {/snippet}
 </ShAlertDialog>
 

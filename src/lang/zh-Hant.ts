@@ -2480,6 +2480,17 @@ export const languageChineseTraditional = {
     "advSectionResponse": "回覆修正",
     "advSectionDevTools": "開發工具",
     "advSectionExperimental": "實驗功能",
+    "risuTosTitle": "RisuAI 服務條款",
+    "risuTosDesc": "此功能使用 RisuAI 營運的伺服器。\nPocketRisu 是獨立於 RisuAI 的專案，以下條款是 RisuAI 自己的條款，而非 PocketRisu 的條款。不同意也不影響 PocketRisu 的其他功能。",
+    "risuTosScope": "這些條款僅適用於：",
+    "risuTosScopeRealm": "RisuRealm（瀏覽、搜尋、下載和檢舉角色）",
+    "risuTosScopeMcp": "MCP 伺服器 OAuth 登入（透過 RisuAI 帳號伺服器中繼）",
+    "risuTosTerms": "RisuAI 服務條款",
+    "risuTosPrivacy": "RisuAI 隱私權政策",
+    "risuTosAccept": "同意",
+    "risuTosDecline": "不同意",
+    "risuTosGate": "RisuRealm 使用 RisuAI 營運的伺服器。需要同意 RisuAI 服務條款才能使用。",
+    "risuTosGateButton": "查看條款",
 } satisfies I18nTranslation;
 
 type I18nTranslationFunction = (...args: any[]) => string;
