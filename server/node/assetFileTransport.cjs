@@ -32,14 +32,26 @@ async function sendAsset(res, entry, contentType, headers = {}) {
 function writeChunk(destination, chunk) {
     if (destination.destroyed) return Promise.reject(new Error('Stream destination closed'));
     return new Promise((resolve, reject) => {
+        let drainEmitter;
         const closed = () => finish(new Error('Stream destination closed'));
+        const drained = () => finish();
         const finish = error => {
+            drainEmitter?.removeListener('drain', drained);
             destination.removeListener('close', closed);
+            destination.removeListener('error', finish);
             if (error) reject(error);
             else resolve();
         };
         destination.once('close', closed);
-        destination.write(chunk, finish);
+        destination.once('error', finish);
+        try {
+            // Response middleware may discard write callbacks. Its drain listener can
+            // also live on a different emitter, so retain the emitter for cleanup.
+            if (destination.write(chunk)) finish();
+            else drainEmitter = destination.on('drain', drained);
+        } catch (error) {
+            finish(error);
+        }
     });
 }
 
