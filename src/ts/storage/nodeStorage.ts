@@ -368,7 +368,11 @@ export class NodeStorage{
         const headers = new Headers(init.headers)
         headers.set('risu-auth', await this.createAuth())
 
+        // Storage calls share one URL per endpoint and differ only by headers,
+        // so Chrome's HTTP cache can serialize them on one cache entry. An asset
+        // read once sat "Stalled" forever without ever reaching the server.
         const response = await this.fetchFn(input, {
+            cache: 'no-store',
             ...init,
             headers
         })
@@ -446,7 +450,9 @@ export class NodeStorage{
             'file-path': Buffer.from(key, 'utf-8').toString('hex')
         }
 
-        const da = await this.authFetch('/api/read', { method: "GET", headers })
+        // database.bin keeps HTTP revalidation (304 on an unchanged boot).
+        const cache: RequestCache = key === 'database/database.bin' ? 'default' : 'no-store'
+        const da = await this.authFetch('/api/read', { method: "GET", headers, cache })
         if(da.status < 200 || da.status >= 300){
             throw await this.storageRequestError('getItem', da)
         }

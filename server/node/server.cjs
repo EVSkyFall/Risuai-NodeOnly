@@ -4727,6 +4727,9 @@ app.get('/api/read', async (req, res, next) => {
     }
     try {
         const key = Buffer.from(filePath, 'hex').toString('utf-8');
+        // One URL serves every key (the key travels in a header), so apart from
+        // the revalidated database.bin nothing here may enter the HTTP cache.
+        if (key !== 'database/database.bin') res.set('Cache-Control', 'no-store');
         if (key.startsWith('assets/')) {
             const entry = await assetFileStore.open(key);
             if (!entry) return res.send();
