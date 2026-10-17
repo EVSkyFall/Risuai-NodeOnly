@@ -1,3 +1,4 @@
+import { raceAbort, throwIfAborted } from "./abort";
 import { get } from "svelte/store";
 import { type character, type MessageGenerationInfo, type Chat, type MessagePresetInfo, changeToPreset, setCurrentChat, type Message, normalizeChat } from "../storage/database.svelte";
 import { DBState } from '../stores.svelte';
@@ -34,7 +35,7 @@ import { getActiveHypaV3Preset } from "./memory/memoryPresets"
 import { resolveModelPresetContextBudget } from "./request/contextBudget"
 import { hydrateAssetListsForCbs, serializeForCbsScan } from "../parser/assetListHydration";
 import { pluginV2 } from "../plugins/plugins.svelte";
-import { chatGenKey, chatProcessStage, endGeneration, isChatGenerating, setGenerationStage, startGeneration } from "./generationState";
+import { registerAbort, chatGenKey, chatProcessStage, endGeneration, isChatGenerating, setGenerationStage, startGeneration } from "./generationState";
 import { createMainJobCompletion, prepareMainJobContinuation } from './request/mainJobCompletion';
 import type { JobClaimHandle } from './request/jobFetch';
 import { clearPendingSend, registerPendingSend } from "./request/pendingSends";
@@ -59,7 +60,7 @@ function findMessageIndexByChatId(chat: Chat, chatId?: string){
     return chat.message.findIndex((message) => message.chatId === chatId)
 }
 
-async function runChatOutputListeners(char: any, chat: any, characterIndex: number, chatIndex: number, messageIndex: number){
+async function runChatOutputListeners(char: any, chat: any, characterIndex: number, chatIndex: number, messageIndex: number, signal?: AbortSignal){
     if(pluginV2.chatOutput.size === 0){
         return
     }
@@ -68,15 +69,16 @@ async function runChatOutputListeners(char: any, chat: any, characterIndex: numb
     const chatSnapshot = $state.snapshot(chat)
     for(const listener of pluginV2.chatOutput){
         try {
-            await listener({
+            await raceAbort(() => (listener({
                 char: charSnapshot,
                 chat: chatSnapshot,
                 characterIndex,
                 chatIndex,
                 messageIndex,
-            })
+            })), signal)
         }
         catch(e) {
+            throwIfAborted(signal)
             console.error(e)
         }
     }
@@ -135,7 +137,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     chatProcessStage.set(0)
     // Set turn ID for Copilot quota bundling — all API calls within this sendChat share the same turn
     const turnId = arg.copilotTurnId || v4()
-    const abortSignal = arg.signal ?? (new AbortController()).signal
+    const ownAbortController = arg.signal ? undefined : new AbortController()
+    const abortSignal = arg.signal ?? ownAbortController.signal
     const responseStartedAt = arg.responseStartedAt ?? performance.now()
     
     // NOTE: `throwError()` can be called before these are populated (e.g. HypaV3 early validation errors).
@@ -252,6 +255,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
     }
     const generationId = v4()
+    if (ownAbortController) registerAbort(genKey, ownAbortController)
     startGeneration(genKey, generationId)
     // Resumable-send tombstone (pendingSends.ts): registered before the
     // pipeline so an interrupted tab leaves a recoverable marker. Preview
@@ -338,7 +342,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     if (currentChar.additionalAssetManifest
         || DBState.db.modules?.some(module => module.assetManifest)
         || DBState.db.personas?.some(persona => persona.embeddedModule?.assetManifest)) {
-        await hydrateAssetListsForCbs(currentChar, promptCbsSources(currentChar, nowChatroom.chats[selectedChat]))
+        await raceAbort(() => (hydrateAssetListsForCbs(currentChar, promptCbsSources(currentChar, nowChatroom.chats[selectedChat]))), abortSignal)
     }
 
     let chatAdditonalTokens = arg.chatAdditonalTokens ?? caculatedChatTokens
@@ -507,7 +511,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     {
         let description = risuChatParser((DBState.db.promptPreprocess ? DBState.db.descriptionPrefix: '') + currentChar.desc, {chara: currentChar})
 
-        const additionalInfo = await additionalInformations(currentChar, currentChat)
+        const additionalInfo = await raceAbort(() => (additionalInformations(currentChar, currentChat)), abortSignal)
 
         if(additionalInfo){
             description += '\n\n' + risuChatParser(additionalInfo, {chara:currentChar})
@@ -529,7 +533,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
 
     }
 
-    const lorepmt = await loadLoreBookV3Prompt()
+    const lorepmt = await raceAbort(() => (loadLoreBookV3Prompt()), abortSignal)
 
     const positionRegex = /{{position::(.+?)}}/g
     const replaceposition = (text:string):{text:string, replaced:boolean} => {
@@ -729,7 +733,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                         }
                     }
 
-                    await tokenizeChatArray(pmt)
+                    await raceAbort(() => (tokenizeChatArray(pmt)), abortSignal)
                     break
                 }
                 case 'description':{
@@ -740,7 +744,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                         }
                     }
 
-                    await tokenizeChatArray(pmt)
+                    await raceAbort(() => (tokenizeChatArray(pmt)), abortSignal)
                     break
                 }
                 case 'authornote':{
@@ -752,20 +756,20 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                         }
                     }
 
-                    await tokenizeChatArray(pmt)
+                    await raceAbort(() => (tokenizeChatArray(pmt)), abortSignal)
                     break
                 }
                 case 'lorebook':{
-                    await tokenizeChatArray(unformated.lorebook)
+                    await raceAbort(() => (tokenizeChatArray(unformated.lorebook)), abortSignal)
                     break
                 }
                 case 'postEverything':{
-                    await tokenizeChatArray(unformated.postEverything)
+                    await raceAbort(() => (tokenizeChatArray(unformated.postEverything)), abortSignal)
                     if(usingPromptTemplate && DBState.db.promptSettings.postEndInnerFormat){
-                        await tokenizeChatArray([{
+                        await raceAbort(() => (tokenizeChatArray([{
                             role: 'system',
                             content: DBState.db.promptSettings.postEndInnerFormat
-                        }])
+                        }])), abortSignal)
                     }
                     break
                 }
@@ -804,12 +808,12 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                         content: content
                     }
 
-                    await tokenizeChatArray([prompt])
+                    await raceAbort(() => (tokenizeChatArray([prompt])), abortSignal)
                     break
                 }
                 case 'chatML':{
                     let prompts = parseChatML(card.text)
-                    await tokenizeChatArray(prompts)
+                    await raceAbort(() => (tokenizeChatArray(prompts)), abortSignal)
                     break
                 }
                 case 'chat':{
@@ -840,7 +844,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     if(usingPromptTemplate && DBState.db.promptSettings.sendChatAsSystem && (!card.chatAsOriginalOnSystem)){
                         chats = systemizeChat(chats)
                     }
-                    await tokenizeChatArray(chats)
+                    await raceAbort(() => (tokenizeChatArray(chats)), abortSignal)
                     break
                 }
                 case 'memory':{
@@ -858,7 +862,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         for(const key in unformated){
             const chats = unformated[key] as OpenAIChat[]
             for(const chat of chats){
-                currentTokens += await tokenizer.tokenizeChat(chat)
+                currentTokens += await raceAbort(() => (tokenizer.tokenizeChat(chat)), abortSignal)
             }
         }
     }
@@ -866,7 +870,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     const examples = exampleMessage(currentChar, getUserName())
 
     for(const example of examples){
-        currentTokens += await tokenizer.tokenizeChat(example)
+        currentTokens += await raceAbort(() => (tokenizer.tokenizeChat(example)), abortSignal)
     }
 
     let chats:OpenAIChat[] = examples
@@ -905,9 +909,9 @@ export async function sendChat(chatProcessIndex = -1,arg:{
 
         const chat:OpenAIChat = {
             role: 'assistant',
-            content: await (processScript(nowChatroom,
+            content: await raceAbort(() => ((processScript(nowChatroom,
                 risuChatParser(firstMsg, {chara: currentChar}),
-            'editprocess'))
+            'editprocess', {}, abortSignal))), abortSignal)
         }
 
         if(usingPromptTemplate && DBState.db.promptSettings.sendName){
@@ -915,12 +919,12 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             chat.attr = ['nameAdded']
         }
         chats.push(chat)
-        currentTokens += await tokenizer.tokenizeChat(chat)
+        currentTokens += await raceAbort(() => (tokenizer.tokenizeChat(chat)), abortSignal)
     }
     
     console.log('Prepared messages for token calculation:', ms)
 
-    const triggerResult = await runTrigger(currentChar, 'start', {chat: currentChat})
+    const triggerResult = await raceAbort(() => (runTrigger(currentChar, 'start', {chat: currentChat, signal: abortSignal})), abortSignal)
     if(triggerResult){
         currentChat = triggerResult.chat
         setCurrentChat(currentChat)
@@ -935,9 +939,9 @@ export async function sendChat(chatProcessIndex = -1,arg:{
 
     let index = 0
     for(const msg of ms){
-        let formatedChat = stripIllustrationControlNodes((await processScriptFull(nowChatroom,risuChatParser(msg.data, {chara: currentChar, role: msg.role}), 'editprocess', index, {
+        let formatedChat = stripIllustrationControlNodes((await raceAbort(() => (processScriptFull(nowChatroom,risuChatParser(msg.data, {chara: currentChar, role: msg.role}), 'editprocess', index, {
             chatRole: msg.role,
-        })).data)
+        }, abortSignal)), abortSignal)).data)
         let name = ''
         if(msg.role === 'char'){
             if(msg.saying){
@@ -980,7 +984,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         if(inlays.length > 0){
             for(const inlay of inlays){
                 const inlayName = inlay.replace('{{inlayed::', '').replace('{{inlay::', '').replace('}}', '').replace('{{inlayeddata::', '')
-                const inlayData = await getInlayAsset(inlayName)
+                const inlayData = await raceAbort(() => (getInlayAsset(inlayName)), abortSignal)
                 if(inlayData?.type === 'image'){
                     if(modelinfo.flags.includes(LLMFlags.hasImageInput) || presetVisionCapable){
                         multimodal.push({
@@ -991,7 +995,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                         })
                     }
                     else{
-                        const captionResult = await runImageEmbedding(inlayData.data) 
+                        const captionResult = await raceAbort(() => (runImageEmbedding(inlayData.data)), abortSignal) 
                         formatedChat += `[${captionResult[0].generated_text}]`
                     }
                 }
@@ -1038,7 +1042,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             })
             if(asset){
                 assetPromises.push((async () => {
-                    const assetDataBuf = await readImage(asset[1])
+                    const assetDataBuf = await raceAbort(() => (readImage(asset[1])), abortSignal)
                     multimodal.push({
                         type: "image",
                         base64: `data:image/png;base64,${Buffer.from(assetDataBuf).toString('base64')}`
@@ -1053,16 +1057,16 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     assetPromises.push((async () => {
                         // The legacy array path above matches asset_prompt names
                         // exactly; keep the manifest path at the same strictness.
-                        const resolved = await resolvePrioritizedAssetManifestNames(
+                        const resolved = await raceAbort(() => (resolvePrioritizedAssetManifestNames(
                             currentChar.additionalAssetManifest,
                             moduleManifests,
                             [p1],
                             { fuzzy: false },
-                        )
+                        )), abortSignal)
                         const path = resolved[p1.toLocaleLowerCase()]?.path
                         const source = path || (p1 === 'icon' ? currentChar.image ?? '' : '')
                         if (!source) return
-                        const assetDataBuf = await readImage(source)
+                        const assetDataBuf = await raceAbort(() => (readImage(source)), abortSignal)
                         multimodal.push({
                             type: "image",
                             base64: `data:image/png;base64,${Buffer.from(assetDataBuf).toString('base64')}`
@@ -1072,7 +1076,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             }
             return ''          
         })
-        await Promise.all(assetPromises)
+        await raceAbort(() => (Promise.all(assetPromises)), abortSignal)
 
         const chat:OpenAIChat = {
             role: role,
@@ -1086,7 +1090,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             delete chat.multimodals
         }
         chats.push(chat)
-        currentTokens += await tokenizer.tokenizeChat(chat)
+        currentTokens += await raceAbort(() => (tokenizer.tokenizeChat(chat)), abortSignal)
         index++
     }
     console.log(JSON.stringify(chats, null, 2))
@@ -1100,7 +1104,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             role: depthPrompt.role,
             content: risuChatParser(resolvePosition(depthPrompt.prompt), {chara: currentChar})
         }
-        currentTokens += await tokenizer.tokenizeChat(chat)
+        currentTokens += await raceAbort(() => (tokenizer.tokenizeChat(chat)), abortSignal)
     }
     
     if(getActiveHypaV3Preset(DBState.db, nowChatroom, currentChat)){
@@ -1109,7 +1113,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         stageTimings.stage2Start = Date.now()
         console.log("Current chat's hypaV3 Data: ", currentChat.hypaV3Data)
         chats = stripIllustrationControlNodesFromPrompt(chats)
-        const sp = await hypaMemoryV3(chats, currentTokens, maxContextTokens, currentChat, nowChatroom, tokenizer)
+        const sp = await raceAbort(() => (hypaMemoryV3(chats, currentTokens, maxContextTokens, currentChat, nowChatroom, tokenizer, abortSignal)), abortSignal)
         if(sp.error){
             // Save new summary
             if (sp.memory) {
@@ -1144,7 +1148,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 return false
             }
 
-            currentTokens -= await tokenizer.tokenizeChat(chats[0])
+            currentTokens -= await raceAbort(() => (tokenizer.tokenizeChat(chats[0])), abortSignal)
             chats.splice(0, 1)
         }
     }
@@ -1487,11 +1491,11 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     }
 
     formated = stripIllustrationControlNodesFromPrompt(formated)
-    formated = await runLuaEditTrigger(currentChar, 'editRequest', formated)
+    formated = await raceAbort(() => (runLuaEditTrigger(currentChar, 'editRequest', formated, undefined, abortSignal)), abortSignal)
     formated = stripIllustrationControlNodesFromPrompt(formated)
 
     if(DBState.db.promptInfoInsideChat && DBState.db.promptTextInfoInsideChat){
-        promptBodyformatedForChatStore = await runLuaEditTrigger(currentChar, 'editRequest', promptBodyformatedForChatStore)
+        promptBodyformatedForChatStore = await raceAbort(() => (runLuaEditTrigger(currentChar, 'editRequest', promptBodyformatedForChatStore, undefined, abortSignal)), abortSignal)
         promptInfo.promptText = promptBodyformatedForChatStore
     }
 
@@ -1499,7 +1503,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     inputTokens = 0
 
     for(const chat of formated){
-        inputTokens += await tokenizer.tokenizeChat(chat)
+        inputTokens += await raceAbort(() => (tokenizer.tokenizeChat(chat)), abortSignal)
     }
 
     if(inputTokens > maxContextTokens){
@@ -1511,7 +1515,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 return false
             }
             if(formated[pointer].removable){
-                inputTokens -= await tokenizer.tokenizeChat(formated[pointer])
+                inputTokens -= await raceAbort(() => (tokenizer.tokenizeChat(formated[pointer])), abortSignal)
                 formated[pointer].content = ''
             }
             pointer++
@@ -1612,13 +1616,13 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     const completeMainJob = createMainJobCompletion(mainJobContext)
     if (arg.continue && !arg.previewPrompt && realChatId && DBState.db.nodeOnlyServerSideRequests === true) {
         try {
-            await prepareMainJobContinuation(mainJobContext)
+            await raceAbort(() => (prepareMainJobContinuation(mainJobContext)), abortSignal)
         } catch (error) {
-            await clearPendingSend(realChatId, generationId)
+            await raceAbort(() => (clearPendingSend(realChatId, generationId)), abortSignal)
             throw error
         }
     }
-    const req = await requestChatData({
+    const req = await raceAbort(() => (requestChatData({
         formated: requestFormated,
         biasString: arg.replayRequest ? (arg.replayRequest.biasString ?? []) : biases,
         currentChar: currentChar,
@@ -1637,7 +1641,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         replayStaticModel: arg.replayRequest?.staticModel,
         replayTools: arg.replayRequest?.tools,
         generationInfo,
-    }, 'model', abortSignal)
+    }, 'model', abortSignal)), abortSignal)
 
     // Commit the staged replay snapshot only for responses that will actually
     // land in the chat — a failed attempt keeps the previous snapshot valid.
@@ -1722,7 +1726,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             while(streamAborted === false){
                 let readed: ReadableStreamReadResult<{ [key: string]: string }>
                 try {
-                    readed = await reader.read()
+                    readed = await raceAbort(() => (reader.read()), abortSignal)
                 }
                 catch(error){
                     if(abortSignal.aborted || streamAborted){
@@ -1758,14 +1762,15 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                             lastScriptDurationMs = 0
                         } else {
                             const passInput = reformatContent(prefix + result)
-                            const passPromise = processScriptFull(nowChatroom, passInput, 'editoutput', msgIndex)
+                            const passPromise = processScriptFull(nowChatroom, passInput, 'editoutput', msgIndex, {}, abortSignal)
+                            void passPromise.catch(() => {})
                             let raceTimer: ReturnType<typeof setTimeout>
                             let raced: { done: true, r: Awaited<typeof passPromise> } | { done: false }
                             try {
-                                raced = await Promise.race([
+                                raced = await raceAbort(() => (Promise.race([
                                     passPromise.then((r) => ({ done: true as const, r })),
                                     new Promise<{ done: false }>((res) => { raceTimer = setTimeout(() => res({ done: false }), STREAM_SCRIPT_BUDGET_MS) }),
-                                ])
+                                ])), abortSignal)
                             } finally {
                                 clearTimeout(raceTimer)
                             }
@@ -1805,14 +1810,17 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             abortSignal.removeEventListener('abort', abortReader)
             disarmStreamingScriptCircuit()
             // Process final pending chunk that was throttled
-            if (pendingFinalProcess && result) {
-                let result2 = await processScriptFull(nowChatroom, reformatContent(prefix + result), 'editoutput', msgIndex)
-                DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = result2.data
-                emoChanged = result2.emoChanged
+            try {
+                if (pendingFinalProcess && result && !abortSignal.aborted) {
+                    let result2 = await raceAbort(() => (processScriptFull(nowChatroom, reformatContent(prefix + result), 'editoutput', msgIndex, {}, abortSignal)), abortSignal)
+                    DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = result2.data
+                    emoChanged = result2.emoChanged
+                }
+            } finally {
+                DBState.db.characters[selectedChar].chats[selectedChat].isStreaming = false
+                DBState.db.characters[selectedChar].reloadKeys += 1
+                void reader.cancel().catch(() => {})
             }
-            DBState.db.characters[selectedChar].chats[selectedChat].isStreaming = false
-            DBState.db.characters[selectedChar].reloadKeys += 1
-            void reader.cancel().catch(() => {})
         }
 
         if(streamAborted || abortSignal.aborted){
@@ -1822,7 +1830,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
 
         DBState.db.characters[selectedChar].chats[selectedChat] = runCurrentChatFunction(DBState.db.characters[selectedChar].chats[selectedChat])
         currentChat = DBState.db.characters[selectedChar].chats[selectedChat]        
-        const triggerResult = await runTrigger(currentChar, 'output', {chat:currentChat})
+        const triggerResult = await raceAbort(() => (runTrigger(currentChar, 'output', {chat:currentChat, signal: abortSignal})), abortSignal)
         if(triggerResult && triggerResult.chat){
             currentChat = normalizeChat(triggerResult.chat)
         }
@@ -1835,11 +1843,13 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         const outputMessage = currentChat.message[inlayMessageIndex]
         terminalMessageReference = outputMessage ?? terminalMessageReference
         if(outputMessage){
-            const inlayr = runInlayScreen(currentChar, outputMessage.data)
+            const inlayr = runInlayScreen(currentChar, outputMessage.data, abortSignal)
+            void inlayr.promise?.catch(() => {})
             outputMessage.data = inlayr.text
             DBState.db.characters[selectedChar].chats[selectedChat] = currentChat
             if(inlayr.promise){
-                const t = await inlayr.promise
+                const t = await raceAbort(() => (inlayr.promise), abortSignal)
+                throwIfAborted(abortSignal)
                 currentChat = DBState.db.characters[selectedChar].chats[selectedChat]
                 const asyncInlayMessageIndex = findMessageIndexByChatId(currentChat, outputMessageId)
                 if(asyncInlayMessageIndex !== -1){
@@ -1850,9 +1860,9 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
         currentChat = DBState.db.characters[selectedChar].chats[selectedChat]
         const listenerMessageIndex = findMessageIndexByChatId(currentChat, outputMessageId)
-        await runChatOutputListeners(currentChar, currentChat, selectedChar, selectedChat, listenerMessageIndex)
+        await raceAbort(() => (runChatOutputListeners(currentChar, currentChat, selectedChar, selectedChat, listenerMessageIndex, abortSignal)), abortSignal)
         if(DBState.db.ttsAutoSpeech){
-            await sayTTS(currentChar, result)
+            await raceAbort(() => (sayTTS(currentChar, result, abortSignal)), abortSignal)
         }
     }
     else{
@@ -1866,17 +1876,19 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             let msg = msgs[i]
             let mess = msg[1]
             let msgIndex = DBState.db.characters[selectedChar].chats[selectedChat].message.length
-            let result2 = await processScriptFull(nowChatroom, reformatContent(mess), 'editoutput', msgIndex)
+            let result2 = await raceAbort(() => (processScriptFull(nowChatroom, reformatContent(mess), 'editoutput', msgIndex, {}, abortSignal)), abortSignal)
             if(i === 0 && arg.continue){
                 msgIndex -= 1
                 let beforeChat = DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex]
-                result2 = await processScriptFull(nowChatroom, reformatContent(beforeChat.data + mess), 'editoutput', msgIndex)
+                result2 = await raceAbort(() => (processScriptFull(nowChatroom, reformatContent(beforeChat.data + mess), 'editoutput', msgIndex, {}, abortSignal)), abortSignal)
             }
             if(DBState.db.removeIncompleteResponse){
                 result2.data = trimUntilPunctuation(result2.data)
             }
             result = result2.data
-            const inlayResult = runInlayScreen(currentChar, result)
+            const inlayResult = runInlayScreen(currentChar, result, abortSignal)
+            // Reroll candidates also start inlays, but only the first candidate is awaited.
+            void inlayResult.promise?.catch(() => {})
             result = inlayResult.text
             emoChanged = result2.emoChanged
             if(i === 0 && arg.continue){
@@ -1893,7 +1905,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 }
                 terminalMessageReference = DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex]
                 if(inlayResult.promise){
-                    const p = await inlayResult.promise
+                    const p = await raceAbort(() => (inlayResult.promise), abortSignal)
+                    throwIfAborted(abortSignal)
                     DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = p
                 }
                 outputMessageIndex = msgIndex
@@ -1912,7 +1925,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 const ind = DBState.db.characters[selectedChar].chats[selectedChat].message.length - 1
                 terminalMessageReference = DBState.db.characters[selectedChar].chats[selectedChat].message[ind]
                 if(inlayResult.promise){
-                    const p = await inlayResult.promise
+                    const p = await raceAbort(() => (inlayResult.promise), abortSignal)
+                    throwIfAborted(abortSignal)
                     DBState.db.characters[selectedChar].chats[selectedChat].message[ind].data = p
                 }
                 mrerolls.push(result)
@@ -1924,14 +1938,14 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             }
             DBState.db.characters[selectedChar].reloadKeys += 1
             if(DBState.db.ttsAutoSpeech){
-                await sayTTS(currentChar, result)
+                await raceAbort(() => (sayTTS(currentChar, result, abortSignal)), abortSignal)
             }
         }
 
         DBState.db.characters[selectedChar].chats[selectedChat] = runCurrentChatFunction(DBState.db.characters[selectedChar].chats[selectedChat])
         currentChat = DBState.db.characters[selectedChar].chats[selectedChat]        
 
-        const triggerResult = await runTrigger(currentChar, 'output', {chat:currentChat})
+        const triggerResult = await raceAbort(() => (runTrigger(currentChar, 'output', {chat:currentChat, signal: abortSignal})), abortSignal)
         if(triggerResult && triggerResult.chat){
             DBState.db.characters[selectedChar].chats[selectedChat] = normalizeChat(triggerResult.chat)
             // The trigger deep-clones the chat, so the pre-trigger reference is
@@ -1954,12 +1968,12 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         currentChat = DBState.db.characters[selectedChar].chats[selectedChat]
         if(outputMessageId){
             outputMessageIndex = findMessageIndexByChatId(currentChat, outputMessageId)
-            await runChatOutputListeners(currentChar, currentChat, selectedChar, selectedChat, outputMessageIndex)
+            await raceAbort(() => (runChatOutputListeners(currentChar, currentChat, selectedChar, selectedChat, outputMessageIndex, abortSignal)), abortSignal)
         }
     }
 
     let needsAutoContinue = false
-    const resultTokens = await tokenize(result) + (arg.usedContinueTokens || 0)
+    const resultTokens = await raceAbort(() => (tokenize(result)), abortSignal) + (arg.usedContinueTokens || 0)
     if(DBState.db.autoContinueMinTokens > 0 && resultTokens < DBState.db.autoContinueMinTokens){
         needsAutoContinue = true
     }
@@ -1970,26 +1984,26 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     }
 
     if(needsAutoContinue){
-        if (realChatId && !await completeMainJob() && mainJobHandles.length > 0) return false
+        if (realChatId && !await raceAbort(() => (completeMainJob()), abortSignal) && mainJobHandles.length > 0) return false
         endGeneration(genKey, { keepPendingAbort: true })
-        return await sendChat(chatProcessIndex, {
+        return await raceAbort(() => (sendChat(chatProcessIndex, {
             responseStartedAt,
             chatAdditonalTokens: arg.chatAdditonalTokens,
             continue: true,
             signal: abortSignal,
             usedContinueTokens: resultTokens,
             copilotTurnId: turnId,
-        })
+        })), abortSignal)
     }
 
     const igp = risuChatParser(DBState.db.igpPrompt ?? "")
 
     if(igp){
         const igpFormated = parseChatML(igp)
-        const rq = await requestChatData({
+        const rq = await raceAbort(() => (requestChatData({
             formated: igpFormated,
             bias: {}
-        },'emotion', abortSignal)
+        },'emotion', abortSignal)), abortSignal)
 
         DBState.db.characters[selectedChar].chats[selectedChat].message[DBState.db.characters[selectedChar].chats[selectedChat].message.length - 1].data += rq
     }
@@ -2017,13 +2031,13 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             DBState.db.characters[selectedChar].chats[selectedChat].message[lastMessageIndex].generationInfo = generationInfo
         }
         
-        if (realChatId && !await completeMainJob() && mainJobHandles.length > 0) return false
+        if (realChatId && !await raceAbort(() => (completeMainJob()), abortSignal) && mainJobHandles.length > 0) return false
         endGeneration(genKey, { keepPendingAbort: true })
-        return await sendChat(chatProcessIndex, {
+        return await raceAbort(() => (sendChat(chatProcessIndex, {
             signal: abortSignal,
             copilotTurnId: turnId,
             responseStartedAt,
-        })
+        })), abortSignal)
     }
 
     if(DBState.db.notification){
@@ -2033,17 +2047,17 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             if(!termuxNotifyUnavailable){
                 try {
                     const elapsedMs = performance.now() - responseStartedAt
-                    const response = await fetch('/api/termux-notify', {
+                    const response = await raceAbort(async () => (fetch('/api/termux-notify', {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json',
-                            'risu-auth': await forageStorage.createAuth()
+                            'risu-auth': await raceAbort(() => (forageStorage.createAuth()), abortSignal)
                         },
                         body: JSON.stringify({
                             elapsedMs,
                             character: currentChar?.name ?? ''
                         })
-                    })
+                    })), abortSignal)
 
                     if(response.status === 403 || response.status === 503){
                         termuxNotifyUnavailable = true
@@ -2057,7 +2071,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             }
 
             try {
-                const permission = await Notification.requestPermission()
+                const permission = await raceAbort(() => (Notification.requestPermission()), abortSignal)
                 if(permission === 'granted'){
                     const noti = new Notification('Risuai', {
                         body: result
@@ -2117,8 +2131,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
 
             if(DBState.db.emotionProcesser === 'embedding'){
                 const hypaProcesser = new HypaProcesser()
-                await hypaProcesser.addText(emotionList.map((v) => 'emotion:' + v))
-                let searched = (await hypaProcesser.similaritySearchScored(result)).map((v) => {
+                await raceAbort(() => (hypaProcesser.addText(emotionList.map((v) => 'emotion:' + v))), abortSignal)
+                let searched = (await raceAbort(() => (hypaProcesser.similaritySearchScored(result)), abortSignal)).map((v) => {
                     v[0] = v[0].replace("emotion:",'')
                     return v
                 })
@@ -2158,7 +2172,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 
 
                 captureIllustrationRootTurn()
-                if (realChatId) await completeMainJob()
+                if (realChatId) await raceAbort(() => (completeMainJob()), abortSignal)
                 return true
             }
 
@@ -2173,7 +2187,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             let emobias:{[key:number]:number} = {}
 
             for(const emo of emotionList){
-                const tokens = await tokenizeNum(emo)
+                const tokens = await raceAbort(() => (tokenizeNum(emo)), abortSignal)
                 for(const token of tokens){
                     emobias[token] = 10
                 }
@@ -2182,7 +2196,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             for(let i =0;i<tempEmotion.length;i++){
                 const emo = tempEmotion[i]
 
-                const tokens = await tokenizeNum(emo[0])
+                const tokens = await raceAbort(() => (tokenizeNum(emo[0])), abortSignal)
                 const modifier = 20 - ((tempEmotion.length - (i + 1)) * (20/4))
 
                 for(const token of tokens){
@@ -2212,15 +2226,15 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 },
             ]
 
-            const rq = await requestChatData({
+            const rq = await raceAbort(() => (requestChatData({
                 formated: promptbody,
                 bias: emobias,
                 currentChar: currentChar,
                 maxTokens: 30,
-            }, 'emotion', abortSignal)
+            }, 'emotion', abortSignal)), abortSignal)
 
             if(rq.type === 'fail'){
-                if (realChatId) await completeMainJob()
+                if (realChatId) await raceAbort(() => (completeMainJob()), abortSignal)
                 if(abortSignal.aborted){
                     captureIllustrationRootTurn()
                     return true
@@ -2230,7 +2244,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 return true
             }
             if(rq.type === 'streaming' || rq.type === 'multiline'){
-                if (realChatId) await completeMainJob()
+                if (realChatId) await raceAbort(() => (completeMainJob()), abortSignal)
                 if(abortSignal.aborted){
                     captureIllustrationRootTurn()
                     return true
@@ -2279,13 +2293,13 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 } catch (error) {
                     throwError(language.errors.httpError + `${error}`)
                     captureIllustrationRootTurn()
-                    if (realChatId) await completeMainJob()
+                    if (realChatId) await raceAbort(() => (completeMainJob()), abortSignal)
                     return true
                 }
             }
             
             captureIllustrationRootTurn()
-            if (realChatId) await completeMainJob()
+            if (realChatId) await raceAbort(() => (completeMainJob()), abortSignal)
             return true
 
 
@@ -2304,7 +2318,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             }
 
 
-            await stableDiff(currentChar, msgStr)
+            await raceAbort(() => (stableDiff(currentChar, msgStr, abortSignal)), abortSignal)
         }
     }
 
@@ -2323,9 +2337,16 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     }
 
     captureIllustrationRootTurn()
-    if (realChatId) await completeMainJob()
+    if (realChatId) await raceAbort(() => (completeMainJob()), abortSignal)
     return true
+    } catch (error) {
+        if (!abortSignal.aborted) throw error
+        return false
     } finally {
+        if (abortSignal.aborted) {
+            endGeneration(genKey)
+            if (realChatId) void clearPendingSend(realChatId, generationId)
+        }
         if (getCurrentTurnId() === turnId) setCurrentTurnId(null)
     }
 }

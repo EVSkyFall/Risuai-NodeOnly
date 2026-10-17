@@ -1,3 +1,4 @@
+import { throwIfAborted } from "../abort";
 import { getCurrentCharacter } from "../../storage/database.svelte";
 import { NodeStorage } from "../../storage/nodeStorage";
 
@@ -22,9 +23,10 @@ class NodeInlayMetaStorage {
         return `${INLAY_META_PREFIX}${id}`
     }
 
-    async setItem(id: string, meta: InlayAssetMeta): Promise<void> {
+    async setItem(id: string, meta: InlayAssetMeta, signal?: AbortSignal): Promise<void> {
         const bytes = new TextEncoder().encode(JSON.stringify(meta))
-        await this.nodeStorage.setItem(this.serverKey(id), bytes)
+        throwIfAborted(signal)
+        await this.nodeStorage.setItem(this.serverKey(id), bytes, undefined, signal)
     }
 
     async getItem(id: string): Promise<InlayAssetMeta | null> {
@@ -88,8 +90,8 @@ function getStorage(): NodeInlayMetaStorage {
     return _storage
 }
 
-export async function setInlayMeta(id: string, meta: InlayAssetMeta): Promise<void> {
-    await getStorage().setItem(id, meta)
+export async function setInlayMeta(id: string, meta: InlayAssetMeta, signal?: AbortSignal): Promise<void> {
+    await getStorage().setItem(id, meta, signal)
 }
 
 export async function removeInlayMeta(id: string): Promise<void> {

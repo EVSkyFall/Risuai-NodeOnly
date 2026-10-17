@@ -1,10 +1,11 @@
+import { raceAbort, throwIfAborted } from "./abort";
 import { InlayImageWriteError, writeInlayImage } from "./files/inlays";
 import type { character } from "../storage/database.svelte";
 import { generateAIImage } from "./stableDiff";
 
 const imggenRegex = [/<ImgGen="(.+?)">/gi, /{{ImgGen="(.+?)"}}/gi] as const
 
-export function runInlayScreen(char:character, data:string):{text:string, promise?:Promise<string>} {
+export function runInlayScreen(char:character, data:string, signal?: AbortSignal):{text:string, promise?:Promise<string>} {
     if(char.inlayViewScreen){      
         if(char.viewScreen === 'emotion'){
             return {text: data.replace(/<Emotion="(.+?)">/gi, '{{emotion::$1}}')}
@@ -19,16 +20,17 @@ export function runInlayScreen(char:character, data:string):{text:string, promis
                         data.replace(regex, (match, p1) => {
                             const prompt = char.newGenData.prompt.replaceAll('{{slot}}', p1)
                             promises.push((async () => {
-                                const v = await generateAIImage(prompt, char, neg, 'inlay')
+                                const v = await raceAbort(() => (generateAIImage(prompt, char, neg, 'inlay', 'interactive', signal)), signal)
                                 if(!v){
                                     return ''
                                 }
                                 const imgHTML = new Image()
                                 imgHTML.src = v
                                 try {
-                                    const inlay = await writeInlayImage(imgHTML)
+                                    const inlay = await raceAbort(() => (writeInlayImage(imgHTML, { signal })), signal)
                                     return `{{inlay::${inlay}}}`
                                 } catch (error) {
+                                    throwIfAborted(signal)
                                     if (error instanceof InlayImageWriteError) {
                                         console.warn('Failed to decode generated inlay image:', error)
                                         return ''
@@ -38,7 +40,7 @@ export function runInlayScreen(char:character, data:string):{text:string, promis
                             })())
                             return match
                         })
-                        const d = await Promise.all(promises)
+                        const d = await raceAbort(() => (Promise.all(promises)), signal)
                         data = data.replace(regex, () => {
                             const result = d.shift()
                             if(result === false){

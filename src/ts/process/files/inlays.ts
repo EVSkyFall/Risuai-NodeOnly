@@ -1,3 +1,4 @@
+import { throwIfAborted } from "../abort";
 import { v4 } from "uuid";
 import { getImageType } from "src/ts/media";
 import { getDatabase } from "../../storage/database.svelte";
@@ -63,6 +64,7 @@ export type CharacterChatIndexItem = {
 }
 
 export type InlayImageWriteOptions = {
+    signal?: AbortSignal
     name?: string
     ext?: string
     id?: string
@@ -262,9 +264,12 @@ class NodeInlayStorage {
         }
     }
 
-    async setItem(id: string, asset: InlayAsset): Promise<void> {
+    async setItem(id: string, asset: InlayAsset, signal?: AbortSignal): Promise<void> {
+        throwIfAborted(signal)
         const bytes = await this.serializeAsset(asset)
-        await this.nodeStorage.setItem(this.serverKey(id), bytes)
+        throwIfAborted(signal)
+        await this.nodeStorage.setItem(this.serverKey(id), bytes, undefined, signal)
+        throwIfAborted(signal)
         lruSet(id, toCoreInlayAsset(asset))
     }
 
@@ -334,9 +339,10 @@ class NodeInlayInfoStorage {
         return `${INLAY_INFO_PREFIX}${id}`
     }
 
-    async setItem(id: string, info: InlayExplorerInfo): Promise<void> {
+    async setItem(id: string, info: InlayExplorerInfo, signal?: AbortSignal): Promise<void> {
         const bytes = new TextEncoder().encode(JSON.stringify(info))
-        await this.nodeStorage.setItem(this.serverKey(id), bytes)
+        throwIfAborted(signal)
+        await this.nodeStorage.setItem(this.serverKey(id), bytes, undefined, signal)
     }
 
     async getItem<T>(id: string): Promise<T | null> {
@@ -547,6 +553,7 @@ export async function postInlayAsset(img: { name: string, data: Uint8Array }) {
 }
 
 export async function writeInlayImage(imgObj: HTMLImageElement, arg: InlayImageWriteOptions = {}) {
+    throwIfAborted(arg.signal)
     let drawHeight = 0
     let drawWidth = 0
     const canvas = document.createElement('canvas')
@@ -635,6 +642,7 @@ export async function writeInlayImage(imgObj: HTMLImageElement, arg: InlayImageW
             }
         }
     })
+    throwIfAborted(arg.signal)
     const db = getDatabase()
     const [mimeType, ext, quality]: [string, string, number?] = db.inlayImageLossless
         ? ['image/png', 'png', undefined]
@@ -659,11 +667,13 @@ export async function writeInlayImage(imgObj: HTMLImageElement, arg: InlayImageW
             ))
         }
     })
+    throwIfAborted(arg.signal)
     const imgid = arg.id ?? v4()
     await setInlayAsset(
         imgid,
         { name: arg.name ?? imgid, data: imageBlob, ext, height: drawHeight, width: drawWidth, type: 'image' },
         arg.target,
+        arg.signal,
     )
     return `${imgid}`
 }
@@ -823,12 +833,17 @@ export async function listInlayExplorerItems(forceRefresh = false): Promise<Inla
     return items
 }
 
-export async function setInlayAsset(id: string, img: InlayAsset, target?: InlayTarget) {
+export async function setInlayAsset(id: string, img: InlayAsset, target?: InlayTarget, signal?: AbortSignal) {
+    throwIfAborted(signal)
     const existingMeta = await getInlayMeta(id)
+    throwIfAborted(signal)
     const nextMeta = buildInlayMeta(existingMeta, target)
-    await getInlayStorage().setItem(id, toCoreInlayAsset(img))
-    await getInlayInfoStorage().setItem(id, buildInlayExplorerInfo(toCoreInlayAsset(img)))
-    await setInlayMeta(id, nextMeta)
+    await getInlayStorage().setItem(id, toCoreInlayAsset(img), signal)
+    throwIfAborted(signal)
+    await getInlayInfoStorage().setItem(id, buildInlayExplorerInfo(toCoreInlayAsset(img)), signal)
+    throwIfAborted(signal)
+    await setInlayMeta(id, nextMeta, signal)
+    throwIfAborted(signal)
     _explorerItemsCache = null // invalidate gallery cache
 }
 

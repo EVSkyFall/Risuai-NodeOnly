@@ -109,7 +109,7 @@ export interface OnnxModelFiles {
     name?: string
 }
 
-export const runVITS = async (text: string, modelData: string | OnnxModelFiles = 'Xenova/mms-tts-eng') => {
+export const runVITS = async (text: string, modelData: string | OnnxModelFiles = 'Xenova/mms-tts-eng', signal?: AbortSignal) => {
     await initTransformers()
     const { WaveFile } = await import('wavefile')
     const { pipeline, env } = await import('@huggingface/transformers');
@@ -135,11 +135,14 @@ export const runVITS = async (text: string, modelData: string | OnnxModelFiles =
             synthesizer = await pipeline<"text-to-speech">('text-to-speech', modelData.id);
         }
     }
+    if (signal?.aborted) return
     let out = await synthesizer(text, {});
+    if (signal?.aborted) return
     const wav = new WaveFile();
     wav.fromScratch(1, out.sampling_rate, '32f', out.audio);
     const audioContext = new AudioContext();
     audioContext.decodeAudioData(asBuffer(wav.toBuffer().buffer), (decodedData) => {
+        if (signal?.aborted) return
         const sourceNode = audioContext.createBufferSource();
         sourceNode.buffer = decodedData;
         sourceNode.connect(audioContext.destination);

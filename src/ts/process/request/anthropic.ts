@@ -1,3 +1,4 @@
+import { raceAbort, throwIfAborted } from "../abort";
 import { Sha256 } from "@aws-crypto/sha256-js"
 import { HttpRequest } from "@smithy/protocol-http"
 import { SignatureV4 } from "@smithy/signature-v4"
@@ -326,6 +327,7 @@ export async function requestClaude(arg:RequestDataArgumentExtended):Promise<req
                             return ''
                         }
                     } catch (error) {
+                        throwIfAborted(arg.abortSignal)
                         
                     }
 
@@ -661,6 +663,7 @@ export async function requestClaude(arg:RequestDataArgumentExtended):Promise<req
             // find the slot if the tab closes mid-batch (DB-mutation fallback).
             arg.additionalBatchId = batchId
             const abortSignal = arg.abortSignal
+            let cleanupAbort = () => {}
             return {
                 type: 'streaming',
                 result: new ReadableStream<StreamResponseChunk>({
@@ -669,19 +672,22 @@ export async function requestClaude(arg:RequestDataArgumentExtended):Promise<req
                         // sendChat shows the message as "generating" the whole time;
                         // when complete the tracker enqueues+closes through us, so
                         // the on-output trigger pipeline runs natively in-place.
-                        registerBatchStream(batchId, controller)
+                        registerBatchStream(batchId, controller, () => cleanupAbort())
                         // Show a notice while waiting (ReadableStream chunks are
                         // treated as full text replacement by sendChat — the final
                         // result will overwrite this placeholder).
                         const placeholder = `[배치 처리 중 — ID ${batchId.substring(0, 18)}\u2026 ⏳]\n` +
                             `[Anthropic Batches API. 응답 도착 시 자동 갱신됩니다. 탭을 닫아도 결과는 저장됩니다.]`
-                        try { controller.enqueue({ "0": placeholder }) } catch {}
+                        try { controller.enqueue({ "0": placeholder }) } catch {
+                            throwIfAborted(arg.abortSignal)}
                         if (abortSignal) {
                             const onAbort = () => {
+                                cleanupAbort()
                                 unregisterBatchStream(batchId)
                                 cancelClaudeBatch(batchId).catch(() => {})
                                 try { controller.close() } catch {}
                             }
+                            cleanupAbort = () => abortSignal.removeEventListener('abort', onAbort)
                             if (abortSignal.aborted) onAbort()
                             else abortSignal.addEventListener('abort', onAbort, { once: true })
                         }
@@ -690,11 +696,13 @@ export async function requestClaude(arg:RequestDataArgumentExtended):Promise<req
                         // Reader was cancelled (eg navigation); leave the batch
                         // in the persistent tracker so it can be applied via DB
                         // mutation when results arrive.
+                        cleanupAbort()
                         unregisterBatchStream(batchId)
                     }
                 }),
             }
         } catch (e: any) {
+            throwIfAborted(arg.abortSignal)
             return {
                 type: 'fail',
                 result: e?.message || 'Batch submission failed',
@@ -770,6 +778,7 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
                     interceptor: 'anthropic_streaming'
                 })
             } catch(fetchErr: any) {
+                throwIfAborted(arg.abortSignal)
                 // Network error (ERR_INCOMPLETE_CHUNKED_ENCODING, TypeError: network error, etc.)
                 console.warn(`[Anthropic Stream] Fetch error on attempt ${attempt + 1}/${STREAM_MAX_RETRIES}: ${fetchErr?.message || fetchErr}`)
                 lastErrText = fetchErr?.message || 'network error'
@@ -900,7 +909,8 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
                         if(parsedData?.type === 'content_block_stop'){
                             if(currentToolBlock?.type === 'tool_use'){
                                 const rawJson = currentToolBlock._inputJson || '{}'
-                                try { currentToolBlock.input = JSON.parse(rawJson) } catch { currentToolBlock.input = {} }
+                                try { currentToolBlock.input = JSON.parse(rawJson) } catch {
+                                    throwIfAborted(arg.abortSignal); currentToolBlock.input = {} }
                                 delete currentToolBlock._inputJson
                                 streamToolUseBlocks.push(currentToolBlock)
                                 console.warn(`%c[Tool Input] ${currentToolBlock.name}`, 'color: #81c784; font-weight: bold', currentToolBlock.input)
@@ -927,6 +937,7 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
 
                     }
                     catch (error) {
+                        throwIfAborted(arg.abortSignal)
                     }
 
 
@@ -999,13 +1010,15 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
                         })
 
                     } catch (error) {
+                        throwIfAborted(arg.abortSignal)
                         if(arg?.abortSignal?.aborted) break
 
                         // Preserve completed tool_use blocks — execute them and let Claude continue
                         if(streamToolUseBlocks.length > 0){
                             console.warn(`[Anthropic Stream] Connection lost (${error?.message || ''}), but ${streamToolUseBlocks.length} tool(s) completed — proceeding with tool execution as if stop_reason=tool_use`)
                             streamStopReason = 'tool_use'
-                            try { reader.cancel() } catch {}
+                            try { reader.cancel() } catch {
+                                throwIfAborted(arg.abortSignal)}
                             break
                         }
 
@@ -1027,7 +1040,8 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
 
                         if(hasContent){
                             console.warn(`[Anthropic Stream] Connection lost (${error?.message || ''}), attempting continuation-style retry: ${text.length} chars + ${completedBlocks.length} blocks preserved, ${streamRetryCount}/${STREAM_MID_RETRY_MAX} in ${waitMs}ms`)
-                            try { reader.cancel() } catch {}
+                            try { reader.cancel() } catch {
+                                throwIfAborted(arg.abortSignal)}
                             await sleep(waitMs)
                             // Build proper multi-turn: assistant with partial content + user "continue" instruction
                             // This avoids prefill (which Copilot rejects) and uses valid Anthropic multi-turn structure
@@ -1068,15 +1082,18 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
                                     continue
                                 }
                                 console.warn(`[Anthropic Stream] Continuation retry got ${retryRes.status} — falling back to full retry`)
-                                try { await textifyReadableStream(retryRes.body) } catch {}
+                                try { await textifyReadableStream(retryRes.body) } catch {
+                                    throwIfAborted(arg.abortSignal)}
                             } catch(contErr) {
+                                throwIfAborted(arg.abortSignal)
                                 console.warn(`[Anthropic Stream] Continuation retry error: ${contErr?.message || contErr} — falling back to full retry`)
                             }
                         }
 
                         // Full retry fallback
                         console.warn(`[Anthropic Stream] Full retry ${streamRetryCount}/${STREAM_MID_RETRY_MAX} in ${waitMs}ms (had ${text.length} chars, 0 completed tools)`)
-                        try { reader.cancel() } catch {}
+                        try { reader.cancel() } catch {
+                            throwIfAborted(arg.abortSignal)}
                         text = ''
                         parserData = ''
                         prevText = ''
@@ -1102,8 +1119,10 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
                                 continue
                             }
                             console.warn(`[Anthropic Stream] Retry got ${retryRes.status}`)
-                            try { await textifyReadableStream(retryRes.body) } catch {}
+                            try { await textifyReadableStream(retryRes.body) } catch {
+                                throwIfAborted(arg.abortSignal)}
                         } catch(retryErr) {
+                            throwIfAborted(arg.abortSignal)
                             console.warn(`[Anthropic Stream] Retry fetch error: ${retryErr?.message || retryErr}`)
                         }
                     }
@@ -1117,7 +1136,8 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
 
                 if(currentToolBlock?.type === 'tool_use'){
                     const rawJson = currentToolBlock._inputJson || '{}'
-                    try { currentToolBlock.input = JSON.parse(rawJson) } catch { currentToolBlock.input = {} }
+                    try { currentToolBlock.input = JSON.parse(rawJson) } catch {
+                        throwIfAborted(arg.abortSignal); currentToolBlock.input = {} }
                     delete currentToolBlock._inputJson
                     streamToolUseBlocks.push(currentToolBlock)
                     console.warn(`[Anthropic Stream] Rescued incomplete tool_use: ${currentToolBlock.name}`, currentToolBlock.input)
@@ -1141,7 +1161,7 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
                     for(const toolBlock of streamToolUseBlocks){
                         console.warn(`%c[Tool Exec] ${toolBlock.name}`, 'color: #ffb74d; font-weight: bold', 'Starting...')
                         const execStart = performance.now()
-                        const used = await callTool(toolBlock.name, toolBlock.input)
+                        const used = await callTool(toolBlock.name, toolBlock.input, arg.abortSignal)
                         const r: Claude3ToolResponseBlock = {
                             type: 'tool_result',
                             tool_use_id: toolBlock.id,
@@ -1193,6 +1213,7 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
                                         controller.enqueue({ "0": text + contText })
                                     }
                                 } catch(readErr) {
+                                    throwIfAborted(arg.abortSignal)
                                     console.warn(`[Tool Continuation] Stream read error on attempt ${toolContAttempt + 1}: ${readErr?.message || readErr}`)
                                     contBroken = true
                                 }
@@ -1213,6 +1234,7 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
                                 console.warn(`[Tool Continuation] Attempt ${toolContAttempt + 1}/${TOOL_CONT_MAX_RETRIES} failed: ${String(errMsg).substring(0, 100)}`)
                             }
                         } catch(e: any) {
+                            throwIfAborted(arg.abortSignal)
                             console.warn(`[Tool Continuation] Attempt ${toolContAttempt + 1}/${TOOL_CONT_MAX_RETRIES} error: ${e?.message || e}`)
                         }
                         if(toolContAttempt < TOOL_CONT_MAX_RETRIES - 1){
@@ -1328,7 +1350,7 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
             }
 
             if(content.type === 'tool_use'){
-                const used = await callTool(content.name, content.input)
+                const used = await callTool(content.name, content.input, arg.abortSignal)
                 const r:Claude3ToolResponseBlock = {
                     type: 'tool_result',
                     tool_use_id: content.id,

@@ -89,3 +89,19 @@ describe('runHookPipeline', () => {
         expect(result.ctx.text).toBe('hello S');
     });
 });
+
+
+it('Stop releases a pending TTS hook and skips later hooks', async () => {
+    const controller = new AbortController()
+    let resolve!: (value: BeforeTTSResult) => void
+    const next = vi.fn()
+    const pending = runHookPipeline<BeforeTTSContext, BeforeTTSResult>([
+        () => new Promise(r => { resolve = r }), next,
+    ], makeCtx(), undefined, controller.signal)
+    for (let i = 0; i < 10; i++) await Promise.resolve()
+    controller.abort()
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+    resolve({ text: 'late audio text' })
+    for (let i = 0; i < 10; i++) await Promise.resolve()
+    expect(next).not.toHaveBeenCalled()
+})

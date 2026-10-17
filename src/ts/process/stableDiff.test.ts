@@ -742,7 +742,61 @@ describe('generateAIImage Comfy polling', () => {
         }
     })
 
-    it('keeps a retiring in-flight poller shared when another job subscribes', async () => {
+    it('Stop releases a shared queue wait without cancelling the other subscriber', async () => {
+        vi.useFakeTimers()
+        try {
+            const controller = new AbortController()
+            const queueResponse = deferred<ReturnType<typeof jsonResponse>>()
+            const emptyQueue = { queue_pending: [], queue_running: [] }
+            let queueSignal: AbortSignal | undefined
+            let promptIndex = 0
+            const historyIds: string[] = []
+            mocks.db = makeComfyUiDatabase()
+            mocks.globalFetch.mockImplementation(async () => ({
+                ok: true,
+                data: { prompt_id: ['stopped-job', 'surviving-job'][promptIndex++] },
+            }))
+            mocks.fetchNative.mockImplementation((url: string, options: { signal?: AbortSignal }) => {
+                if (url.endsWith('/queue')) {
+                    queueSignal = options.signal
+                    return queueResponse.promise
+                }
+                if (url.includes('/history/')) {
+                    const id = decodeURIComponent(new URL(url).pathname.split('/').pop() ?? '')
+                    historyIds.push(id)
+                    return Promise.resolve(jsonResponse(id === 'stopped-job' ? {} : completedComfyHistory(id)))
+                }
+                if (url.includes('/view?')) return Promise.resolve(imageResponse())
+                throw new Error(`Unexpected URL: ${url}`)
+            })
+            const stopped = generateAIImageTyped(
+                'prompt', currentChar, 'negative', 'inlay', 'interactive', { signal: controller.signal },
+            )
+            const aborted = expect(stopped).rejects.toMatchObject({ name: 'AbortError' })
+            await vi.advanceTimersByTimeAsync(0)
+            const survivor = generateAIImageTyped(
+                'prompt', currentChar, 'negative', 'inlay', 'interactive', {},
+            )
+            await vi.advanceTimersByTimeAsync(0)
+            controller.abort()
+            await aborted
+            expect(queueSignal?.aborted).toBe(false)
+            expect(historyIds).toEqual(['stopped-job'])
+            queueResponse.resolve(jsonResponse(emptyQueue))
+            await vi.advanceTimersByTimeAsync(1500)
+            expect((await survivor).result.ok).toBe(true)
+            expect(historyIds).toEqual(['stopped-job', 'surviving-job'])
+            expect(mocks.charEmotionSet).not.toHaveBeenCalled()
+            expect(mocks.alertError).not.toHaveBeenCalled()
+            expect(mocks.notifyError).not.toHaveBeenCalled()
+        } finally {
+            resetComfyPollersForTest()
+            vi.useRealTimers()
+        }
+    })
+
+    it.each([false, true])('keeps a retiring in-flight poller shared when another job subscribes (signal: %s)', async withSignal => {
+        const options = withSignal ? { signal: new AbortController().signal } : {}
         vi.useFakeTimers()
         try {
             const promptIds = ['retiring-job', 'replacement-job']
@@ -785,7 +839,7 @@ describe('generateAIImage Comfy polling', () => {
             })
 
             const retiringResult = generateAIImageTyped(
-                'prompt', currentChar, 'negative', 'inlay', 'interactive', {},
+                'prompt', currentChar, 'negative', 'inlay', 'interactive', options,
             )
             await vi.advanceTimersByTimeAsync(0)
             await vi.advanceTimersByTimeAsync(1500)
@@ -797,7 +851,7 @@ describe('generateAIImage Comfy polling', () => {
             expect((await retiringResult).result.ok).toBe(true)
 
             const replacementResult = generateAIImageTyped(
-                'prompt', currentChar, 'negative', 'inlay', 'interactive', {},
+                'prompt', currentChar, 'negative', 'inlay', 'interactive', options,
             )
             await Promise.resolve()
             expect(queueCalls).toBe(2)

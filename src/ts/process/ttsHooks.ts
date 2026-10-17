@@ -1,3 +1,4 @@
+import { raceAbort, throwIfAborted } from "./abort";
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 export interface BeforeTTSContext {
@@ -62,6 +63,7 @@ export async function runHookPipeline<Ctx extends object, Res extends { skip?: b
     hooks: ReadonlyArray<TTSHookFn<Ctx, Res>>,
     ctx: Ctx,
     timeoutMs?: number,
+    signal?: AbortSignal,
 ): Promise<{ ctx: Ctx; skip: boolean }> {
     const TIMEOUT = Symbol('TIMEOUT');
     let current: Ctx = { ...ctx };
@@ -69,16 +71,18 @@ export async function runHookPipeline<Ctx extends object, Res extends { skip?: b
     for (const hook of hooks) {
         let result: Res | void | typeof TIMEOUT;
         try {
-            const hookPromise = Promise.resolve().then(() => hook(current));
+            const hookPromise = raceAbort(() => hook(current), signal);
+            void hookPromise.catch(() => {});
             if (timeoutMs !== undefined && timeoutMs > 0) {
-                result = await Promise.race<Res | void | typeof TIMEOUT>([
+                result = await raceAbort(() => (Promise.race<Res | void | typeof TIMEOUT>([
                     hookPromise,
                     sleep(timeoutMs).then(() => TIMEOUT),
-                ]);
+                ])), signal);
             } else {
-                result = await hookPromise;
+                result = await raceAbort(() => (hookPromise), signal);
             }
         } catch (err) {
+            throwIfAborted(signal)
             console.error('[TTS hook] threw, continuing with next hook:', err);
             continue;
         }

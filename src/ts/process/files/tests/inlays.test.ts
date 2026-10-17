@@ -1,6 +1,7 @@
 import fc from 'fast-check'
 import { beforeEach, describe, expect, test, vi } from 'vitest'
 import type { InlayAsset } from '../inlays'
+import { NodeStorage } from '../../../storage/nodeStorage'
 import {
     getInlayAsset,
     getInlayAssetBlob,
@@ -140,6 +141,62 @@ beforeEach(() => {
     getCurrentCharacterMock.mockReturnValue(null)
     getDatabaseMock.mockReturnValue({ characters: [] })
     __resetInlayStorageForTest()
+})
+
+
+test.each(['metadata', 'serialization'])('Stop during inlay %s writes no asset, info or metadata', async phase => {
+    const controller = new AbortController()
+    let release!: () => void
+    let entered!: () => void
+    const started = new Promise<void>(resolve => { entered = resolve })
+    const write = vi.spyOn(NodeStorage.prototype, 'setItem')
+    const lookup = phase === 'metadata'
+        ? vi.spyOn(NodeStorage.prototype, 'getItem').mockImplementationOnce(() => new Promise(resolve => {
+            release = () => resolve(null)
+            entered()
+        }))
+        : undefined
+    const serialize = phase === 'serialization'
+        ? vi.spyOn(FileReader.prototype, 'readAsDataURL').mockImplementationOnce(function (this: FileReader) {
+            release = () => {
+                Object.defineProperty(this, 'result', { value: 'data:image/png;base64,eA==' })
+                this.onloadend!(new ProgressEvent('loadend') as ProgressEvent<FileReader>)
+            }
+            entered()
+        })
+        : undefined
+    try {
+        const pending = writeInlayImage(makeImage(1, 1), { signal: controller.signal })
+        const rejected = expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+        await started
+        controller.abort()
+        expect(write).not.toHaveBeenCalled()
+        release()
+        await rejected
+        expect(write).not.toHaveBeenCalled()
+        expect(nodeStorageMap.size).toBe(0)
+    } finally {
+        lookup?.mockRestore()
+        serialize?.mockRestore()
+        write.mockRestore()
+    }
+})
+
+test.each(['inlay/', 'inlay_info/'])('Stop after %s write skips all subsequent writes', async prefix => {
+    const controller = new AbortController()
+    const original = NodeStorage.prototype.setItem
+    const write = vi.spyOn(NodeStorage.prototype, 'setItem').mockImplementation(async function (this: NodeStorage, key, value) {
+        await original.call(this, key, value)
+        if (key.startsWith(prefix)) controller.abort()
+    })
+    try {
+        await expect(writeInlayImage(makeImage(1, 1), { signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' })
+        expect([...nodeStorageMap.keys()].map(key => key.split('/')[0])).toEqual(
+            prefix === 'inlay/' ? ['inlay'] : ['inlay', 'inlay_info'],
+        )
+    } finally {
+        write.mockRestore()
+    }
 })
 
 describe('setInlayAsset', () => {
@@ -992,4 +1049,25 @@ describe('set -> remove -> get', () => {
             }),
         )
     })
+})
+
+
+test.each(['decode', 'encode'])('Stop during inlay %s prevents storage writes', async phase => {
+    const controller = new AbortController()
+    const image = phase === 'decode' ? makePendingImage() : makeImage(1, 1)
+    let encode!: BlobCallback
+    const toBlob = vi.fn((cb: BlobCallback) => { encode = cb })
+    const canvas = origCreateElement('canvas')
+    canvas.getContext = (() => fakeCtx) as any
+    canvas.toBlob = toBlob as any
+    vi.mocked(document.createElement).mockReturnValueOnce(canvas)
+    const pending = writeInlayImage(image, { signal: controller.signal })
+    const rejected = expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+    await Promise.resolve()
+    controller.abort()
+    if (phase === 'decode') image.dispatchEvent(new Event('load'))
+    else encode(new Blob(['late image']))
+    await rejected
+    if (phase === 'decode') expect(toBlob).not.toHaveBeenCalled()
+    expect(nodeStorageMap.size).toBe(0)
 })

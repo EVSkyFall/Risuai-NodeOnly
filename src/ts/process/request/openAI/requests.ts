@@ -1,3 +1,4 @@
+import { raceAbort, throwIfAborted } from "../../abort";
 import { language } from "src/lang"
 import { notifyError } from "src/ts/alert";
 import { getDatabase } from "src/ts/storage/database.svelte"
@@ -476,6 +477,7 @@ export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<req
                     result: msg.content ?? ''
                 }
             } catch (error) {
+                throwIfAborted(arg.abortSignal)
                 return {
                     type: 'fail',
                     result: (language.errors.httpError + `${JSON.stringify(dat)}`)
@@ -744,6 +746,7 @@ export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<req
             arg.additionalBatchId = batchId
             return { type: 'streaming', result: placeholderStream }
         } catch (e: any) {
+            throwIfAborted(arg.abortSignal)
             return { type: 'fail', result: e?.message || 'OpenAI Batch submission failed' }
         }
     }
@@ -932,7 +935,7 @@ async function requestHTTPOpenAI(replacerURL:string,body:any, headers:Record<str
                             }
                             else{
                                 const parsed = functionArgs
-                                const x = (await callTool(tool.name, parsed)).filter(m => m.type === 'text')
+                                const x = (await callTool(tool.name, parsed, arg.abortSignal)).filter(m => m.type === 'text')
                                 if(x.length > 0){
                                     messages.push({
                                         role: 'tool',
@@ -960,6 +963,7 @@ async function requestHTTPOpenAI(replacerURL:string,body:any, headers:Record<str
                             }
                         }
                     } catch (error) {
+                        throwIfAborted(arg.abortSignal)
                         messages.push({
                             role: 'tool',
                             content: 'Tool call failed with error: ' + error,
@@ -1032,7 +1036,8 @@ async function requestHTTPOpenAI(replacerURL:string,body:any, headers:Record<str
                 result: result
             }
             
-        } catch (error) {                    
+        } catch (error) {
+            throwIfAborted(arg.abortSignal);                    
             return {
                 type: 'fail',
                 result: (language.errors.httpError + `${JSON.stringify(dat)}`)
@@ -1497,7 +1502,7 @@ function wrapToolStream(
                                     }
                                     else{
                                         const parsed = functionArgs
-                                        const x = (await callTool(tool.name, parsed)).filter(m => m.type === 'text')
+                                        const x = (await callTool(tool.name, parsed, arg.abortSignal)).filter(m => m.type === 'text')
                                         if(x.length > 0){
                                             messages.push({
                                                 role: 'tool',
@@ -1525,6 +1530,7 @@ function wrapToolStream(
                                     }
                                 }
                             } catch (error) {
+                                throwIfAborted(arg.abortSignal)
                                 messages.push({
                                     role: 'tool',
                                     content: 'Tool call failed with error: ' + error,

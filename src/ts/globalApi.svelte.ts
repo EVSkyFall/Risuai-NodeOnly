@@ -1,3 +1,4 @@
+import { raceAbort, throwIfAborted } from "./process/abort";
 import { changeFullscreen, checkNullish, sleep } from "./util"
 import { v4 as uuidv4 } from 'uuid';
 import { tick } from "svelte";
@@ -1487,9 +1488,10 @@ export async function globalFetch(url: string, arg: GlobalFetchArgs = {}): Promi
         if(arg.interceptor){
             for (const interceptor of bodyIntercepterStore) {
                 try {
-                    arg.body = await interceptor.callback(arg.body, arg.interceptor) || arg.body
+                    arg.body = await raceAbort(() => interceptor.callback(arg.body, arg.interceptor), arg.abortSignal) || arg.body
                 }
                 catch (e) {
+                    throwIfAborted(arg.abortSignal)
                     console.error(e)
                 }
             }
@@ -2371,9 +2373,10 @@ async function fetchNativeRaw(url: string, arg: FetchNativeArgs, hooks?: {
         if(useInterceptor) {
             for (const interceptor of bodyIntercepterStore) {
                 try {
-                    body = await interceptor.callback(body, arg.interceptor) || body
+                    body = await raceAbort(() => interceptor.callback(body, arg.interceptor), arg.signal) || body
                 }
                 catch (e) {
+                    throwIfAborted(arg.signal)
                     console.error(e)
                 }
             }

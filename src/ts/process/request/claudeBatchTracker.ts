@@ -194,6 +194,7 @@ async function applyResultToMessage(batchId: string, text: string): Promise<void
             return
         } catch (_e) {
             activeStreams.delete(batchId)
+            try { subscriber.cleanup?.() } catch {}
             // Controller closed/errored on its own (eg navigation); fall
             // through to DB-mutation path below.
         }

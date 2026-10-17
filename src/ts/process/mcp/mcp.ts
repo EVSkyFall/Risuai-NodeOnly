@@ -1,3 +1,4 @@
+import { raceAbort, throwIfAborted } from "../abort";
 import { getDatabase } from "src/ts/storage/database.svelte";
 import { MCPClient, type JsonRPC, type MCPTool, type RPCToolCallContent } from "./mcplib";
 import { DBState } from "src/ts/stores.svelte";
@@ -15,7 +16,7 @@ export type MCPToolWithURL = MCPTool & {
 
 export const MCPs:Record<string,MCPClient|MCPClientLike> = {};
 
-export async function initializeMCPs(additionalMCPs?:string[]) {
+export async function initializeMCPs(additionalMCPs?:string[], signal?: AbortSignal) {
     const db = getDatabase()
     const mcpUrls = getModuleMcps()
     if(additionalMCPs && additionalMCPs.length > 0) {
@@ -33,38 +34,38 @@ export async function initializeMCPs(additionalMCPs?:string[]) {
             if(mcp.startsWith('internal:')) {
                 switch(mcp) {
                     case 'internal:fs':{
-                        const { FileSystemClient } = await import('./filesystemclient');
+                        const { FileSystemClient } = await raceAbort(() => (import('./filesystemclient')), signal);
                         MCPs[mcp] = new FileSystemClient();
                         break;
                     }
                     case 'internal:risuai':{
-                        const { RisuAccessClient } = await import('./risuaccess');
+                        const { RisuAccessClient } = await raceAbort(() => (import('./risuaccess')), signal);
                         MCPs[mcp] = new RisuAccessClient();
                         break;
                     }
                     case 'internal:aiaccess':{
-                        const { AIAccessClient } = await import('./aiaccess');
+                        const { AIAccessClient } = await raceAbort(() => (import('./aiaccess')), signal);
                         MCPs[mcp] = new AIAccessClient();
                         break;
                     }
                     case 'internal:googlesearch': {
-                        const { GoogleSearchClient } = await import('./googlesearchclient');
+                        const { GoogleSearchClient } = await raceAbort(() => (import('./googlesearchclient')), signal);
                         MCPs[mcp] = new GoogleSearchClient();
                         break;
                     }
                     case 'internal:graphmem':{
-                        const { GraphMemClient } = await import('./graphmem');
+                        const { GraphMemClient } = await raceAbort(() => (import('./graphmem')), signal);
                         MCPs[mcp] = new GraphMemClient();
                         break;
                     }
                     case 'internal:dice':{
-                        const { DiceClient } = await import('./dice');
+                        const { DiceClient } = await raceAbort(() => (import('./dice')), signal);
                         MCPs[mcp] = new DiceClient();
                         break;
                     }
                 }
 
-                await MCPs[mcp].checkHandshake();
+                await raceAbort(() => (MCPs[mcp].checkHandshake()), signal);
                 continue;
             }
 
@@ -72,7 +73,7 @@ export async function initializeMCPs(additionalMCPs?:string[]) {
                 const customMCP = registeredCustomPluginMCPs.get(mcp);
                 if(customMCP){
                     MCPs[mcp] = customMCP;
-                    await MCPs[mcp].checkHandshake();
+                    await raceAbort(() => (MCPs[mcp].checkHandshake()), signal);
                     continue;
                 }
             }
@@ -91,6 +92,7 @@ export async function initializeMCPs(additionalMCPs?:string[]) {
                     }
                 }                   
                 catch (error) {
+                    throwIfAborted(signal)
                     throw new Error(`Failed to parse MCP JSON: ${error}`);
                 }
             }
@@ -118,9 +120,10 @@ export async function initializeMCPs(additionalMCPs?:string[]) {
                 const mcpClient = new MCPClient(mcpUrl);
                 mcpClient.registerRefreshToken = registerRefresh;
                 mcpClient.getRefreshToken = getRefresh;
-                await mcpClient.checkHandshake()
+                await raceAbort(() => (mcpClient.checkHandshake()), signal)
                 MCPs[mcp] = mcpClient;   
             } catch (error) {
+                throwIfAborted(signal)
                 console.error(`Failed to initialize MCP at ${mcp}:`, error);
             }
         }
@@ -134,11 +137,11 @@ export async function initializeMCPs(additionalMCPs?:string[]) {
     }
 }
 
-export async function getMCPTools(additionalMCPs?:string[]) {
-    await initializeMCPs(additionalMCPs);
+export async function getMCPTools(additionalMCPs?:string[], signal?: AbortSignal) {
+    await raceAbort(() => (initializeMCPs(additionalMCPs, signal)), signal);
     const tools:MCPToolWithURL[] = [];
     for(const key of Object.keys(MCPs)) {
-        const t = (await MCPs[key].getToolList()).map(tool => {
+        const t = (await raceAbort(() => (MCPs[key].getToolList()), signal)).map(tool => {
             return {
                 ...tool,
                 mcpURL: key
@@ -159,13 +162,13 @@ export async function getMCPMeta(additionalMCPs?:string[]) {
     return meta;
 }
 
-export async function callMCPTool(methodName:string, args:any):Promise<RPCToolCallContent[]> {
-    await initializeMCPs();
+export async function callMCPTool(methodName:string, args:any, signal?: AbortSignal):Promise<RPCToolCallContent[]> {
+    await raceAbort(() => (initializeMCPs(undefined, signal)), signal);
     for(const key of Object.keys(MCPs)) {
-        const tools = await MCPs[key].getToolList();
+        const tools = await raceAbort(() => (MCPs[key].getToolList()), signal);
         const tool = tools.find(t => t.name === methodName);
         if(tool) {
-            return await MCPs[key].callTool(methodName, args);
+            return await raceAbort(() => (MCPs[key].callTool(methodName, args)), signal);
         }
     }
     return  [{
@@ -175,13 +178,13 @@ export async function callMCPTool(methodName:string, args:any):Promise<RPCToolCa
 }
 
 //Currently just a wrapper for getMCPTools, but can be extended later for more than MCPs
-export async function getTools(){
-    return await getMCPTools();
+export async function getTools(signal?: AbortSignal){
+    return await raceAbort(() => (getMCPTools(undefined, signal)), signal);
 }
 
 //Currently just a wrapper for callMCPTool, but can be extended later for more than MCPs
-export async function callTool(methodName:string, args:any) {
-    return await callMCPTool(methodName, args);
+export async function callTool(methodName:string, args:any, signal?: AbortSignal) {
+    return await raceAbort(() => (callMCPTool(methodName, args, signal)), signal);
 }
 
 export async function importMCPModule(){

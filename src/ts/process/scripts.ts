@@ -1,3 +1,4 @@
+import { raceAbort, throwIfAborted } from "./abort";
 import { get } from "svelte/store";
 import { CharEmotion, selectedCharID } from "../stores.svelte";
 import { type character, type customscript, getDatabase, getCurrentCharacter, getCurrentChat } from "../storage/database.svelte";
@@ -24,8 +25,8 @@ type pScript = {
     actions: string[]
 }
 
-export async function processScript(char:character, data:string, mode:ScriptMode, cbsConditions:CbsConditions = {}){
-    return (await processScriptFull(char, data, mode, -1, cbsConditions)).data
+export async function processScript(char:character, data:string, mode:ScriptMode, cbsConditions:CbsConditions = {}, signal?: AbortSignal){
+    return (await raceAbort(() => (processScriptFull(char, data, mode, -1, cbsConditions, signal)), signal)).data
 }
 
 export function exportRegex(s?:customscript[]){
@@ -181,7 +182,8 @@ export function isStreamingScriptTripped(){
     return streamingScriptCircuit.active && streamingScriptCircuit.tripped
 }
 
-export async function processScriptFull(char:character|simpleCharacterArgument, data:string, mode:ScriptMode, chatID = -1, cbsConditions:CbsConditions = {}){
+export async function processScriptFull(char:character|simpleCharacterArgument, data:string, mode:ScriptMode, chatID = -1, cbsConditions:CbsConditions = {}, signal?: AbortSignal){
+    throwIfAborted(signal)
     const circuitTarget = (mode === 'editoutput' || mode === 'editdisplay')
         && streamingScriptCircuit.active
         && chatID === streamingScriptCircuit.msgIndex
@@ -210,7 +212,7 @@ export async function processScriptFull(char:character|simpleCharacterArgument, 
     }
     const start = performance.now()
     try{
-        const res = await processScriptFullInner(char, data, mode, chatID, cbsConditions)
+        const res = await raceAbort(() => (processScriptFullInner(char, data, mode, chatID, cbsConditions, signal)), signal)
         // Don't store passes for the actively streaming message: every chunk is
         // a unique input, and dozens of one-shot entries would churn the FIFO
         // cap and evict the static-message entries right before the post-stream
@@ -233,7 +235,7 @@ export async function processScriptFull(char:character|simpleCharacterArgument, 
             && streamingScriptCircuit.active
             && chatID === streamingScriptCircuit.msgIndex
             && circuitToken === streamingScriptCircuit.token
-        if(stillTarget && dur > STREAM_SCRIPT_BUDGET_MS){
+        if(!signal?.aborted && stillTarget && dur > STREAM_SCRIPT_BUDGET_MS){
             streamingScriptCircuit.tripped = true
             console.warn(`[StreamScriptCircuit] ${mode} pass took ${Math.round(dur)}ms (budget ${STREAM_SCRIPT_BUDGET_MS}ms) — suspending mid-stream script passes for message ${chatID} until stream end`)
         }
@@ -243,26 +245,28 @@ export async function processScriptFull(char:character|simpleCharacterArgument, 
     }
 }
 
-async function processScriptFullInner(char:character|simpleCharacterArgument, data:string, mode:ScriptMode, chatID = -1, cbsConditions:CbsConditions = {}){
+async function processScriptFullInner(char:character|simpleCharacterArgument, data:string, mode:ScriptMode, chatID = -1, cbsConditions:CbsConditions = {}, signal?: AbortSignal){
     let db = getDatabase()
     let emoChanged = false
-    data = await runLuaEditTrigger(char, mode, data, { index:chatID })
+    data = await raceAbort(() => (runLuaEditTrigger(char, mode, data, { index:chatID }, signal)), signal)
 
     if(mode === 'editdisplay'){
         const currentChar = getCurrentCharacter()
         if(currentChar){
             try{
                 const perf = performance.now()
-                const d = await runTrigger(currentChar, 'display', {
+                const d = await raceAbort(() => (runTrigger(currentChar, 'display', {
                     chat: getCurrentChat(),
+                    signal,
                     displayMode: true,
                     displayData: data
-                })
+                })), signal)
     
                 data = d?.displayData ?? data
                 console.log('Trigger time', performance.now() - perf)
             }
             catch(e){
+                throwIfAborted(signal)
                 console.error(e)
             }
         }
@@ -270,7 +274,7 @@ async function processScriptFullInner(char:character|simpleCharacterArgument, da
 
     if(pluginV2[mode].size > 0){
         for(const plugin of pluginV2[mode]){
-            const res = await plugin(data)
+            const res = await raceAbort(() => (plugin(data)), signal)
             if(res !== null && res !== undefined){
                 data = res
             }
@@ -280,10 +284,10 @@ async function processScriptFullInner(char:character|simpleCharacterArgument, da
     const scripts = (db.presetRegex ?? []).concat(char.customscript).concat(getModuleRegexScripts())
     // Scripts below run the synchronous parser on their own output, so a list
     // token introduced by a script template needs its manifests loaded now.
-    await hydrateAssetListsForCbs(char, [
+    await raceAbort(() => (hydrateAssetListsForCbs(char, [
         data,
         ...scripts.filter((script) => script.type === mode).flatMap((script) => [script.in, script.out]),
-    ])
+    ])), signal)
     data = risuChatParser(data, { chatID: chatID, cbsConditions })
     const hash = generateScriptCacheKey(scripts, data, mode, chatID, cbsConditions)
     const cached = getScriptCache(hash)
@@ -495,6 +499,7 @@ async function processScriptFullInner(char:character|simpleCharacterArgument, da
                 console.warn(`[ScriptPerf] customscript '${script.script.comment || script.script.in.slice(0, 40)}' (${mode}) took ${Math.round(dur)}ms`)
             }
         } catch (error) {
+            throwIfAborted(signal)
             console.error(error)
         }
     }
@@ -511,7 +516,7 @@ async function processScriptFullInner(char:character|simpleCharacterArgument, da
         const assetNames = (char.additionalAssets ?? []).map((v) => v[0])
 
         if (char.additionalAssetManifest) {
-            const items = await loadAssetManifestItems(char.additionalAssetManifest)
+            const items = await raceAbort(() => (loadAssetManifestItems(char.additionalAssetManifest)), signal)
             assetNames.push(...items.map((item) => item[0]))
         }
 
@@ -523,12 +528,12 @@ async function processScriptFullInner(char:character|simpleCharacterArgument, da
         }
         for (const module of getModules()) {
             if (!module?.assetManifest) continue
-            const items = await loadAssetManifestItems(module.assetManifest)
+            const items = await raceAbort(() => (loadAssetManifestItems(module.assetManifest)), signal)
             assetNames.push(...items.map((item) => item[0]))
         }
 
         const processer = new HypaProcesser()
-        await processer.addText(assetNames)
+        await raceAbort(() => (processer.addText(assetNames)), signal)
         const matches = data.matchAll(assetRegex)
 
         for(const match of matches){
@@ -540,7 +545,7 @@ async function processScriptFullInner(char:character|simpleCharacterArgument, da
                     data = data.replaceAll(match[0], `{{${type}::${bestMatchCache.get(cacheKey)}}}`)
                 }
                 else if(!assetNames.includes(assetName)){
-                    const searched = await processer.similaritySearch(assetName)
+                    const searched = await raceAbort(() => (processer.similaritySearch(assetName)), signal)
                     const bestMatch = searched[0]
                     if(bestMatch){
                         data = data.replaceAll(match[0], `{{${type}::${bestMatch}}}`)

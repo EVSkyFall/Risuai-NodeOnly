@@ -1,3 +1,4 @@
+import { raceAbort, throwIfAborted } from "./abort";
 import { get } from "svelte/store";
 import { getCurrentCharacter, getCurrentChat, getDatabase, setCurrentChat, setDatabase } from "../storage/database.svelte";
 import { selectedCharID } from "../stores.svelte";
@@ -5,11 +6,11 @@ import { alertInput, alertMd, alertNormal, alertSelect } from "../alert";
 import { sayTTS } from "./tts";
 import { risuChatParser } from "../parser/parser.svelte";
 import { sendChat } from "./index.svelte";
-import { chatGenKey, endGeneration } from "./generationState";
+import { chatGenKey, endGeneration, generationStates, registerAbort, startGeneration } from "./generationState";
 import { loadLoreBookV3Prompt } from "./lorebook.svelte";
 import { runTrigger } from "./triggers";
 
-export async function processMultiCommand(command:string) {
+export async function processMultiCommand(command:string, signal?: AbortSignal, inputGenerationId?: string) {
     let pipe = ''
     const splited:string[] = []
     let lastIndex = 0
@@ -27,7 +28,7 @@ export async function processMultiCommand(command:string) {
     splited.push(command.slice(lastIndex))
     console.log(splited)
     for(let i = 0; i<splited.length; i++){
-        const result = await processCommand(splited[i].trim(), pipe)
+        const result = await raceAbort(() => (processCommand(splited[i].trim(), pipe, signal, inputGenerationId)), signal)
         console.log(pipe)
         if(result === false){
             return false
@@ -40,7 +41,7 @@ export async function processMultiCommand(command:string) {
 }
 
 
-async function processCommand(command:string, pipe:string):Promise<false | string>{
+async function processCommand(command:string, pipe:string, signal?: AbortSignal, inputGenerationId?: string):Promise<false | string>{
     const db = getDatabase()
     const currentChar = db.characters[get(selectedCharID)]
     const currentChat = currentChar.chats[currentChar.chatPage]
@@ -64,7 +65,7 @@ async function processCommand(command:string, pipe:string):Promise<false | strin
     switch(commandName){
         //STScript compatibility commands
         case 'input':{
-            pipe = await alertInput(arg)
+            pipe = await raceAbort(() => (alertInput(arg)), signal)
             return pipe
         }
         case 'echo':
@@ -81,9 +82,10 @@ async function processCommand(command:string, pipe:string):Promise<false | strin
                 try {
                     const JSONLabels = JSON.parse(namedArg.labels)
                     if(Array.isArray(JSONLabels)){
-                        pipe = await alertSelect(JSONLabels)
+                        pipe = await raceAbort(() => (alertSelect(JSONLabels)), signal)
                     }
-                } catch (error) {}
+                } catch (error) {
+                    throwIfAborted(signal)}
             }
             return pipe
         }
@@ -93,7 +95,7 @@ async function processCommand(command:string, pipe:string):Promise<false | strin
         }
         case 'speak': {
             if(currentChar){
-                await sayTTS(currentChar, arg)
+                await raceAbort(() => (sayTTS(currentChar, arg, signal)), signal)
             }
             return pipe
         }
@@ -153,7 +155,8 @@ async function processCommand(command:string, pipe:string):Promise<false | strin
                 if(Array.isArray(parsed)){
                     pipe = parsed.length.toString()
                 }
-            } catch (error) {}
+            } catch (error) {
+                throwIfAborted(signal)}
             return pipe
         }
         case 'multisend':{
@@ -164,6 +167,7 @@ async function processCommand(command:string, pipe:string):Promise<false | strin
                 splited.shift()
             }
             for(const e of splited){
+                throwIfAborted(signal)
                 if(clearMode){
                     currentChat.message = []
                 }
@@ -171,12 +175,19 @@ async function processCommand(command:string, pipe:string):Promise<false | strin
                     role: 'user',
                     data: e
                 })
-                await sendChat(-1)
-                // sendChat leaves its generation entry for the caller to release
-                // (DefaultChatScreen does the same after its own send). Without
-                // this the per-chat guard stays held and every later iteration
-                // returns immediately without sending.
-                endGeneration(chatGenKey(currentChat.id))
+                const key = chatGenKey(currentChat.id)
+                const parent = get(generationStates).get(key)
+                // Only UI input preparation can hand off its entry; an active
+                // send invoking a command from a trigger must retain its guard.
+                const ownsParent = inputGenerationId && parent?.generationId === inputGenerationId
+                    && signal && parent.abortController?.signal === signal
+                if (ownsParent) endGeneration(key, { keepPendingAbort: true })
+                await raceAbort(() => sendChat(-1, { signal }), signal)
+                if (!parent || ownsParent) endGeneration(key, { keepPendingAbort: !!ownsParent })
+                if (ownsParent) {
+                    registerAbort(key, parent.abortController)
+                    startGeneration(key, parent.generationId)
+                }
             }
             return ''
         }
@@ -218,17 +229,19 @@ async function processCommand(command:string, pipe:string):Promise<false | strin
             return pipe
         }
         case 'test_lorebook':{
-            const p = await loadLoreBookV3Prompt()
+            const p = await raceAbort(() => (loadLoreBookV3Prompt()), signal)
             console.log(p)
             alertNormal(p.actives.map((e)=>e.prompt).join('§'))
             return JSON.stringify(p)
         }
         case 'trigger':{
             const currentChar = getCurrentCharacter()
-            const triggerResult = await runTrigger(currentChar, 'manual', {
+            const triggerResult = await raceAbort(() => (runTrigger(currentChar, 'manual', {
+                signal,
+                inputGenerationId,
                 chat: getCurrentChat(),
                 manualName: arg
-            });
+            })), signal);
 
             if(triggerResult){
                setCurrentChat(triggerResult.chat);

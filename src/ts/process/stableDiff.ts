@@ -1,3 +1,4 @@
+import { raceAbort, throwIfAborted } from "./abort";
 import { get } from "svelte/store"
 import { getDatabase, type character } from "../storage/database.svelte"
 import { requestChatData } from "./request/request"
@@ -30,6 +31,7 @@ export type ImageGenerationOptions = {
     preservePromptText?: boolean
     illustrationPrompt?: IllustrationPromptV1
     seed?: number
+    signal?: AbortSignal
 }
 
 const COMFY_QUEUE_POLL_INTERVAL_MS = 1500
@@ -609,7 +611,7 @@ function readWebUiSeed(info: unknown): number | null {
     }
 }
 
-export async function stableDiff(currentChar:character,prompt:string){
+export async function stableDiff(currentChar:character,prompt:string, signal?: AbortSignal){
     let db = getDatabase()
 
     if(db.sdProvider === ''){
@@ -632,7 +634,7 @@ export async function stableDiff(currentChar:character,prompt:string){
         },
     ]
 
-    const rq = await requestChatData({
+    const rq = await raceAbort(() => (requestChatData({
         formated: promptbody,
         currentChar: currentChar,
         temperature: 0.2,
@@ -640,7 +642,7 @@ export async function stableDiff(currentChar:character,prompt:string){
         bias: {},
         useStreaming: false,
         noMultiGen: true
-    }, 'submodel')
+    }, 'submodel', signal)), signal)
 
 
     if(rq.type === 'fail'){
@@ -658,7 +660,7 @@ export async function stableDiff(currentChar:character,prompt:string){
     const genPrompt = currentChar.newGenData.prompt.replaceAll('{{slot}}', r)
     const neg = currentChar.newGenData.negative
 
-    return await generateAIImage(genPrompt, currentChar, neg, '')
+    return await raceAbort(() => (generateAIImage(genPrompt, currentChar, neg, '', 'interactive', signal)), signal)
 }
 
 export async function generateAIImage(
@@ -667,8 +669,9 @@ export async function generateAIImage(
     neg:string,
     returnSdData:string,
     priorityClass:ImageGenerationPriority = 'interactive',
+    signal?: AbortSignal,
 ):Promise<string|false>{
-    const attempt = await generateAIImageTyped(genPrompt, currentChar, neg, returnSdData, priorityClass)
+    const attempt = await raceAbort(() => (generateAIImageTyped(genPrompt, currentChar, neg, returnSdData, priorityClass, { signal })), signal)
     if (!attempt.result.ok && attempt.shouldNotify) {
         notifyError(attempt.notifyErrorValue)
     }
@@ -683,14 +686,15 @@ export async function generateAIImageTyped(
     priorityClass:ImageGenerationPriority,
     options: ImageGenerationOptions = {},
 ):Promise<ImageGenerationAttempt>{
-    const result = await generateAIImageInternal(
+    const signal = options.signal
+    const result = await raceAbort(() => (generateAIImageInternal(
         genPrompt,
         currentChar,
         neg,
         returnSdData,
         priorityClass,
         options,
-    )
+    )), signal)
     if (typeof result === 'object') {
         return result
     }
@@ -714,6 +718,8 @@ async function generateAIImageInternal(
     priorityClass:ImageGenerationPriority,
     options: ImageGenerationOptions,
 ):Promise<string|false|ImageGenerationAttempt>{
+    const signal = options.signal
+    throwIfAborted(signal)
     const db = getDatabase()
     if(options.illustrationPrompt){
         genPrompt = options.illustrationPrompt.basePositive
@@ -737,7 +743,8 @@ async function generateAIImageInternal(
         const uri = new URL(db.webUiUrl)
         uri.pathname = '/sdapi/v1/txt2img'
         try {
-            const da = await globalFetch(uri.toString(), {
+            const da = await raceAbort(() => (globalFetch(uri.toString(), {
+                    abortSignal: signal,
                 body: {
                     "width": db.sdConfig.width,
                     "height": db.sdConfig.height,
@@ -755,7 +762,7 @@ async function generateAIImageInternal(
                 headers:{
                     'Content-Type': 'application/json'
                 }
-            })   
+            })), signal)   
 
             if(returnSdData === 'inlay'){
                 if(da.ok){
@@ -794,6 +801,7 @@ async function generateAIImageInternal(
 
 
         } catch (error) {
+            throwIfAborted(signal)
             notifyError(error)
             return false   
         }
@@ -1037,7 +1045,7 @@ async function generateAIImageInternal(
             let base64img = ''
             if(!db.NAIImgConfig.character_image || db.NAIImgConfig.character_image === ''){
                 const charimg = currentChar.image;
-                const img = await readImage(charimg)
+                const img = await raceAbort(() => (readImage(charimg)), signal)
                 if (img) {
                     base64img = Buffer.from(img).toString('base64')
                 }
@@ -1051,10 +1059,10 @@ async function generateAIImageInternal(
                 const ctx = canvas.getContext('2d');
                 const imageObj = new Image();
                 
-                await new Promise<void>((resolve) => {
+                await raceAbort(() => (new Promise<void>((resolve) => {
                     imageObj.onload = () => resolve();
                     imageObj.src = `data:image/png;base64,${base64img}`;
-                });
+                })), signal);
                 
                 canvas.width = 1472;
                 canvas.height = 1472;
@@ -1071,15 +1079,16 @@ async function generateAIImageInternal(
                 
                 ctx.drawImage(imageObj, x, y, scaledWidth, scaledHeight);
                 
-                const blob = await new Promise<Blob>((resolve) => {
+                const blob = await raceAbort(() => (new Promise<Blob>((resolve) => {
                     canvas.toBlob(resolve, 'image/png');
-                });
+                })), signal);
                 
                 if (blob) {
-                    const arrayBuffer = await blob.arrayBuffer();
+                    const arrayBuffer = await raceAbort(() => (blob.arrayBuffer()), signal);
                     base64img = Buffer.from(arrayBuffer).toString('base64');
                 }
             } catch (error) {
+                throwIfAborted(signal)
                 console.warn('Image resize failed, using original:', error);
             }
             
@@ -1106,7 +1115,7 @@ async function generateAIImageInternal(
             if(!db.NAIImgConfig.image || db.NAIImgConfig.image === ''){
                 const charimg = currentChar.image;
 
-                const img = await readImage(charimg)
+                const img = await raceAbort(() => (readImage(charimg)), signal)
                 if (img) {
                     base64img = Buffer.from(img).toString('base64')
                 }
@@ -1129,14 +1138,15 @@ async function generateAIImageInternal(
             reqlist.body.action = 'generate';
         }
         try {
-            const da = await globalFetch(db.NAIImgUrl, {
+            const da = await raceAbort(() => (globalFetch(db.NAIImgUrl, {
+                    abortSignal: signal,
                 ...reqlist,
                 plainFetchDeforce: true,
                 proxyRequestHeaders: {
                     'risu-image-class': priorityClass,
                 },
                 redactRequestLog: true,
-            })
+            })), signal)
 
             if(!da.ok){
                 const reason = Buffer.from(da.data).toString()
@@ -1154,7 +1164,7 @@ async function generateAIImageInternal(
                 }
             }
 
-            const processed = await processZipWithMetadata(da.data);
+            const processed = await raceAbort(() => (processZipWithMetadata(da.data)), signal);
             const img = processed.dataUrl
             const seedUsed = processed.seedUsed ?? naiSeed
             if(returnSdData === 'inlay'){
@@ -1178,6 +1188,7 @@ async function generateAIImageInternal(
             }
 
         } catch (error) {
+            throwIfAborted(signal)
             return {
                 result: { ok: false, certainty: 'uncertain', reason: String(error) },
                 compatibilityValue: false,
@@ -1187,7 +1198,8 @@ async function generateAIImageInternal(
         }
     }
     if(db.sdProvider === 'dalle'){
-        const da = await globalFetch("https://api.openai.com/v1/images/generations", {
+        const da = await raceAbort(() => (globalFetch("https://api.openai.com/v1/images/generations", {
+                    abortSignal: signal,
             body: {
                 "prompt": genPrompt,
                 "model": "dall-e-3",
@@ -1198,7 +1210,7 @@ async function generateAIImageInternal(
             headers: {
                 "Authorization": "Bearer " + db.openAIKey
             }
-        })
+        })), signal)
 
         console.log(da)
 
@@ -1248,16 +1260,17 @@ async function generateAIImageInternal(
 
         const uri = model === 'core' ? 'core' : model === 'ultra' ? 'ultra' : 'sd3'
         const url = "https://api.stability.ai/v2beta/stable-image/generate/" + uri
-        const da = await fetch(url, {
+        const da = await raceAbort(() => (fetch(url, {
+                    signal: signal,
             body: formData,
             headers:{
                 "authorization": "Bearer " + db.stabilityKey,
                 "accept": "image/*"
             },
             method: 'POST'
-        })
+        })), signal)
 
-        const res = await da.arrayBuffer()
+        const res = await raceAbort(() => (da.arrayBuffer()), signal)
         if(!da.ok){
             notifyError(Buffer.from(res).toString())
             return false
@@ -1296,17 +1309,18 @@ async function generateAIImageInternal(
         const probePromptEndpoint = async (): Promise<boolean> => {
             const queueUrl = createUrl('/queue')
             try {
-                const response = await withComfyRequestTimeout((signal) => globalFetch(queueUrl, {
+                const response = await raceAbort(() => (withComfyRequestTimeout((signal) => globalFetch(queueUrl, {
                     method: 'GET',
                     headers: { 'Content-Type': 'application/json' },
                     abortSignal: signal,
                     requestTimeoutMs: COMFY_REQUEST_TIMEOUT_MS,
                     throwOnTransportError: true,
-                }))
+                }))), signal)
                 return typeof response.status === 'number'
                     && response.status > 0
                     && response.status < 500
             } catch (error) {
+                throwIfAborted(signal)
                 // A probe that failed before its own dispatch (auth refresh, URL
                 // prep) observed nothing about the endpoint — it must not count
                 // as unreachability evidence, so the original POST stays uncertain.
@@ -1319,7 +1333,7 @@ async function generateAIImageInternal(
             message: string,
             transportCause?: unknown,
         ): Promise<never> => {
-            if (!await probePromptEndpoint()) {
+            if (!await raceAbort(() => (probePromptEndpoint()), signal)) {
                 throw new Error(`${message} The one-shot ComfyUI queue probe could not reach the endpoint.`)
             }
             throw new ComfyPromptUncertainError(message, transportCause)
@@ -1329,8 +1343,9 @@ async function generateAIImageInternal(
             console.log(url)
             let response
             try {
-                response = await globalFetch(url, options)
+                response = await raceAbort(() => (globalFetch(url, { ...options, abortSignal: signal })), signal)
             } catch (error) {
+                throwIfAborted(signal)
                 if (isGlobalFetchTransportError(error) && !error.dispatched) {
                     throw new Error(
                         `ComfyUI prompt submission failed before dispatch: ${String(error.transportCause)}`,
@@ -1576,13 +1591,13 @@ async function generateAIImageInternal(
                 }
             }
 
-            const promptResponse = await fetchWrapper(createUrl('/prompt'), {
+            const promptResponse = await raceAbort(() => (fetchWrapper(createUrl('/prompt'), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: { 'prompt': prompt },
                 requestTimeoutMs: COMFY_PROMPT_REQUEST_TIMEOUT_MS,
                 throwOnTransportError: true,
-            })
+            })), signal)
             const id = isComfyRecord(promptResponse) ? promptResponse.prompt_id : undefined
             if (typeof id !== 'string' || id.trim().length === 0) {
                 throw new ComfyPromptUncertainError(
@@ -1594,18 +1609,18 @@ async function generateAIImageInternal(
             const queueSubscription = subscribeComfyQueue(createUrl, id)
             try {
                 let item = queueSubscription.checkHistoryImmediately
-                    ? await readComfyHistory(createUrl, id)
+                    ? await raceAbort(() => (readComfyHistory(createUrl, id)), signal)
                     : undefined
                 let consecutiveAbsences = 0
                 while (!item) {
-                    const queue = await queueSubscription.next()
+                    const queue = await raceAbort(() => (queueSubscription.next()), signal)
                     if (!queue.valid) continue
                     if (queue.queuedIds.has(id)) {
                         consecutiveAbsences = 0
                         continue
                     }
 
-                    const history = await readComfyHistory(createUrl, id)
+                    const history = await raceAbort(() => (readComfyHistory(createUrl, id)), signal)
                     if (history) {
                         item = history
                         break
@@ -1637,14 +1652,14 @@ async function generateAIImageInternal(
                     return false
                 }
 
-                const imgBuffer = await downloadComfyImage(
+                const imgBuffer = await raceAbort(() => (downloadComfyImage(
                     createUrl('/view', {
                         filename: genImgInfo.filename,
                         subfolder: genImgInfo.subfolder,
                         type: genImgInfo.type,
                     }),
                     () => getComfyQueueHealth(createUrl),
-                )
+                )), signal)
                 const img64 = Buffer.from(imgBuffer).toString('base64')
 
                 if(returnSdData === 'inlay'){
@@ -1674,6 +1689,7 @@ async function generateAIImageInternal(
                 queueSubscription.unsubscribe()
             }
         } catch (error) {
+            throwIfAborted(signal)
             if (isComfyPromptUncertainError(error)) {
                 notifyError(error)
                 return {
@@ -1719,14 +1735,15 @@ async function generateAIImageInternal(
             delete body.enable_safety_checker
         }
 
-        const res = await globalFetch('https://fal.run/' + model, {
+        const res = await raceAbort(() => (globalFetch('https://fal.run/' + model, {
+                    abortSignal: signal,
             headers: {
                 "Authorization": "Key " + token,
                 "Content-Type": "application/json"
             },
             method: 'POST',
             body: body
-        })
+        })), signal)
 
         if(!res.ok){
             notifyError(JSON.stringify(res.data))
@@ -1775,13 +1792,14 @@ async function generateAIImageInternal(
 
         const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:predict?key=${db.google.accessToken}`
 
-        const res = await globalFetch(url, {
+        const res = await raceAbort(() => (globalFetch(url, {
+                    abortSignal: signal,
             headers: {
                 "Content-Type": "application/json"
             },
             method: 'POST',
             body: body,
-        })
+        })), signal)
 
         if(!res.ok) {
             notifyError(JSON.stringify(res.data))
@@ -1824,10 +1842,11 @@ async function generateAIImageInternal(
             headers["Authorization"] = "Bearer " + config.key
         }
 
-        const da = await globalFetch(config.url, {
+        const da = await raceAbort(() => (globalFetch(config.url, {
+                    abortSignal: signal,
             body: body,
             headers: headers
-        })
+        })), signal)
 
         if(returnSdData === 'inlay'){
             let res = da?.data?.data?.[0]?.b64_json
@@ -1876,7 +1895,7 @@ async function generateAIImageInternal(
         else if (config.reference_mode === 'character') {
             // reference: auto use the character's default image
             const charimg = currentChar.image;
-            const img = await readImage(charimg)
+            const img = await raceAbort(() => (readImage(charimg)), signal)
             if (img) {
                 base64img = Buffer.from(img).toString('base64')
             }
@@ -1902,13 +1921,14 @@ async function generateAIImageInternal(
         try {
             // First: submit task
             const requestEndpoint = `https://api.wavespeed.ai/api/v3/${config.model}`
-            const requestResponse = await globalFetch(requestEndpoint, {
+            const requestResponse = await raceAbort(() => (globalFetch(requestEndpoint, {
+                    abortSignal: signal,
                 body: body,
                 headers: {
                     "Content-Type": "application/json",
                     "Authorization": "Bearer " + config.key
                 }
-            })
+            })), signal)
             let requestId: string;
             if (requestResponse.ok) {
                 /*
@@ -1940,12 +1960,13 @@ async function generateAIImageInternal(
                     notifyError(`Task timeout after ${MAX_WAIT_TIME / 1000}s`);
                     break;
                 }
-                const taskResponse = await globalFetch(taskEndpoint, {
+                const taskResponse = await raceAbort(() => (globalFetch(taskEndpoint, {
+                    abortSignal: signal,
                     method: 'GET',
                     headers: {
                         "Authorization": "Bearer " + config.key
                     }
-                })
+                })), signal)
                 if (taskResponse.ok) {
                     /*
                     * monitor response:
@@ -1967,7 +1988,7 @@ async function generateAIImageInternal(
                         break
                     }
                     // else keep loop
-                    await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
+                    await raceAbort(() => (new Promise(resolve => setTimeout(resolve, POLL_INTERVAL))), signal);
                 }
                 else {
                     notifyError(JSON.stringify(taskResponse.data))
@@ -1980,13 +2001,14 @@ async function generateAIImageInternal(
             }
 
             // Third: get result
-            const resultResponse = await globalFetch(resultEndpoint, {
+            const resultResponse = await raceAbort(() => (globalFetch(resultEndpoint, {
+                    abortSignal: signal,
                 method: 'GET',
                 headers: {
                     "Authorization": "Bearer " + config.key
                 },
                 rawResponse: true
-            })
+            })), signal)
             if (resultResponse.ok) {
                 // mime-type: jpeg (default), png, webp
                 const contentType = resultResponse.headers?.['content-type'] || 'image/jpeg'
@@ -2014,6 +2036,7 @@ async function generateAIImageInternal(
                 return false
             }
         } catch (error) {
+            throwIfAborted(signal)
             notifyError(error)
             return false
         }

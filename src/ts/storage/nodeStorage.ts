@@ -367,6 +367,9 @@ export class NodeStorage{
         await this.checkAuth()
         const headers = new Headers(init.headers)
         headers.set('risu-auth', await this.createAuth())
+        if (init.signal?.aborted) {
+            throw this.abortReason(init.signal)
+        }
 
         // Storage calls share one URL per endpoint and differ only by headers,
         // so Chrome's HTTP cache can serialize them on one cache entry. An asset
@@ -416,7 +419,7 @@ export class NodeStorage{
         )
     }
 
-    async setItem(key:string, value:Uint8Array, etag?:string) {
+    async setItem(key:string, value:Uint8Array, etag?:string, signal?:AbortSignal) {
         const headers: Record<string, string> = {
             'content-type': 'application/octet-stream',
             'file-path': Buffer.from(key, 'utf-8').toString('hex')
@@ -427,7 +430,8 @@ export class NodeStorage{
         const da = await this.authFetch('/api/write', {
             method: "POST",
             body: value as any,
-            headers
+            headers,
+            signal
         })
         if(da.status === 409){
             const data = await da.json()

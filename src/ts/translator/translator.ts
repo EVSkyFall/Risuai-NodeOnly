@@ -1,3 +1,4 @@
+import { raceAbort, throwIfAborted } from "../process/abort";
 import { get } from "svelte/store"
 import { parseChatML } from "../parser/chatML";
 import { getDatabase, type character, type customscript } from "../storage/database.svelte"
@@ -70,7 +71,7 @@ export async function translate(text:string, reverse:boolean) {
     return runTranslator(text, reverse, db.translator,db.aiModel.startsWith('novellist') ? 'ja' : 'en')
 }
 
-export async function runTranslator(text:string, reverse:boolean, from:string,target:string, exarg?:{translatorNote?:string}) {
+export async function runTranslator(text:string, reverse:boolean, from:string,target:string, exarg?:{translatorNote?:string}, signal?: AbortSignal) {
     const arg = {
 
         from: reverse ? from : target,
@@ -79,7 +80,8 @@ export async function runTranslator(text:string, reverse:boolean, from:string,ta
 
         host: 'translate.googleapis.com',
 
-        translatorNote: exarg?.translatorNote
+        translatorNote: exarg?.translatorNote,
+        signal
     }
     const texts = text.split('\n')
     let chunks:[string,boolean][] = [['', true]]
@@ -108,7 +110,7 @@ export async function runTranslator(text:string, reverse:boolean, from:string,ta
                 fullResult.push(chunk[0])
                 continue
             }
-            const result = await translateMain(trimed, arg);
+            const result = await raceAbort(() => (translateMain(trimed, arg)), signal);
 
             if(result.startsWith('ERR::')){
                 notifyError(result)
@@ -134,11 +136,11 @@ export async function runTranslator(text:string, reverse:boolean, from:string,ta
 
 }
 
-async function translateMain(text:string, arg:{from:string, to:string, host:string, translatorNote?:string}){
+async function translateMain(text:string, arg:{from:string, to:string, host:string, translatorNote?:string, signal?: AbortSignal}){
     let db = getDatabase()
     if(db.translatorType === 'llm'){
         const tr = arg.to || 'en'
-        return translateLLM(text, {to: tr, from: arg.from, translatorNote: arg.translatorNote})
+        return translateLLM(text, {to: tr, from: arg.from, translatorNote: arg.translatorNote, signal: arg.signal})
     }
     if(db.translatorType === 'deepl'){
         const body = {
@@ -146,7 +148,8 @@ async function translateMain(text:string, arg:{from:string, to:string, host:stri
             target_lang: arg.to.toLocaleUpperCase(),
         }
         let url = db.deeplOptions.freeApi ? "https://api-free.deepl.com/v2/translate" : "https://api.deepl.com/v2/translate"
-        const f = await globalFetch(url, {
+        const f = await raceAbort(() => (globalFetch(url, {
+                    abortSignal: arg.signal,
             headers: {
                 "Authorization": "DeepL-Auth-Key " + db.deeplOptions.key,
                 "Content-Type": "application/json"
@@ -154,10 +157,10 @@ async function translateMain(text:string, arg:{from:string, to:string, host:stri
             body: body,
             logCategory: 'translate',
             logSource: 'translate',
-        })
+        })), arg.signal)
 
         if(!f.ok){
-            return 'ERR::DeepL API Error' + (await f.data)
+            return 'ERR::DeepL API Error' + (await raceAbort(() => (f.data), arg.signal))
         }
         return f.data.translations[0].text
 
@@ -167,7 +170,7 @@ async function translateMain(text:string, arg:{from:string, to:string, host:stri
             if(waitTrans - Date.now() > 0){
                 const waitTime = waitTrans - Date.now()
                 waitTrans = Date.now() + 3000
-                await sleep(waitTime)
+                await raceAbort(() => (sleep(waitTime)), arg.signal)
             }
         }
 
@@ -189,15 +192,16 @@ async function translateMain(text:string, arg:{from:string, to:string, host:stri
         if(db.deeplXOptions.token.trim() !== '') { headers["Authorization"] = "Bearer " + db.deeplXOptions.token}
         
         //Since the DeepLX API is non-CORS restricted, we can use the plain fetch function
-        const f = await globalFetch(url, { method: "POST", headers: headers, body: body, plainFetchForce:true, logCategory: 'translate', logSource: 'translate' })
+        const f = await raceAbort(() => (globalFetch(url, {
+                    abortSignal: arg.signal, method: "POST", headers: headers, body: body, plainFetchForce:true, logCategory: 'translate', logSource: 'translate' })), arg.signal)
 
-        if(!f.ok){ return 'ERR::DeepLX API Error' + (await f.data) }
+        if(!f.ok){ return 'ERR::DeepLX API Error' + (await raceAbort(() => (f.data), arg.signal)) }
 
         return f.data.data;
     }
     if(db.translatorType == "bergamot") {
         if(!bergamotTranslate){
-            const bergamotTranslator = await import('./bergamotTranslator')
+            const bergamotTranslator = await raceAbort(() => (import('./bergamotTranslator')), arg.signal)
             bergamotTranslate = bergamotTranslator.bergamotTranslate
         }
 
@@ -210,7 +214,8 @@ async function translateMain(text:string, arg:{from:string, to:string, host:stri
         if(hqAvailable){
             try {
                 const ua = navigator.userAgent
-                const d = await globalFetch(`https://translate.google.com/m?tl=${arg.to}&sl=${arg.from}&q=${encodeURIComponent(text)}`, {
+                const d = await raceAbort(() => (globalFetch(`https://translate.google.com/m?tl=${arg.to}&sl=${arg.from}&q=${encodeURIComponent(text)}`, {
+                    abortSignal: arg.signal,
                     headers: {
                         "User-Agent": ua,
                         "Accept": "*/*",
@@ -218,7 +223,7 @@ async function translateMain(text:string, arg:{from:string, to:string, host:stri
                     method: "GET",
                     logCategory: 'translate',
                     logSource: 'translate',
-                })
+                })), arg.signal)
                 const parser = new DOMParser()
                 const dom = parser.parseFromString(d.data, 'text/html')
                 const result = dom.querySelector('.result-container')?.textContent?.trim()
@@ -226,6 +231,7 @@ async function translateMain(text:string, arg:{from:string, to:string, host:stri
                     return result
                 }
             } catch (error) {
+                throwIfAborted(arg.signal)
                 
             }
         }
@@ -236,13 +242,14 @@ async function translateMain(text:string, arg:{from:string, to:string, host:stri
 
 
 
-    const f = await fetch(url, {
+    const f = await raceAbort(() => (fetch(url, {
+                    signal: arg.signal,
 
         method: "GET",
 
-    })
+    })), arg.signal)
 
-    const res = await f.json()
+    const res = await raceAbort(() => (f.json()), arg.signal)
 
     
 
@@ -260,13 +267,13 @@ async function translateMain(text:string, arg:{from:string, to:string, host:stri
     return result
 }
 
-export async function translateVox(text:string) {    
-    return jaTrans(text)
+export async function translateVox(text:string, signal?: AbortSignal) {    
+    return jaTrans(text, signal)
 }
 
 
-async function jaTrans(text:string) {
-    return await runTranslator(text, true, 'en','ja')
+async function jaTrans(text:string, signal?: AbortSignal) {
+    return await raceAbort(() => (runTranslator(text, true, 'en','ja', undefined, signal)), signal)
 }
 
 export function isExpTranslator(){
@@ -521,14 +528,14 @@ function needSuperChunkedTranslate(){
     return getDatabase().translatorType === 'deeplX'
 }
 
-async function translateLLM(text:string, arg:{to:string, from:string, regenerate?:boolean,translatorNote?:string, onCacheState?:(cached:boolean) => void}):Promise<string>{
+async function translateLLM(text:string, arg:{to:string, from:string, regenerate?:boolean,translatorNote?:string, onCacheState?:(cached:boolean) => void, signal?: AbortSignal}):Promise<string>{
     if(!arg.regenerate){
         const cacheMatch = llmTranslateCache.get(text)
         if(cacheMatch){
             arg.onCacheState?.(true)
             return cacheMatch
         }
-        const persistedCacheMatch = await getPersistentLLMCache(text)
+        const persistedCacheMatch = await raceAbort(() => (getPersistentLLMCache(text)), arg.signal)
         if (persistedCacheMatch !== null) {
             arg.onCacheState?.(true)
             return persistedCacheMatch
@@ -581,13 +588,13 @@ async function translateLLM(text:string, arg:{to:string, from:string, regenerate
             }
         ]
     }
-    const rq = await requestChatData({
+    const rq = await raceAbort(() => (requestChatData({
         formated,
         bias: {},
         useStreaming: false,
         noMultiGen: true,
         maxTokens: preset.maxResponse,
-    }, 'translate')
+    }, 'translate', arg.signal)), arg.signal)
 
     if(rq.type === 'fail'){
         notifyError(rq.result)

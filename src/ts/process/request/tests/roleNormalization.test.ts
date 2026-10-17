@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
 // Harness pattern copied from illustrationGenerationCap.test.ts (that file is left untouched).
 // It hand-mirrors the real LLMFlags/LLMFormat/LLMProvider enums so the mocked modellist can
@@ -398,5 +398,126 @@ describe('provider-aware system->developer role normalization', () => {
         const sentBody = harness.globalFetch.mock.calls[0][1].body as { messages: Array<{ role: string }> }
         // no second dispatch that downgrades the role, and the single dispatch reflects the decision
         expect(sentBody.messages.map((m) => m.role)).toEqual(['developer', 'user'])
+    })
+})
+
+
+describe('request plugin Stop', () => {
+    let plugins: typeof import('src/ts/plugins/plugins.svelte').pluginV2
+    let request: typeof import('../request').requestChatData
+    beforeEach(async () => {
+        plugins = (await import('src/ts/plugins/plugins.svelte')).pluginV2
+        request = (await import('../request')).requestChatData
+        plugins.replacerbeforeRequest.clear()
+        plugins.replacerafterRequest.clear()
+        harness.db.aiModel = 'pluginmodel:::stop-test'
+        harness.models.set(harness.db.aiModel, model(harness.db.aiModel, harness.formats.Plugin, { flags: [FULL] }))
+        harness.providers.set('stop-test', harness.provider)
+        harness.provider.mockResolvedValue({ success: true, content: 'response' })
+        vi.useFakeTimers()
+    })
+    afterEach(() => {
+        plugins.replacerbeforeRequest.clear()
+        plugins.replacerafterRequest.clear()
+        vi.useRealTimers()
+    })
+    const args = () => ({ formated: [{ role: 'user' as const, content: 'original' }], bias: {}, tools: [] })
+    const flush = async () => { for (let i = 0; i < 100; i++) await Promise.resolve() }
+
+    test.each(['before', 'after'] as const)('%s replacer never answers: Stop settles without advancing the timeout', async phase => {
+        const started = vi.fn()
+        const hook = (..._args: any[]) => { started(); return new Promise<any>(() => {}) }
+        if (phase === 'before') plugins.replacerbeforeRequest.add(hook)
+        else plugins.replacerafterRequest.add(hook)
+        const controller = new AbortController()
+        let result: unknown
+        const pending = request(args(), 'model', controller.signal).then(value => { result = value })
+        await flush()
+        expect(started).toHaveBeenCalledOnce()
+        controller.abort()
+        await flush()
+        expect(result).toEqual({ type: 'fail', result: 'Aborted' })
+        await pending
+    })
+    test('late before result and direct mutations cannot change the formatted prompt', async () => {
+        let resolve!: (value: any) => void
+        let guestInput: any
+        plugins.replacerbeforeRequest.add(input => { guestInput = input; return new Promise(r => { resolve = r }) })
+        const controller = new AbortController()
+        const argument = args()
+        const pending = request(argument, 'model', controller.signal)
+        await flush()
+        controller.abort()
+        await expect(pending).resolves.toEqual({ type: 'fail', result: 'Aborted' })
+        guestInput[0].content = 'late mutation'
+        resolve([{ role: 'user', content: 'late replacement' }])
+        await flush()
+        expect(argument.formated[0].content).toBe('original')
+        expect(harness.provider).not.toHaveBeenCalled()
+    })
+    test('late after result is discarded and the next hook is skipped', async () => {
+        let resolve!: (value: string) => void
+        const next = vi.fn((value: string) => value)
+        plugins.replacerafterRequest.add(() => new Promise(r => { resolve = r }))
+        plugins.replacerafterRequest.add(next)
+        const controller = new AbortController()
+        const pending = request(args(), 'model', controller.signal)
+        await flush()
+        controller.abort()
+        await expect(pending).resolves.toEqual({ type: 'fail', result: 'Aborted' })
+        resolve('late output')
+        await flush()
+        expect(next).not.toHaveBeenCalled()
+    })
+    test('normal before and after replacements still apply', async () => {
+        plugins.replacerbeforeRequest.add(input => [{ ...input[0], content: 'replaced' }])
+        plugins.replacerafterRequest.add(value => value + ' edited')
+        const result = await request(args(), 'model')
+        expect(harness.provider.mock.calls[0][0].prompt_chat[0].content).toBe('replaced')
+        expect(result).toMatchObject({ type: 'success', result: 'response edited' })
+    })
+    test.each([['before', 600000], ['after', 60000]] as const)('%s timeout keeps the original duration and fails open', async (phase, timeout) => {
+        const hook = () => new Promise<any>(() => {})
+        if (phase === 'before') plugins.replacerbeforeRequest.add(hook)
+        else plugins.replacerafterRequest.add(hook)
+        let settled = false
+        const pending = request(args(), 'model').then(value => { settled = true; return value })
+        await flush()
+        await vi.advanceTimersByTimeAsync(timeout - 1)
+        expect(settled).toBe(false)
+        await vi.advanceTimersByTimeAsync(1)
+        await expect(pending).resolves.toMatchObject({ type: 'success', result: 'response' })
+    })
+    test('throwing and invalid replacers still fail open', async () => {
+        plugins.replacerbeforeRequest.add(() => { throw new Error('before failure') })
+        plugins.replacerbeforeRequest.add((() => null) as any)
+        plugins.replacerafterRequest.add(() => { throw new Error('after failure') })
+        plugins.replacerafterRequest.add((() => []) as any)
+        await expect(request(args(), 'model')).resolves.toMatchObject({ type: 'success', result: 'response' })
+    })
+    test('already aborted requests skip every hook', async () => {
+        const hook = vi.fn()
+        plugins.replacerbeforeRequest.add(hook)
+        const controller = new AbortController()
+        controller.abort()
+        await expect(request(args(), 'model', controller.signal)).resolves.toEqual({ type: 'fail', result: 'Aborted' })
+        expect(hook).not.toHaveBeenCalled()
+        expect(harness.provider).not.toHaveBeenCalled()
+    })
+    test('a provider ignoring the signal settles immediately and cannot mutate the prompt later', async () => {
+        let resolve!: (value: any) => void
+        let input: any
+        harness.provider.mockImplementation(arg => { input = arg; return new Promise(r => { resolve = r }) })
+        const controller = new AbortController()
+        const argument = args()
+        const pending = request(argument, 'model', controller.signal)
+        await flush()
+        expect(harness.provider.mock.calls[0][1]).toBe(controller.signal)
+        controller.abort()
+        await expect(pending).resolves.toEqual({ type: 'fail', result: 'Aborted' })
+        input.prompt_chat[0].content = 'late provider mutation'
+        resolve({ success: true, content: 'late' })
+        await flush()
+        expect(argument.formated[0].content).toBe('original')
     })
 })

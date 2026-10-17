@@ -16,7 +16,8 @@
     import { getCharImage } from "../../ts/characters";
     import { chatProcessStage, sendChat } from "../../ts/process/index.svelte";
     import { getReplayableSnapshot, type MainRequestSnapshot } from '../../ts/process/request/requestReplay';
-    import { abortGeneration, chatGenKey, endGeneration, generationStates, registerAbort } from "../../ts/process/generationState";
+    import { raceAbort, throwIfAborted } from "../../ts/process/abort";
+    import { abortGeneration, chatGenKey, endGeneration, generationStates, registerAbort, startGeneration } from "../../ts/process/generationState";
     import { clearPendingSend, resumableSends, resumePendingSend, takeResumable } from "../../ts/process/request/pendingSends";
     import { ensureCurrentChatReady } from "../../ts/storage/chatStorage";
     import { sleep } from "../../ts/util";
@@ -338,69 +339,81 @@ import { isMobile } from 'src/ts/platform'
         const activeChat = await ensureActiveChatReady(selectedChar)
         if(!activeChat) return
 
-        let cha = activeChat.message
+        const inputController = new AbortController()
+        const inputGenKey = currentChatGenKey()
+        registerAbort(inputGenKey, inputController)
+        const inputGenerationId = v4()
+        startGeneration(inputGenKey, inputGenerationId)
+        try {
+            let cha = activeChat.message
 
-        if(messageInput.startsWith('/')){
-            const commandProcessed = await processMultiCommand(messageInput)
-            if(commandProcessed !== false){
-                messageInput = ''
-                messageInputTranslate = ''
-                removeChatDraft(draftChaId, draftChatId)
-                return
+            if(messageInput.startsWith('/')){
+                const commandProcessed = await raceAbort(() => processMultiCommand(messageInput, inputController.signal, inputGenerationId), inputController.signal)
+                if(commandProcessed !== false){
+                    messageInput = ''
+                    messageInputTranslate = ''
+                    removeChatDraft(draftChaId, draftChatId)
+                    return
+                }
             }
-        }
 
-        if(fileInput.length > 0){
-            for(const file of fileInput){
-                messageInput += `{{inlayed::${file}}}`
+            if(fileInput.length > 0){
+                for(const file of fileInput){
+                    messageInput += `{{inlayed::${file}}}`
+                }
+                fileInput = []
             }
-            fileInput = []
-        }
 
-        if(messageInput === ''){
-            if(cha.length === 0 || cha[cha.length - 1].role !== 'user'){
-                if(DBState.db.useSayNothing){
+            if(messageInput === ''){
+                if(cha.length === 0 || cha[cha.length - 1].role !== 'user'){
+                    if(DBState.db.useSayNothing){
+                        cha.push({
+                            role: 'user',
+                            data: '*says nothing*',
+                            name: null
+                        })
+                    }
+                }
+            }
+            else{
+                const char = DBState.db.characters[selectedChar]
+                if(char.type === 'character'){
+                    let triggerResult = await raceAbort(() => runTrigger(char,'input', {chat: activeChat, signal: inputController.signal, inputGenerationId}), inputController.signal)
+                    if(triggerResult){
+                        cha = triggerResult.chat.message
+                    }
+
                     cha.push({
                         role: 'user',
-                        data: '*says nothing*',
+                        data: await raceAbort(() => processScript(char,messageInput,'editinput', {}, inputController.signal), inputController.signal),
+                        time: Date.now(),
+                        name: null
+                    })
+                }
+                else{
+                    cha.push({
+                        role: 'user',
+                        data: messageInput,
+                        time: Date.now(),
                         name: null
                     })
                 }
             }
+            messageInput = ''
+            messageInputTranslate = ''
+            removeChatDraft(draftChaId, draftChatId)
+            DBState.db.characters[selectedChar].chats[DBState.db.characters[selectedChar].chatPage].message = cha
+
+            await raceAbort(() => sleep(10), inputController.signal)
+            updateInputSizeAll()
+            throwIfAborted(inputController.signal)
+            endGeneration(inputGenKey)
+            await sendChatMain(continueResponse, undefined, inputController)
+        } catch (error) {
+            if (!inputController.signal.aborted) throw error
+        } finally {
+            endGeneration(inputGenKey)
         }
-        else{
-            const char = DBState.db.characters[selectedChar]
-            if(char.type === 'character'){
-                let triggerResult = await runTrigger(char,'input', {chat: activeChat})
-                if(triggerResult){
-                    cha = triggerResult.chat.message
-                }
-
-                cha.push({
-                    role: 'user',
-                    data: await processScript(char,messageInput,'editinput'),
-                    time: Date.now(),
-                    name: null
-                })
-            }
-            else{
-                cha.push({
-                    role: 'user',
-                    data: messageInput,
-                    time: Date.now(),
-                    name: null
-                })
-            }
-        }
-        messageInput = ''
-        messageInputTranslate = ''
-        removeChatDraft(draftChaId, draftChatId)
-        DBState.db.characters[selectedChar].chats[DBState.db.characters[selectedChar].chatPage].message = cha
-
-        await sleep(10)
-        updateInputSizeAll()
-        await sendChatMain(continueResponse)
-
     }
 
     // Fullscreen compose mode: the same messageInput, just shown in a full-screen
@@ -563,7 +576,7 @@ import { isMobile } from 'src/ts/platform'
     // switch because currentChatGenKey reads the selected char/chatPage.
     let currentChatGenerating = $derived($generationStates.has(currentChatGenKey()))
 
-    async function sendChatMain(continued:boolean = false, replayRequest?:MainRequestSnapshot) {
+    async function sendChatMain(continued:boolean = false, replayRequest?:MainRequestSnapshot, controller?: AbortController) {
 
         messageInput = ''
         const chatId = currentChatId()
@@ -575,7 +588,7 @@ import { isMobile } from 'src/ts/platform'
         if ($generationStates.has(genKey)) {
             return false
         }
-        const abortController = new AbortController()
+        const abortController = controller ?? new AbortController()
         registerAbort(genKey, abortController)
         let generated = false
         let generationId: string | undefined

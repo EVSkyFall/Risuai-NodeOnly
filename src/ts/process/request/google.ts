@@ -1,3 +1,4 @@
+import { raceAbort, throwIfAborted } from "../abort";
 import { fetchNative, textifyReadableStream } from "src/ts/globalApi.svelte"
 import { LLMFlags, LLMFormat, type LLMModel } from "src/ts/model/modellist"
 import { getDatabase, setDatabase } from "src/ts/storage/database.svelte"
@@ -816,7 +817,8 @@ async function requestGoogle(url:string, body:any, headers:{[key:string]:string}
 
                         imgHTML.src = `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`
                         await writeInlayImage(imgHTML, {
-                            id: id
+                            id: id,
+                            signal: arg.abortSignal
                         })
                         rDatas.push({
                             text: `{{inlayeddata::${id}}}`
@@ -842,13 +844,14 @@ async function requestGoogle(url:string, body:any, headers:{[key:string]:string}
             
             for (const interceptor of bodyIntercepterStore) {
                 try {
-                    await interceptor.callback({
+                    await raceAbort(() => interceptor.callback({
                         usageMetadata: data.usageMetadata,
                         modelStatus: data.modelStatus,
                         promptFeedback: data.promptFeedback
-                    }, 'meta_gemini')
+                    }, 'meta_gemini'), arg.abortSignal)
                 }
                 catch (e) {
+                    throwIfAborted(arg.abortSignal)
                     console.error(e)
                 }
             }
@@ -920,7 +923,7 @@ async function requestGoogle(url:string, body:any, headers:{[key:string]:string}
             
             const tool = tools.find((t) => t.name === functionName)
             if(tool){
-                const result = (await callTool(tool.name, functionArgs)).filter((r) => {
+                const result = (await callTool(tool.name, functionArgs, arg.abortSignal)).filter((r) => {
                     return r.type === 'text'
                 })
                 if(result.length === 0){
@@ -952,6 +955,7 @@ async function requestGoogle(url:string, body:any, headers:{[key:string]:string}
                             data: JSON.parse(response)
                         }
                     } catch (error) {
+                        throwIfAborted(arg.abortSignal)
                         response = {
                             data: response
                         }
@@ -1238,7 +1242,7 @@ function wrapToolStream(
                             const functionArgs = call.args
                             const tool = tools.find((t) => t.name === functionName)
                             if(tool){
-                                const result = (await callTool(tool.name, functionArgs)).filter((r) => {
+                                const result = (await callTool(tool.name, functionArgs, arg.abortSignal)).filter((r) => {
                                     return r.type === 'text'
                                 })
                                 if(result.length === 0){
@@ -1268,6 +1272,7 @@ function wrapToolStream(
                                             data: JSON.parse(response)
                                         }
                                     } catch (error) {
+                                        throwIfAborted(arg.abortSignal)
                                         response = {
                                             data: response
                                         }
@@ -1356,9 +1361,10 @@ function wrapToolStream(
 
                     for (const interceptor of bodyIntercepterStore) {
                         try {
-                            await interceptor.callback(value, 'meta_gemini_stream')
+                            await raceAbort(() => interceptor.callback(value, 'meta_gemini_stream'), arg.abortSignal)
                         }
                         catch (e) {
+                            throwIfAborted(arg.abortSignal)
                             console.error(e)
                         }
                     }

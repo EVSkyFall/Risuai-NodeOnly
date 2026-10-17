@@ -1,3 +1,4 @@
+import { raceAbort, throwIfAborted } from "./abort";
 import { parseChatML } from "../parser/chatML";
 import { risuChatParser } from "../parser/parser.svelte";
 import { getCurrentCharacter, getCurrentChat, getDatabase, setCurrentCharacter, setDatabase, type Chat, type character } from "../storage/database.svelte";
@@ -1045,6 +1046,8 @@ export const requestAllowList = [
 
 export async function runTrigger(char:character,mode:triggerMode, arg:{
     chat: Chat,
+    signal?: AbortSignal,
+    inputGenerationId?: string,
     recursiveCount?: number
     additonalSysPrompt?: additonalSysPrompt
     stopSending?: boolean
@@ -1054,6 +1057,8 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
     displayData?: string
     tempVars?: Record<string, string>
 }){
+    const signal = arg.signal
+    throwIfAborted(signal)
     arg.recursiveCount ??= 0
     char = arg.displayMode ? char : safeStructuredClone(char)
     let varChanged = false
@@ -1087,6 +1092,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
         return null
     }
 
+    try {
     let tempVars:Record<string, string> = arg.tempVars ?? {}
     
     let localVarScopes: Record<number, Record<string, string>>[] = [{}]
@@ -1221,6 +1227,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
     
     
     for(const trigger of triggers){
+        throwIfAborted(signal)
         let tempVars:Record<string, number> = {}
 
         if(trigger.effect[0]?.type === 'triggercode' || trigger.effect[0]?.type === 'triggerlua'){
@@ -1317,6 +1324,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
         }
 
         for(let index = 0; index < trigger.effect.length; index++){
+            throwIfAborted(signal)
             const effect = trigger.effect[index]
             if(mode === 'display' && !displayAllowList.includes(effect.type)){
                 continue
@@ -1382,7 +1390,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                 }
                 case 'command':{
                     const effectValue = risuChatParser(effect.value,{chara:char})
-                    await processMultiCommand(effectValue)
+                    await raceAbort(() => (processMultiCommand(effectValue, signal, arg.inputGenerationId)), signal)
                     break
                 }
                 case 'stop':
@@ -1393,13 +1401,15 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                 case 'runtrigger':{
                     if(arg.recursiveCount < 10 || trigger.lowLevelAccess){
                         arg.recursiveCount++
-                        const r = await runTrigger(char,'manual',{
+                        const r = await raceAbort(() => (runTrigger(char,'manual',{
                             chat,
+                            signal,
+                            inputGenerationId: arg.inputGenerationId,
                             recursiveCount: arg.recursiveCount,
                             additonalSysPrompt,
                             stopSending,
                             manualName: effect.value
-                        })
+                        })), signal)
                         if(r){
                             additonalSysPrompt = r.additonalSysPrompt
                             chat = r.chat
@@ -1446,12 +1456,12 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                             break
                         }
                         case 'input':{
-                            const val = await alertInput(effectValue)
+                            const val = await raceAbort(() => (alertInput(effectValue)), signal)
                             setVar(inputVar, val)
                             break;
                         }
                         case 'select':{
-                            const val = await alertSelect(effectValue.split('§'))
+                            const val = await raceAbort(() => (alertSelect(effectValue.split('§'))), signal)
                             setVar(inputVar, val)
                         }
                     }
@@ -1476,13 +1486,13 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                     if(!promptbody){
                         promptbody = [{role:'user', content:effectValue}]
                     }
-                    const result = await requestChatData({
+                    const result = await raceAbort(() => (requestChatData({
                         formated: promptbody,
                         bias: {},
                         useStreaming: false,
                         noMultiGen: true,
                         moduleId: trigger.moduleId,
-                    }, 'model')
+                    }, 'model', signal)), signal)
 
                     if(result.type === 'fail' || result.type === 'streaming' || result.type === 'multiline'){
                         setVar(varName, 'Error: ' + result.result)
@@ -1502,8 +1512,8 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                     const processer = new HypaProcesser()
                     const effectValue = risuChatParser(effect.value,{chara:char})
                     const source = risuChatParser(effect.source,{chara:char})
-                    await processer.addText(effectValue.split('§'))
-                    const val = await processer.similaritySearch(source)
+                    await raceAbort(() => (processer.addText(effectValue.split('§'))), signal)
+                    const val = await raceAbort(() => (processer.similaritySearch(source)), signal)
                     setVar(effect.inputVar, val.join('§'))
                     break
                 }
@@ -1532,7 +1542,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
 
                     const effectValue = risuChatParser(effect.value,{chara:char})
                     const negValue = risuChatParser(effect.negValue,{chara:char})
-                    const gen = await generateAIImage(effectValue, char, negValue, 'inlay')
+                    const gen = await raceAbort(() => (generateAIImage(effectValue, char, negValue, 'inlay', 'interactive', signal)), signal)
                     if(!gen){
                         setVar(effect.inputVar, 'Error: Image generation failed')
                         break
@@ -1540,10 +1550,11 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                     const imgHTML = new Image()
                     imgHTML.src = gen
                     try {
-                        const inlay = await writeInlayImage(imgHTML)
+                        const inlay = await raceAbort(() => (writeInlayImage(imgHTML, { signal })), signal)
                         const res = `{{inlay::${inlay}}}`
                         setVar(effect.inputVar, res)
                     } catch (error) {
+                        throwIfAborted(signal)
                         if (error instanceof InlayImageWriteError) {
                             console.warn('Failed to decode trigger-generated inlay image:', error)
                             setVar(effect.inputVar, 'Error: Image generation failed')
@@ -1555,7 +1566,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                 }
 
                 case 'triggerlua':{
-                    const triggerCodeResult = await runScripted(effect.code,{
+                    const triggerCodeResult = await raceAbort(() => (runScripted(effect.code,{
                         lowLevelAccess: trigger.lowLevelAccess,
                         mode: mode === 'manual' ? arg.manualName : mode,
                         setVar: setVar,
@@ -1563,7 +1574,8 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         char: char,
                         chat: chat,
                         moduleId: trigger.moduleId,
-                    })
+                        signal,
+                    })), signal)
 
                     if(triggerCodeResult.stopSending){
                         stopSending = true
@@ -1665,6 +1677,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                             try {
                                 pass = JSON.parse(targetValue).includes(sourceValue)
                             } catch (error) {
+                                throwIfAborted(signal)
                                 pass = false
                             }
                             break
@@ -1673,6 +1686,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                             try {
                                 pass = JSON.parse(sourceValue).includes(targetValue)
                             } catch (error) {
+                                throwIfAborted(signal)
                                 pass = false
                             }
                             break
@@ -1681,6 +1695,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                             try {
                                 pass = !JSON.parse(targetValue).includes(sourceValue)
                             } catch (error) {
+                                throwIfAborted(signal)
                                 pass = true
                             }
                             break
@@ -1689,6 +1704,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                             try {
                                 pass = !JSON.parse(sourceValue).includes(targetValue)
                             } catch (error) {
+                                throwIfAborted(signal)
                                 pass = true
                             }
                             break
@@ -1776,7 +1792,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         //this is for preventing lagging
                         tempVars['loopTimes'] = (tempVars['loopTimes'] ?? 0) + 1
                         if(tempVars['loopTimes'] > 100){
-                            await sleep(1)
+                            await raceAbort(() => (sleep(1)), signal)
                             tempVars['loopTimes'] = 0
                         }
                     }
@@ -1802,13 +1818,15 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                 case 'v2RunTrigger':{
                     if(arg.recursiveCount < 10 || trigger.lowLevelAccess){
                         arg.recursiveCount++
-                        const r = await runTrigger(char,'manual',{
+                        const r = await raceAbort(() => (runTrigger(char,'manual',{
                             chat,
+                            signal,
+                            inputGenerationId: arg.inputGenerationId,
                             recursiveCount: arg.recursiveCount,
                             additonalSysPrompt,
                             stopSending,
                             manualName: effect.target
-                        })
+                        })), signal)
                         if(r){
                             additonalSysPrompt = r.additonalSysPrompt
                             chat = r.chat
@@ -1864,7 +1882,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                 }
                 case 'v2Command':{
                     let value = effect.valueType === 'value' ? risuChatParser(effect.value,{chara:char}) : getVar(risuChatParser(effect.value,{chara:char}))
-                    await processMultiCommand(value)
+                    await raceAbort(() => (processMultiCommand(value, signal, arg.inputGenerationId)), signal)
                     break
                 }
                 case 'v2SendAIprompt':{
@@ -1880,7 +1898,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                     }
                     let value = effect.valueType === 'value' ? risuChatParser(effect.value,{chara:char}) : getVar(risuChatParser(effect.value,{chara:char}))
                     let negValue = effect.negValueType === 'value' ? risuChatParser(effect.negValue,{chara:char}) : getVar(risuChatParser(effect.negValue,{chara:char}))
-                    let gen = await generateAIImage(value, char, negValue, 'inlay')
+                    let gen = await raceAbort(() => (generateAIImage(value, char, negValue, 'inlay', 'interactive', signal)), signal)
                     if(!gen){
                         setVar(risuChatParser(effect.outputVar, {chara:char}), 'null')
                         break
@@ -1888,10 +1906,11 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                     let imgHTML = new Image()
                     imgHTML.src = gen
                     try {
-                        let inlay = await writeInlayImage(imgHTML)
+                        let inlay = await raceAbort(() => (writeInlayImage(imgHTML, { signal })), signal)
                         let res = `{{inlay::${inlay}}}`
                         setVar(risuChatParser(effect.outputVar, {chara:char}), res)
                     } catch (error) {
+                        throwIfAborted(signal)
                         if (error instanceof InlayImageWriteError) {
                             console.warn('Failed to decode V2 trigger-generated inlay image:', error)
                             setVar(risuChatParser(effect.outputVar, {chara:char}), 'null')
@@ -1909,8 +1928,8 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                     let source = effect.sourceType === 'value' ? risuChatParser(effect.source,{chara:char}) : getVar(risuChatParser(effect.source,{chara:char}))
                     let value = effect.valueType === 'value' ? risuChatParser(effect.value,{chara:char}) : getVar(risuChatParser(effect.value,{chara:char}))
                     let processer = new HypaProcesser()
-                    await processer.addText(value.split('§'))
-                    let val = await processer.similaritySearch(source)
+                    await raceAbort(() => (processer.addText(value.split('§'))), signal)
+                    let val = await raceAbort(() => (processer.similaritySearch(source)), signal)
                     setVar(risuChatParser(effect.outputVar, {chara:char}), val.join('§'))
                     break
                 }
@@ -1923,13 +1942,13 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                     if(!promptbody){
                         promptbody = [{role:'user', content:value}]
                     }
-                    let result = await requestChatData({
+                    let result = await raceAbort(() => (requestChatData({
                         formated: promptbody,
                         bias: {},
                         useStreaming: effect.streaming ?? false,
                         noMultiGen: true,
                         moduleId: trigger.moduleId,
-                    }, effect.model)
+                    }, effect.model, signal)), signal)
 
                     if(result.type === 'fail' || result.type === 'multiline'){
                         // Silent aux-request death made the 2026-07-06 replacer-freeze
@@ -1938,7 +1957,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         setVar(risuChatParser(effect.outputVar, {chara:char}), 'null')
                     }
                     else if(result.type === 'streaming'){
-                        const text = await collectStreamingText(result.result)
+                        const text = await raceAbort(() => (collectStreamingText(result.result)), signal)
                         setVar(risuChatParser(effect.outputVar, {chara:char}), text)
                     }
                     else{
@@ -2108,6 +2127,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                                 result = source.split(regex)
                             }
                         } catch (error) {
+                            throwIfAborted(signal)
                             result = [source]
                         }
                     } else {
@@ -2124,6 +2144,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         let delimiter = effect.delimiterType === 'value' ? risuChatParser(effect.delimiter,{chara:char}) : getVar(risuChatParser(effect.delimiter,{chara:char}))
                         setVar(risuChatParser(effect.outputVar, {chara:char}), arr.join(delimiter))
                     } catch (error) {
+                        throwIfAborted(signal)
                         setVar(risuChatParser(effect.outputVar, {chara:char}), '')
                     }
                     break
@@ -2186,6 +2207,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         let arr = JSON.parse(varValue)
                         setVar(risuChatParser(effect.outputVar, {chara:char}), arr.length.toString())
                     } catch (error) {
+                        throwIfAborted(signal)
                         setVar(risuChatParser(effect.outputVar, {chara:char}), '0')
                     }
                     break
@@ -2198,6 +2220,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         let index = effect.indexType === 'value' ? Number(risuChatParser(effect.index,{chara:char})) : Number(getVar(risuChatParser(effect.index,{chara:char})))
                         setVar(risuChatParser(effect.outputVar, {chara:char}), arr[index] ?? 'null')
                     } catch (error) {
+                        throwIfAborted(signal)
                         setVar(risuChatParser(effect.outputVar, {chara:char}), 'null')
                     }
                     break
@@ -2211,6 +2234,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         arr.push(value)
                         setVar(varName, JSON.stringify(arr))
                     } catch (error) {
+                        throwIfAborted(signal)
                         const varName = risuChatParser(effect.var, {chara:char})
                         setVar(varName, '[]')
                     }
@@ -2224,6 +2248,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         setVar(risuChatParser(effect.outputVar, {chara:char}), arr.pop() ?? 'null')
                         setVar(varName, JSON.stringify(arr))
                     } catch (error) {
+                        throwIfAborted(signal)
                         const varName = risuChatParser(effect.var, {chara:char})
                         setVar(varName, '[]')
                         setVar(risuChatParser(effect.outputVar, {chara:char}), 'null')
@@ -2238,6 +2263,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         setVar(risuChatParser(effect.outputVar, {chara:char}), arr.shift() ?? 'null')
                         setVar(varName, JSON.stringify(arr))
                     } catch (error) {
+                        throwIfAborted(signal)
                         const varName = risuChatParser(effect.var, {chara:char})
                         setVar(varName, '[]')
                         setVar(risuChatParser(effect.outputVar, {chara:char}), 'null')
@@ -2253,6 +2279,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         arr.unshift(value)
                         setVar(varName, JSON.stringify(arr))
                     } catch (error) {
+                        throwIfAborted(signal)
                         const varName = risuChatParser(effect.var, {chara:char})
                         setVar(varName, '[]')
                     }
@@ -2268,6 +2295,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         arr.splice(start, 0, value)
                         setVar(varName, JSON.stringify(arr))
                     } catch (error) {
+                        throwIfAborted(signal)
                         const varName = risuChatParser(effect.var, {chara:char})
                         setVar(varName, '[]')
                     }
@@ -2283,6 +2311,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         
                         setVar(risuChatParser(effect.outputVar, {chara:char}), JSON.stringify(arr.slice(start,end)))
                     } catch (error) {
+                        throwIfAborted(signal)
                         setVar(risuChatParser(effect.outputVar, {chara:char}), '[]')
                     }
                     break
@@ -2295,6 +2324,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         let value = effect.valueType === 'value' ? risuChatParser(effect.value,{chara:char}) : getVar(risuChatParser(effect.value,{chara:char}))
                         setVar(risuChatParser(effect.outputVar, {chara:char}), arr.indexOf(value).toString())
                     } catch (error) {
+                        throwIfAborted(signal)
                         setVar(risuChatParser(effect.outputVar, {chara:char}), '-1')
                     }
                     break
@@ -2308,6 +2338,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         arr.splice(index, 1)
                         setVar(varName, JSON.stringify(arr))
                     } catch (error) {
+                        throwIfAborted(signal)
                         const varName = risuChatParser(effect.var, {chara:char})
                         setVar(varName, '[]')
                     }
@@ -2337,9 +2368,9 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                     if(arg.displayMode){
                         return
                     }
-                    let value = await alertInput(
+                    let value = await raceAbort(() => (alertInput(
                         effect.displayType === 'value' ? risuChatParser(effect.display,{chara:char}) : getVar(risuChatParser(effect.display,{chara:char}))
-                    )
+                    )), signal)
                     setVar(risuChatParser(effect.outputVar, {chara:char}), value)
                     break
                 }
@@ -2350,7 +2381,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                     const display = effect.displayType === 'value' ? risuChatParser(effect.display,{chara:char}) : getVar(risuChatParser(effect.display,{chara:char}))
                     const value = effect.valueType === 'value' ? risuChatParser(effect.value,{chara:char}) : getVar(risuChatParser(effect.value,{chara:char}))
                     const options = value.split('|')
-                    let result = await alertSelect(options, display)
+                    let result = await raceAbort(() => (alertSelect(options, display)), signal)
                     setVar(risuChatParser(effect.outputVar, {chara:char}), result)
                     break
                 }
@@ -2367,6 +2398,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         arr[index] = value
                         setVar(varName, JSON.stringify(arr))
                     } catch (error) {
+                        throwIfAborted(signal)
                         
                     }
                     break
@@ -2399,7 +2431,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                 }
                 case 'v2Wait':{
                     let value = effect.valueType === 'value' ? Number(risuChatParser(effect.value,{chara:char})) : Number(getVar(risuChatParser(effect.value,{chara:char})))
-                    await sleep(value * 1000)
+                    await raceAbort(() => (sleep(value * 1000)), signal)
                     break
                 }
                 case 'v2GetRequestState':{
@@ -2480,7 +2512,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                 }
                 case 'v2Tokenize':{
                     const value = effect.valueType === 'value' ? risuChatParser(effect.value,{chara:char}) : getVar(risuChatParser(effect.value,{chara:char}))
-                    setVar(risuChatParser(effect.outputVar, {chara:char}), (await tokenize(value)).toString())
+                    setVar(risuChatParser(effect.outputVar, {chara:char}), (await raceAbort(() => (tokenize(value)), signal)).toString())
                     break
                 }
                 case 'v2GetAllLorebooks':{
@@ -2628,6 +2660,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         const result = regex.test(value)
                         setVar(risuChatParser(effect.outputVar, {chara:char}), result ? '1' : '0')
                     } catch (error) {
+                        throwIfAborted(signal)
                         setVar(risuChatParser(effect.outputVar, {chara:char}), '0')
                     }
                     break
@@ -2665,6 +2698,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         let key = effect.keyType === 'value' ? risuChatParser(effect.key,{chara:char}) : getVar(risuChatParser(effect.key,{chara:char}))
                         setVar(risuChatParser(effect.outputVar, {chara:char}), dict[key] ?? 'null')
                     } catch (error) {
+                        throwIfAborted(signal)
                         setVar(risuChatParser(effect.outputVar, {chara:char}), 'null')
                     }
                     break
@@ -2683,6 +2717,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         dict[key] = value
                         setVar(risuChatParser(effect.var, {chara:char}), JSON.stringify(dict))
                     } catch (error) {
+                        throwIfAborted(signal)
                         if(effect.varType === 'var') {
                             const value = effect.valueType === 'value' ? risuChatParser(effect.value,{chara:char}) : getVar(risuChatParser(effect.value,{chara:char}))
                             const key = effect.keyType === 'value' ? risuChatParser(effect.key,{chara:char}) : getVar(risuChatParser(effect.key,{chara:char}))
@@ -2705,6 +2740,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         delete dict[key]
                         setVar(risuChatParser(effect.var, {chara:char}), JSON.stringify(dict))
                     } catch (error) {
+                        throwIfAborted(signal)
                         if(effect.varType === 'var') {
                             setVar(risuChatParser(effect.var, {chara:char}), '{}')
                         }
@@ -2718,6 +2754,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         let key = effect.keyType === 'value' ? risuChatParser(effect.key,{chara:char}) : getVar(risuChatParser(effect.key,{chara:char}))
                         setVar(risuChatParser(effect.outputVar, {chara:char}), Object.hasOwn(dict, key) ? '1' : '0')
                     } catch (error) {
+                        throwIfAborted(signal)
                         setVar(risuChatParser(effect.outputVar, {chara:char}), '0')
                     }
                     break
@@ -2735,6 +2772,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         let dict = JSON.parse(varValue)
                         setVar(risuChatParser(effect.outputVar, {chara:char}), Object.keys(dict).length.toString())
                     } catch (error) {
+                        throwIfAborted(signal)
                         setVar(risuChatParser(effect.outputVar, {chara:char}), '0')
                     }
                     break
@@ -2746,6 +2784,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         let keys = Object.keys(dict)
                         setVar(risuChatParser(effect.outputVar, {chara:char}), JSON.stringify(keys))
                     } catch (error) {
+                        throwIfAborted(signal)
                         setVar(risuChatParser(effect.outputVar, {chara:char}), '[]')
                     }
                     break
@@ -2757,6 +2796,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         let values = Object.values(dict)
                         setVar(risuChatParser(effect.outputVar, {chara:char}), JSON.stringify(values))
                     } catch (error) {
+                        throwIfAborted(signal)
                         setVar(risuChatParser(effect.outputVar, {chara:char}), '[]')
                     }
                     break
@@ -2773,6 +2813,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         const result = calcString(expression)
                         setVar(risuChatParser(effect.outputVar, {chara:char}), result.toString())
                     } catch (error) {
+                        throwIfAborted(signal)
                         setVar(risuChatParser(effect.outputVar, {chara:char}), '0')
                     }
                     break
@@ -2810,6 +2851,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         })
                         setVar(risuChatParser(effect.outputVar, {chara:char}), result)
                     } catch (error) {
+                        throwIfAborted(signal)
                         const source = effect.sourceType === 'value' ? risuChatParser(effect.source,{chara:char}) : getVar(risuChatParser(effect.source,{chara:char}))
                         setVar(risuChatParser(effect.outputVar, {chara:char}), source)
                     }
@@ -2824,14 +2866,15 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
     
     let caculatedTokens = 0
     if(additonalSysPrompt.start){
-        caculatedTokens += await tokenize(additonalSysPrompt.start)
+        caculatedTokens += await raceAbort(() => (tokenize(additonalSysPrompt.start)), signal)
     }
     if(additonalSysPrompt.historyend){
-        caculatedTokens += await tokenize(additonalSysPrompt.historyend)
+        caculatedTokens += await raceAbort(() => (tokenize(additonalSysPrompt.historyend)), signal)
     }
     if(additonalSysPrompt.promptend){
-        caculatedTokens += await tokenize(additonalSysPrompt.promptend)
+        caculatedTokens += await raceAbort(() => (tokenize(additonalSysPrompt.promptend)), signal)
     }
+    throwIfAborted(signal)
     if(varChanged){
         const currentChat = getCurrentChat()
         currentChat.scriptstate = chat.scriptstate
@@ -2843,5 +2886,9 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
     }
     
     return {additonalSysPrompt, chat, tokens:caculatedTokens, stopSending, sendAIprompt, displayData: arg.displayData, tempVars: arg.tempVars}
-
+    } finally {
+        if (signal?.aborted && shouldSetTriggerId && get(CurrentTriggerIdStore) === (arg.triggerId || null)) {
+            CurrentTriggerIdStore.set(previousTriggerId)
+        }
+    }
 }

@@ -1,3 +1,4 @@
+import { raceAbort, throwIfAborted } from "../abort";
 import { type memoryVector, HypaProcesser, similarity, contextHash, getPersistedHypaVector, setPersistedHypaVector } from "./hypamemory";
 import { isContextModel, getContextProvider } from "./contextualEmbedding";
 import { TaskRateLimiter } from "./taskRateLimiter";
@@ -99,7 +100,8 @@ export async function hypaMemoryV3(
     maxContextTokens: number,
     room: Chat,
     char: character,
-    tokenizer: ChatTokenizer
+    tokenizer: ChatTokenizer,
+    signal?: AbortSignal
 ): Promise<HypaV3Result> {
     const preset = getActiveHypaV3Preset(getDatabase(), char, room);
     if (!preset) throw new Error("Preset not found. Please select a valid preset.");
@@ -109,25 +111,28 @@ export async function hypaMemoryV3(
         if (settings.useExperimentalImpl) {
             console.log(logPrefix, "Using experimental implementation.");
 
-            return await hypaMemoryV3MainExp(
+            return await raceAbort(() => (hypaMemoryV3MainExp(
                 chats,
                 currentTokens,
                 maxContextTokens,
                 room,
                 char,
-                tokenizer
-            );
+                tokenizer,
+                signal
+            )), signal);
         }
 
-        return await hypaMemoryV3Main(
+        return await raceAbort(() => (hypaMemoryV3Main(
             chats,
             currentTokens,
             maxContextTokens,
             room,
             char,
-            tokenizer
-        );
+            tokenizer,
+            signal
+        )), signal);
     } catch (error) {
+        throwIfAborted(signal)
         if (error instanceof Error) {
             // Standard Error instance
             error.message = `${logPrefix} ${error.message}`;
@@ -140,15 +145,18 @@ export async function hypaMemoryV3(
         try {
             errorMessage = JSON.stringify(error);
         } catch {
+            throwIfAborted(signal)
             errorMessage = String(error);
         }
 
         throw new Error(`${logPrefix} ${errorMessage}`);
     } finally {
+        if (signal?.aborted) hypaV3ProgressStore.set({ open: false, miniMsg: '', msg: '', subMsg: '' })
         if (settings.summarizationModel !== "subModel") {
             try {
-                await unloadEngine();
-            } catch { }
+                await raceAbort(() => (unloadEngine()), signal);
+            } catch {
+                throwIfAborted(signal); }
         }
     }
 }
@@ -159,7 +167,8 @@ async function hypaMemoryV3MainExp(
     maxContextTokens: number,
     room: Chat,
     char: character,
-    tokenizer: ChatTokenizer
+    tokenizer: ChatTokenizer,
+    signal?: AbortSignal
 ): Promise<HypaV3Result> {
     const db = getDatabase();
     const settings = getCurrentHypaV3Preset().settings;
@@ -204,7 +213,7 @@ async function hypaMemoryV3MainExp(
             // Exclude tokens from summarized chats
             const summarizedChats = chats.slice(0, lastChatIndex + 1);
             for (const chat of summarizedChats) {
-                currentTokens -= await tokenizer.tokenizeChat(chat);
+                currentTokens -= await raceAbort(() => (tokenizer.tokenizeChat(chat)), signal);
             }
         }
     }
@@ -212,10 +221,10 @@ async function hypaMemoryV3MainExp(
     console.log(logPrefix, "Starting index:", startIdx);
 
     // Reserve memory tokens
-    const emptyMemoryTokens = await tokenizer.tokenizeChat({
+    const emptyMemoryTokens = await raceAbort(() => (tokenizer.tokenizeChat({
         role: "system",
         content: wrapWithXml(memoryPromptTag, ""),
-    });
+    })), signal);
     const memoryTokens = Math.floor(
         maxContextTokens * settings.memoryTokensRatio
     );
@@ -276,7 +285,7 @@ async function hypaMemoryV3MainExp(
             currentIndex < chats.length - settings.queryChatCount
         ) {
             const chat = chats[currentIndex];
-            const chatTokens = await tokenizer.tokenizeChat(chat);
+            const chatTokens = await raceAbort(() => (tokenizer.tokenizeChat(chat)), signal);
 
             console.log(
                 logPrefix,
@@ -374,6 +383,7 @@ async function hypaMemoryV3MainExp(
         });
 
         rateLimiter.taskQueueChangeCallback = (queuedCount) => {
+            if (signal?.aborted) return
             hypaV3ProgressStore.set({
                 open: true,
                 miniMsg: `${rateLimiter.queuedTaskCount}`,
@@ -383,7 +393,7 @@ async function hypaMemoryV3MainExp(
         };
 
         const summarizationTasks = toSummarizeArray.map(
-            (item) => () => summarize(item)
+            (item) => () => summarize(item, false, signal)
         );
 
         // Start of performance measurement: summarize
@@ -393,9 +403,9 @@ async function hypaMemoryV3MainExp(
         );
         const summarizeStartTime = performance.now();
 
-        const batchResult = await rateLimiter.executeBatch<string>(
+        const batchResult = await raceAbort(() => (rateLimiter.executeBatch<string>(
             summarizationTasks
-        );
+        )), signal);
 
         const summarizeEndTime = performance.now();
         console.debug(
@@ -488,10 +498,10 @@ async function hypaMemoryV3MainExp(
     {
         for (const summary of data.summaries) {
             if (summary.isImportant) {
-                const summaryTokens = await tokenizer.tokenizeChat({
+                const summaryTokens = await raceAbort(() => (tokenizer.tokenizeChat({
                     role: "system",
                     content: summary.text + summarySeparator,
-                });
+                })), signal);
 
                 if (summaryTokens > availableMemoryTokens) {
                     break;
@@ -533,10 +543,10 @@ async function hypaMemoryV3MainExp(
         // Add one by one from the end
         for (let i = unusedSummaries.length - 1; i >= 0; i--) {
             const summary = unusedSummaries[i];
-            const summaryTokens = await tokenizer.tokenizeChat({
+            const summaryTokens = await raceAbort(() => (tokenizer.tokenizeChat({
                 role: "system",
                 content: summary.text + summarySeparator,
-            });
+            })), signal);
 
             if (
                 summaryTokens + consumedRecentMemoryTokens >
@@ -615,6 +625,7 @@ async function hypaMemoryV3MainExp(
         });
 
         processor.progressCallback = (queuedCount) => {
+            if (signal?.aborted) return
             hypaV3ProgressStore.set({
                 open: true,
                 miniMsg: `${queuedCount}`,
@@ -631,7 +642,7 @@ async function hypaMemoryV3MainExp(
             const addStartTime = performance.now();
 
             // Add EmbeddingTexts to processor for similarity search
-            await processor.addTexts(ebdTexts);
+            await raceAbort(() => (processor.addTexts(ebdTexts)), signal);
 
             const addEndTime = performance.now();
             console.debug(
@@ -639,6 +650,7 @@ async function hypaMemoryV3MainExp(
             );
             // End of performance measurement: addTexts
         } catch (error) {
+            throwIfAborted(signal)
             return {
                 currentTokens,
                 chats,
@@ -683,9 +695,9 @@ async function hypaMemoryV3MainExp(
                 );
                 const searchStartTime = performance.now();
 
-                const batchScoredResults = await processor.similaritySearchScoredBatch(
+                const batchScoredResults = await raceAbort(() => (processor.similaritySearchScoredBatch(
                     queries.map((query) => query.content)
-                );
+                )), signal);
 
                 /*
                 // Hybrid search may be implemented in the future
@@ -731,10 +743,10 @@ async function hypaMemoryV3MainExp(
 
                 while (rankedSummaries.length > 0) {
                     const summary = rankedSummaries.shift();
-                    const summaryTokens = await tokenizer.tokenizeChat({
+                    const summaryTokens = await raceAbort(() => (tokenizer.tokenizeChat({
                         role: "system",
                         content: summary.text + summarySeparator,
-                    });
+                    })), signal);
 
                     if (
                         summaryTokens + consumedSimilarMemoryTokens >
@@ -754,6 +766,7 @@ async function hypaMemoryV3MainExp(
 
                 selectedSummaries.push(...selectedSimilarSummaries);
             } catch (error) {
+                throwIfAborted(signal)
                 return {
                     currentTokens,
                     chats,
@@ -816,10 +829,10 @@ async function hypaMemoryV3MainExp(
             .sort(() => Math.random() - 0.5); // Random shuffle
 
         for (const summary of unusedSummaries) {
-            const summaryTokens = await tokenizer.tokenizeChat({
+            const summaryTokens = await raceAbort(() => (tokenizer.tokenizeChat({
                 role: "system",
                 content: summary.text + summarySeparator,
-            });
+            })), signal);
 
             if (
                 summaryTokens + consumedRandomMemoryTokens >
@@ -859,10 +872,10 @@ async function hypaMemoryV3MainExp(
         memoryPromptTag,
         selectedSummaries.map((e) => e.text).join(summarySeparator)
     );
-    const realMemoryTokens = await tokenizer.tokenizeChat({
+    const realMemoryTokens = await raceAbort(() => (tokenizer.tokenizeChat({
         role: "system",
         content: memory,
-    });
+    })), signal);
 
     // Release reserved memory tokens
     if (shouldReserveMemoryTokens) {
@@ -939,7 +952,8 @@ async function hypaMemoryV3Main(
     maxContextTokens: number,
     room: Chat,
     char: character,
-    tokenizer: ChatTokenizer
+    tokenizer: ChatTokenizer,
+    signal?: AbortSignal
 ): Promise<HypaV3Result> {
     const db = getDatabase();
     const settings = getCurrentHypaV3Preset().settings;
@@ -984,7 +998,7 @@ async function hypaMemoryV3Main(
             // Exclude tokens from summarized chats
             const summarizedChats = chats.slice(0, lastChatIndex + 1);
             for (const chat of summarizedChats) {
-                currentTokens -= await tokenizer.tokenizeChat(chat);
+                currentTokens -= await raceAbort(() => (tokenizer.tokenizeChat(chat)), signal);
             }
         }
     }
@@ -992,10 +1006,10 @@ async function hypaMemoryV3Main(
     console.log(logPrefix, "Starting index:", startIdx);
 
     // Reserve memory tokens
-    const emptyMemoryTokens = await tokenizer.tokenizeChat({
+    const emptyMemoryTokens = await raceAbort(() => (tokenizer.tokenizeChat({
         role: "system",
         content: wrapWithXml(memoryPromptTag, ""),
-    });
+    })), signal);
     const memoryTokens = Math.floor(
         maxContextTokens * settings.memoryTokensRatio
     );
@@ -1063,7 +1077,7 @@ async function hypaMemoryV3Main(
 
         for (let i = startIdx; i < endIdx; i++) {
             const chat = chats[i];
-            const chatTokens = await tokenizer.tokenizeChat(chat);
+            const chatTokens = await raceAbort(() => (tokenizer.tokenizeChat(chat)), signal);
 
             console.log(
                 logPrefix,
@@ -1130,7 +1144,7 @@ async function hypaMemoryV3Main(
             );
 
             try {
-                const summarizeResult = await summarize(toSummarize);
+                const summarizeResult = await raceAbort(() => (summarize(toSummarize, false, signal)), signal);
 
                 data.summaries.push({
                     text: summarizeResult,
@@ -1140,6 +1154,7 @@ async function hypaMemoryV3Main(
                     tags: [],
                 });
             } catch (error) {
+                throwIfAborted(signal)
                 console.log(logPrefix, "Summarization failed:", `\n${error}`);
 
                 return {
@@ -1207,10 +1222,10 @@ async function hypaMemoryV3Main(
     {
         for (const summary of data.summaries) {
             if (summary.isImportant) {
-                const summaryTokens = await tokenizer.tokenizeChat({
+                const summaryTokens = await raceAbort(() => (tokenizer.tokenizeChat({
                     role: "system",
                     content: summary.text + summarySeparator,
-                });
+                })), signal);
 
                 if (summaryTokens > availableMemoryTokens) {
                     break;
@@ -1252,10 +1267,10 @@ async function hypaMemoryV3Main(
         // Add one by one from the end
         for (let i = unusedSummaries.length - 1; i >= 0; i--) {
             const summary = unusedSummaries[i];
-            const summaryTokens = await tokenizer.tokenizeChat({
+            const summaryTokens = await raceAbort(() => (tokenizer.tokenizeChat({
                 role: "system",
                 content: summary.text + summarySeparator,
-            });
+            })), signal);
 
             if (
                 summaryTokens + consumedRecentMemoryTokens >
@@ -1332,8 +1347,9 @@ async function hypaMemoryV3Main(
 
         // Add summaryChunks to processor for similarity search
         try {
-            await processor.addSummaryChunks(summaryChunks);
+            await raceAbort(() => (processor.addSummaryChunks(summaryChunks)), signal);
         } catch (error) {
+            throwIfAborted(signal)
             return {
                 currentTokens,
                 chats,
@@ -1363,10 +1379,11 @@ async function hypaMemoryV3Main(
                 );
 
                 try {
-                    const summarizeResult = await summarize(recentChats);
+                    const summarizeResult = await raceAbort(() => (summarize(recentChats, false, signal)), signal);
 
                     queries.push(summarizeResult);
                 } catch (error) {
+                    throwIfAborted(signal)
                     console.log(logPrefix, "Summarization failed:", `\n${error}`);
 
                     return {
@@ -1383,7 +1400,7 @@ async function hypaMemoryV3Main(
 
                 for (let i = 0; i < queries.length; i++) {
                     const query = queries[i];
-                    const scoredChunks = await processor.similaritySearchScoredEx(query);
+                    const scoredChunks = await raceAbort(() => (processor.similaritySearchScoredEx(query)), signal);
 
                     scoredLists.push(scoredChunks);
                 }
@@ -1402,10 +1419,10 @@ async function hypaMemoryV3Main(
 
                 while (rankedSummaries.length > 0) {
                     const summary = rankedSummaries.shift();
-                    const summaryTokens = await tokenizer.tokenizeChat({
+                    const summaryTokens = await raceAbort(() => (tokenizer.tokenizeChat({
                         role: "system",
                         content: summary.text + summarySeparator,
-                    });
+                    })), signal);
 
                     if (
                         summaryTokens + consumedSimilarMemoryTokens >
@@ -1425,6 +1442,7 @@ async function hypaMemoryV3Main(
 
                 selectedSummaries.push(...selectedSimilarSummaries);
             } catch (error) {
+                throwIfAborted(signal)
                 return {
                     currentTokens,
                     chats,
@@ -1480,10 +1498,10 @@ async function hypaMemoryV3Main(
             .sort(() => Math.random() - 0.5); // Random shuffle
 
         for (const summary of unusedSummaries) {
-            const summaryTokens = await tokenizer.tokenizeChat({
+            const summaryTokens = await raceAbort(() => (tokenizer.tokenizeChat({
                 role: "system",
                 content: summary.text + summarySeparator,
-            });
+            })), signal);
 
             if (
                 summaryTokens + consumedRandomMemoryTokens >
@@ -1523,10 +1541,10 @@ async function hypaMemoryV3Main(
         memoryPromptTag,
         selectedSummaries.map((e) => e.text).join(summarySeparator)
     );
-    const realMemoryTokens = await tokenizer.tokenizeChat({
+    const realMemoryTokens = await raceAbort(() => (tokenizer.tokenizeChat({
         role: "system",
         content: memory,
-    });
+    })), signal);
 
     // Release reserved memory tokens
     if (shouldReserveEmptyMemoryTokens) {
@@ -1660,7 +1678,7 @@ function sanitizeSummaryContent(content: string): string {
     return content.replace(inlayTokenRegex, "[Image]");
 }
 
-export async function summarize(oaiMessages: OpenAIChat[], isResummarize: boolean = false): Promise<string> {
+export async function summarize(oaiMessages: OpenAIChat[], isResummarize: boolean = false, signal?: AbortSignal): Promise<string> {
     const db = getDatabase();
     const settings = getCurrentHypaV3Preset().settings;
 
@@ -1703,7 +1721,7 @@ export async function summarize(oaiMessages: OpenAIChat[], isResummarize: boolea
             subModelUrl = db.customModels?.find(m => m.id === actualModel)?.url ?? '';
         }
 
-        const response = await requestChatData(
+        const response = await raceAbort(() => (requestChatData(
             {
                 formated,
                 bias: {},
@@ -1711,8 +1729,8 @@ export async function summarize(oaiMessages: OpenAIChat[], isResummarize: boolea
                 noMultiGen: true,
                 forceLocalNetwork: isLocalNetworkUrl(subModelUrl),
             },
-            "memory"
-        );
+            "memory", signal
+        )), signal);
 
         if (response.type === "streaming" || response.type === "multiline") {
             throw new Error("Unexpected response type");
@@ -1744,13 +1762,13 @@ export async function summarize(oaiMessages: OpenAIChat[], isResummarize: boolea
         formated.unshift(system);
     }
 
-    const content = await chatCompletion(formated, settings.summarizationModel, {
+    const content = await raceAbort(() => (chatCompletion(formated, settings.summarizationModel, {
         max_tokens: 8192,
         temperature: 0,
         extra_body: {
             enable_thinking: false,
         },
-    });
+    })), signal);
 
     if (!content || content.trim().length === 0) {
         throw new Error("Empty summary returned");

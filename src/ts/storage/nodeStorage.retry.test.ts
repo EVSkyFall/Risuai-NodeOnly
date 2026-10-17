@@ -144,6 +144,35 @@ describe('NodeStorage authFetch transient retry', () => {
         expect(fetchMock).toHaveBeenCalledTimes(1)
         expect(delay).not.toHaveBeenCalled()
     })
+
+    test('Stop during write authentication prevents the actual storage request', async () => {
+        const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200))
+        const { storage } = setUpStorage(fetchMock)
+        const controller = new AbortController()
+        let release!: (value: string) => void
+        let entered!: () => void
+        const started = new Promise<void>(resolve => { entered = resolve })
+        vi.mocked(storage.createAuth).mockImplementationOnce(() => new Promise(resolve => {
+            release = resolve
+            entered()
+        }))
+        const pending = storage.setItem('inlay/test', new Uint8Array([1]), undefined, controller.signal)
+        const rejected = expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+        await started
+        controller.abort()
+        release('test-token')
+        await rejected
+        expect(fetchMock).not.toHaveBeenCalled()
+    })
+
+    test('setItem preserves etag and forwards the generation signal', async () => {
+        const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200))
+        const { storage } = setUpStorage(fetchMock)
+        const controller = new AbortController()
+        await storage.setItem('inlay/test', new Uint8Array([1]), 'old-etag', controller.signal)
+        expect(fetchMock.mock.calls[0][1].signal).toBe(controller.signal)
+        expect(fetchMock.mock.calls[0][1].headers.get('x-if-match')).toBe('old-etag')
+    })
 })
 
 describe('NodeStorage manifest revision recovery', () => {

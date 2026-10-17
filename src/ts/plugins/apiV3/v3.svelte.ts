@@ -1,3 +1,4 @@
+import { raceAbort, throwIfAborted } from "../../process/abort";
 import { allowedDbKeys, customProviderStore, getV2PluginAPIs, handlePluginInstallViaPlugin, pluginV2, type PluginV2ProviderArgument, type PluginV2ProviderOptions, type RisuPlugin } from "../plugins.svelte";
 import { SandboxHost } from "./factory";
 import { getCurrentContextLite, getDatabase, normalizeChat } from "src/ts/storage/database.svelte";
@@ -796,10 +797,13 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
                if(!conf){
                    return { success: false, content: language.permissionDenied };
                }
+               throwIfAborted(abortSignal);
                //mode is overridden to v3, due to vulnerabilities using mode.
                //Alternative to mode will be added in future
                arg.mode = 'v3'
-               return await func(arg, abortSignal);
+               return await raceAbort(async () => {
+                   return await func(arg, abortSignal);
+               }, abortSignal);
             }
             pluginV2.providers.set(name, provider)
             pluginV2.providerOptions.set(name, options ?? {})

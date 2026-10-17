@@ -1,3 +1,4 @@
+import { raceAbort, throwIfAborted } from "../abort";
 import { Ollama } from 'ollama/dist/browser.mjs';
 import { language } from "../../../lang";
 import { globalFetch, fetchNative } from "../../globalApi.svelte";
@@ -174,11 +175,20 @@ function replacerWithTimeout<T>(run: () => T | Promise<T>, ms: number): Promise<
 }
 
 export async function requestChatData(arg:requestDataArgument, model:ModelModeExtended, abortSignal:AbortSignal=null):Promise<requestDataResponse> {
+    try {
+        return await raceAbort(() => requestChatDataInner(arg, model, abortSignal), abortSignal)
+    } catch (error) {
+        if (abortSignal?.aborted) return { type: 'fail', result: 'Aborted' }
+        throw error
+    }
+}
+
+async function requestChatDataInner(arg:requestDataArgument, model:ModelModeExtended, abortSignal:AbortSignal=null):Promise<requestDataResponse> {
     const db = getDatabase()
     const fallBackModels:string[] = arg.replayExact
         ? [arg.replayStaticModel ?? '']
         : safeStructuredClone(db?.fallbackModels?.[model] ?? [])
-    const tools = arg.replayTools ?? arg.tools ?? (await getTools())
+    const tools = arg.replayTools ?? arg.tools ?? (await raceAbort(() => getTools(abortSignal), abortSignal))
     if(!arg.replayExact) fallBackModels.push('')
     let da:requestDataResponse
 
@@ -218,11 +228,19 @@ export async function requestChatData(arg:requestDataArgument, model:ModelModeEx
             console.warn(`[plugin] beforeRequest replacers at call time: ${pluginV2.replacerbeforeRequest.size}${arg.replayExact ? ' (replayExact: skipped)' : ''}`)
             if(!arg.replayExact && pluginV2.replacerbeforeRequest.size > 0){
                 for(const replacer of pluginV2.replacerbeforeRequest){
+                    throwIfAborted(abortSignal)
+                    const input = safeStructuredClone(arg.formated)
                     try {
-                        const next = await replacerWithTimeout(() => replacer(arg.formated, model), REPLACER_BEFORE_TIMEOUT_MS)
-                        if (Array.isArray(next)) arg.formated = next
+                        const next = await raceAbort(() => replacerWithTimeout(() => {
+                            throwIfAborted(abortSignal)
+                            return replacer(input, model)
+                        }, REPLACER_BEFORE_TIMEOUT_MS), abortSignal)
+                        arg.formated = safeStructuredClone(input)
+                        if (Array.isArray(next)) arg.formated = safeStructuredClone(next)
                         else console.warn('[plugin] beforeRequest replacer returned a non-array — keeping previous messages')
                     } catch (e) {
+                        throwIfAborted(abortSignal)
+                        arg.formated = safeStructuredClone(input)
                         console.warn('[plugin] beforeRequest replacer failed or timed out — skipping (fail-open):', e)
                     }
                 }
@@ -233,11 +251,12 @@ export async function requestChatData(arg:requestDataArgument, model:ModelModeEx
                     const currentChar = getCurrentCharacter()
                     if(currentChar){
                         const perf = performance.now()
-                        const d = await runTrigger(currentChar, 'request', {
+                        const d = await raceAbort(() => runTrigger(currentChar, 'request', {
                             chat: getCurrentChat(),
+                            signal: abortSignal,
                             displayMode: true,
                             displayData: JSON.stringify(arg.formated)
-                        })
+                        }), abortSignal)
 
                         const got = JSON.parse(d.displayData)
                         if(!got || !Array.isArray(got)){
@@ -248,6 +267,7 @@ export async function requestChatData(arg:requestDataArgument, model:ModelModeEx
                     }
                 }
                 catch(e){
+                    throwIfAborted(abortSignal)
                     console.error(e)
                 }
             }
@@ -275,29 +295,27 @@ export async function requestChatData(arg:requestDataArgument, model:ModelModeEx
                 })
             }
 
-            da = await requestChatDataMain({
+            da = await raceAbort(() => requestChatDataMain({
                 ...arg,
                 staticModel: fallBackModels[fallbackIndex],
                 tools: tools,
-            }, model, abortSignal)
+            }, model, abortSignal), abortSignal)
 
-            // A ModelPreset response that already executed tools must be returned
-            // as-is and NEVER re-run: the side effects (possibly writes) are done.
-            // This guard runs BEFORE the abort check and the success-path retries
-            // (banned charset / blank fallback) — otherwise a follow-up abort or a
-            // ban/blank hit would discard the result and the outer loop would
-            // replay the prompt, double-executing tools. after-replacers still run
-            // (transform only), but in a try/catch so a throwing plugin can't lose
-            // the side-effect record either.
+            // Tool side effects must never be replayed by success-path retries.
+            // Stop exits through the outer Aborted result; it never retries this turn.
             if(da.type === 'success' && da.toolExecuted){
                 if(arg.escape) da.result = risuEscape(da.result)
                 for(const replacer of pluginV2.replacerafterRequest){
                     try {
-                        const next = await replacerWithTimeout(() => replacer(da.result as string, model), REPLACER_AFTER_TIMEOUT_MS)
+                        const next = await raceAbort(() => replacerWithTimeout(() => {
+                            throwIfAborted(abortSignal)
+                            return replacer(da.result as string, model)
+                        }, REPLACER_AFTER_TIMEOUT_MS), abortSignal)
                         if (typeof next === 'string') da.result = next
                         else console.warn('[ModelPreset] after-replacer returned a non-string — keeping previous result')
                     }
-                    catch(e){ console.error('[ModelPreset] after-replacer failed', e) }
+                    catch(e){
+                        throwIfAborted(abortSignal); console.error('[ModelPreset] after-replacer failed', e) }
                 }
                 return {
                     ...da,
@@ -319,10 +337,14 @@ export async function requestChatData(arg:requestDataArgument, model:ModelModeEx
             if(da.type === 'success' && pluginV2.replacerafterRequest.size > 0){
                 for(const replacer of pluginV2.replacerafterRequest){
                     try {
-                        const next = await replacerWithTimeout(() => replacer(da.result as string, model), REPLACER_AFTER_TIMEOUT_MS)
+                        const next = await raceAbort(() => replacerWithTimeout(() => {
+                            throwIfAborted(abortSignal)
+                            return replacer(da.result as string, model)
+                        }, REPLACER_AFTER_TIMEOUT_MS), abortSignal)
                         if (typeof next === 'string') da.result = next
                         else console.warn('[plugin] afterRequest replacer returned a non-string — keeping previous result')
                     } catch (e) {
+                        throwIfAborted(abortSignal)
                         console.warn('[plugin] afterRequest replacer failed or timed out — skipping (fail-open):', e)
                     }
                 }
@@ -477,6 +499,7 @@ export function reformater(formated:OpenAIChat[],modelInfo:LLMModel|LLMFlags[]){
 export async function requestChatDataMain(arg:requestDataArgument, model:ModelModeExtended, abortSignal:AbortSignal=null):Promise<requestDataResponse> {
     const db = getDatabase()
     const targ:RequestDataArgumentExtended = arg
+    targ.abortSignal = abortSignal
 
     // P4 dual-regime dispatch (plan v6 §7). Resolve the per-chat ModelPreset
     // binding BEFORE any classic model selection so a binding chat never touches
@@ -1233,11 +1256,11 @@ async function runModelPresetToolLoop(
     // Tracks whether any tool actually ran, so the caller can block outer
     // success-path retries that would otherwise re-execute side-effecting tools.
     let toolsExecuted = false
-    const result = await runToolLoop(messages, {
+    const result = await raceAbort(() => runToolLoop(messages, {
         maxSteps: MODEL_PRESET_MAX_TOOL_STEPS,
         formatReasoning: formatPresetReasoning,
         abortSignal: abortSignal ?? undefined,
-        send: (convo) => sendModelPreset(
+        send: (convo) => raceAbort(() => sendModelPreset(
             kind, preset,
             {
                 messages: convo, tools, abortSignal: abortSignal ?? undefined, fetchImpl,
@@ -1246,10 +1269,10 @@ async function runModelPresetToolLoop(
                 anthropicCache1h: getDatabase().claude1HourCaching === true,
             },
             credential,
-        ),
+        ), abortSignal),
         executeTool: async (call) => {
             toolsExecuted = true
-            const executed = await executeModelPresetTool(arg, call)
+            const executed = await raceAbort(() => executeModelPresetTool(arg, call), abortSignal)
             // Persistence is best-effort: the tool already ran, so a failed
             // encode must not throw (the loop would otherwise drop later results,
             // and a propagated error could trigger an outer re-run). Skip the
@@ -1257,17 +1280,18 @@ async function runModelPresetToolLoop(
             let encoded: string | undefined
             if (arg.rememberToolUsage && executed.response.length > 0) {
                 try {
-                    encoded = await encodeToolCall({
+                    encoded = await raceAbort(() => encodeToolCall({
                         call: { id: call.id, name: call.name, arg: call.arguments },
                         response: executed.response,
-                    })
+                    }), abortSignal)
                 } catch (e) {
+                    throwIfAborted(abortSignal)
                     console.error('[ModelPreset] tool-call persistence failed', e)
                 }
             }
             return { text: executed.text, encoded }
         },
-    })
+    }), abortSignal)
     return { result, toolsExecuted }
 }
 
@@ -1286,10 +1310,11 @@ async function executeModelPresetTool(
         return { text: 'Tool call has invalid JSON arguments: ' + (e instanceof Error ? e.message : String(e)), response: [] }
     }
     try {
-        const response = await callTool(call.name, parsedArgs)
+        const response = await callTool(call.name, parsedArgs, arg.abortSignal)
         const text = toolResponseText(response)
         return { text: text.length > 0 ? text : 'Tool call returned no text response', response }
     } catch (e) {
+        throwIfAborted(arg.abortSignal)
         return { text: 'Tool call failed: ' + (e instanceof Error ? e.message : String(e)), response: [] }
     }
 }
@@ -1649,7 +1674,7 @@ async function requestPlugin(arg:RequestDataArgumentExtended):Promise<requestDat
         } catch {}
     }
     try {
-        const formated = arg.formated
+        const formated = safeStructuredClone(arg.formated)
         const maxTokens = arg.maxTokens
         const bias = arg.biasString
         const model = isV3Model ? arg.aiModel.replace('pluginmodel:::', '') : db.currentPluginProvider
@@ -1683,7 +1708,7 @@ async function requestPlugin(arg:RequestDataArgumentExtended):Promise<requestDat
             frequency_penalty: (db.frequencyPenalty / 100)
         }
         providerArgForLog = providerArg
-        const d = v2Function ? (await v2Function(providerArg as any, arg.abortSignal)) : await pluginProcess(providerArg)
+        const d = await raceAbort(() => v2Function ? v2Function(providerArg as any, arg.abortSignal) : pluginProcess(providerArg), arg.abortSignal)
 
         if(!d){
             writeLog(model, providerArg, language.errors.unknownModel, false, false)
@@ -1694,7 +1719,7 @@ async function requestPlugin(arg:RequestDataArgumentExtended):Promise<requestDat
             }
         }
         else if(!d.success){
-            const content = d.content instanceof ReadableStream ? await (new Response(d.content)).text() : d.content
+            const content = d.content instanceof ReadableStream ? await raceAbort(() => (new Response(d.content as ReadableStream)).text(), arg.abortSignal) : d.content
             writeLog(model, providerArg, content, false, d.content instanceof ReadableStream)
             return {
                 type: 'fail',
@@ -1737,6 +1762,7 @@ async function requestPlugin(arg:RequestDataArgumentExtended):Promise<requestDat
             }
         }   
     } catch (error) {
+        if (arg.abortSignal?.aborted) return { type: 'fail', result: 'Aborted' }
         console.error(error)
         writeLog(providerForLog, providerArgForLog, '', false, false, { aborted: arg.abortSignal?.aborted, errorMessage: `${error}` })
         return {
