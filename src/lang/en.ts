@@ -1718,6 +1718,10 @@ export const languageEnglish = {
             name: "Sending chat messages",
             desc: "Sends chat messages on your behalf, which triggers AI responses.",
         },
+        inlay: {
+            name: "Inlay access",
+            desc: "Reads, saves and edits inlay images in your chats.",
+        },
     },
     pluginV2Warning: "Plugin V2 and V2.1 is considered unsafe and will stop working in future versions. **Please do not use these versions of plugins.**. If you are the developer of this plugin, please update to V3 as soon as possible.",
     createFolderOnBranch: "Create Folder on Branch",

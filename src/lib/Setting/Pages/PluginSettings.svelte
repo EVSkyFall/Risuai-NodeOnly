@@ -320,8 +320,8 @@
                         {#each pluginPermissionDescList as desc}
                             <div class="flex flex-wrap items-center justify-between gap-2 mt-4">
                                 <div class="flex flex-col min-w-40 flex-1">
-                                    <span class="text-sm">{language.pluginPermissionLabels[desc].name}</span>
-                                    <span class="text-xs text-textcolor2">{language.pluginPermissionLabels[desc].desc}</span>
+                                    <span class="text-sm">{language.pluginPermissionLabels[desc]?.name ?? desc}</span>
+                                    <span class="text-xs text-textcolor2">{language.pluginPermissionLabels[desc]?.desc ?? ''}</span>
                                 </div>
                                 <SegmentedControl
                                     size="sm"
