@@ -818,8 +818,10 @@ import { isMobile } from 'src/ts/platform'
 
     // Typing reaches the composer through bind:value, so this effect is the
     // one place a keystroke measures it (an extra call in oninput measured the
-    // same text twice, translate box included).
-    $effect.pre(() => {
+    // same text twice, translate box included). It runs after the DOM update:
+    // text set from code (a translation, an inserted sticker or file) is only
+    // in the textarea by then, and a pre-effect measured the old text.
+    $effect(() => {
         updateInputSize()
     });
     // The translate box is measured after its DOM value updates, which covers
