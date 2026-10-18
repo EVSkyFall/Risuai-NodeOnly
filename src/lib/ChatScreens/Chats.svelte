@@ -122,10 +122,10 @@
 
             // Identity = the old content hash MINUS message.data (plus room
             // scoping): any interaction-driven transition (swipe, disable,
-            // reload, reroll-target shift, room switch) remounts exactly as
+            // reload, room switch) remounts exactly as
             // before. Only streaming-time mutations flow through the content
             // string into in-place prop updates.
-            const identity = 'id|' + roomId + '|' + (message.chatId ?? '') + '|' + (message.time ?? '') + '|' + i.toString() + '|' + message.role + '|' + swipeId.toString() + '|' + (swipes?.length ?? 0).toString() + '|' + message.disabled?.toString() + '|' + (message.isComment ?? false).toString() + '|' + reloadPointer.toString() + '|' + messageLargePortrait.toString() + '|' + isRerollTarget.toString();
+            const identity = 'id|' + roomId + '|' + (message.chatId ?? '') + '|' + (message.time ?? '') + '|' + i.toString() + '|' + message.role + '|' + swipeId.toString() + '|' + (swipes?.length ?? 0).toString() + '|' + message.disabled?.toString() + '|' + (message.isComment ?? false).toString() + '|' + reloadPointer.toString() + '|' + messageLargePortrait.toString();
             // Only shallow, streaming-relevant reads here — generationId is a
             // single leaf; deep-serializing generationInfo (or the character)
             // in a tracked context is a long-chat performance landmine.
@@ -134,6 +134,11 @@
 
             const existing = mountRecords.get(identity);
             if(existing){
+                existing.props.rerollIcon = isRerollTarget ? 'force' : false;
+                existing.props.onNextSwipe = isRerollTarget ? onNextSwipe : noopSwipe;
+                existing.props.onDeleteSwipe = isRerollTarget ? onDeleteSwipe : noopSwipe;
+                existing.props.currentPage = isRerollTarget ? swipeId + 1 : 1;
+                existing.props.totalPages = isRerollTarget ? (swipes?.length ?? 1) : 1;
                 if(existing.content !== content){
                     const p = existing.props;
                     p.message = message.data;

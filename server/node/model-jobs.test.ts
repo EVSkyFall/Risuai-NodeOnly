@@ -1,5 +1,6 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest'
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest'
 import http from 'node:http'
+import net from 'node:net'
 import express from 'express'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -7,8 +8,9 @@ import os from 'node:os'
 import Database from 'better-sqlite3'
 import pkg from './model-jobs.cjs'
 
-const { createModelJobs } = pkg as {
+const { createModelJobs, requestUpstreamStream } = pkg as {
     createModelJobs: (opts: { saveDir: string; logger?: unknown }) => any
+    requestUpstreamStream: (targetUrl: string, arg: any) => Promise<{ status: number; body: http.IncomingMessage }>
 }
 
 const AUTH_TOKEN = 'test-token'
@@ -756,5 +758,42 @@ describe('model-jobs rotation', () => {
         }
         store.close()
         fs.rmSync(dir, { recursive: true, force: true })
+    })
+})
+
+// PR #95: Node 24's global agent turns on TCP keepalive with a 1s idle and
+// 1s probe interval; a middlebox that stops answering probes while the model
+// is still thinking kills the socket with ETIMEDOUT (~38s) long before the
+// request timeout. The upstream socket must have keepalive turned off before
+// the response starts.
+describe('model-jobs upstream socket', () => {
+    it('disables TCP keepalive on the upstream socket while waiting for headers', async () => {
+        const calls: { socket: net.Socket; enable: boolean | undefined }[] = []
+        const original = net.Socket.prototype.setKeepAlive
+        const spy = vi.spyOn(net.Socket.prototype, 'setKeepAlive').mockImplementation(function (this: net.Socket, enable?: boolean, delay?: number) {
+            calls.push({ socket: this, enable })
+            return original.call(this, enable, delay)
+        })
+        let disabledBeforeHeaders = false
+        const upstream = http.createServer((req, res) => {
+            const clientPort = req.socket.remotePort
+            const clientCalls = calls.filter((c) => c.socket.localPort === clientPort)
+            disabledBeforeHeaders = clientCalls.length > 0 && clientCalls[clientCalls.length - 1].enable === false
+            res.end('ok')
+        })
+        const port = await listen(upstream)
+        try {
+            const result = await requestUpstreamStream(`http://127.0.0.1:${port}/`, {
+                method: 'GET',
+                headers: {},
+                timeoutMs: 5_000,
+            })
+            result.body.resume()
+            expect(result.status).toBe(200)
+            expect(disabledBeforeHeaders).toBe(true)
+        } finally {
+            spy.mockRestore()
+            await new Promise((r) => upstream.close(r))
+        }
     })
 })

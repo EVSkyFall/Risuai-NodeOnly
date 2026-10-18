@@ -47,7 +47,8 @@ describe('plugin startup bridge contracts', () => {
         const component = read('../../../lib/Others/AlertComp.svelte')
         const dialog = read('../../../lib/UI/GUI/ShAlertDialog.svelte')
 
-        const iframeZ = Number(v3.match(/iframe\.style\.zIndex\s*=\s*"(\d+)"/)?.[1])
+        const iframeLayer = v3.match(/iframe\.style\.zIndex[^\n]+/)?.[0] ?? ''
+        const iframeZ = Math.max(...[...iframeLayer.matchAll(/"(\d+)"/g)].map(match => Number(match[1])))
         const permissionZ = Number(component.match(/abovePlugin\s*\?\s*'z-\[(\d+)\]'/)?.[1])
 
         expect(v3).toMatch(/alertConfirm\(alertTitle,\s*\{\s*abovePlugin:\s*true\s*\}\)/)

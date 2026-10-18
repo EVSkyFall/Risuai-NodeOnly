@@ -19,7 +19,10 @@ const source = fs.readFileSync(path.join(sourceDir, 'server.cjs'), 'utf8')
 const cleanup: Array<() => Promise<void>> = []
 afterEach(async () => { vi.restoreAllMocks(); for (const fn of cleanup.splice(0).reverse()) await fn() })
 const section = (start: string, end: string) => source.slice(source.indexOf(start), source.indexOf(end, source.indexOf(start)))
-const evaluate = (code: string, deps: Record<string, any>, expression: string) => new Function(...Object.keys(deps), code + '\nreturn ' + expression)(...Object.values(deps))
+const evaluate = (code: string, deps: Record<string, any>, expression: string) => {
+    deps = { pendingActivations: new Map(), checkBackupDownloadAuth: async () => true, restoringSnapshotKey: null, lastDbPersistMs: null, databaseHashDiagnostics: () => ({}), ...deps };
+    return new Function(...Object.keys(deps), code + '\nreturn ' + expression)(...Object.values(deps));
+}
 const deferred = () => { let resolve!: () => void; const promise = new Promise<void>(r => { resolve = r }); return { promise, resolve } }
 
 async function fixture(options: Record<string, any> = {}) {
@@ -261,7 +264,7 @@ describe('round 2 asset regressions', () => {
             await handler({ headers: { 'file-path': Buffer.from(key).toString('hex') }, body: {
                 expectedHash: utils.calculateHash({ value: before }).toString(16), patch: [{ op: 'replace', path: '/value', value: after }],
             } }, res)
-            expect(res.code).toBe(200)
+            expect(res.code, JSON.stringify(res.body)).toBe(200)
         }
         await set('old'); await patch('old', 'patched')
         expect((await utils.decodeRisuSave(await store.get(key))).value).toBe('patched')

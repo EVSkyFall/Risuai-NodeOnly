@@ -25,7 +25,7 @@ import { runInlayScreen } from "./inlayScreen";
 import { runImageEmbedding } from "./transformers";
 import { runLuaEditTrigger } from "./scriptings";
 import { getModelInfo, LLMFlags } from "../model/modellist";
-import { resolveChatModelBinding, resolvePresetMaxOutputTokens, presetSupportsVision } from "./request/modelPresetBinding";
+import { resolveChatModelBinding, resolveClassicModelId, resolvePresetMaxOutputTokens, presetSupportsVision } from "./request/modelPresetBinding";
 import { hypaMemoryV3 } from "./memory/hypav3";
 import { getModuleAssets, getModuleLorebooks, getModules, getModuleToggles, getModuleTriggers } from "./modules";
 import { forageStorage, getCurrentTurnId, readImage, resolvePrioritizedAssetManifestNames, setCurrentTurnId } from "../globalApi.svelte";
@@ -35,7 +35,7 @@ import { getActiveHypaV3Preset } from "./memory/memoryPresets"
 import { resolveModelPresetContextBudget } from "./request/contextBudget"
 import { hydrateAssetListsForCbs, serializeForCbsScan } from "../parser/assetListHydration";
 import { pluginV2 } from "../plugins/plugins.svelte";
-import { registerAbort, chatGenKey, chatProcessStage, endGeneration, isChatGenerating, setGenerationStage, startGeneration } from "./generationState";
+import { abortGeneration, registerAbort, chatGenKey, chatProcessStage, endGeneration, isChatGenerating, onDatabaseRebased, setGenerationStage, startGeneration } from "./generationState";
 import { createMainJobCompletion, prepareMainJobContinuation } from './request/mainJobCompletion';
 import type { JobClaimHandle } from './request/jobFetch';
 import { clearPendingSend, registerPendingSend } from "./request/pendingSends";
@@ -288,10 +288,35 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     const nowChatroom = DBState.db.characters[selectedChar]
     nowChatroom.lastInteraction = Date.now()
     selectedChat = nowChatroom.chatPage
+    // The indices above address DBState.db for the rest of this send. A save
+    // conflict rebase may replace the database (and reorder characters) while
+    // streaming, so re-resolve them by id when that happens; the listener is
+    // dropped with the generation entry.
+    {
+        const sendChaId = nowChatroom.chaId
+        const sendChatId = nowChatroom.chats?.[selectedChat]?.id
+        onDatabaseRebased(genKey, () => {
+            const chars = DBState.db.characters ?? []
+            const charIdx = chars.findIndex((c) => c?.chaId === sendChaId)
+            if (charIdx === -1) {
+                // Deactivated on another device mid-generation. The rebase
+                // aborts such generations and waits for them to end BEFORE
+                // swapping the database (globalApi), so this branch is only
+                // reached if that wait timed out; abort again as a last
+                // resort and leave the indices (the old target object is
+                // gone either way).
+                abortGeneration(genKey)
+                return
+            }
+            selectedChar = charIdx
+            const chatIdx = sendChatId ? (chars[charIdx].chats ?? []).findIndex((c) => c?.id === sendChatId) : -1
+            if (chatIdx !== -1) selectedChat = chatIdx
+        })
+    }
     // Block send if chat is still a placeholder (hydration not complete)
     if (nowChatroom.chats[nowChatroom.chatPage]?._placeholder) {
         alertError('Chat is still loading. Please wait a moment.')
-        endGeneration(genKey)
+        endGeneration(genKey, { generationId })
         if (realChatId) clearPendingSend(realChatId, generationId)
         return false
     }
@@ -326,8 +351,12 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
     }
 
+    // The classic model the main request goes to (a slot-pinned legacy model
+    // included); the global db.aiModel when the main slot is a ModelPreset, as
+    // before. Drives the classic prompt-shaping checks below.
+    const mainModel = resolveClassicModelId(nowChatroom.chats[selectedChat], 'model') ?? DBState.db.aiModel
     let caculatedChatTokens = 0
-    if(DBState.db.aiModel.startsWith('gpt')){
+    if(mainModel.startsWith('gpt')){
         caculatedChatTokens += 5
     }
     else{
@@ -346,7 +375,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     }
 
     let chatAdditonalTokens = arg.chatAdditonalTokens ?? caculatedChatTokens
-    const tokenizer = new ChatTokenizer(chatAdditonalTokens, DBState.db.aiModel.startsWith('gpt') ? 'noName' : 'name')
+    const tokenizer = new ChatTokenizer(chatAdditonalTokens, mainModel.startsWith('gpt') ? 'noName' : 'name', mainModel)
     let currentChat = runCurrentChatFunction(nowChatroom.chats[selectedChat])
     nowChatroom.chats[selectedChat] = currentChat
     let maxContextTokens = DBState.db.maxContext
@@ -875,7 +904,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
 
     let chats:OpenAIChat[] = examples
 
-    if(!DBState.db.aiModel.startsWith('novelai') && !DBState.db?.promptSettings?.trimStartNewChat){
+    if(!mainModel.startsWith('novelai') && !DBState.db?.promptSettings?.trimStartNewChat){
         chats.push({
             role: 'system',
             content: '[Start a new chat]',
@@ -931,7 +960,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         ms = makeMs(currentChat)
         currentTokens += triggerResult.tokens
         if(triggerResult.stopSending){
-            endGeneration(genKey)
+            endGeneration(genKey, { generationId })
             if (realChatId) clearPendingSend(realChatId, generationId)
             return false
         }
@@ -980,7 +1009,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
 
         let multimodal:MultiModal[] = []
-        const modelinfo = getModelInfo(DBState.db.aiModel)
+        const modelinfo = getModelInfo(mainModel)
         if(inlays.length > 0){
             for(const inlay of inlays){
                 const inlayName = inlay.replace('{{inlayed::', '').replace('{{inlay::', '').replace('}}', '').replace('{{inlayeddata::', '')
@@ -1225,7 +1254,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     }
 
     //continue chat model
-    if(arg.continue && (DBState.db.aiModel.startsWith('claude') || DBState.db.aiModel.startsWith('gpt') || DBState.db.aiModel.startsWith('openrouter') || DBState.db.aiModel.startsWith('reverse_proxy') || DBState.db.aiModel === 'vercel')){
+    if(arg.continue && (mainModel.startsWith('claude') || mainModel.startsWith('gpt') || mainModel.startsWith('openrouter') || mainModel.startsWith('reverse_proxy') || mainModel === 'vercel')){
         unformated.postEverything.push({
             role: 'system',
             content: '[Continue the last response]'
@@ -1237,7 +1266,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             if(!chat.content.trim() && !(chat.multimodals && chat.multimodals.length > 0)){
                 continue
             }
-            if(!(DBState.db.aiModel.startsWith('gpt') || DBState.db.aiModel.startsWith('claude') || DBState.db.aiModel === 'openrouter' || DBState.db.aiModel === 'reverse_proxy' || DBState.db.aiModel === 'vercel')){
+            if(!(mainModel.startsWith('gpt') || mainModel.startsWith('claude') || mainModel === 'openrouter' || mainModel === 'reverse_proxy' || mainModel === 'vercel')){
                 formated.push(chat)
                 continue
             }
@@ -1985,7 +2014,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
 
     if(needsAutoContinue){
         if (realChatId && !await raceAbort(() => (completeMainJob()), abortSignal) && mainJobHandles.length > 0) return false
-        endGeneration(genKey, { keepPendingAbort: true })
+        endGeneration(genKey, { keepPendingAbort: true, generationId })
         return await raceAbort(() => (sendChat(chatProcessIndex, {
             responseStartedAt,
             chatAdditonalTokens: arg.chatAdditonalTokens,
@@ -1998,14 +2027,17 @@ export async function sendChat(chatProcessIndex = -1,arg:{
 
     const igp = risuChatParser(DBState.db.igpPrompt ?? "")
 
-    if(igp){
+    // Stop can land while the output triggers above were still running.
+    if(igp && !abortSignal.aborted){
         const igpFormated = parseChatML(igp)
         const rq = await raceAbort(() => (requestChatData({
             formated: igpFormated,
             bias: {}
         },'emotion', abortSignal)), abortSignal)
 
-        DBState.db.characters[selectedChar].chats[selectedChat].message[DBState.db.characters[selectedChar].chats[selectedChat].message.length - 1].data += rq
+        if(!abortSignal.aborted){
+            DBState.db.characters[selectedChar].chats[selectedChat].message[DBState.db.characters[selectedChar].chats[selectedChat].message.length - 1].data += rq
+        }
     }
 
     stageTimings.stage3Duration = Date.now() - stageTimings.stage3Start
@@ -2032,7 +2064,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
         
         if (realChatId && !await raceAbort(() => (completeMainJob()), abortSignal) && mainJobHandles.length > 0) return false
-        endGeneration(genKey, { keepPendingAbort: true })
+        endGeneration(genKey, { keepPendingAbort: true, generationId })
         return await raceAbort(() => (sendChat(chatProcessIndex, {
             signal: abortSignal,
             copilotTurnId: turnId,
@@ -2344,7 +2376,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         return false
     } finally {
         if (abortSignal.aborted) {
-            endGeneration(genKey)
+            endGeneration(genKey, { generationId })
             if (realChatId) void clearPendingSend(realChatId, generationId)
         }
         if (getCurrentTurnId() === turnId) setCurrentTurnId(null)

@@ -1,3 +1,5 @@
+> Please read [CONTRIBUTING.md](https://github.com/PocketRisu/PocketRisu/blob/develop/CONTRIBUTING.md) for how pull requests are handled and credited.
+
 ## PR Checklist
 
 - Required Checks

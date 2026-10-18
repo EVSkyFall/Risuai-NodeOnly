@@ -63,28 +63,8 @@
     async function downloadBackup(backup: BackupEntry) {
         alertWait(language.serverBackupDownloading);
         try {
-            const response = await forageStorage.downloadServerBackup(backup.filename);
-            if (response.body) {
-                const streamSaver = await import('streamsaver');
-                const writableStream = streamSaver.createWriteStream(backup.filename);
-                const writer = writableStream.getWriter();
-                const reader = response.body.getReader();
-                const totalBytes = Number(response.headers.get('content-length') ?? '0');
-                let downloaded = 0;
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-                    downloaded += value.length;
-                    if (totalBytes > 0) {
-                        alertWait(`${language.serverBackupDownloading} (${((downloaded / totalBytes) * 100).toFixed(1)}%)`);
-                    }
-                    await writer.write(value);
-                }
-                await writer.close();
-            } else {
-                await downloadFile(backup.filename, new Uint8Array(await response.arrayBuffer()));
-            }
-            alertNormal('Success');
+            await forageStorage.downloadServerBackup(backup.filename);
+            alertNormal(language.backupBrowserDownloadStarted);
         } catch (error) {
             alertError(error instanceof Error ? error.message : 'Download failed');
         }

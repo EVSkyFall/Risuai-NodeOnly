@@ -20,7 +20,7 @@ export interface AlertAction {
 export interface alertData{
     type: 'error'|'normal'|'none'|'ask'|'wait'|'selectChar'
             |'input'|'wait2'|'markdown'|'select'|'login'
-            |'tos'|'cardexport'|'requestdata'|'addchar'|'selectModule'
+            |'cardexport'|'requestdata'|'addchar'|'selectModule'
             |'pukmakkurit'|'branches'|'progress'|'pluginconfirm'
             |'confirmMulti',
     msg: string,
@@ -47,9 +47,6 @@ export const alertStore = {
         alertStoreImported.set(d)
     }
 }
-
-// Shared acceptance cache for both global startup TOS and Realm download confirmation.
-const TOS_ACCEPTANCE_STORAGE_KEY = 'tos2'
 
 // Normalize any value (string / Error / plain object / primitive) into a
 // human-readable message and an optional stack trace. Shared by alertError
@@ -349,27 +346,6 @@ export async function alertCardExport(type:string = ''){
         type: string,
         type2: string,
     }
-}
-
-export async function alertTOS(){
-
-    if(localStorage.getItem(TOS_ACCEPTANCE_STORAGE_KEY) === 'true'){
-        return true
-    }
-
-    alertStoreImported.set({
-        'type': 'tos',
-        'msg': 'tos'
-    })
-
-    await waitAlert()
-
-    if(get(alertStoreImported).msg === 'yes'){
-        localStorage.setItem(TOS_ACCEPTANCE_STORAGE_KEY, 'true')
-        return true
-    }
-
-    return false
 }
 
 export async function alertInput(msg:string, datalist?:[string, string][], defaultValue?:string) {

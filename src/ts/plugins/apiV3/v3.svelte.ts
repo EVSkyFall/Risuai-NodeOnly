@@ -1,12 +1,14 @@
 import { raceAbort, throwIfAborted } from "../../process/abort";
 import { allowedDbKeys, customProviderStore, getV2PluginAPIs, handlePluginInstallViaPlugin, pluginV2, type PluginV2ProviderArgument, type PluginV2ProviderOptions, type RisuPlugin } from "../plugins.svelte";
 import { SandboxHost } from "./factory";
-import { getCurrentContextLite, getDatabase, normalizeChat } from "src/ts/storage/database.svelte";
+import { getCurrentChat, getCurrentContextLite, getDatabase, normalizeChat } from "src/ts/storage/database.svelte";
+import { resolveClassicModelId } from "src/ts/process/request/modelPresetBinding";
+import { fetchChatFromServer, saveChatToServer } from "src/ts/storage/chatStorage";
 import { SafeLocalPluginStorage, tagWhitelist } from "../pluginSafeClass";
 import { recordOwner, removeOwner, clearOwners } from "../pluginStorageMeta";
 import * as pluginStorageStore from "../pluginStorageStore";
 import DOMPurify from 'dompurify';
-import { additionalChatMenu, additionalFloatingActionButtons, additionalHamburgerMenu, additionalSettingsMenu, bodyIntercepterStore, chatPanelStore, DBState, selectedCharID, type MenuDef } from "src/ts/stores.svelte";
+import { additionalChatMenu, additionalFloatingActionButtons, additionalHamburgerMenu, additionalSettingsMenu, alertStore as alertStateStore, bodyIntercepterStore, chatPanelStore, DBState, selectedCharID, type MenuDef } from "src/ts/stores.svelte";
 import { v4 } from "uuid";
 import { sleep } from "src/ts/util";
 import { alertConfirm, alertError, alertNormal, alertNormalWait, notifyWarning } from "src/ts/alert";
@@ -17,11 +19,12 @@ import { get } from "svelte/store";
 import { registerMCPModule, unregisterMCPModule } from "src/ts/process/mcp/pluginmcp";
 import { getInlayAsset } from "src/ts/process/files/inlays";
 import { getLLMCache, searchLLMCache } from "src/ts/translator/translator";
-import { hasher } from "src/ts/parser/parser.svelte";
+import { hasher, risuChatParser, type CbsConditions } from "src/ts/parser/parser.svelte";
 import { LLMFlags, LLMFormat, LLMProvider, LLMTokenizer, type LLMModel } from "src/ts/model/types";
 import { readPersistentJson, removePersistentKey, writePersistentJson } from "src/ts/storage/persistentKv";
 import { endAllGenerations } from "src/ts/process/generationState";
 import { sendChat as processSendChat, doingChat } from "src/ts/process/index.svelte";
+import { processScriptFull } from "src/ts/process/scripts";
 import { getModelInfo } from "src/ts/model/modellist";
 import type { ModelModeExtended } from "src/ts/process/request/shared";
 import { requestChatDataMain } from "src/ts/process/request/request";
@@ -635,6 +638,27 @@ const pluginPermissionManager = createPluginPermissionManager({
     hashPluginScript: (script) => hasher(new TextEncoder().encode(script)),
 })
 
+// A fullscreen plugin frame sits above the whole app (z-index 1000), which
+// also covered the app's own alerts — among them the permission prompt the
+// plugin itself is waiting on, so it could hang forever. While an alert is
+// open the frame drops below the alert layer (z-50).
+const fullscreenPluginFrames = new Set<HTMLIFrameElement>()
+let appAlertOpen = false
+let alertLayerWatched = false
+
+function applyFullscreenFrameLayer(iframe: HTMLIFrameElement) {
+    iframe.style.zIndex = appAlertOpen ? "40" : "1000"
+}
+
+function watchAlertLayer() {
+    if (alertLayerWatched) return
+    alertLayerWatched = true
+    alertStateStore.subscribe((alert) => {
+        appAlertOpen = alert.type !== 'none'
+        for (const frame of fullscreenPluginFrames) applyFullscreenFrameLayer(frame)
+    })
+}
+
 export async function resetAllPluginPermissions() {
     await pluginPermissionManager.resetAll()
 }
@@ -1030,26 +1054,96 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
                 DBState.db.characters[charId] = restorePluginCharacterManifest(char, db.characters[charId])
             }
         },
-        getChatFromIndex: (characterIndex:number, chatIndex:number) => {
+        getChatFromIndex: async (characterIndex:number, chatIndex:number) => {
             const db = DBState.db
             const charIds = Object.keys(db.characters);
             const charId = charIds[characterIndex];
             if(charId){
                 const chats = db.characters[charId].chats;
-                if(chats && chats[chatIndex]){
-                    return $state.snapshot(chats[chatIndex]);
+                const slot = chats?.[chatIndex];
+                if(slot){
+                    // A chat not opened yet is only a placeholder here (no
+                    // messages). Hand out the server's copy without loading
+                    // it into the app, like exports do; a fetch error throws.
+                    if(slot._placeholder){
+                        if(!slot.id) return null;
+                        return await fetchChatFromServer(db.characters[charId].chaId, chatIndex, slot.id);
+                    }
+                    return $state.snapshot(slot);
                 }
             }
             return null;
         },
-        setChatToIndex: (characterIndex:number, chatIndex:number, chat:any) => {
+        parseRisuChat: async (text:string, options?:{
+            messageIndex?: number
+            role?: string
+            processRegex?: boolean
+            runVar?: boolean
+            rmVar?: boolean
+            tokenizeAccurate?: boolean
+            cbsConditions?: CbsConditions
+        }) => {
+            const db = DBState.db
+            const char = db.characters[get(selectedCharID)];
+            if(!char){
+                throw new Error('No character selected');
+            }
+            const chat = char.chats?.[char.chatPage];
+            if(!chat){
+                throw new Error('No active chat found');
+            }
+            const chatID = options?.messageIndex ?? -1;
+            if(!Number.isInteger(chatID) || chatID < -1 || chatID >= chat.message.length){
+                throw new Error(`Invalid messageIndex: ${chatID}`);
+            }
+            const role = options?.role;
+            const cbsConditions:CbsConditions = {
+                ...(role ? { chatRole: role } : {}),
+                ...(options?.cbsConditions ?? {}),
+            };
+            const parsed = risuChatParser(text ?? '', {
+                chara: char,
+                chatID,
+                role,
+                runVar: options?.runVar,
+                rmVar: options?.rmVar,
+                tokenizeAccurate: options?.tokenizeAccurate,
+                cbsConditions,
+            });
+
+            if(!options?.processRegex){
+                return parsed;
+            }
+
+            return (await processScriptFull(char, parsed, 'editprocess', chatID, cbsConditions)).data;
+        },
+        setChatToIndex: async (characterIndex:number, chatIndex:number, chat:any) => {
+            // A placeholder (an unopened chat taken from getCharacter* or
+            // getDatabase) has no messages: writing it back would empty the
+            // chat. Its contents come from getChatFromIndex.
+            if(chat?._placeholder === true){
+                throw new Error('setChatToIndex: this chat is not loaded; read it with getChatFromIndex first');
+            }
             const db = DBState.db
             const charIds = Object.keys(db.characters);
             const charId = charIds[characterIndex];
             if(charId){
                 const chats = db.characters[charId].chats;
                 if(chats && chats[chatIndex]){
+                    // A chat built from scratch keeps the slot's id: the
+                    // server stores chat bodies by id.
+                    if(chat && typeof chat === 'object' && !chat.id && chats[chatIndex].id){
+                        chat.id = chats[chatIndex].id
+                    }
                     DBState.db.characters[charId].chats[chatIndex] = normalizeChat(chat)
+                    // Only the open chat is saved by change tracking; save any
+                    // other chat directly or the write is lost on reload.
+                    const char = DBState.db.characters[charId]
+                    const isOpen = Number(charId) === get(selectedCharID) && char.chatPage === chatIndex
+                    if(!isOpen){
+                        const saved = char.chats[chatIndex]
+                        await saveChatToServer(char.chaId, chatIndex, saved.id, $state.snapshot(saved) as any)
+                    }
                 }
             }
         },
@@ -1097,7 +1191,9 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
                     iframe.style.width = "100%";
                     iframe.style.height = "100%";
                     iframe.style.border = "none";
-                    iframe.style.zIndex = "1000";
+                    fullscreenPluginFrames.add(iframe);
+                    watchAlertLayer();
+                    applyFullscreenFrameLayer(iframe);
                     break;
                 }
                 default: {
@@ -1107,6 +1203,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
         },
         hideContainer: () => {
             iframe.style.display = "none";
+            fullscreenPluginFrames.delete(iframe);
         },
         getRootDocument: async () => {
             const conf = await getPluginPermission(plugin.name, 'mainDom');
@@ -1571,7 +1668,10 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
                 throw new Error("A chat is already in progress");
             }
 
-            if(getModelInfo(DBState.db.aiModel).id.startsWith('pluginmodel:::')){
+            // The model the main request would go to: a plugin provider there
+            // (global or slot-pinned) is blocked; a ModelPreset main is not.
+            const mainModelId = resolveClassicModelId(getCurrentChat(), 'model')
+            if(mainModelId && getModelInfo(mainModelId).id.startsWith('pluginmodel:::')){
                 // Executing plugin provider is block because it can be used for loopholes for ipc right now.
                 throw new Error("Sending chat with plugin-based model is currently blocked");
             }

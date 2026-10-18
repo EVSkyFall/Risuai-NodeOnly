@@ -1,6 +1,8 @@
 import { afterEach, expect, test, vi } from 'vitest'
 import fs from 'node:fs'
 import ts from 'typescript'
+import { mergeServerDbWithTrackedLocalChanges, withTrackedCharacters, hasAmbiguousCharacterIds } from './storage/rebaseMerge'
+import { newSaveTiming } from './storage/saveMetrics'
 
 const source = fs.readFileSync('src/ts/globalApi.svelte.ts', 'utf8').replace(/\r\n/g, '\n')
 const ast = ts.createSourceFile('globalApi.ts', source, ts.ScriptTarget.Latest, true)
@@ -14,6 +16,13 @@ function extract(name: string) {
     return text
 }
 function run(code: string, deps: Record<string, any>) {
+    deps = { newSaveTiming, recordSaveSample: vi.fn(), recordDbTransferSize: vi.fn(),
+        mergeServerDbWithTrackedLocalChanges, withTrackedCharacters, hasAmbiguousCharacterIds,
+        generatingCharacters: () => new Map(), abortGenerationsAndWait: async () => {},
+        normalizeJSON: (x: any) => x, convertStubsToPlaceholders: (x: any) => x,
+        notifyDatabaseRebased: () => {}, notifyError: vi.fn(), ...deps }
+    code = 'let saveSeq = 0, lastSavedSeq = 0; ' + code
+
     const js = ts.transpileModule(`const { ${Object.keys(deps).join(',')} } = deps; ${code}`, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText
     return new Function('deps', js)(deps)
 }
@@ -52,7 +61,7 @@ test('cause4: 409 fallback rebases same-character remote new chat and preserves 
     class ConflictError extends Error { currentEtag = 'new' }
     class Encoder { async init() {} async set() {} encode() { return new Uint8Array([1]) } }
     const commit = vi.fn()
-    class Patcher { async init() {} async prepare() { return { patchData: { patch: [], expectedHash: 'hash' }, commit } } }
+    class Patcher { async init() {} baselineArchivedCharacterIds() { return new Set() } baselineDb() { return local } estimatePayloadBytes() { return 0 } async prepare() { return { changedCharacterIds: ['c'], patchData: { patch: [], expectedHash: 'hash' }, commit } } }
     const storage = {
         patchItem: vi.fn().mockResolvedValueOnce({ success: false, etag: 'new' }).mockResolvedValue({ success: true, etag: 'merged' }),
         setDbEtag: vi.fn(v => { etag = v }), getDbEtag: () => etag,
@@ -67,7 +76,7 @@ test('cause4: 409 fallback rebases same-character remote new chat and preserves 
         const knownChatIdsByCharacter = new Map([['c', new Set(['keep', 'deleted'])]]);
         ${extract('rebaseTrackedLocalChangesOnLatestServerDb')}
         ${extract('persistTrackedChanges')}
-        return { persistTrackedChanges, dirty: () => changed };
+        return { persistTrackedChanges: changes => persistTrackedChanges(changes, newSaveTiming()), dirty: () => changed };
     `, { forageStorage: storage, getDatabase: () => db, setDatabase: v => { db = v },
         decodeRisuSave: async () => server, safeStructuredClone: structuredClone, supportsPatchSync: true,
         RisuSaveEncoder: Encoder, RisuSavePatcher: Patcher, collectChatsToPersist: () => [], findDangerousChatOps: () => [],
@@ -88,7 +97,7 @@ test('cause4: 409 fallback rebases same-character remote new chat and preserves 
 })
 
 test('cause6: queue registration marks a nonselected chat dirty', () => {
-    const registration = source.slice(source.indexOf('    requeueChatSaveImpl = (chaId, chatId) =>'), source.indexOf('    let encoder = new RisuSaveEncoder()', source.indexOf('export async function saveDb')))
+    const registration = source.slice(source.indexOf('    requeueChatSaveImpl = (chaId, chatId) =>'), source.indexOf('    let patcher = new RisuSavePatcher()', source.indexOf('export async function saveDb')))
     const api = run(`
         let changed = false, requeueChatSaveImpl;
         const pendingChatSaveRetries = [];
@@ -202,7 +211,7 @@ ${extract('fetchViaProxyJobWs')}; return fetchViaProxyJobWs;`, {
 
 
 test.each(['chat', 'character', 'root'])('round3-5: successful immediate save drains in-flight requeued %s through the actual loop', async kind => {
-    const registration = source.slice(source.indexOf('    requeueChatSaveImpl = (chaId, chatId) =>'), source.indexOf('    let encoder = new RisuSaveEncoder()', source.indexOf('export async function saveDb')))
+    const registration = source.slice(source.indexOf('    requeueChatSaveImpl = (chaId, chatId) =>'), source.indexOf('    let patcher = new RisuSavePatcher()', source.indexOf('export async function saveDb')))
     const immediate = source.slice(source.indexOf('    requestImmediateSaveImpl = async (options) =>'), source.indexOf('    while (true) {', source.indexOf('    requestImmediateSaveImpl = async (options) =>')))
     const loop = source.slice(source.indexOf('    while (true) {', source.indexOf('    requestImmediateSaveImpl = async (options) =>')), source.indexOf('\n}\n', source.indexOf('    requestImmediateSaveImpl = async (options) =>')))
     let release: () => void
@@ -247,4 +256,25 @@ test.each(['chat', 'character', 'root'])('round3-5: successful immediate save dr
     else if (kind === 'character') expect(persisted[1].character).toEqual(['background'])
     else expect(persisted[1].root).toBe(true)
     expect(api.pending()).toBe(false)
+})
+
+
+test.each(['download', 'decode'])('failed rebase %s preserves the pre-conflict ETag', async phase => {
+    let etag = 'our-synced-revision'
+    const offline = new Error('interrupted rebase')
+    const forageStorage = {
+        getDbEtag: () => etag,
+        setDbEtag: (v: string) => { etag = v },
+        getItem: async () => {
+            // Headers can arrive before a response body fails.
+            etag = 'foreign-revision'
+            if (phase === 'download') throw offline
+            return new Uint8Array([1])
+        },
+    }
+    const rebase = run(`${extract('rebaseTrackedLocalChangesOnLatestServerDb')}; return rebaseTrackedLocalChangesOnLatestServerDb;`, {
+        forageStorage, decodeRisuSave: async () => { throw offline },
+    })
+    await expect(rebase('foreign-revision', { characters: [] }, { character: [], chat: [] })).rejects.toBe(offline)
+    expect(etag).toBe('our-synced-revision')
 })

@@ -243,6 +243,31 @@ export const accessibilitySettingsItems: SettingItem[] = [
         helpKey: 'hideLeftBarCollapseButton',
         keywords: ['left', 'bar', 'collapse', 'toggle', 'mobile', 'sidebar', 'hide'],
     },
+    // Character list (rail + character manager) display options.
+    {
+        id: 'acc.roundIcons',
+        type: 'check',
+        labelKey: 'roundIcons',
+        helpKey: 'roundIcons',
+        bindKey: 'roundIcons',
+        keywords: ['round', 'icons', 'character', 'sidebar'],
+    },
+    {
+        id: 'acc.nodeOnlyHideRecentChats',
+        type: 'check',
+        labelKey: 'hideRecentChats',
+        helpKey: 'hideRecentChats',
+        bindKey: 'nodeOnlyHideRecentChats',
+        keywords: ['recent', 'chats', 'hide', 'home', 'sidebar', 'character'],
+    },
+    {
+        id: 'acc.nodeOnlyHideArchivedCharacters',
+        type: 'check',
+        labelKey: 'hideDeactivatedCharacters',
+        helpKey: 'hideDeactivatedCharacters',
+        bindKey: 'nodeOnlyHideArchivedCharacters',
+        keywords: ['deactivated', 'archived', 'hide', 'sidebar', 'character'],
+    },
     {
         id: 'acc.nodeOnlyRestoreLastChat',
         type: 'check',
@@ -320,7 +345,10 @@ export const accessibilitySettingsItems: SettingItem[] = [
                 if (chat) loadTogglesFromChat(chat);
             }
         }
-    }
+    },
+    // moved from Advanced
+    { id: 'adv.bookmark', type: 'check', labelKey: 'bookmark', bindKey: 'enableBookmark', helpKey: 'bookmark', classes: 'mt-4' },
+    { id: 'adv.scrollToActive', type: 'check', labelKey: 'enableScrollToActiveChar', bindKey: 'enableScrollToActiveChar', helpKey: 'enableScrollToActiveChar', classes: 'mt-4' },
 ];
 
 // Tab groupings (the flat array above stays the source of truth + search index).
@@ -339,6 +367,7 @@ export const accessibilityEditingItems = pick([
     'acc.enableDragPartialEdit',
     'acc.longPressToPopupEditor',
     'acc.showInputActionBar',
+    'adv.bookmark',
 ]);
 
 export const accessibilityScrollItems = pick([
@@ -358,6 +387,13 @@ export const accessibilitySidebarItems = pick([
     'acc.showPresetInSidebar',
     'acc.showPersonaInSidebar',
     'acc.showMemoryInSidebar',
+    'adv.scrollToActive',
+]);
+
+export const accessibilityCharacterItems = pick([
+    'acc.roundIcons',
+    'acc.nodeOnlyHideRecentChats',
+    'acc.nodeOnlyHideArchivedCharacters',
 ]);
 
 export const accessibilityOtherItems = pick([

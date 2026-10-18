@@ -1,8 +1,9 @@
 <script lang="ts">
     import { DBState } from 'src/ts/stores.svelte';
     import Hub from "./Realm/RealmMain.svelte";
-    import { OpenRealmStore, RealmInitialOpenChar } from "src/ts/stores.svelte";
-    import { ArrowLeft, ChevronDown, MailIcon, SendIcon, TriangleAlertIcon, UsersIcon } from "@lucide/svelte";
+    import { OpenRealmStore, RealmInitialOpenChar, openCharacterManager } from "src/ts/stores.svelte";
+    import { dbTransferSizeStore, transferSizeWarningDismissed } from "src/ts/transferSize";
+    import { ArrowLeft, ChevronDown, MailIcon, SendIcon, TriangleAlertIcon, UsersIcon, XIcon } from "@lucide/svelte";
     import GithubIcon from "./GithubIcon.svelte";
     import { getVersionString, openURL } from "src/ts/globalApi.svelte";
     import { language } from "src/lang";
@@ -16,6 +17,19 @@
     import ShButton from "./GUI/ShButton.svelte";
 
     let realmOpen = $state(!DBState.db.hideRealm);
+
+    // The home screen is often only passed through: on a phone the user opens
+    // the app and goes straight into a chat. Ask the hub for its cards only
+    // once home has stayed up for a moment, so its full-size card images (up
+    // to a few MB) do not compete with the chat body on a slow remote link.
+    const HUB_LOAD_DELAY_MS = 1500;
+    let hubReady = $state(false);
+    $effect(() => {
+      const timer = setTimeout(() => { hubReady = true; }, HUB_LOAD_DELAY_MS);
+      return () => clearTimeout(timer);
+    });
+
+    const fmtMB = (n: number) => `${Math.round(n / 1024 / 1024)} MB`;
 
     const relatedLinkIconClass =
       "h-40 w-40 md:h-44 md:w-44 origin-right -rotate-12 opacity-[0.12] transition-all duration-500 group-hover:scale-105 group-hover:opacity-[0.22]";
@@ -69,6 +83,31 @@
           </ShButton>
         </div>
       {/if}
+      {#if $dbTransferSizeStore.overLimit && DBState.db.nodeOnlyTransferSizeWarning !== false && !$transferSizeWarningDismissed}
+        <div class="mt-4 w-full bg-yellow-900/30 border border-yellow-700/40 rounded-md px-4 py-3 flex items-center justify-between gap-3 flex-wrap text-yellow-300">
+          <div class="flex items-start gap-2.5 min-w-0 flex-1">
+            <TriangleAlertIcon class="size-4 shrink-0 mt-0.5 text-yellow-400" />
+            <div class="flex flex-col min-w-0">
+              <span class="font-medium text-sm">{language.transferSizeWarningTitle}</span>
+              <span class="leading-relaxed text-sm opacity-90">{language.transferSizeWarningBody.replace('{{size}}', fmtMB($dbTransferSizeStore.bytes ?? 0))}</span>
+            </div>
+          </div>
+          <div class="flex items-center gap-2 shrink-0">
+            <ShButton variant="outline" size="sm" onclick={() => openCharacterManager.set(true)}>
+              {language.transferSizeOpenCharacterManager}
+            </ShButton>
+            <button
+              type="button"
+              class="text-yellow-400/70 hover:text-yellow-300 cursor-pointer"
+              aria-label={language.transferSizeDismiss}
+              title={language.transferSizeDismiss}
+              onclick={() => transferSizeWarningDismissed.set(true)}
+            >
+              <XIcon class="size-4" />
+            </button>
+          </div>
+        </div>
+      {/if}
       <div class="mt-4 mb-4 w-full border-t border-t-selected"></div>
       <div class="flex items-center gap-2">
         <button
@@ -98,7 +137,7 @@
         aria-hidden={!realmOpen}
         inert={!realmOpen}
       >
-        {#if realmOpen}
+        {#if realmOpen && hubReady}
           {#await getRisuHub({
                 search: '',
                 page: 0,

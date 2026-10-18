@@ -1,5 +1,6 @@
 <script lang="ts">
     import { getActiveHypaV3Preset } from "src/ts/process/memory/memoryPresets";
+    import { untrack } from "svelte";
     import { language } from "../../lang";
     import { tokenizeAccurate } from "../../ts/tokenizer";
     import { saveImage as saveAsset, type character, getCurrentCharacter } from "../../ts/storage/database.svelte";
@@ -10,6 +11,7 @@
     import { PlusIcon, SmileIcon, TrashIcon, UserIcon, ActivityIcon, BookIcon, Braces, Volume2Icon, DownloadIcon, HardDriveUploadIcon, Share2Icon, ImageIcon, ImageOffIcon, ArrowUp, ArrowDown, TriangleAlertIcon } from '@lucide/svelte'
     import Check from "../UI/GUI/CheckInput.svelte";
     import { addCharEmotion, addingEmotion, getCharImage, rmCharEmotion, selectCharImg, removeChar, changeCharImage } from "../../ts/characters";
+    import { archiveCharacter } from "../../ts/characterArchive";
     import LoreBook from "./LoreBook/LoreBookSetting.svelte";
     import { getAuthorNoteDefaultText, selectMultipleFile, selectSingleFile } from "../../ts/util";
     import Help from "../Others/Help.svelte";
@@ -107,24 +109,60 @@ import ShButton from "../UI/GUI/ShButton.svelte";
         return DBState.db.characters[$selectedCharID] as character
     }
 
+    // This panel stays mounted across character switches, so the loaded page
+    // is tagged with the character it belongs to. Row actions index into the
+    // current character's manifest; running them against another character's
+    // page would rename or delete the wrong asset.
+    let manifestOwner: string | null = $state(null)
+    let manifestRequestSeq = 0
+
+    function clearManifestPage() {
+        manifestRequestSeq++
+        manifestItems = []
+        manifestOffset = 0
+        manifestTotal = 0
+        manifestOwner = null
+        manifestLoading = false
+        assetFileExtensions = []
+        assetFilePath = []
+    }
+
+    function manifestPageIsCurrent(char: character) {
+        return !!char?.additionalAssetManifest && manifestOwner === char.chaId
+    }
+
     async function loadCharacterManifestPage(offset = 0) {
-        const manifest = currentChar().additionalAssetManifest
+        const char = currentChar()
+        const manifest = char?.additionalAssetManifest
         if (!manifest) return
+        const seq = ++manifestRequestSeq
         manifestLoading = true
         try {
             const page = await forageStorage.getAssetManifestPage(manifest, {
                 offset,
                 limit: manifestPageSize,
             })
+            // A newer load (or a character switch) superseded this one.
+            if (seq !== manifestRequestSeq || currentChar()?.chaId !== char.chaId) return
             manifestItems = page.items as [string, string, string][]
             manifestOffset = page.offset
             manifestTotal = page.total
+            manifestOwner = char.chaId
             assetFileExtensions = []
             assetFilePath = []
         } finally {
-            manifestLoading = false
+            if (seq === manifestRequestSeq) manifestLoading = false
         }
     }
+
+    $effect(() => {
+        const chaId = currentCharacter?.chaId
+        untrack(() => {
+            if (manifestOwner === chaId) return
+            if (manifestOwner !== null) clearManifestPage()
+            if (viewSubMenu === 2 && currentChar()?.additionalAssetManifest) void loadCharacterManifestPage(0)
+        })
+    })
 
     async function openCharacterAssetsTab() {
         viewSubMenu = 2
@@ -154,11 +192,17 @@ import ShButton from "../UI/GUI/ShButton.svelte";
     async function renameCharacterManifestAsset(index: number, name: string) {
         const char = currentChar()
         if (!char.additionalAssetManifest) return
+        if (!manifestPageIsCurrent(char)) return
+        // The row on screen now; another page or a reload may replace it
+        // while the rename is in flight.
+        const row = manifestItems[index]
         try {
             char.additionalAssetManifest = await editAssetManifest(char.additionalAssetManifest, [
                 { type: 'rename', index: manifestOffset + index, name },
             ])
-            await loadCharacterManifestPage(manifestOffset)
+            // Rename in place: reloading the page swapped the whole table for
+            // a loading row, which threw the scroll back to the top.
+            if (row && manifestItems[index] === row) row[0] = name
         } catch (error) {
             if (!await recoverAssetManifestConflict(error, () => loadCharacterManifestPage(0))) throw error
         }
@@ -166,6 +210,7 @@ import ShButton from "../UI/GUI/ShButton.svelte";
 
     async function removeCharacterManifestAsset(index: number) {
         const char = currentChar()
+        if (char.additionalAssetManifest && !manifestPageIsCurrent(char)) return
         char.chats[char.chatPage].fmIndex = -1
         if (!char.additionalAssetManifest) {
             char.additionalAssets?.splice(index, 1)
@@ -618,14 +663,11 @@ import ShButton from "../UI/GUI/ShButton.svelte";
             {#if DBState.db.newImageHandlingBeta}
             <CheckInput bind:check={DBState.db.characters[$selectedCharID].prebuiltAssetCommand} name={language.insertAssetPrompt}/>
 
-            {#if DBState.db.characters[$selectedCharID].prebuiltAssetCommand}
-
             <span class="text-textcolor mt-2">{language.assetStyle}</span>
             <SelectInput className="mb-2" bind:value={DBState.db.characters[$selectedCharID].prebuiltAssetStyle}>
                 <OptionInput value="">{language.static}</OptionInput>
                 <OptionInput value="dynamic">{language.dynamic}</OptionInput>
             </SelectInput>
-            {/if}
             {/if}
             <div class="w-full max-w-full border border-selected rounded-md p-2 mt-2">
                 <table class="contain w-full max-w-full tabler mt-2">
@@ -827,8 +869,12 @@ import ShButton from "../UI/GUI/ShButton.svelte";
     }}>{language.convertToModule}</Button>
 
     <Button onclick={async () => {
+        await archiveCharacter($selectedCharID)
+    }} className="mt-2" size="md">{language.deactivateCharacter}</Button>
+
+    <Button onclick={async () => {
         removeChar($selectedCharID, DBState.db.characters[$selectedCharID].name)
-    }} className="mt-2" size="md">{language.removeCharacter}</Button>
+    }} className="mt-2" size="md">{language.moveToTrash}</Button>
 
     {#if DBState.db.characters[$selectedCharID].type === 'character'}
         {@const char = DBState.db.characters[$selectedCharID] as character}

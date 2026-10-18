@@ -7,7 +7,7 @@ import ts from 'typescript'
 
 const source = fs.readFileSync(new URL('./server.cjs', import.meta.url), 'utf8')
 const writeStart = source.indexOf("app.post('/api/write'")
-const hydrateStart = source.indexOf('                    const fullDb = hydrateDatabaseForDisk(incomingDb);', writeStart)
+const hydrateStart = source.indexOf('                    let fullDb = hydrateDatabaseForDisk(incomingDb);', writeStart)
 const repairStart = source.lastIndexOf('                    await repairStubFlagLossChats(incomingDb);', hydrateStart)
 const writeBoundary = source.slice(repairStart > writeStart ? repairStart : hydrateStart, source.indexOf('// Same boundary for lazy asset', hydrateStart))
 const ast = ts.createSourceFile('server.cjs', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS)
@@ -18,11 +18,13 @@ function fixture() {
     const disk = { characters: [{ chaId: 'char', chats: [{ id: 'chat', name: 'original', message: [{ data: 'disk message' }] }] }] }
     const kvSet = vi.fn((_key, data) => { Object.assign(disk, JSON.parse(data.toString())) })
     const logger = { error: vi.fn(), warn: vi.fn() }
-    const ctx = vm.createContext({ Buffer, Map, Array, Date, AsyncLocalStorage, setTimeout, clearTimeout, logger, kvSet,
+    const ctx = vm.createContext({ Buffer, Map, Array, Date, performance, AsyncLocalStorage, setTimeout, clearTimeout, logger, kvSet,
         kvGet: vi.fn(() => Buffer.from(JSON.stringify(disk))),
         encodeRisuSaveLegacy: (x: any) => Buffer.from(JSON.stringify(x)),
         decodeRisuSave: async (b: Buffer) => JSON.parse(b.toString()), normalizeJSON: (x: any) => x,
-        ensureChatStore: async () => {},
+        ensureChatStore: async () => {}, carryPendingActivations: () => {}, archivedStubsOf: () => [], pendingActivations: new Map(),
+        findArchiveConflicts: () => null, databaseHashDiagnostics: () => ({}),
+        findUnmergedArchivedChats: () => [], restoreArchivedChatsForDisk: async (db: any) => db,
         nodeCrypto: { randomUUID: () => 'assigned-id' },
         createBackupAndRotate: vi.fn(), clearPersistFailure: vi.fn(), recordPersistFailure: vi.fn(),
         writeFileSync: vi.fn(), SESSION_FILE: 'synthetic-sessions',
@@ -33,7 +35,7 @@ function fixture() {
         const storageOperationContext = new AsyncLocalStorage();
         const CHAT_CONTENT_PERSIST_SOURCE = 'chat-content', CHAT_CONTENT_BACKUP_SOURCE = 'chat-content-backup';
         let dbDirty = false, dbRetryDelay = 5000, saveTimers = {}, dbCache = {};
-        let fullChatStore = new Map(), dbEtag;
+        let fullChatStore = new Map(), dbEtag, lastDbPersistMs = null;
         const computeBufferEtag = () => 'synthetic-etag';
         const sessions = new Map(); let sessionSaveTimer, sessionRetryDelay = 5000;
         ${functions(['queueStorageOperation', 'writeStorageValue', 'chatToStub', 'scheduleChatContentPersist', 'retryDatabasePersist', 'flushPendingDb', 'scheduleDatabasePersist',
@@ -364,7 +366,7 @@ test.each(['cold', 'warm'])('round3-2: %s flush and api/write cannot overwrite t
     await Promise.all([flush, write])
     expect(disk).toMatchObject({ title: 'new write' })
     expect(disk.characters[0].chats[0].message).toEqual([{ data: 'new write' }])
-    expect(api.cache()).toBeUndefined()
+    expect(api.cache()).toMatchObject({ title: 'new write' })
     expect(api.dirty()).toBe(false)
 })
 

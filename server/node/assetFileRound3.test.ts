@@ -17,7 +17,10 @@ const source = fs.readFileSync(path.join(sourceDir, 'server.cjs'), 'utf8')
 const cleanup: Array<() => Promise<void>> = []
 afterEach(async () => { vi.restoreAllMocks(); for (const fn of cleanup.splice(0).reverse()) await fn() })
 const section = (start: string, end: string) => source.slice(source.indexOf(start), source.indexOf(end, source.indexOf(start)))
-const evaluate = (code: string, deps: Record<string, any>, expression: string) => new Function(...Object.keys(deps), code + '\nreturn ' + expression)(...Object.values(deps))
+const evaluate = (code: string, deps: Record<string, any>, expression: string) => {
+    deps = { pendingActivations: new Map(), checkBackupDownloadAuth: async () => true, restoringSnapshotKey: null, lastDbPersistMs: null, databaseHashDiagnostics: () => ({}), ...deps };
+    return new Function(...Object.keys(deps), code + '\nreturn ' + expression)(...Object.values(deps));
+}
 
 async function fixture(options: Record<string, any> = {}) {
     const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'asset-round3-'))
@@ -59,6 +62,7 @@ describe('round 3 asset regressions', () => {
             const read = (key: string) => db.prepare('SELECT value FROM kv WHERE key = ?').get(key)?.value
             const code = `let dbCache = {}, fullChatStore = null, dbEtag = null; const saveTimers = {};
                 const initChatStore = obj => { fullChatStore = obj; };
+                const initChatStoreFromDisk = async obj => { initChatStore(obj); return obj; };
                 ${section('function invalidateDbCache()', '// ─── Chat runtime')}
                 ${section('async function ensureChatStore()', '// Stub metadata')}
                 ${section('async function loadDatabase()', '/** Persist database changes')}

@@ -9,6 +9,7 @@ import { language } from "src/lang"
 import { alertInput, waitAlert, notifyError } from "../alert"
 import { decodeRisuSave, encodeRisuSaveLegacy } from "./risuSave"
 import { normalizeChat } from "./database.svelte"
+import type { PatchServerTimings } from "./saveMetrics"
 
 const AUTH_FETCH_TRANSIENT_MAX_RETRIES = 3
 const AUTH_FETCH_TRANSIENT_BASE_DELAY_MS = 500
@@ -40,10 +41,13 @@ const defaultAuthFetchRetryOptions: AuthFetchRetryOptions = {
 // Custom error class for database conflict detection
 export class ConflictError extends Error {
     currentEtag: string
-    constructor(message: string, currentEtag: string) {
+    /** Server guard code (e.g. ARCHIVE_GUARD_REJECTED); undefined for a plain etag conflict. */
+    code?: string
+    constructor(message: string, currentEtag: string, code?: string) {
         super(message)
         this.name = 'ConflictError'
         this.currentEtag = currentEtag
+        this.code = code
     }
 }
 
@@ -83,6 +87,17 @@ export class StorageRequestError extends Error {
     }
 }
 
+// Thrown by importBackup when the server rejects a backup. `code` is the
+// server's machine-readable reason (e.g. BACKUP_ENCRYPTED) so the UI can show
+// a localized explanation instead of the raw message.
+export class BackupImportError extends Error {
+    constructor(message: string, public readonly code: string | null = null) {
+        super(message)
+        this.name = 'BackupImportError'
+        Object.setPrototypeOf(this, BackupImportError.prototype)
+    }
+}
+
 // Warning the server attaches to /api/patch responses when the most recent
 // debounced persist failed (Stage 1 visibility — see issues.md).
 export interface PersistWarning {
@@ -98,6 +113,35 @@ export interface PatchItemResult {
     persistWarning?: PersistWarning
     /** Set when the server's chat-internal-field guard rejected the patch. */
     chatGuardRejected?: boolean
+    /** Server-side per-key hashes sent with a hash-mismatch 409. */
+    hashDiagnostics?: PatchHashDiagnostics
+    /** `code` / `error` of a 409 body, for logging which guard rejected the patch. */
+    conflictCode?: string
+    conflictError?: string
+    /** Server stage timings on success (older servers omit them). */
+    serverTimings?: PatchServerTimings
+}
+
+/** Hash fields a 409 or a full-write response may carry; null when absent. */
+export function parseHashDiagnostics(data: any): PatchHashDiagnostics | null {
+    if (!data || typeof data !== 'object') return null
+    if (!(data.keyHashes || data.characterHashes || typeof data.serverHash === 'string')) return null
+    return {
+        serverHash: typeof data.serverHash === 'string' ? data.serverHash : undefined,
+        keyHashes: data.keyHashes && typeof data.keyHashes === 'object' ? data.keyHashes : undefined,
+        characterHashes: data.characterHashes && typeof data.characterHashes === 'object' ? data.characterHashes : undefined,
+        duplicateCharIds: Array.isArray(data.duplicateCharIds) ? data.duplicateCharIds.filter((id: unknown) => typeof id === 'string') : undefined,
+    }
+}
+
+export interface PatchHashDiagnostics {
+    serverHash?: string
+    /** Root key → hex hash of the server's current value. */
+    keyHashes?: Record<string, string>
+    /** chaId (or `#index` when missing) → hex hash of the server's stubbed character (first occurrence). */
+    characterHashes?: Record<string, string>
+    /** chaIds that repeat in the server's characters array. */
+    duplicateCharIds?: string[]
 }
 
 export interface ExportBackupOptions {
@@ -156,6 +200,8 @@ export class NodeStorage{
     private static readonly BULK_WRITE_CLIENT_BATCH = 20
 
     _lastDbEtag: string | null = null
+
+    private _lastDbWriteDiagnostics: PatchHashDiagnostics | null = null
     authChecked = false
     private cachedJwt: { token: string; expiresAt: number } | null = null
     private refreshPending: Promise<string> | null = null
@@ -435,7 +481,7 @@ export class NodeStorage{
         })
         if(da.status === 409){
             const data = await da.json()
-            throw new ConflictError(data.error, data.currentEtag)
+            throw new ConflictError(data.error, data.currentEtag, typeof data.code === 'string' ? data.code : undefined)
         }
         if(da.status < 200 || da.status >= 300){
             throw await this.storageRequestError('setItem', da)
@@ -448,6 +494,16 @@ export class NodeStorage{
         if (key === 'database/database.bin' && nextEtag) {
             this._lastDbEtag = nextEtag
         }
+        if (key === 'database/database.bin') {
+            this._lastDbWriteDiagnostics = parseHashDiagnostics(data)
+        }
+    }
+
+    /** Hashes of the view the last database.bin full write persisted; consumed once. */
+    takeDbWriteDiagnostics(): PatchHashDiagnostics | null {
+        const diagnostics = this._lastDbWriteDiagnostics
+        this._lastDbWriteDiagnostics = null
+        return diagnostics
     }
     async getItem(key:string):Promise<Buffer> {
         const headers: Record<string, string> = {
@@ -509,7 +565,17 @@ export class NodeStorage{
         }
     }
 
-    private async checkAuth(initializeSession = true){
+    private authPending: Promise<void> | null = null
+    private async checkAuth(initializeSession = true) {
+        const needsAuth = !this.authChecked
+        if (needsAuth) {
+            this.authPending ??= this.runAuthCheck().finally(() => { this.authPending = null })
+            await this.authPending
+        }
+        if (needsAuth && initializeSession && this.cachedJwt) await this.initSession(this.cachedJwt.token)
+    }
+    private async runAuthCheck() {
+        const initializeSession = false
 
         if(!this.authChecked){
             const data = await (await fetch('/api/test_auth',{
@@ -576,6 +642,10 @@ export class NodeStorage{
 
         if (da.status === 409) {
             const data = await da.json()
+            // The server's etag is returned for the caller to compare, not
+            // adopted: if it differs from the one this client last synced
+            // against, someone else wrote in between, and adopting it would
+            // let the full-write fallback pass x-if-match and overwrite them.
             const currentEtag = data.currentEtag as string | undefined
             // Server signals chat-guard rejection via explicit fields. The
             // error string fallback is kept for forward-compat with deployed
@@ -583,7 +653,14 @@ export class NodeStorage{
             const rejectedByChatGuard = data.chatGuardRejected === true
                 || data.code === 'CHAT_GUARD_REJECTED'
                 || (typeof data.error === 'string' && data.error.includes('chat-internal field ops'))
-            return { success: false, etag: currentEtag, chatGuardRejected: rejectedByChatGuard }
+            return {
+                success: false,
+                etag: currentEtag,
+                chatGuardRejected: rejectedByChatGuard,
+                hashDiagnostics: parseHashDiagnostics(data) ?? undefined,
+                conflictCode: typeof data.code === 'string' ? data.code : undefined,
+                conflictError: typeof data.error === 'string' ? data.error : undefined,
+            }
         }
         if (da.status < 200 || da.status >= 300) {
             // Surface the server's error detail — without this the browser
@@ -602,7 +679,10 @@ export class NodeStorage{
             this._lastDbEtag = nextEtag
         }
         const persistWarning = data.persistWarning as PersistWarning | undefined
-        return { success: true, etag: nextEtag, persistWarning }
+        const serverTimings = data.timings && typeof data.timings === 'object'
+            ? data.timings as PatchServerTimings
+            : undefined
+        return { success: true, etag: nextEtag, persistWarning, serverTimings }
     }
 
     // ── Bulk asset operations (3-2-B) ──────────────────────────────────────────
@@ -668,6 +748,10 @@ export class NodeStorage{
         if (options.offset != null) params.set('offset', String(options.offset))
         if (options.limit != null) params.set('limit', String(options.limit))
         if (options.search) params.set('search', options.search)
+        // The server caches pages as immutable (content-addressed ids); the
+        // format version in the URL keeps a newer client from reading a page
+        // shape cached by an older one.
+        if (descriptor?.version != null) params.set('v', String(descriptor.version))
         const query = params.toString()
         for (let attempt = 0; attempt < 2; attempt++) {
             const da = await this.authFetch(`/api/asset-manifests/${encodeURIComponent(manifestId)}${query ? `?${query}` : ''}`)
@@ -766,16 +850,35 @@ export class NodeStorage{
         return await da.json()
     }
 
-    async exportBackup(opts?: ExportBackupOptions): Promise<Response> {
+    /** Hands the backup export to the browser's own download manager. */
+    async downloadBackupExport(opts?: ExportBackupOptions): Promise<void> {
         const params = new URLSearchParams()
         if (opts?.target === 'upstream') params.set('target', 'upstream')
         if (opts?.mode === 'settings') params.set('mode', 'settings')
         if (opts?.moduleAssets === false) params.set('moduleAssets', '0')
         const query = params.toString()
-        const url = query ? `/api/backup/export?${query}` : '/api/backup/export'
-        const da = await this.authFetch(url)
-        if (da.status < 200 || da.status >= 300) throw `backup export error: ${da.status}`
-        return da
+        await this.startCookieDownload(query ? `/api/backup/export?${query}` : '/api/backup/export')
+    }
+
+    // A backup is streamed by the browser's download manager straight to disk
+    // instead of relayed through this tab (whose memory Safari fills with the
+    // whole file, and which non-secure origins route through a third-party
+    // page). The GET authenticates with the session cookie, so refresh it
+    // first. No x-session-id: registering a boot here would disturb the
+    // writer lock.
+    private async startCookieDownload(url: string): Promise<void> {
+        const res = await fetch('/api/session', {
+            method: 'POST',
+            headers: { 'risu-auth': await this.createAuth() },
+        })
+        if (!res.ok) throw new Error(`session refresh failed: ${res.status}`)
+        const anchor = document.createElement('a')
+        anchor.href = url
+        anchor.download = ''
+        anchor.style.display = 'none'
+        document.body.appendChild(anchor)
+        anchor.click()
+        anchor.remove()
     }
 
     // Key names + sizes only; values stay on the server until read per key.
@@ -861,6 +964,7 @@ export class NodeStorage{
             let leftover = ''
             let result: {ok: boolean, assetsRestored: number, coldStorageFailed?: number} | null = null
             let serverErrorMsg: string | null = null
+            let serverErrorCode: string | null = null
 
             const drainNdjson = () => {
                 const text = xhr.responseText
@@ -881,6 +985,7 @@ export class NodeStorage{
                         result = msg
                     } else if (msg.type === 'error') {
                         serverErrorMsg = typeof msg.message === 'string' ? msg.message : 'backup import failed'
+                        serverErrorCode = typeof msg.code === 'string' ? msg.code : null
                     }
                     // Ignore 'heartbeat' and unknown event types.
                 }
@@ -899,7 +1004,7 @@ export class NodeStorage{
                     return
                 }
                 drainNdjson()
-                if (serverErrorMsg) reject(new Error(serverErrorMsg))
+                if (serverErrorMsg) reject(new BackupImportError(serverErrorMsg, serverErrorCode))
                 else if (result) resolve(result)
                 else reject(new Error('backup import: no result received'))
             }
@@ -1010,11 +1115,8 @@ export class NodeStorage{
         if (da.status < 200 || da.status >= 300) throw new Error(`server backup delete error: ${da.status}`)
     }
 
-    async downloadServerBackup(filename: string): Promise<Response> {
-        const da = await this.authFetch(`/api/backup/server/download/${encodeURIComponent(filename)}`)
-        if (da.status === 404) throw new Error('Backup file not found')
-        if (da.status < 200 || da.status >= 300) throw new Error(`server backup download error: ${da.status}`)
-        return da
+    async downloadServerBackup(filename: string): Promise<void> {
+        await this.startCookieDownload(`/api/backup/server/download/${encodeURIComponent(filename)}`)
     }
 
     // ── Chat content (runtime lazy load) ────────────────────────────────────
@@ -1031,7 +1133,7 @@ export class NodeStorage{
 
     private chatSaveChains = new Map<string, Promise<unknown>>()
 
-    private enqueueChatSave<T>(chaId: string, chatId: string, save: () => Promise<T>): Promise<T> {
+    enqueueChatSave<T>(chaId: string, chatId: string, save: () => Promise<T>): Promise<T> {
         const key = JSON.stringify([chaId, chatId])
         const previous = this.chatSaveChains.get(key) ?? Promise.resolve()
         const next = previous.then(save, save)
@@ -1041,6 +1143,61 @@ export class NodeStorage{
         }
         void next.then(cleanup, cleanup)
         return next
+    }
+
+    /**
+     * Chat delta sync (see server `sendChatContent`): with a base, the server
+     * answers with only the messages after it when the prefix verifies —
+     * `deltaBase` is then set and `chat.message` holds just the rest.
+     */
+    async fetchChatContentDelta(chaId: string, chatIndex: number, chatId: string, base: { count: number, fp: string } | null): Promise<{ chat: any, deltaBase: number | null } | null> {
+        const headers: Record<string, string> = { 'x-chat-id': chatId }
+        if (base) {
+            headers['x-chat-base-count'] = String(base.count)
+            headers['x-chat-base-fp'] = base.fp
+        }
+        const da = await this.authFetch(`/api/chat-content/${encodeURIComponent(chaId)}/${chatIndex}`, { headers })
+        if (da.status === 404) return null
+        if (da.status < 200 || da.status >= 300) throw new Error(`fetchChatContent error: ${da.status}`)
+        const deltaHeader = da.headers.get('x-chat-delta-base')
+        const deltaBase = deltaHeader !== null && base && Number(deltaHeader) === base.count ? base.count : null
+        const buffer = new Uint8Array(await da.arrayBuffer())
+        return { chat: normalizeChat(await decodeRisuSave(buffer)), deltaBase }
+    }
+
+    /**
+     * Save a chat, optionally as a delta: `base` names the prefix the server
+     * already holds and `chat.message` carries only the messages after it.
+     * The body is gzipped when the browser can. Returns 'base-mismatch' when
+     * the server could not verify the prefix (the caller then saves in full).
+     */
+    async saveChatContentDelta(chaId: string, chatIndex: number, chatId: string, chat: any, base: { count: number, fp: string } | null): Promise<'ok' | 'base-mismatch'> {
+        return this.enqueueChatSave(chaId, chatId, () => this.saveChatContentDeltaUnqueued(chaId, chatIndex, chatId, chat, base))
+    }
+
+    async saveChatContentDeltaUnqueued(chaId: string, chatIndex: number, chatId: string, chat: any, base: { count: number, fp: string } | null): Promise<'ok' | 'base-mismatch'> {
+        const encoded = encodeRisuSaveLegacy(chat)
+        const headers: Record<string, string> = {
+            'content-type': 'application/octet-stream',
+            'x-chat-id': chatId,
+        }
+        if (base) {
+            headers['x-chat-base-count'] = String(base.count)
+            headers['x-chat-base-fp'] = base.fp
+        }
+        const gzipped = await gzipForUpload(encoded)
+        if (gzipped) headers['content-encoding'] = 'gzip'
+        const da = await this.authFetch(`/api/chat-content/${encodeURIComponent(chaId)}/${chatIndex}`, {
+            method: 'POST',
+            headers,
+            body: (gzipped ?? encoded) as BodyInit,
+        })
+        if (base && da.status === 409) {
+            const body = await da.json().catch(() => ({})) as { code?: string }
+            if (body?.code === 'CHAT_DELTA_BASE_MISMATCH') return 'base-mismatch'
+        }
+        if (da.status < 200 || da.status >= 300) throw new Error(`saveChatContent error: ${da.status}`)
+        return 'ok'
     }
 
     async saveChatContent(chaId: string, chatIndex: number, chatId: string, chat: any): Promise<void> {
@@ -1097,6 +1254,83 @@ export class NodeStorage{
 
             return data as unknown as DurableChatSaveResult
         })
+    }
+
+    // ── Character archive (deactivate / activate) — see src/ts/characterArchive.ts ──
+
+    /** Server writes + verifies the payload; returns the stub to keep in the database. */
+    async archiveCharacter(chaId: string, arg: { acceptLostChats?: boolean } = {}): Promise<any> {
+        const da = await this.authFetch(`/api/characters/${encodeURIComponent(chaId)}/archive`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ acceptLostChats: arg.acceptLostChats === true }),
+        })
+        const body = await da.json().catch(() => ({})) as { ok?: boolean; stub?: any; error?: string; code?: string; chats?: string[] }
+        if (da.status < 200 || da.status >= 300 || !body?.stub) {
+            throw new CharacterArchiveError(body?.code ?? `HTTP_${da.status}`, body?.error ?? `archive error: ${da.status}`, body?.chats)
+        }
+        return body.stub
+    }
+
+    /**
+     * Archive rows for many characters in one request. Throws only when the
+     * request as a whole fails; each character's outcome is in its result.
+     */
+    async archiveCharacters(chaIds: string[], arg: { acceptLostChats?: boolean } = {}): Promise<ArchiveBatchResult[]> {
+        const da = await this.authFetch('/api/characters/archive-batch', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ chaIds, acceptLostChats: arg.acceptLostChats === true }),
+        })
+        const body = await da.json().catch(() => ({})) as { ok?: boolean; results?: ArchiveBatchResult[]; error?: string; code?: string }
+        if (da.status < 200 || da.status >= 300 || !Array.isArray(body?.results)) {
+            throw new CharacterArchiveError(body?.code ?? `HTTP_${da.status}`, body?.error ?? `archive error: ${da.status}`)
+        }
+        return body.results
+    }
+
+    /** Server registers the chats and returns the client-view character (stub chats, manifest descriptor). */
+    async activateCharacter(chaId: string, archivedAt?: number): Promise<any> {
+        const da = await this.authFetch(`/api/characters/${encodeURIComponent(chaId)}/activate`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ archivedAt }),
+        })
+        const body = await da.json().catch(() => ({})) as { ok?: boolean; character?: any; error?: string; code?: string }
+        if (da.status < 200 || da.status >= 300 || !body?.character) {
+            throw new CharacterArchiveError(body?.code ?? `HTTP_${da.status}`, body?.error ?? `activate error: ${da.status}`)
+        }
+        return body.character
+    }
+
+    /** Permanently delete every archive row of a deactivated character (the caller drops the stub). */
+    async deleteArchivedCharacter(chaId: string): Promise<void> {
+        const da = await this.authFetch(`/api/characters/${encodeURIComponent(chaId)}/archive`, { method: 'DELETE' })
+        if (da.status < 200 || da.status >= 300) {
+            const body = await da.json().catch(() => ({})) as { error?: string; code?: string }
+            throw new CharacterArchiveError(body?.code ?? `HTTP_${da.status}`, body?.error ?? `archive delete error: ${da.status}`)
+        }
+    }
+
+    /** Server-side inlay reference scan over every chat body (lazy-loaded and deactivated ones included). */
+    async fetchInlayReferences(): Promise<{ scannedAt: number; totalMessages: number; refCounts: Record<string, number> }> {
+        const da = await this.authFetch('/api/inlays/references')
+        if (da.status < 200 || da.status >= 300) {
+            const body = await da.json().catch(() => ({})) as { error?: string }
+            throw new Error(body?.error ?? `inlay reference scan error: ${da.status}`)
+        }
+        return await da.json()
+    }
+
+    /** Every deactivated character as a full legacy record (partial backup). */
+    async fetchArchivedCharactersInline(): Promise<any[]> {
+        const da = await this.authFetch('/api/characters/archived/inline')
+        if (da.status < 200 || da.status >= 300) {
+            const body = await da.json().catch(() => ({})) as { error?: string; code?: string }
+            throw new CharacterArchiveError(body?.code ?? `HTTP_${da.status}`, body?.error ?? `archived inline error: ${da.status}`)
+        }
+        const decoded = await decodeRisuSave(new Uint8Array(await da.arrayBuffer())) as { characters?: any[] }
+        return Array.isArray(decoded?.characters) ? decoded.characters : []
     }
 
     // ── Save-folder migration ─────────────────────────────────────────────────
@@ -1203,4 +1437,38 @@ async function digestPassword(message:string) {
         throw new Error(`Password hashing failed (${res.status})`)
     }
     return await res.text()
+}
+
+/** Failure reported by the character archive endpoints; `code` is the server's error code. */
+/** One character's outcome in /api/characters/archive-batch. */
+export type ArchiveBatchResult =
+    | { chaId: string; ok: true; stub: any }
+    | { chaId: string; ok: false; code: string; error: string; chats?: string[] }
+
+export class CharacterArchiveError extends Error {
+    code: string
+    /** Names of the chats the failure is about (ARCHIVE_CHATS_UNAVAILABLE). */
+    chats: string[]
+    constructor(code: string, message: string, chats: string[] = []) {
+        super(message)
+        this.name = 'CharacterArchiveError'
+        this.code = code
+        this.chats = Array.isArray(chats) ? chats : []
+    }
+}
+
+// Chat bodies are text-heavy (Korean prose is ~3 bytes a character), so the
+// upload shrinks several-fold; small bodies are not worth the round trip
+// through the stream. The server's express.raw() inflates Content-Encoding
+// gzip transparently, and old servers never see this header from old code.
+const GZIP_MIN_BYTES = 8 * 1024
+
+async function gzipForUpload(bytes: Uint8Array): Promise<Uint8Array | null> {
+    if (bytes.byteLength < GZIP_MIN_BYTES || typeof CompressionStream === 'undefined') return null
+    try {
+        const stream = new Blob([bytes as BlobPart]).stream().pipeThrough(new CompressionStream('gzip'))
+        return new Uint8Array(await new Response(stream).arrayBuffer())
+    } catch {
+        return null
+    }
 }

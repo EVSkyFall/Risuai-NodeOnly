@@ -80,6 +80,8 @@ export const displayThemeSettingsItems: SettingItem[] = [
         componentProps: { messageKey: 'customCSSWarning' },
         keywords: ['custom', 'css', 'warning'],
     },
+    // moved from Advanced (only matters with custom CSS)
+    { id: 'adv.cssErr', type: 'check', labelKey: 'returnCSSError', bindKey: 'returnCSSError', helpKey: 'returnCSSError', classes: 'mt-4' },
     {
         id: 'display.waifuWidth',
         type: 'slider',
@@ -299,12 +301,25 @@ export const displaySizeSettingsItems: SettingItem[] = [
         options: { min: 16, max: 48, step: 1 },
         keywords: ['settings', 'close', 'button', 'size'],
     },
+    // moved from Advanced (mobile viewport height unit)
+    {
+        id: 'adv.heightMode', type: 'select', labelKey: 'heightMode', bindKey: 'heightMode',
+        helpKey: 'heightMode',
+        options: {
+            selectOptions: [
+                { value: 'normal', label: 'Normal' },
+                { value: 'percent', label: 'Percent' },
+                { value: 'vh', label: 'VH' },
+                { value: 'dvh', label: 'DVH' },
+                { value: 'svh', label: 'SVH' },
+                { value: 'lvh', label: 'LVH' }
+            ]
+        }
+    },
 ];
 
 export const displayOtherHomeItems: SettingItem[] = [
     { id: 'display.hideRealm', type: 'check', labelKey: 'hideRealm', helpKey: 'hideRealm', bindKey: 'hideRealm', keywords: ['realm', 'hide'] },
-    { id: 'display.showFolderName', type: 'check', labelKey: 'showFolderNameInIcon', helpKey: 'showFolderNameInIcon', bindKey: 'showFolderName', keywords: ['folder', 'name', 'icon'] },
-    { id: 'display.roundIcons', type: 'check', labelKey: 'roundIcons', helpKey: 'roundIcons', bindKey: 'roundIcons', keywords: ['round', 'icons'] },
     { id: 'display.hideMessagePageCount', type: 'check', labelKey: 'hideMessagePageCount', helpKey: 'hideMessagePageCountDesc', bindKey: 'hideMessagePageCount', keywords: ['message', 'page', 'count', 'hide'] },
 ];
 

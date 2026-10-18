@@ -5,6 +5,7 @@ const https = require('https');
 const path = require('path');
 const net = require('net');
 const compression = require('compression');
+const { messageFingerprints, prefixFingerprint } = require('./chatFingerprint.cjs');
 const htmlparser = require('node-html-parser');
 const { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, unlinkSync, statSync } = require('fs');
 const fs = require('fs/promises')
@@ -191,6 +192,10 @@ const SAVE_INTERVAL = 5000;
 let dbDirty = false;
 let dbRetryDelay = 5000;
 let fullChatStore = null; // Map<chaId, Map<chatId, chatObject>> — lazy-initialized
+// chaId → archivedAt of characters activated in this process whose return to
+// `characters` the client has not saved yet. Their chats live only in
+// fullChatStore until then, so initChatStore carries them over (see there).
+const pendingActivations = new Map();
 
 // ETag for database.bin
 let dbEtag = null;
@@ -201,6 +206,30 @@ function computeBufferEtag(buffer) {
 
 function computeDatabaseEtagFromObject(databaseObject) {
     return computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(databaseObject)));
+}
+
+// Per-root-key and per-character hashes of a client-view database, in the
+// hex form RisuSavePatcher.describeHashMismatch compares against its own
+// baseline. Characters are keyed by chaId (or `#index` when missing); the
+// first occurrence of a repeated id wins and the repeats are listed so the
+// client sees a stable pair instead of a last-writer-wins collision.
+function databaseHashDiagnostics(databaseObject) {
+    const keyHashes = {};
+    for (const [key, value] of Object.entries(databaseObject ?? {})) {
+        keyHashes[key] = calculateHash(value).toString(16);
+    }
+    const characterHashes = {};
+    const duplicateCharIds = [];
+    const characters = Array.isArray(databaseObject?.characters) ? databaseObject.characters : [];
+    characters.forEach((character, index) => {
+        const id = typeof character?.chaId === 'string' && character.chaId ? character.chaId : `#${index}`;
+        if (Object.prototype.hasOwnProperty.call(characterHashes, id)) {
+            duplicateCharIds.push(id);
+            return;
+        }
+        characterHashes[id] = calculateHash(character).toString(16);
+    });
+    return { keyHashes, characterHashes, duplicateCharIds };
 }
 
 let storageOperationQueue = Promise.resolve();
@@ -321,8 +350,14 @@ function getSnapshotLimits() {
 // Walk newest → oldest; keep within both limits, delete the rest. The most
 // recent snapshot is always kept (even if it alone exceeds the byte limit) so
 // we never end up with zero backups after a config change.
+// Snapshot a restore is reading from. The restore flushes a pending save
+// first, and that flush can take a new snapshot and trim the oldest one —
+// which may be the very snapshot being restored.
+let restoringSnapshotKey = null;
+
 function trimSnapshotsToLimits() {
     const { maxCount, maxBytes } = getSnapshotLimits();
+    const pluginSize = snapshotPluginSizer();
     // Size each snapshot by its marginal disk cost (chunks not shared with the
     // live blob), not its logical size — chunked snapshots share chunks, so a
     // logical measure would over-trim ones that cost almost nothing on disk.
@@ -331,7 +366,7 @@ function trimSnapshotsToLimits() {
             const tsRaw = parseInt(key.slice(DB_BACKUP_PREFIX.length, -4), 10);
             // Plugin bytes are marginal too: blobs only this snapshot references
             // (see plugin-storage-store.cjs snapshotBytes).
-            return { key, size: snapshotFootprint(key) + snapshotPluginBytes(key), ts: Number.isFinite(tsRaw) ? tsRaw : 0 };
+            return { key, size: snapshotFootprint(key) + pluginSize(key).bytes, ts: Number.isFinite(tsRaw) ? tsRaw : 0 };
         })
         .sort((a, b) => b.ts - a.ts);
 
@@ -342,6 +377,7 @@ function trimSnapshotsToLimits() {
         const isFirst = i === 0;
         const fitsByCount = i < maxCount;
         const fitsByBytes = runningBytes + e.size <= maxBytes;
+        if (e.key === restoringSnapshotKey) continue;
         if (isFirst || (fitsByCount && fitsByBytes)) {
             runningBytes += e.size;
         } else {
@@ -357,7 +393,7 @@ function trimSnapshotsToLimits() {
 // the split has run, so every snapshot also carries a content-addressed map
 // of the plugin-storage/ rows (see plugin-storage-store.cjs snapshotTo).
 // These helpers keep the two halves created, sized, deleted and restored
-// together. snapshotPluginBytes is the marginal cost (blobs only that
+// together. snapshotPluginSizer gives the marginal cost (blobs only that
 // snapshot references + its map row); dropping a snapshot GCs its unique
 // blobs in the same transaction.
 // Only the exact `database/dbbackup-<digits>.bin` shape names a snapshot. A
@@ -373,8 +409,11 @@ function snapshotPluginId(key) {
     return m[1];
 }
 
-function snapshotPluginBytes(key) {
-    return pluginStorage.snapshotBytes(snapshotPluginId(key));
+// Sizes the plugin halves of all snapshots in one pass and returns
+// key → { bytes, logicalBytes }; bytes is the marginal cost.
+function snapshotPluginSizer() {
+    const sizeOf = pluginStorage.snapshotSizer();
+    return (key) => sizeOf(snapshotPluginId(key));
 }
 
 function deleteSnapshot(key) {
@@ -396,11 +435,12 @@ function listSnapshotKeys() {
 
 function snapshotUsage() {
     const keys = listSnapshotKeys();
+    const pluginSize = snapshotPluginSizer();
     let bytes = 0, logicalBytes = 0;
     for (const k of keys) {
-        const id = snapshotPluginId(k);
-        bytes += snapshotFootprint(k) + pluginStorage.snapshotBytes(id);
-        logicalBytes += (kvSize(k) || 0) + pluginStorage.snapshotLogicalBytes(id);
+        const plugin = pluginSize(k);
+        bytes += snapshotFootprint(k) + plugin.bytes;
+        logicalBytes += (kvSize(k) || 0) + plugin.logicalBytes;
     }
     return { count: keys.length, bytes, logicalBytes };
 }
@@ -519,6 +559,19 @@ async function flushPendingDb() {
     }
 }
 
+// A failed persist used to drop its timer, so nothing wrote the pending
+// changes again until the next edit (and a restart lost them). Try again
+// later while the cache still holds them. A guard that refused to persist
+// drops dbCache on purpose; then there is nothing to retry, and a no-op
+// "success" must not clear the failure it recorded.
+const PERSIST_RETRY_MS = process.env.POCKETRISU_PERSIST_RETRY_MS
+    ? Number(process.env.POCKETRISU_PERSIST_RETRY_MS)
+    : 30_000; // override for tests
+function retryDatabasePersistLater(source) {
+    if (!dbCache[DB_HEX_KEY] || saveTimers[DB_HEX_KEY]) return;
+    scheduleDatabasePersist(`${source}:retry`, PERSIST_RETRY_MS);
+}
+
 // ── /api/patch × plugin storage ─────────────────────────────────────────────
 // During the mixed old/new client window, an older client still patches
 // `/pluginCustomStorage/<key>` in database.bin. Applying those to dbCache
@@ -578,6 +631,7 @@ async function loadDbCacheIfMissing({ createBackup = false } = {}) {
 function invalidateDbCache() {
     delete dbCache[DB_HEX_KEY];
     fullChatStore = null;
+    pendingActivations.clear();
     if (saveTimers[DB_HEX_KEY]) {
         clearTimeout(saveTimers[DB_HEX_KEY]);
         delete saveTimers[DB_HEX_KEY];
@@ -599,6 +653,40 @@ function assignMissingChatIds(dbObj) {
         }
     }
     return changed;
+}
+
+// Character and chat ids made unique the way the browser's assignIds
+// (src/ts/bootstrap.ts) does it — one set over every chaId and chat id, in
+// order, the first occurrence keeps its id — but here, on the full decoded
+// database, where each chat still carries its body. The browser renaming a
+// duplicate on its own left the server's body under the old id: the chat
+// opened empty and the next save dropped the body from disk (and two chats
+// sharing an id inside one character shared one body on the server). Once
+// this has run and persisted, the browser finds nothing to rename.
+function dedupeCharacterAndChatIds(dbObj) {
+    const renamed = [];
+    if (!Array.isArray(dbObj?.characters)) return renamed;
+    const seen = new Set();
+    for (const char of dbObj.characters) {
+        if (!char || typeof char !== 'object') continue;
+        if (!char.chaId || seen.has(char.chaId)) {
+            const next = nodeCrypto.randomUUID();
+            if (char.chaId) renamed.push(`character ${char.chaId} → ${next}`);
+            char.chaId = next;
+        }
+        seen.add(char.chaId);
+        if (!Array.isArray(char.chats)) continue;
+        for (const chat of char.chats) {
+            if (!chat || typeof chat !== 'object') continue;
+            if (!chat.id || seen.has(chat.id)) {
+                const next = nodeCrypto.randomUUID();
+                if (chat.id) renamed.push(`chat ${char.chaId}/${chat.id} → ${next}`);
+                chat.id = next;
+            }
+            seen.add(chat.id);
+        }
+    }
+    return renamed;
 }
 
 // Recovers chats whose folderId points to a deleted folder. The previous merge
@@ -635,39 +723,14 @@ async function decodeDatabaseWithPersistentChatIds(raw, options = {}) {
         if (fresh) raw = fresh;
     }
 
-    const needsPluginMigration = !kvGet('_meta/plugin-storage-migrated');
-    const dbObj = normalizeJSON(await decodeRisuSave(raw, {
-        extractPluginStorage: needsPluginMigration,
-    }));
+    const dbObj = normalizeJSON(await decodeRisuSave(raw, { extractPluginStorage: true }));
     let needsPersist = false;
-
-    if (needsPluginMigration) {
-        const pcs = dbObj.pluginCustomStorage;
-        if (pcs && typeof pcs === 'object') {
-            const pcsKeys = Object.keys(pcs);
-            if (pcsKeys.length > 0) {
-                let migratedCount = 0;
-                for (const k of pcsKeys) {
-                    const encoded = Buffer.from(k, 'utf-8')
-                        .toString('base64')
-                        .replace(/\+/g, '-')
-                        .replace(/\//g, '_')
-                        .replace(/=+$/, '');
-                    const storageKey = `plugin-custom-storage/${encoded}.json`;
-                    // A lost marker must not let legacy save data overwrite live KV storage.
-                    if (kvGet(storageKey) !== null) continue;
-                    kvSet(storageKey, Buffer.from(JSON.stringify(pcs[k]), 'utf-8'));
-                    migratedCount++;
-                }
-                logger.info(`[Migration] Migrated ${migratedCount} pluginCustomStorage entries to KV`);
-                dbObj.pluginCustomStorage = {};
-                needsPersist = true;
-            }
-        }
-        kvSet('_meta/plugin-storage-migrated', Buffer.from('1'));
-    }
-
+    const coldPluginResult = restoreColdPluginStorageInDb(dbObj);
+    if (coldPluginResult.failed) logger.warn(`[ColdStorage] ${coldPluginResult.failed} plugin value(s) remain recoverable in _coldplugin`);
+    const pluginMigration = pluginStorage.migrateFromDb(dbObj, { kvWinsOnRemigration: true });
+    if (pluginMigration.migrated) needsPersist = true;
     dbObj.pluginCustomStorage = {};
+    kvSet('_meta/plugin-storage-migrated', Buffer.from('1'));
 
     const hadMissingIds = assignMissingChatIds(dbObj);
     if (hadMissingIds) needsPersist = true;
@@ -681,6 +744,14 @@ async function decodeDatabaseWithPersistentChatIds(raw, options = {}) {
     // Failed characters are promoted to safe blank characters — their KV data is preserved for manual recovery.
     const coldRestoreResult = restoreColdStorageCharactersInDb(dbObj);
     if (coldRestoreResult.restored > 0 || coldRestoreResult.failed > 0) needsPersist = true;
+
+    // After the cold-storage restore: it replaces restored characters' chats
+    // wholesale and may bring duplicate or missing ids back.
+    const renamedIds = dedupeCharacterAndChatIds(dbObj);
+    if (renamedIds.length > 0) {
+        needsPersist = true;
+        logger.warn(`[Load] Renamed ${renamedIds.length} duplicate character/chat id(s), keeping each chat's content: ${renamedIds.slice(0, 5).join(', ')}`);
+    }
     if (coldRestoreResult.failed > 0) {
         logger.error(`[ColdStorage] ${coldRestoreResult.failed} character(s) could not be restored and were converted to safe blank characters. Cold storage KV data is preserved.`);
         for (const name of coldRestoreResult.failedNames) {
@@ -696,7 +767,6 @@ async function decodeDatabaseWithPersistentChatIds(raw, options = {}) {
     // in remotes/<chaId>.local.bin.
     const remoteRecoveryResult = await recoverChatsFromRemotes(dbObj);
     if (remoteRecoveryResult.recovered > 0) needsPersist = true;
-
     if (needsPersist) {
         kvSet('database/database.bin', Buffer.from(encodeRisuSaveLegacy(dbObj)));
         if (createBackup) {
@@ -750,11 +820,16 @@ function chatToStub(chat) {
  * reproduce the hybrid on disk.
  */
 function initChatStore(dbObj, { preserveMissing = false } = {}) {
+    const previous = fullChatStore;
     if (!preserveMissing || !fullChatStore) fullChatStore = new Map();
+    carryPendingActivations(previous, dbObj);
+    for (const stub of archivedStubsOf(dbObj)) {
+        if (!pendingActivations.has(stub.chaId)) fullChatStore.delete(stub.chaId);
+    }
     if (!dbObj?.characters) return;
     for (const char of dbObj.characters) {
         if (!char?.chaId || !char.chats) continue;
-        const charChats = preserveMissing ? (fullChatStore.get(char.chaId) || new Map()) : new Map();
+        const charChats = (preserveMissing || pendingActivations.has(char.chaId)) ? (fullChatStore.get(char.chaId) || new Map()) : new Map();
         for (const chat of char.chats) {
             if (!chat) continue;
             const isStub = chat._stub === true;
@@ -774,6 +849,49 @@ function initChatStore(dbObj, { preserveMissing = false } = {}) {
             fullChatStore.set(char.chaId, charChats);
         }
     }
+}
+
+// An activated character's chats are registered here before the client's save
+// puts the character back into `characters`. A store rebuild in between (any
+// persist) would drop them: the save that returns the character is then
+// refused as "returned from the archive without activation", and chat bodies
+// posted meanwhile are lost. Keep them while the character is still off the
+// list and its archive stub is the version that was activated; forget the
+// activation once it is listed or the stub is gone or replaced.
+function carryPendingActivations(previous, dbObj) {
+    if (pendingActivations.size === 0) return;
+    const listed = new Set((Array.isArray(dbObj?.characters) ? dbObj.characters : []).map((c) => c?.chaId).filter(Boolean));
+    const stubAt = new Map(archivedStubsOf(dbObj).map((s) => [s.chaId, s.archivedAt]));
+    for (const [chaId, archivedAt] of pendingActivations) {
+        if (listed.has(chaId) || stubAt.get(chaId) !== archivedAt) {
+            pendingActivations.delete(chaId);
+            continue;
+        }
+        const chats = previous?.get(chaId);
+        if (chats) fullChatStore.set(chaId, chats);
+    }
+}
+
+/**
+ * initChatStore for a database just decoded from disk. A reactivated
+ * character can sit on disk with bodiless `_stub` chats whose bodies only its
+ * archive rows hold; restore them before anything reads the store, or a chat
+ * opened before the next save loads empty and the edit that follows replaces
+ * the history for good. A failure here only logs: the app must still load,
+ * and the persist path refuses on its own when a row is unreadable.
+ * Returns the database the store was built from.
+ */
+async function initChatStoreFromDisk(dbObj) {
+    let db = dbObj;
+    if (findUnmergedArchivedChats(dbObj).length > 0) {
+        try {
+            db = await restoreArchivedChatsForDisk(dbObj, 'load');
+        } catch (error) {
+            logger.warn(`[Archive] load: could not restore chats from archive rows: ${error?.message || error}`);
+        }
+    }
+    initChatStore(db);
+    return db;
 }
 
 /**
@@ -1067,6 +1185,7 @@ async function migrateRemoteBlocksIfNeeded() {
     kvCopyValue('database/database.bin', backupKey);
 
     const dbObj = await decodeRisuSave(raw, {
+        extractPluginStorage: true,
         resolveRemote: async (name) => {
             const value = kvGet(`remotes/${name}.local.bin`);
             return value || null;
@@ -1116,7 +1235,7 @@ async function ensureChatStore() {
     const dbObj = await decodeDatabaseWithPersistentChatIds(raw, {
         createBackup: true,
     });
-    initChatStore(dbObj);
+    await initChatStoreFromDisk(dbObj);
 }
 
 // Stub metadata fields a JSON Patch may legitimately touch on a `chats[i]`
@@ -1276,7 +1395,12 @@ async function repairStubFlagLossChats(db) {
 /**
  * Persist dbCache to disk with full chats merged back in.
  */
+// Duration of the last successful debounced database write, reported with
+// /api/patch responses for the client's save dashboard.
+let lastDbPersistMs = null;
+
 async function persistDbCacheWithChats(filePath, decodedKey) {
+    const persistStartedAt = performance.now();
     await ensureChatStore();
     let strippedDb;
     do {
@@ -1285,8 +1409,9 @@ async function persistDbCacheWithChats(filePath, decodedKey) {
         if (decodedKey === 'database/database.bin') await repairStubFlagLossChats(strippedDb);
         // Disk repair can yield while PATCH replaces the cache root.
     } while (strippedDb !== dbCache[filePath]);
-    const fullDb = hydrateDatabaseForDisk(strippedDb);
+    let fullDb = hydrateDatabaseForDisk(strippedDb);
 
+    if (findUnmergedArchivedChats(fullDb).length > 0) fullDb = await restoreArchivedChatsForDisk(fullDb, 'persist');
     const data = Buffer.from(encodeRisuSaveLegacy(fullDb));
     try {
         await writeStorageValue(decodedKey, data);
@@ -1307,6 +1432,7 @@ async function persistDbCacheWithChats(filePath, decodedKey) {
         dbDirty = false;
         dbRetryDelay = 5000;
         initChatStore(fullDb, { preserveMissing: true });
+        lastDbPersistMs = Math.round(performance.now() - persistStartedAt);
     }
     return true;
 }
@@ -1402,7 +1528,13 @@ function shouldCompress(req, res) {
     // 502-avoidance the streaming endpoints were built for. compressible's
     // mime-db happens not to list application/x-ndjson today (so this is
     // a no-op in practice) but a future dep upgrade could flip it on.
+    // Exception: the plugin-storage dump is a bulk transfer the client reads
+    // to the end (no heartbeats), and long-term-memory plugins push it to
+    // hundreds of MB of text — over a remote link gzip pays off (#93).
     if (contentType.includes('application/x-ndjson')) {
+        if (url.split('?')[0] === '/api/plugin-storage/all') {
+            return true;
+        }
         return false;
     }
     // Already-compressed media formats: gzip adds CPU cost with ~0% size gain
@@ -1850,6 +1982,23 @@ function getInlaySidecarPath(id) {
     return p;
 }
 
+// Derived thumbnails live in a subfolder (inlay scans only look at files; the
+// import swap replaces the whole inlay folder, cache included). A thumbnail is
+// named after the exact source version it was built from, so a cache hit can
+// never be stale; removing a source file removes its version's thumbnail.
+const inlayThumbDir = path.join(inlayDir, '.thumbs')
+
+function inlaySourceVersion(stat) {
+    return `${Math.floor(stat.mtimeMs)}-${stat.size}`;
+}
+
+function getInlayThumbPath(id, version) {
+    if (!isSafeInlayId(id)) throw new Error(`Invalid inlay id: ${id}`);
+    const p = path.join(inlayThumbDir, `${id}.${version}.webp`);
+    assertInsideInlayDir(p);
+    return p;
+}
+
 async function ensureInlayDir() {
     await fs.mkdir(inlayDir, { recursive: true });
 }
@@ -2007,12 +2156,19 @@ function writeInlayFileSync(id, ext, buffer, info = null) {
 async function deleteInlayRawFile(id) {
     const filePath = await resolveInlayFilePath(id);
     if (!filePath) return;
+    const stat = await fs.stat(filePath).catch(() => null);
+    if (stat) await fs.unlink(getInlayThumbPath(id, inlaySourceVersion(stat))).catch(() => {});
     await fs.unlink(filePath).catch(() => {});
 }
 
 function deleteInlayRawFileSync(id) {
     const filePath = resolveInlayFilePathSync(id);
     if (!filePath) return;
+    try {
+        unlinkSync(getInlayThumbPath(id, inlaySourceVersion(statSync(filePath))));
+    } catch {
+        // ignore
+    }
     try {
         unlinkSync(filePath);
     } catch {
@@ -2222,6 +2378,14 @@ function sessionAuthMiddleware(req, res, next) {
     const token = parseSessionCookie(req)
     if (token && (sessions.get(token) ?? 0) > Date.now()) return next()
     res.status(401).end()
+}
+
+// Backup GETs are also opened as plain browser downloads (<a download>), which
+// carry the session cookie (HttpOnly, SameSite=Strict) but no risu-auth header.
+async function checkBackupDownloadAuth(req, res) {
+    const token = parseSessionCookie(req)
+    if (token && (sessions.get(token) ?? 0) > Date.now()) return true
+    return checkAuth(req, res)
 }
 
 // MIME detection by magic bytes (fallback when key has no extension)
@@ -2952,6 +3116,41 @@ async function parseBackupChunk(buffer, onEntry) {
     return buffer.subarray(offset);
 }
 
+// ─── Backup import guards ───────────────────────────────────────────────────
+
+function backupImportError(message, code) {
+    const error = new Error(message);
+    error.code = code;
+    return error;
+}
+
+// Upstream RisuAI (web build, account sync) has encrypted database.risudat in
+// its local backups since v2026.6.102 (kwaroran/RisuAI d0548267). The key is
+// fetched from sv.risuai.xyz per backup and is not obtainable from here.
+const BACKUP_ENCRYPTED_MESSAGE =
+    'This backup was exported from RisuAI while logged in to a web account (sync), so its database is encrypted and cannot be imported. ' +
+    'In RisuAI, log out of the account (your data is moved to the device) or use Partial Backup, then export again. Your existing database was not replaced.';
+
+// decodeRisuSave has lenient fallbacks that can turn random bytes into a
+// msgpack primitive instead of throwing, so the result must also be an object.
+async function assertBackupDatabaseDecodable(raw) {
+    let decoded;
+    try {
+        decoded = await decodeRisuSave(raw);
+    } catch (error) {
+        throw backupImportError(
+            `Backup database could not be decoded (${error?.message || error}). The file may be corrupted or encrypted. Your existing database was not replaced.`,
+            'BACKUP_DATABASE_UNREADABLE'
+        );
+    }
+    if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) {
+        throw backupImportError(
+            'Backup database is not a RisuAI database. The file may be corrupted or encrypted. Your existing database was not replaced.',
+            'BACKUP_DATABASE_UNREADABLE'
+        );
+    }
+}
+
 // ─── Shared backup import logic ─────────────────────────────────────────────
 // Accepts any async iterable of Buffer chunks (HTTP request body, file stream, etc.)
 async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0, onProgress = null } = {}) {
@@ -2969,7 +3168,14 @@ async function importBackupFromSourceUnlocked(dataSource, { maxBytes = 0, totalB
     let pendingChunks = [];
     let pendingTotal = 0;
     let nextEntryThreshold = 8;
-    let hasDatabase = false;
+    // database.risudat is held back and written only after the whole stream
+    // was read and the payload proved decodable (see below the loop).
+    let pendingDatabase = null;
+    // Set when the upstream encryption marker is seen. The upload is then
+    // only drained: replying while the client is still sending makes the
+    // browser (and Node's fetch) report a connection reset instead of
+    // delivering the error event, so the rejection waits for the stream end.
+    let encryptedMarker = false;
     let assetsRestored = 0;
     let bytesReceived = 0;
     let batchCount = 0;
@@ -3017,7 +3223,10 @@ async function importBackupFromSourceUnlocked(dataSource, { maxBytes = 0, totalB
     }
 
     await flushPendingDb();
-    createBackupAndRotate();
+    // Always snapshot the live database right before it is replaced. The
+    // default cooldown could skip this when an autosave snapshot landed
+    // within the last few minutes, leaving no pre-import copy to restore.
+    createBackupAndRotate({ force: true });
 
     sqliteDb.pragma('synchronous = OFF');
 
@@ -3075,6 +3284,7 @@ async function importBackupFromSourceUnlocked(dataSource, { maxBytes = 0, totalB
             pendingTotal = 0;
 
             const remaining = await parseBackupChunk(buffer, async (name, data) => {
+                if (encryptedMarker) return;
                 if (seenEntryNames.has(name)) {
                     throw new Error(`Duplicate backup entry: ${name}`);
                 }
@@ -3140,6 +3350,10 @@ async function importBackupFromSourceUnlocked(dataSource, { maxBytes = 0, totalB
                     }
                 } else if (name.startsWith('inlay_thumb/')) {
                     // Skip deprecated thumbnail entries from legacy backups
+                } else if (name === 'encryption.risudat') {
+                    let meta;
+                    try { meta = JSON.parse(data.toString('utf-8')); } catch {}
+                    if (meta?.type === 'account') encryptedMarker = true;
                 } else if (name === PLUGIN_ATOMIC_BACKUP_ENTRY_NAME) {
                     // Restores the rows the export carried, with revisions and
                     // tombstones intact, on top of the wipe performed above.
@@ -3161,26 +3375,10 @@ async function importBackupFromSourceUnlocked(dataSource, { maxBytes = 0, totalB
                             parseColdStorageJsonBuffer(data, name, { allowPlainJson: true }).coldData
                         )
                         : data;
-                    if (storageKey === DB_BLOB_KEY) {
-                        const incomingDb = await decodeRisuSave(storageValue, { extractPluginStorage: true });
-                        const incomingStorage = incomingDb?.pluginCustomStorage;
-                        if (incomingStorage && typeof incomingStorage === 'object' && Object.keys(incomingStorage).length > 0) {
-                            const hadNamespacedPayload = pluginWipeDone;
-                            pluginWipeDone = await preparePluginStorageImport({
-                                storageKey: `${pluginStorage.PREFIX}legacy.json`, pluginWipeDone,
-                                dumpPluginStorageRescue, kvDelPrefix,
-                            });
-                            pluginStorage.migrateFromDb(incomingDb, { kvWinsOnRemigration: hadNamespacedPayload });
-                            incomingDb.pluginCustomStorage = {};
-                            storageValue = Buffer.from(encodeRisuSaveLegacy(incomingDb));
-                        }
-                    }
-                    if (storageKey.startsWith('assets/')) {
-                        await assetFileStore.legacyBatch(writer => writer.put(storageKey, storageValue));
-                    } else kvSet(storageKey, storageValue);
-                    if (storageKey === 'database/database.bin') {
-                        hasDatabase = true;
-                    } else {
+                    if (storageKey === DB_BLOB_KEY) pendingDatabase = storageValue;
+                    else {
+                        if (storageKey.startsWith('assets/')) await assetFileStore.legacyBatch(writer => writer.put(storageKey, storageValue));
+                        else kvSet(storageKey, storageValue);
                         assetsRestored += 1;
                     }
                 }
@@ -3213,12 +3411,33 @@ async function importBackupFromSourceUnlocked(dataSource, { maxBytes = 0, totalB
             }
         }
 
+        if (encryptedMarker) {
+            throw backupImportError(BACKUP_ENCRYPTED_MESSAGE, 'BACKUP_ENCRYPTED');
+        }
         if (pendingTotal > 0) {
             throw new Error('Backup stream ended with incomplete entry');
         }
-        if (!hasDatabase) {
+        if (!pendingDatabase) {
             throw new Error('Backup does not contain database.risudat');
         }
+        // Prove the database decodes before it replaces the live blob. Up to
+        // v1.11.2 the bytes were committed first and decoded only afterwards,
+        // so an unreadable payload (encrypted upstream backup, corrupt file)
+        // left /api/read failing with 500 on every boot — infinite loading
+        // with no way back from the UI.
+        await assertBackupDatabaseDecodable(pendingDatabase);
+        const importedDb = await decodeRisuSave(pendingDatabase, { extractPluginStorage: true });
+        restoreColdPluginStorageInDb(importedDb);
+        if (importedDb?.pluginCustomStorage && Object.keys(importedDb.pluginCustomStorage).length) {
+            pluginWipeDone = await preparePluginStorageImport({
+                storageKey: `${pluginStorage.PREFIX}legacy.json`, pluginWipeDone,
+                dumpPluginStorageRescue, kvDelPrefix,
+            });
+            pluginStorage.migrateFromDb(importedDb, { kvWinsOnRemigration: true });
+            importedDb.pluginCustomStorage = {};
+            pendingDatabase = Buffer.from(encodeRisuSaveLegacy(importedDb));
+        }
+        kvSet('database/database.bin', pendingDatabase);
         for (const [id, info] of legacyInlayInfoMap.entries()) {
             if (importedInlayIds.has(id) && !importedSidecarIds.has(id)) {
                 writeStagingSidecarSync(id, info);
@@ -3271,7 +3490,7 @@ async function importBackupFromSourceUnlocked(dataSource, { maxBytes = 0, totalB
             migrationResult: migration,
         });
         coldStorageFailed = migration.coldStorageFailed || 0;
-        initChatStore(dbObj);
+        await initChatStoreFromDisk(dbObj);
     }
 
     try {
@@ -4030,11 +4249,15 @@ const reverseProxyFunc = async (req, res, next) => {
     catch (err) {
         if (downstreamDisconnected || res.destroyed) return;
         if (err?.name === 'AbortError') {
+            // The client left; there is no one to send an error to.
+            if (res.destroyed) return;
             if (!res.headersSent) {
                 res.status(504).send({
-                    error: timeoutMs
-                        ? `Proxy request timed out after ${timeoutMs}ms`
-                        : 'Proxy request aborted'
+                    error: idle.idle()
+                        ? `Proxy upstream sent nothing for ${idleMs}ms`
+                        : timeoutMs
+                            ? `Proxy request timed out after ${timeoutMs}ms`
+                            : 'Proxy request aborted'
                 });
             } else {
                 res.end();
@@ -4128,11 +4351,15 @@ const reverseProxyFunc_get = async (req, res, next) => {
     catch (err) {
         if (downstreamDisconnected || res.destroyed) return;
         if (err?.name === 'AbortError') {
+            // The client left; there is no one to send an error to.
+            if (res.destroyed) return;
             if (!res.headersSent) {
                 res.status(504).send({
-                    error: timeoutMs
-                        ? `Proxy request timed out after ${timeoutMs}ms`
-                        : 'Proxy request aborted'
+                    error: idle.idle()
+                        ? `Proxy upstream sent nothing for ${idleMs}ms`
+                        : timeoutMs
+                            ? `Proxy request timed out after ${timeoutMs}ms`
+                            : 'Proxy request aborted'
                 });
             } else {
                 res.end();
@@ -4507,6 +4734,34 @@ const THUMB_MAX_SIDE = 320;
 const THUMB_QUALITY = 75;
 const THUMB_IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp']);
 
+// wasm-vips runs synchronously on the event loop, so builds are serialized:
+// other requests get served between them, and a request queued behind a build
+// of the same thumbnail finds it cached instead of building it again.
+let thumbnailQueue = Promise.resolve();
+
+async function getInlayThumbnail(id, sourcePath, version) {
+    const thumbPath = getInlayThumbPath(id, version);
+    const readCached = () => fs.readFile(thumbPath).catch(() => null);
+    const cached = await readCached();
+    if (cached) return cached;
+    const build = thumbnailQueue.then(async () => {
+        const fresh = await readCached();
+        if (fresh) return fresh;
+        const thumb = await generateThumbnail(await fs.readFile(sourcePath));
+        const tmpPath = `${thumbPath}.tmp`;
+        try {
+            await fs.mkdir(inlayThumbDir, { recursive: true });
+            await fs.writeFile(tmpPath, thumb);
+            await fs.rename(tmpPath, thumbPath);
+        } finally {
+            await fs.rm(tmpPath, { force: true });
+        }
+        return thumb;
+    });
+    thumbnailQueue = build.catch(() => {});
+    return await build;
+}
+
 async function generateThumbnail(buffer) {
     const vips = await getVips()
     const img = vips.Image.thumbnailBuffer(buffer, THUMB_MAX_SIDE, {
@@ -4549,13 +4804,14 @@ app.get('/api/asset/:hexKey', async (req, res) => {
             if (!sidecar || sidecar.type !== 'image' || !THUMB_IMAGE_EXTS.has(sidecar.ext)) {
                 return res.status(404).end()
             }
-            const file = await readInlayFile(id)
-            if (!file) return res.status(404).set('Cache-Control', 'no-store').end()
-            const etag = `"thumb-${Math.floor(file.mtimeMs)}"`
+            const filePath = await resolveInlayFilePath(id)
+            if (!filePath) return res.status(404).set('Cache-Control', 'no-store').end()
+            const stat = await fs.stat(filePath)
+            const etag = `"thumb-${Math.floor(stat.mtimeMs)}"`
             if (req.headers['if-none-match'] === etag) {
                 return res.status(304).set('Cache-Control', 'public, max-age=31536000, immutable').end()
             }
-            const thumb = await generateThumbnail(file.buffer)
+            const thumb = await getInlayThumbnail(id, filePath, inlaySourceVersion(stat))
             res.set({
                 'Content-Type': 'image/webp',
                 'Cache-Control': 'public, max-age=31536000, immutable',
@@ -4813,13 +5069,7 @@ app.get('/api/plugin-storage/all', async (req, res, next) => {
         res.once('close', () => { closed = true; });
         for (const entry of pluginStorage.entriesRaw()) {
             if (closed) return;
-            const ok = res.write(JSON.stringify([entry.key, entry.text]) + '\n');
-            // Wait for backpressure to clear, but stop if the client went away.
-            if (!ok) await new Promise((resolve) => {
-                const done = () => { res.off('drain', done); res.off('close', done); resolve(); };
-                res.once('drain', done);
-                res.once('close', done);
-            });
+            await writeChunk(res, JSON.stringify([entry.key, entry.text]) + '\n');
         }
         res.end();
     } catch (error) {
@@ -5031,7 +5281,21 @@ app.post('/api/write', async (req, res, next) => {
                 try {
                     // eslint-disable-next-line no-var
                     var persistedEtag;
+                    // eslint-disable-next-line no-var
+                    var persistedHashes;
+                    // eslint-disable-next-line no-var
+                    var persistedView;
                     const incomingDb = await decodeRisuSave(fileContent);
+                    const archiveConflict = findArchiveConflicts(dbCache[DB_HEX_KEY], incomingDb, null);
+                    if (archiveConflict) {
+                        logger.warn(`[Write] Rejected: ${archiveConflict}`);
+                        res.status(409).send({
+                            error: `Write rejected: ${archiveConflict}`,
+                            code: 'ARCHIVE_GUARD_REJECTED',
+                            currentEtag: dbEtag ?? undefined,
+                        });
+                        return;
+                    }
                     await ensureChatStore();
                     if (findAssetManifestConflicts(incomingDb).length > 0) {
                         res.status(409).json({
@@ -5041,7 +5305,8 @@ app.post('/api/write', async (req, res, next) => {
                         return;
                     }
                     await repairStubFlagLossChats(incomingDb);
-                    const fullDb = hydrateDatabaseForDisk(incomingDb);
+                    let fullDb = hydrateDatabaseForDisk(incomingDb);
+                    if (findUnmergedArchivedChats(fullDb).length) fullDb = await restoreArchivedChatsForDisk(fullDb, '/api/write');
 
                     // Same boundary for lazy asset manifests (see
                     // findAssetManifestLossOwners). Compared against the
@@ -5091,9 +5356,23 @@ app.post('/api/write', async (req, res, next) => {
                     // PERSISTED DB, stripped. Not the request bytes — the
                     // split above may have emptied pluginCustomStorage, so
                     // the client's copy and the served copy differ.
-                    persistedEtag = computeDatabaseEtagFromObject(
-                        normalizeJSON(stripDatabaseForClient(fullDb, { reconcileManifests: true })),
-                    );
+                    persistedView = normalizeJSON(stripDatabaseForClient(fullDb, { reconcileManifests: true }));
+                    persistedEtag = computeDatabaseEtagFromObject(persistedView);
+                    // Hashes of that same view, so the client can tell at once
+                    // whether the baseline it re-seeds from its own bytes matches
+                    // what the server holds — a silent difference here is what
+                    // turns every later save into a full write.
+                    try {
+                        // keyHashes first: hash() then composes from the cached
+                        // per-key values instead of walking the view again.
+                        const diagnostics = databaseHashDiagnostics(persistedView);
+                        persistedHashes = {
+                            serverHash: calculateHash(persistedView).toString(16),
+                            ...diagnostics,
+                        };
+                    } catch {
+                        persistedHashes = undefined;
+                    }
                 } catch (e) {
                     logger.error('[Write] Failed to merge chats into database.bin:', e.message);
                     // Do NOT write stubs-only to disk — that would permanently
@@ -5107,7 +5386,16 @@ app.post('/api/write', async (req, res, next) => {
 
             // Update ETag, backup, and invalidate cache after database.bin write
             if (key === 'database/database.bin') {
-                delete dbCache[DB_HEX_KEY];
+                // Keep the cache warm with the view just persisted: it is the
+                // exact object the next /api/read or /api/patch would rebuild
+                // by cold-decoding the blob (stripped + normalized, and the
+                // patch hash cache is already keyed on it above). Dropping it
+                // cost one full decode after every full write.
+                if (persistedView) {
+                    dbCache[DB_HEX_KEY] = persistedView;
+                } else {
+                    delete dbCache[DB_HEX_KEY];
+                }
                 if (saveTimers[DB_HEX_KEY]) {
                     clearTimeout(saveTimers[DB_HEX_KEY]);
                     delete saveTimers[DB_HEX_KEY];
@@ -5118,7 +5406,8 @@ app.post('/api/write', async (req, res, next) => {
 
             res.send({
                 success: true,
-                etag: key === 'database/database.bin' ? dbEtag : undefined
+                etag: key === 'database/database.bin' ? dbEtag : undefined,
+                ...(key === 'database/database.bin' && persistedHashes ? persistedHashes : {}),
             });
         });
     } catch (error) {
@@ -5368,8 +5657,18 @@ app.post('/api/patch', async (req, res, next) => {
     // Which step of the patch flow was running when the outer catch fired —
     // without it a bare error name (e.g. RangeError) is undiagnosable.
     let patchStage = 'load';
+    // Stage timings for the client's save dashboard (see saveMetrics.ts).
+    const patchStartedAt = performance.now();
     try {
         await queueStorageOperation(async () => {
+            const timings = { queueMs: Math.round(performance.now() - patchStartedAt) };
+            let stageAt = performance.now();
+            const lap = () => {
+                const now = performance.now();
+                const ms = Math.round(now - stageAt);
+                stageAt = now;
+                return ms;
+            };
             const decodedKey = Buffer.from(filePath, 'hex').toString('utf-8');
             if (decodedKey.startsWith('assets/')) {
                 clearTimeout(saveTimers[filePath]);
@@ -5447,21 +5746,42 @@ app.post('/api/patch', async (req, res, next) => {
             }
 
             patchStage = 'hash';
+            lap();
             const serverHash = calculateHash(dbCache[filePath]).toString(16);
+            timings.hashMs = lap();
 
             if (expectedHash !== serverHash) {
-                console.log(`[Patch] Hash mismatch for ${decodedKey}: expected=${expectedHash}, server=${serverHash}`);
+                logger.warn(`[Patch] Hash mismatch for ${decodedKey}: expected=${expectedHash}, server=${serverHash}`);
                 let currentEtag = undefined;
+                // Per-key hashes let the client name the diverged root keys and
+                // characters (see RisuSavePatcher.describeHashMismatch). Only
+                // computed on this rare path; hashing cost is bounded by one
+                // full-document hash.
+                let keyHashes = undefined;
+                let characterHashes = undefined;
+                let duplicateCharIds = undefined;
                 if (decodedKey === 'database/database.bin') {
                     // Encode failure must not upgrade this 409 into a 500.
                     try {
                         currentEtag = computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(dbCache[filePath])));
                         dbEtag = currentEtag;
                     } catch {}
+                    try {
+                        ({ keyHashes, characterHashes, duplicateCharIds } = databaseHashDiagnostics(dbCache[filePath]));
+                    } catch {
+                        keyHashes = undefined;
+                        characterHashes = undefined;
+                        duplicateCharIds = undefined;
+                    }
                 }
                 res.status(409).send({
                     error: 'Hash mismatch - data out of sync',
-                    currentEtag
+                    code: 'HASH_MISMATCH',
+                    currentEtag,
+                    serverHash,
+                    keyHashes,
+                    characterHashes,
+                    duplicateCharIds,
                 });
                 return;
             }
@@ -5565,6 +5885,28 @@ app.post('/api/patch', async (req, res, next) => {
                     return;
                 }
             }
+            // Deactivated-character guard: a chaId lives either in `characters`
+            // or in `nodeOnlyArchivedCharacters`, never both; and a character
+            // that returns from the archive must have had its chats registered
+            // by /activate in this process, otherwise persist would write
+            // bodiless `_stub` chats. 409 so the client re-activates/rebases.
+            if (decodedKey === 'database/database.bin') {
+                const archiveConflict = findArchiveConflicts(dbCache[filePath], next, patch);
+                if (archiveConflict) {
+                    logger.warn(`[Patch] Rejected: ${archiveConflict}`);
+                    let currentEtag;
+                    try {
+                        currentEtag = computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(dbCache[filePath])));
+                        dbEtag = currentEtag;
+                    } catch {}
+                    res.status(409).send({
+                        error: `Patch rejected: ${archiveConflict}`,
+                        code: 'ARCHIVE_GUARD_REJECTED',
+                        currentEtag,
+                    });
+                    return;
+                }
+            }
             dbCache[filePath] = next;
             if (decodedKey === 'database/database.bin') scheduleDatabasePersist('patch:database/database.bin');
             // DB patch is in; now the kv half (see ordering note above).
@@ -5599,16 +5941,22 @@ app.post('/api/patch', async (req, res, next) => {
                 }), SAVE_INTERVAL);
             }
 
+            timings.applyMs = lap();
+
             // Update ETag after successful patch (based on stripped version)
             patchStage = 'etag';
             if (decodedKey === 'database/database.bin') {
                 dbEtag = computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(dbCache[filePath])));
             }
+            timings.etagMs = lap();
+            timings.totalMs = Math.round(performance.now() - patchStartedAt);
+            if (lastDbPersistMs !== null) timings.lastPersistMs = lastDbPersistMs;
 
             const responsePayload = {
                 success: true,
                 appliedOperations: result.length + pluginKvOps.length,
                 etag: decodedKey === 'database/database.bin' ? dbEtag : undefined,
+                timings,
             };
             const persistWarning = currentPersistWarning();
             if (persistWarning) {
@@ -5660,7 +6008,16 @@ app.get('/api/asset-manifests/:manifestId', async (req, res, next) => {
             limit: req.query.limit,
             search: req.query.search,
         });
-        if (!page) return res.status(404).json({ error: 'Asset manifest not found' });
+        if (!page) return res.status(404).set('Cache-Control', 'no-store').json({ error: 'Asset manifest not found' });
+        // Manifest ids are content-addressed, so a page for a given id and
+        // query never changes: let the browser keep it across reloads. The
+        // client's in-memory manifest cache is cold on every page load, and
+        // re-downloading every page over a remote link is what made chat
+        // entry slow. The page JSON shape is part of the manifest format —
+        // bump MANIFEST_FORMAT_VERSION (the client sends it as `v`) when
+        // changing it, so stale cached pages are never read by newer code.
+        // `private`: the route is auth-gated, so only the browser may keep it.
+        res.set('Cache-Control', 'private, max-age=31536000, immutable');
         res.json(page);
     } catch (error) { next(error); }
 });
@@ -5858,6 +6215,7 @@ function stripToSettingsOnly(dbObj) {
         ...dbObj,
         characters: [],
         characterOrder: [],
+        nodeOnlyArchivedCharacters: [],
     };
 }
 
@@ -5919,19 +6277,28 @@ async function buildSettingsOnlyPlan({ includeModuleAssets = true } = {}) {
 async function buildFullExportDbValue({ embedPluginStorage = false } = {}) {
     const raw = kvGet('database/database.bin');
     if (!raw) return null;
-    if (!embedPluginStorage || pluginStorage.list().length === 0) return raw;
+    const hasPluginRows = embedPluginStorage && pluginStorage.list().length > 0;
     const dbObj = await decodeRisuSave(raw);
-    const fromDb = dbObj.pluginCustomStorage;
-    const merged = pluginStorage.readAll();
-    if (fromDb && typeof fromDb === 'object') {
-        for (const key of Object.keys(fromDb)) {
-            Object.defineProperty(merged, key, {
-                value: Object.getOwnPropertyDescriptor(fromDb, key).value,
-                enumerable: true, writable: true, configurable: true,
-            });
+    const hasArchive = Object.prototype.hasOwnProperty.call(dbObj, 'nodeOnlyArchivedCharacters');
+    if (!hasPluginRows && !hasArchive) return raw;
+    if (hasPluginRows) {
+        const fromDb = dbObj.pluginCustomStorage;
+        const merged = pluginStorage.readAll();
+        if (fromDb && typeof fromDb === 'object') {
+            for (const key of Object.keys(fromDb)) {
+                Object.defineProperty(merged, key, {
+                    value: Object.getOwnPropertyDescriptor(fromDb, key).value,
+                    enumerable: true, writable: true, configurable: true,
+                });
+            }
         }
+        dbObj.pluginCustomStorage = merged;
     }
-    dbObj.pluginCustomStorage = merged;
+    // Deactivated characters travel inline: a .bin must be a complete legacy
+    // database for upstream RisuAI and older PocketRisu builds, which know
+    // nothing about the archive. Throws when a payload is missing rather than
+    // shipping a backup that would import as a lost character.
+    await inlineArchivedCharacters(dbObj);
     return Buffer.from(encodeRisuSaveLegacy(dbObj));
 }
 
@@ -5954,7 +6321,7 @@ app.get('/api/backup/export/settings-estimate', async (req, res, next) => {
 });
 
 app.get('/api/backup/export', async (req, res, next) => {
-    if(!await checkAuth(req, res)){ return; }
+    if(!await checkBackupDownloadAuth(req, res)){ return; }
     let capturedAssets, capturedEntries;
     try {
         // ?target=upstream excludes NodeOnly-only inlay namespaces (inlay/,
@@ -6248,7 +6615,7 @@ app.post('/api/backup/import', async (req, res, next) => {
     } catch (error) {
         if (wantsNdjson && res.headersSent) {
             try {
-                res.write(JSON.stringify({ type: 'error', message: error?.message || 'backup import failed' }) + '\n');
+                res.write(JSON.stringify({ type: 'error', message: error?.message || 'backup import failed', code: error?.code }) + '\n');
                 res.end();
             } catch (_) {}
         } else {
@@ -6518,7 +6885,7 @@ app.delete('/api/backup/server/:filename', async (req, res, next) => {
 
 // Download a server backup file
 app.get('/api/backup/server/download/:filename', async (req, res, next) => {
-    if (!await checkAuth(req, res)) { return; }
+    if (!await checkBackupDownloadAuth(req, res)) { return; }
     try {
         const filename = req.params.filename;
         if (!BACKUP_FILENAME_REGEX.test(filename)) {
@@ -6633,6 +7000,52 @@ function restoreColdStorageCharactersInDb(dbObj) {
     return result;
 }
 
+// Upstream (cad8595a) keeps v3 pluginStorage values in cold storage and leaves
+// only a key -> cold id map in pluginCustomStorage._coldplugin. Fold the
+// values back inline so pluginStorage.migrateFromDb moves them into kv.
+// Keys whose entry is missing or unreadable stay in _coldplugin as recovery
+// breadcrumbs; their cold storage KV entries are never deleted.
+const COLD_PLUGIN_STORAGE_KEY = '_coldplugin';
+
+function restoreColdPluginStorageInDb(dbObj) {
+    const result = { restored: 0, failed: 0, failedKeys: [] };
+    const storage = dbObj?.pluginCustomStorage;
+    if (!storage || typeof storage !== 'object' || Array.isArray(storage)) return result;
+    if (!Object.prototype.hasOwnProperty.call(storage, COLD_PLUGIN_STORAGE_KEY)) return result;
+    const map = storage[COLD_PLUGIN_STORAGE_KEY];
+    if (!map || typeof map !== 'object' || Array.isArray(map)) return result;
+
+    const remaining = Object.create(null);
+    for (const key of Object.keys(map)) {
+        const coldId = map[key];
+        let entry = null;
+        try {
+            entry = typeof coldId === 'string' && coldId
+                ? readColdStorageJsonEntry(coldId, { migrateLegacy: true })
+                : null;
+        } catch (err) {
+            logger.error(`[ColdStorage] plugin storage key "${key}" (${coldId}) could not be read:`, err.message);
+        }
+        if (!entry) {
+            remaining[key] = coldId;
+            result.failed++;
+            result.failedKeys.push(key);
+            continue;
+        }
+        // The cold copy is upstream's live value; an inline key of the same
+        // name is a stale pre-migration leftover.
+        Object.defineProperty(storage, key, { value: entry.coldData, enumerable: true, configurable: true, writable: true });
+        result.restored++;
+    }
+
+    if (Object.keys(remaining).length > 0) {
+        storage[COLD_PLUGIN_STORAGE_KEY] = remaining;
+    } else {
+        delete storage[COLD_PLUGIN_STORAGE_KEY];
+    }
+    return result;
+}
+
 function isColdStorageChat(chat) {
     return chat?.message?.[0]?.data?.startsWith(COLD_STORAGE_HEADER);
 }
@@ -6666,6 +7079,43 @@ function restoreColdStorageChat(chat) {
 }
 
 // GET /api/chat-content/:chaId/:chatIndex — retrieve full chat from server
+// ── Chat delta sync ─────────────────────────────────────────────────────────
+// The client may say "I already hold the first N messages, whose prefix
+// fingerprint is F" (x-chat-base-count / x-chat-base-fp). When the stored
+// chat's first N messages fingerprint to the same F, only the rest crosses
+// the wire: a GET returns the chat with message = messages[N:] (response
+// header x-chat-delta-base: N), a POST body carries only messages[N:] and is
+// spliced onto the stored prefix. Anything that does not verify falls back
+// to a full transfer (GET) or a 409 the client answers with a full save
+// (POST) — the delta path never guesses. See chatFingerprint.cjs.
+function readChatDeltaBase(req) {
+    const countHeader = req.headers['x-chat-base-count'];
+    const fp = req.headers['x-chat-base-fp'];
+    if (typeof countHeader !== 'string' || typeof fp !== 'string' || !fp) return null;
+    const count = Number(countHeader);
+    if (!Number.isInteger(count) || count < 1) return null;
+    return { count, fp };
+}
+
+function chatPrefixMatches(chat, base) {
+    const messages = Array.isArray(chat?.message) ? chat.message : null;
+    if (!messages || base.count > messages.length) return false;
+    return prefixFingerprint(messageFingerprints(messages.slice(0, base.count)), base.count) === base.fp;
+}
+
+function sendChatContent(req, res, chat) {
+    // The body depends on the base headers, so a cached response must never
+    // be reused for a request with different ones.
+    res.setHeader('Vary', 'x-chat-base-count, x-chat-base-fp');
+    res.setHeader('Content-Type', 'application/octet-stream');
+    const base = readChatDeltaBase(req);
+    if (base && chatPrefixMatches(chat, base)) {
+        res.setHeader('x-chat-delta-base', String(base.count));
+        return res.send(Buffer.from(encodeRisuSaveLegacy({ ...chat, message: chat.message.slice(base.count) })));
+    }
+    return res.send(Buffer.from(encodeRisuSaveLegacy(chat)));
+}
+
 app.get('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
     if (!await checkAuth(req, res)) { return; }
     try {
@@ -6685,9 +7135,7 @@ app.get('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
                 if (!restoreColdStorageChat(chat)) {
                     return res.status(500).json({ error: 'Cold storage restore failed' });
                 }
-                const encoded = Buffer.from(encodeRisuSaveLegacy(chat));
-                res.setHeader('Content-Type', 'application/octet-stream');
-                return res.send(encoded);
+                return sendChatContent(req, res, chat);
             }
             if (chat) {
                 logger.error(`[ChatContent] refusing to serve message-less chat entry ${chaId}/${expectedChatId} (poisoned store?)`);
@@ -6713,9 +7161,7 @@ app.get('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
         if (!restoreColdStorageChat(chat)) {
             return res.status(500).json({ error: 'Cold storage restore failed' });
         }
-        const encoded = Buffer.from(encodeRisuSaveLegacy(chat));
-        res.setHeader('Content-Type', 'application/octet-stream');
-        res.send(encoded);
+        sendChatContent(req, res, chat);
     } catch (error) {
         next(error);
     }
@@ -6767,6 +7213,20 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
             }
 
             await ensureChatStore();
+
+            // Delta save: the body holds only the messages after a prefix the
+            // client says the server already has. Splice it onto the stored
+            // chat only when that prefix verifies; otherwise ask for a full
+            // save (the client retries with the whole chat — never an error
+            // the user sees, never a partial write).
+            const deltaBase = readChatDeltaBase(req);
+            if (deltaBase) {
+                const stored = fullChatStore.get(chaId)?.get(expectedChatId);
+                if (!stored || !restoreColdStorageChat(stored) || !Array.isArray(chatData.message) || !chatPrefixMatches(stored, deltaBase)) {
+                    return res.status(409).json({ error: 'Chat delta base does not match', code: 'CHAT_DELTA_BASE_MISMATCH' });
+                }
+                chatData.message = stored.message.slice(0, deltaBase.count).concat(chatData.message);
+            }
 
             // Update fullChatStore
             if (!fullChatStore.has(chaId)) {
@@ -6887,6 +7347,7 @@ function clearImportedPluginStorage() {
 
 function finishImportedPluginStorage(database) {
     // Explicit KV payload wins if a legacy blob also contains stale copies.
+    restoreColdPluginStorageInDb(database);
     pluginStorage.migrateFromDb(database, { kvWinsOnRemigration: true });
     kvSet('_meta/plugin-storage-migrated', Buffer.from('1'));
     kvSet('_meta/plugin-blob-migrated', Buffer.from('1'));
@@ -7123,6 +7584,758 @@ app.post('/api/migrate/save-folder/cleanup/execute', async (req, res, next) => {
     }
 });
 
+// ── Character archive (user-facing: deactivate / activate) ─────────────────
+// A deactivated character leaves `characters` for the small stub list
+// `nodeOnlyArchivedCharacters`. Its full body — chats inline, asset arrays
+// inline (manifest hydrated) — lives in kv `archive/<chaId>/<archivedAt>`
+// (chunk-routed, see db.cjs) with a sidecar index
+// `archive-meta/<chaId>/<archivedAt>` holding the asset references for the
+// orphan sweep and sizes for the dashboard.
+//
+// Invariants:
+// - Pointers never leave the server: every .bin export re-inlines archived
+//   characters (inlineArchivedCharacters), so upstream RisuAI and older
+//   PocketRisu builds only ever see a complete legacy database.
+// - Rows are immutable and never deleted automatically. Each deactivation
+//   writes a new `<archivedAt>` row and the stub names its own row, so a
+//   restored database.bin snapshot resolves to the exact body it was taken
+//   with — never to a newer deactivation, never to nothing. Rows no longer
+//   referenced by the live database are "orphan" and reclaimed only by the
+//   dashboard's explicit purge (same policy as assets/*). Backup import does
+//   not touch them either: the imported database is inlined and references
+//   no rows, and the pre-import snapshot may still.
+// - The endpoints below only write/read rows. Moving the character between
+//   `characters` and the stub list is done by the client through the normal
+//   /api/patch path, so dbCache, hashes and etag stay in one flow.
+const ARCHIVE_PREFIX = 'archive/';
+const ARCHIVE_META_PREFIX = 'archive-meta/';
+const ARCHIVE_FORMAT_VERSION = 1;
+
+function isArchivableChaId(chaId) {
+    return typeof chaId === 'string' && chaId.length > 0
+        && !chaId.includes('/') && chaId !== '§temp' && chaId !== '§playground';
+}
+function isValidArchivedAt(v) {
+    return Number.isInteger(v) && v > 0;
+}
+function archiveRowId(chaId, archivedAt) { return `${chaId}/${archivedAt}`; }
+function archiveKey(chaId, archivedAt) { return ARCHIVE_PREFIX + archiveRowId(chaId, archivedAt); }
+function archiveMetaKey(chaId, archivedAt) { return ARCHIVE_META_PREFIX + archiveRowId(chaId, archivedAt); }
+
+// `<prefix><chaId>/<archivedAt>` → { chaId, archivedAt } or null.
+function parseArchiveRowKey(key, prefix) {
+    if (typeof key !== 'string' || !key.startsWith(prefix)) return null;
+    const rowId = key.slice(prefix.length);
+    const slash = rowId.lastIndexOf('/');
+    if (slash <= 0) return null;
+    const chaId = rowId.slice(0, slash);
+    const archivedAt = Number(rowId.slice(slash + 1));
+    if (!isArchivableChaId(chaId) || !isValidArchivedAt(archivedAt)) return null;
+    return { chaId, archivedAt, rowId };
+}
+
+function archivedStubsOf(dbObj) {
+    const list = dbObj?.nodeOnlyArchivedCharacters;
+    return Array.isArray(list)
+        ? list.filter((s) => s && typeof s.chaId === 'string' && isValidArchivedAt(s.archivedAt))
+        : [];
+}
+
+function hasArchivePayload(chaId, archivedAt) {
+    return (kvSize(archiveKey(chaId, archivedAt)) || 0) > 0;
+}
+function listArchivePayloadKeysFor(chaId) {
+    return kvList(ARCHIVE_PREFIX + chaId + '/');
+}
+function hasAnyArchivePayload(chaId) {
+    return listArchivePayloadKeysFor(chaId).length > 0;
+}
+
+// Parsed archive-meta row, or null when absent. Throws on a malformed row.
+function readArchiveMeta(chaId, archivedAt) {
+    const raw = kvGet(archiveMetaKey(chaId, archivedAt));
+    if (!raw) return null;
+    const meta = JSON.parse(Buffer.from(raw).toString('utf-8'));
+    if (!meta || typeof meta !== 'object' || meta.chaId !== chaId || meta.archivedAt !== archivedAt || !Array.isArray(meta.assetRefs)) {
+        throw new Error(`archive index malformed: ${archiveRowId(chaId, archivedAt)}`);
+    }
+    return meta;
+}
+
+function listArchiveMetas() {
+    const out = [];
+    for (const key of kvList(ARCHIVE_META_PREFIX)) {
+        const parsed = parseArchiveRowKey(key, ARCHIVE_META_PREFIX);
+        if (!parsed) throw new Error(`archive index key malformed: ${key}`);
+        const meta = readArchiveMeta(parsed.chaId, parsed.archivedAt);
+        if (meta) out.push(meta);
+    }
+    return out;
+}
+
+// Decoded payload row, or null when absent. Throws when the row exists but is
+// not a payload for this character/version.
+async function decodeArchivePayload(chaId, archivedAt) {
+    const raw = kvGet(archiveKey(chaId, archivedAt));
+    if (!raw) return null;
+    const payload = normalizeJSON(await decodeRisuSave(raw));
+    const character = payload?.character;
+    if (!character || typeof character !== 'object' || character.chaId !== chaId
+        || payload.archivedAt !== archivedAt || !Array.isArray(character.chats)) {
+        throw new Error(`archive payload malformed: ${archiveRowId(chaId, archivedAt)}`);
+    }
+    return { payload, bytes: raw.length };
+}
+
+function buildArchivedCharacterStub(character, { archivedAt, bytes }) {
+    const chats = Array.isArray(character.chats) ? character.chats : [];
+    const stub = {
+        chaId: character.chaId,
+        name: typeof character.name === 'string' ? character.name : '',
+        image: typeof character.image === 'string' ? character.image : '',
+        tags: Array.isArray(character.tags) ? character.tags.filter((t) => typeof t === 'string') : [],
+        lastInteraction: typeof character.lastInteraction === 'number' ? character.lastInteraction : 0,
+        archivedAt,
+        bytes,
+        chatCount: chats.length,
+        chatIds: chats.map((c) => c?.id).filter((id) => typeof id === 'string'),
+    };
+    if (typeof character.nickname === 'string') stub.nickname = character.nickname;
+    if (typeof character.creation_date === 'number') stub.creation_date = character.creation_date;
+    return stub;
+}
+
+function referencedArchiveRowIds(dbObj) {
+    return new Set(archivedStubsOf(dbObj).map((s) => archiveRowId(s.chaId, s.archivedAt)));
+}
+
+// Asset references of every archive row, added to `uncleanable`. Mirrors
+// addLiveManifestRefs: an unreadable index row throws, and a stub the
+// database still points at whose payload or index is gone throws too — a
+// partial view must never turn into a purge. Orphan rows (no stub) still
+// count: they are kept until explicitly purged, so their assets are kept.
+function addArchivedCharacterRefs(uncleanable, dbObj) {
+    const referenced = referencedArchiveRowIds(dbObj);
+    const indexed = new Set();
+    for (const meta of listArchiveMetas()) {
+        const rowId = archiveRowId(meta.chaId, meta.archivedAt);
+        indexed.add(rowId);
+        if (referenced.has(rowId) && !hasArchivePayload(meta.chaId, meta.archivedAt)) {
+            throw new Error(`deactivated character payload missing: ${meta.name || rowId}`);
+        }
+        for (const ref of meta.assetRefs) {
+            const bn = statsBasename(ref);
+            if (bn) uncleanable.add(bn);
+        }
+    }
+    for (const rowId of referenced) {
+        if (!indexed.has(rowId)) throw new Error(`deactivated character index missing: ${rowId}`);
+    }
+}
+
+// Archive rows the live database no longer points at (re-activated, deleted,
+// or replaced by a backup import). Sizes are logical (chunk-aware).
+// A row just written is referenced by no stub until the client's save lands
+// (a bulk run keeps rows in that state for a whole chunk). Rows this young are
+// never orphans, so a purge in that window cannot delete them.
+const ARCHIVE_ORPHAN_GRACE_MS = process.env.POCKETRISU_ARCHIVE_ORPHAN_GRACE_MS
+    ? Number(process.env.POCKETRISU_ARCHIVE_ORPHAN_GRACE_MS)
+    : 10 * 60 * 1000; // override for tests that purge rows they just wrote
+
+async function listOrphanArchiveRows(dbObj) {
+    const referenced = referencedArchiveRowIds(dbObj);
+    for (const [chaId, archivedAt] of pendingActivations) referenced.add(archiveRowId(chaId, archivedAt));
+    for (const key of [...listSnapshotKeys(), ...kvList('migration-backup/')]) {
+        try {
+            const snapshot = await decodeRisuSave(kvGet(key));
+            for (const rowId of referencedArchiveRowIds(snapshot)) referenced.add(rowId);
+        } catch (error) {
+            logger.warn(`[Archive] Retaining rows: snapshot ${key} could not be read`, error);
+            return { payloads: [], metas: [], bytes: 0 };
+        }
+    }
+    const payloads = [];
+    const metas = [];
+    let bytes = 0;
+    const youngestOrphan = Date.now() - ARCHIVE_ORPHAN_GRACE_MS;
+    for (const key of kvList(ARCHIVE_PREFIX)) {
+        const parsed = parseArchiveRowKey(key, ARCHIVE_PREFIX);
+        if (parsed && (referenced.has(parsed.rowId) || parsed.archivedAt > youngestOrphan)) continue;
+        const size = kvSize(key) || 0;
+        payloads.push({ key, size });
+        bytes += size;
+    }
+    for (const key of kvList(ARCHIVE_META_PREFIX)) {
+        const parsed = parseArchiveRowKey(key, ARCHIVE_META_PREFIX);
+        if (parsed && (referenced.has(parsed.rowId) || parsed.archivedAt > youngestOrphan)) continue;
+        metas.push(key);
+    }
+    return { payloads, metas, bytes };
+}
+
+async function purgeOrphanArchiveRows(dbObj) {
+    const orphan = await listOrphanArchiveRows(dbObj);
+    sqliteDb.transaction(() => {
+        // kvDel routes through the chunk store so chunked payloads drop their
+        // manifests too; the index rows are plain kv.
+        for (const it of orphan.payloads) kvDel(it.key);
+        for (const key of orphan.metas) kvDel(key);
+    })();
+    return { deleted: orphan.payloads.length, metas: orphan.metas.length, bytes: orphan.bytes };
+}
+
+// A chat the server holds no body for: a `_stub` with nothing in fullChatStore.
+// Bodies are never re-hydrated once lost, so this state is permanent.
+function isBodilessChat(chat) {
+    return !!chat && (chat._stub === true || !Array.isArray(chat.message));
+}
+
+// What a bodiless chat already shows the user: its metadata over no messages.
+function emptyChatFrom(chat) {
+    const { _stub, ...meta } = chat;
+    return { note: '', localLore: [], ...meta, message: [] };
+}
+
+// Full legacy-shaped character for one dbCache entry: chats merged from
+// fullChatStore, asset arrays hydrated from the manifest store. A bodiless chat
+// has nothing to archive; it is refused (its name reported) unless the caller
+// accepts storing it as the empty chat it already is.
+async function hydrateCharacterForArchive(character, { acceptLostChats = false } = {}) {
+    await ensureChatStore();
+    let full = hydrateDatabaseForDisk({ characters: [character] }).characters[0];
+    // A character reactivated earlier may still have its bodies only in its
+    // archive rows.
+    if (full.chats?.some((c) => c && c._stub === true)) {
+        full = (await restoreUnmergedArchivedChats({ characters: [full] })).db.characters[0];
+    }
+    const chats = Array.isArray(full.chats) ? full.chats : [];
+    const lost = chats.filter(isBodilessChat);
+    if (lost.length > 0 && !acceptLostChats) {
+        const err = new Error(`${lost.length} chat(s) of "${character.name}" have no body on the server`);
+        err.code = 'ARCHIVE_CHATS_UNAVAILABLE';
+        err.chats = lost.map((c) => (typeof c.name === 'string' ? c.name : ''));
+        throw err;
+    }
+    return normalizeJSON(lost.length > 0
+        ? { ...full, chats: chats.map((c) => (isBodilessChat(c) ? emptyChatFrom(c) : c)) }
+        : full);
+}
+
+// Re-inline deactivated characters into a decoded database (export path).
+// Mutates and returns dbObj. Throws when any referenced row is missing.
+async function inlineArchivedCharacters(dbObj) {
+    const stubs = archivedStubsOf(dbObj);
+    if (stubs.length > 0) {
+        if (!Array.isArray(dbObj.characters)) dbObj.characters = [];
+        const present = new Set(dbObj.characters.map((c) => c?.chaId).filter(Boolean));
+        const missing = [];
+        for (const stub of stubs) {
+            if (present.has(stub.chaId)) continue;
+            let decoded = null;
+            try { decoded = await decodeArchivePayload(stub.chaId, stub.archivedAt); } catch { decoded = null; }
+            if (!decoded) {
+                missing.push(stub.name || stub.chaId);
+                continue;
+            }
+            const inlined = decoded.payload.character;
+            // A trashed stub travels as upstream's trash marker so any importer
+            // (upstream RisuAI, older PocketRisu) files it under its own trash.
+            if (isValidArchivedAt(stub.trashedAt)) inlined.trashTime = stub.trashedAt;
+            else delete inlined.trashTime;
+            dbObj.characters.push(inlined);
+            present.add(stub.chaId);
+        }
+        if (missing.length > 0) {
+            const err = new Error(`Deactivated character data missing: ${missing.join(', ')}`);
+            err.code = 'ARCHIVE_PAYLOAD_MISSING';
+            throw err;
+        }
+    }
+    if ('nodeOnlyArchivedCharacters' in dbObj) delete dbObj.nodeOnlyArchivedCharacters;
+    return dbObj;
+}
+
+function patchTouchesCharacterLists(patch) {
+    if (!Array.isArray(patch)) return true;
+    return patch.some((op) => typeof op?.path === 'string'
+        && (op.path === '' || op.path.startsWith('/characters') || op.path.startsWith('/nodeOnlyArchivedCharacters')));
+}
+
+// Returns a human-readable conflict, or null. `prev` may be undefined (cold
+// write). `patch` null means "assume the lists were touched".
+function findArchiveConflicts(prev, next, patch) {
+    if (!next || typeof next !== 'object') return null;
+    if (!patchTouchesCharacterLists(patch)) return null;
+    const archived = new Set(archivedStubsOf(next).map((s) => s.chaId));
+    const nextChars = Array.isArray(next.characters) ? next.characters : [];
+    if (archived.size > 0) {
+        for (const c of nextChars) {
+            if (c?.chaId && archived.has(c.chaId)) return `character ${c.chaId} is both active and deactivated`;
+        }
+    }
+    return null;
+}
+
+// Characters in a reassembled (disk-shaped) database that still carry `_stub`
+// chats AND have an archive row — the activation-without-chats case.
+function findUnmergedArchivedChats(fullDb) {
+    const out = [];
+    for (const c of Array.isArray(fullDb?.characters) ? fullDb.characters : []) {
+        if (!c?.chaId || !Array.isArray(c.chats)) continue;
+        if (!c.chats.some((ch) => ch && ch._stub === true)) continue;
+        if (hasAnyArchivePayload(c.chaId)) out.push(c.chaId);
+    }
+    return out;
+}
+
+// Fill the bodiless `_stub` chats of live characters that have archive rows
+// from those rows, matched by chat id, newest row first. Such a character
+// came back from the archive without its chats registered in this process
+// (a restart in between, a store rebuild, or a full write from a client).
+// Only chats the server holds no body for are filled, so nothing newer can be
+// overwritten. A chat no row holds has no body anywhere and stays a stub —
+// refusing to persist over it would block every save of the whole database
+// and recover nothing. Throws when a row cannot be read (fail closed).
+// Returns a new database object; `fullDb`'s branches are never mutated.
+async function restoreUnmergedArchivedChats(fullDb) {
+    // Only a stub with no message array lacks its body. A legacy hybrid
+    // (`_stub: true` and a real message array) carries the body itself and
+    // may be newer than any row; initChatStore just drops its flag.
+    const lacksBody = (ch) => !!ch && ch._stub === true && !Array.isArray(ch.message);
+    const result = { db: fullDb, restored: [], unresolved: [] };
+    const characters = Array.isArray(fullDb?.characters) ? fullDb.characters : null;
+    if (!characters) return result;
+    let nextCharacters = null;
+    for (let i = 0; i < characters.length; i++) {
+        const c = characters[i];
+        if (!c?.chaId || !Array.isArray(c.chats) || !c.chats.some(lacksBody)) continue;
+        const rows = listArchivePayloadKeysFor(c.chaId)
+            .map((key) => parseArchiveRowKey(key, ARCHIVE_PREFIX))
+            .filter((row) => row && row.chaId === c.chaId)
+            .sort((a, b) => b.archivedAt - a.archivedAt);
+        if (rows.length === 0) continue;
+        const wanted = new Set(c.chats.filter((ch) => lacksBody(ch) && ch.id).map((ch) => ch.id));
+        const found = new Map();
+        for (const row of rows) {
+            if (found.size === wanted.size) break;
+            const decoded = await decodeArchivePayload(c.chaId, row.archivedAt);
+            for (const chat of decoded?.payload.character.chats || []) {
+                if (chat?.id && wanted.has(chat.id) && !found.has(chat.id) && Array.isArray(chat.message)) {
+                    found.set(chat.id, chat);
+                }
+            }
+            for (const [alias, index] of Object.entries(decoded?.payload.chatAliases ?? {})) {
+                const chat = Number.isInteger(index) ? decoded.payload.character.chats[index] : null;
+                if (wanted.has(alias) && !found.has(alias) && Array.isArray(chat?.message)) {
+                    found.set(alias, { ...chat, id: alias });
+                }
+            }
+        }
+        const chats = c.chats.map((ch) => {
+            if (!lacksBody(ch)) return ch;
+            const body = ch.id ? found.get(ch.id) : undefined;
+            if (!body) {
+                result.unresolved.push(`${c.chaId}/${ch.id || '?'}`);
+                return ch;
+            }
+            result.restored.push(`${c.chaId}/${ch.id}`);
+            return mergeChatStubWithFullChat(ch, body);
+        });
+        if (found.size > 0) {
+            nextCharacters ??= characters.slice();
+            nextCharacters[i] = { ...c, chats };
+        }
+    }
+    if (nextCharacters) result.db = { ...fullDb, characters: nextCharacters };
+    return result;
+}
+
+// Chats already reported as missing from the rows: every later persist sees
+// them again, so each is logged once per process.
+const reportedUnresolvedArchiveChats = new Set();
+
+// persistDbCacheWithChats / /api/write: restore what the archive rows hold
+// and log what they do not. Throws only when a row is unreadable.
+async function restoreArchivedChatsForDisk(fullDb, source) {
+    const r = await restoreUnmergedArchivedChats(fullDb);
+    if (r.restored.length > 0) {
+        logger.info(`[Archive] ${source}: restored ${r.restored.length} chat body(s) from archive rows. sample=[${r.restored.slice(0, 3).join(', ')}]`);
+    }
+    const fresh = r.unresolved.filter((key) => !reportedUnresolvedArchiveChats.has(key));
+    if (fresh.length > 0) {
+        for (const key of fresh) reportedUnresolvedArchiveChats.add(key);
+        logger.warn(`[Archive] ${source}: ${fresh.length} chat(s) of reactivated characters have no body on the server or in their archive rows; kept as-is. sample=[${fresh.slice(0, 3).join(', ')}]`);
+    }
+    return r.db;
+}
+
+function jsonLength(value) {
+    try { return JSON.stringify(value).length; } catch { return 0; }
+}
+
+// `{{inlay::id}}` / `{{inlayed::id}}` / `{{inlayeddata::id}}` references in
+// chat messages. Mirrors INLAY_REF_REGEX in src/ts/process/files/inlays.ts.
+const INLAY_REF_RE = /\{\{(?:inlay|inlayed|inlayeddata)::(.+?)\}\}/g;
+
+function addInlayRefCounts(refCounts, chats) {
+    let messages = 0;
+    for (const chat of Array.isArray(chats) ? chats : []) {
+        if (!Array.isArray(chat?.message)) continue;
+        for (const msg of chat.message) {
+            if (typeof msg?.data !== 'string') continue;
+            messages++;
+            INLAY_REF_RE.lastIndex = 0;
+            let m;
+            while ((m = INLAY_REF_RE.exec(msg.data)) !== null) {
+                refCounts[m[1]] = (refCounts[m[1]] ?? 0) + 1;
+            }
+        }
+    }
+    return messages;
+}
+
+// Which inlay images are still referenced by a chat message. The client
+// cannot answer this itself: lazy-loaded chats are placeholders with no
+// messages in the browser, and deactivated characters' chats live only in
+// their archive rows (their counts come from archive-meta, orphan rows
+// included — kept rows keep their images). Fails closed: an unreadable index
+// makes the whole request fail rather than under-count.
+app.get('/api/inlays/references', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    try {
+        const result = await queueStorageOperation(async () => {
+            await ensureChatStore();
+            // Null-prototype map: an id such as "constructor" must still count.
+            const refCounts = Object.create(null);
+            let totalMessages = 0;
+            let chats = 0;
+            for (const charChats of fullChatStore.values()) {
+                const list = Array.from(charChats.values());
+                chats += list.length;
+                totalMessages += addInlayRefCounts(refCounts, list);
+            }
+            let archived = 0;
+            for (const meta of listArchiveMetas()) {
+                archived++;
+                const refs = meta.inlayRefs;
+                // Fail closed: an index row without inlay counts cannot vouch
+                // for its chats, and skipping it would under-count.
+                if (!refs || typeof refs !== 'object') {
+                    throw new Error(`archive index lacks inlay references: ${archiveRowId(meta.chaId, meta.archivedAt)}`);
+                }
+                for (const [id, count] of Object.entries(refs)) {
+                    if (typeof count === 'number' && count > 0) refCounts[id] = (refCounts[id] ?? 0) + count;
+                }
+            }
+            return { scannedAt: Date.now(), totalMessages, refCounts, sources: { chats, archived } };
+        });
+        res.json(result);
+    } catch (err) {
+        logger.warn(`[Inlay] reference scan failed: ${err?.message || err}`);
+        res.status(500).json({ error: `Inlay reference scan failed: ${err?.message || err}` });
+    }
+});
+
+// Write the archive row (and index row) for one live character of `db`,
+// verified by reading it back. The database itself is left alone: the client
+// moves the character to its stub list and saves. Caller holds the storage
+// queue and has flushed pending persists. Resolves to { ok: true, stub } or
+// { ok: false, status, code, error, chats? }.
+async function writeArchiveRow(db, chaId, { acceptLostChats = false } = {}) {
+    const character = (Array.isArray(db.characters) ? db.characters : []).find((c) => c?.chaId === chaId);
+    if (!character) {
+        return { ok: false, status: 404, error: 'Character not found', code: 'ARCHIVE_CHARACTER_NOT_FOUND' };
+    }
+    if (archivedStubsOf(db).some((s) => s.chaId === chaId)) {
+        return { ok: false, status: 409, error: 'Character is already deactivated', code: 'ARCHIVE_ALREADY' };
+    }
+    let full;
+    try {
+        full = await hydrateCharacterForArchive(character, { acceptLostChats });
+    } catch (err) {
+        if (err?.code === 'ARCHIVE_CHATS_UNAVAILABLE') {
+            return { ok: false, status: 409, error: err.message, code: err.code, chats: err.chats };
+        }
+        throw err;
+    }
+    // The trash marker lives on the stub (`trashedAt`), never in the row:
+    // a legacy-trashed character migrating into the archive must come
+    // back clean when activated.
+    delete full.trashTime;
+    // New row per deactivation; never overwrite an existing version.
+    let archivedAt = Date.now();
+    while (kvSize(archiveKey(chaId, archivedAt)) || kvGet(archiveMetaKey(chaId, archivedAt))) archivedAt++;
+    const payload = { v: ARCHIVE_FORMAT_VERSION, chaId, archivedAt, character: full };
+    const encoded = Buffer.from(encodeRisuSaveLegacy(payload));
+    kvSet(archiveKey(chaId, archivedAt), encoded);
+    // Read back before anything depends on it: the next step (the client
+    // dropping the character from `characters`) is only safe if this
+    // row decodes to exactly what we hydrated.
+    try {
+        const verified = await decodeArchivePayload(chaId, archivedAt);
+        if (!verified || calculateHash(verified.payload.character) !== calculateHash(full)) {
+            throw new Error('read-back does not match');
+        }
+    } catch (err) {
+        kvDel(archiveKey(chaId, archivedAt));
+        logger.error(`[Archive] verification failed for ${chaId}:`, err?.message || err);
+        return { ok: false, status: 500, error: `Archive verification failed: ${err?.message || err}`, code: 'ARCHIVE_VERIFY_FAILED' };
+    }
+    const { chats: fullChats, ...card } = full;
+    const meta = {
+        v: ARCHIVE_FORMAT_VERSION,
+        chaId,
+        archivedAt,
+        name: typeof full.name === 'string' ? full.name : '',
+        image: typeof full.image === 'string' ? full.image : '',
+        bytes: encoded.length,
+        chatCount: Array.isArray(fullChats) ? fullChats.length : 0,
+        chatIds: (Array.isArray(fullChats) ? fullChats : []).map((c) => c?.id).filter((id) => typeof id === 'string'),
+        cardBytes: jsonLength(card),
+        chatBytes: jsonLength(fullChats),
+        // Same walker as the live sweep, so the two can never disagree
+        // about which fields hold asset references.
+        assetRefs: Array.from(buildUncleanableSet({ characters: [full] })),
+        // Inlay references of the archived chats, for /api/inlays/references.
+        inlayRefs: (() => { const counts = Object.create(null); addInlayRefCounts(counts, fullChats); return counts; })(),
+    };
+    kvSet(archiveMetaKey(chaId, archivedAt), Buffer.from(JSON.stringify(meta), 'utf-8'));
+    logger.info(`[Archive] deactivated ${chaId}@${archivedAt} (${encoded.length} bytes, ${meta.chatCount} chats, ${meta.assetRefs.length} asset refs)`);
+    return { ok: true, stub: buildArchivedCharacterStub(full, { archivedAt, bytes: encoded.length }) };
+}
+
+app.post('/api/characters/:chaId/archive', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    const chaId = req.params.chaId;
+    if (!isArchivableChaId(chaId)) {
+        return res.status(400).json({ error: 'Invalid character id', code: 'ARCHIVE_BAD_ID' });
+    }
+    try {
+        await queueStorageOperation(async () => {
+            await flushPendingDb();
+            if (!(await loadDbCacheIfMissing())) {
+                return res.status(404).json({ error: 'No database', code: 'ARCHIVE_NO_DB' });
+            }
+            const result = await writeArchiveRow(dbCache[DB_HEX_KEY], chaId, {
+                acceptLostChats: req.body?.acceptLostChats === true,
+            });
+            if (!result.ok) {
+                const { ok: _ok, status, ...body } = result;
+                return res.status(status).json(body);
+            }
+            res.json({ ok: true, stub: result.stub });
+        });
+    } catch (err) { next(err); }
+});
+
+// Many characters in one request (bulk trash / deactivate from the character
+// manager): pending persists are flushed once for the whole request instead
+// of once per character — each flush rewrites all of database.bin — and each
+// character gets its own result. The client applies the successes to its
+// database and saves after every request, as for a single archive.
+app.post('/api/characters/archive-batch', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    const chaIds = req.body?.chaIds;
+    if (!Array.isArray(chaIds) || chaIds.length === 0
+        || chaIds.some((id) => typeof id !== 'string') || new Set(chaIds).size !== chaIds.length) {
+        return res.status(400).json({ error: 'chaIds must contain distinct character ids', code: 'ARCHIVE_BAD_BATCH' });
+    }
+    const acceptLostChats = req.body?.acceptLostChats === true;
+    try {
+        await queueStorageOperation(async () => {
+            await flushPendingDb();
+            if (!(await loadDbCacheIfMissing())) {
+                return res.status(404).json({ error: 'No database', code: 'ARCHIVE_NO_DB' });
+            }
+            const db = dbCache[DB_HEX_KEY];
+            const results = [];
+            for (const chaId of chaIds) {
+                if (!isArchivableChaId(chaId)) {
+                    results.push({ chaId, ok: false, error: 'Invalid character id', code: 'ARCHIVE_BAD_ID' });
+                    continue;
+                }
+                try {
+                    const { status: _status, ...result } = await writeArchiveRow(db, chaId, { acceptLostChats });
+                    results.push({ chaId, ...result });
+                } catch (error) {
+                    // One unreadable character must not cost the others their
+                    // results: a row it may have left stays unreferenced (and
+                    // young rows are never purged), the character stays active.
+                    logger.error(`[Archive] batch: ${chaId} failed:`, error?.message || error);
+                    results.push({ chaId, ok: false, code: 'ARCHIVE_FAILED', error: String(error?.message || error) });
+                }
+            }
+            res.json({ ok: true, results });
+        });
+    } catch (err) { next(err); }
+});
+
+app.post('/api/characters/:chaId/activate', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    const chaId = req.params.chaId;
+    if (!isArchivableChaId(chaId)) {
+        return res.status(400).json({ error: 'Invalid character id', code: 'ARCHIVE_BAD_ID' });
+    }
+    try {
+        await queueStorageOperation(async () => {
+            await flushPendingDb();
+            if (!(await loadDbCacheIfMissing())) {
+                return res.status(404).json({ error: 'No database', code: 'ARCHIVE_NO_DB' });
+            }
+            const db = dbCache[DB_HEX_KEY];
+            if ((Array.isArray(db.characters) ? db.characters : []).some((c) => c?.chaId === chaId)) {
+                return res.status(409).json({ error: 'Character is already active', code: 'ARCHIVE_ALREADY_ACTIVE' });
+            }
+            // Which version: the client's stub (its view of the database) or,
+            // failing that, the stub in our own view.
+            const requested = req.body && typeof req.body === 'object' ? req.body.archivedAt : undefined;
+            const stub = archivedStubsOf(db).find((s) => s.chaId === chaId);
+            const archivedAt = isValidArchivedAt(requested) ? requested : stub?.archivedAt;
+            if (!isValidArchivedAt(archivedAt)) {
+                return res.status(404).json({ error: 'Character is not deactivated', code: 'ARCHIVE_PAYLOAD_MISSING' });
+            }
+            let decoded;
+            try {
+                decoded = await decodeArchivePayload(chaId, archivedAt);
+            } catch (err) {
+                logger.error(`[Archive] payload unreadable for ${chaId}@${archivedAt}:`, err?.message || err);
+                return res.status(400).json({ error: err?.message || 'Archive payload unreadable', code: 'ARCHIVE_PAYLOAD_INVALID' });
+            }
+            if (!decoded) {
+                return res.status(404).json({ error: 'Deactivated character data is missing', code: 'ARCHIVE_PAYLOAD_MISSING' });
+            }
+            const full = structuredClone(decoded.payload.character);
+            assignMissingChatIds({ characters: [full] });
+            // The browser keeps every chaId and chat id unique across the
+            // database and renames a returning chat whose id another chat took
+            // meanwhile — away from its body. Rename here instead, where the
+            // body moves with it (the row itself is left unchanged).
+            const liveIds = new Set();
+            for (const c of Array.isArray(db.characters) ? db.characters : []) {
+                if (c?.chaId) liveIds.add(c.chaId);
+                for (const ch of Array.isArray(c?.chats) ? c.chats : []) if (ch?.id) liveIds.add(ch.id);
+            }
+            const ownIds = new Set([chaId]);
+            for (const chat of full.chats) {
+                if (!chat || typeof chat !== 'object') continue;
+                if (!chat.id || liveIds.has(chat.id) || ownIds.has(chat.id)) {
+                    const next = nodeCrypto.randomUUID();
+                    logger.warn(`[Archive] activate ${chaId}: chat id ${chat.id || '(none)'} is taken; renamed to ${next}`);
+                    chat.id = next;
+                }
+                ownIds.add(chat.id);
+            }
+            const aliases = Object.assign(Object.create(null), decoded.payload.chatAliases);
+            let aliasesChanged = false;
+            full.chats.forEach((chat, index) => {
+                if (chat?.id && chat.id !== decoded.payload.character.chats[index]?.id) {
+                    aliases[chat.id] = index;
+                    aliasesChanged = true;
+                }
+            });
+            if (aliasesChanged) {
+                // Preserve the snapshot's original character while making renamed
+                // activation IDs recoverable after a restart before the client saves.
+                const bytes = Buffer.from(encodeRisuSaveLegacy({ ...decoded.payload, chatAliases: aliases }));
+                const meta = readArchiveMeta(chaId, archivedAt);
+                sqliteDb.transaction(() => {
+                    kvSet(archiveKey(chaId, archivedAt), bytes);
+                    if (meta) kvSet(archiveMetaKey(chaId, archivedAt), Buffer.from(JSON.stringify({ ...meta, bytes: bytes.length })));
+                })();
+            }
+            await ensureChatStore();
+            const charChats = new Map();
+            for (const chat of full.chats) {
+                if (!chat || chat._stub === true || !Array.isArray(chat.message)) continue;
+                charChats.set(chat.id, chat);
+            }
+            fullChatStore.set(chaId, charChats);
+            pendingActivations.set(chaId, archivedAt);
+            // Client view: chats as stubs, asset array as a manifest descriptor.
+            // `reconcile` reuses the live manifest when the content is unchanged.
+            const clientView = stripDatabaseForClient({ characters: [full] }, { reconcileManifests: true }).characters[0];
+            logger.info(`[Archive] activated ${chaId}@${archivedAt} (${charChats.size} chats registered); row retained`);
+            res.json({ ok: true, character: normalizeJSON(clientView) });
+        });
+    } catch (err) { next(err); }
+});
+
+// Every deactivated character as a full legacy-shaped object — for the
+// client-assembled partial backup, which must carry them like the server
+// export does. Missing rows fail the whole request (same rule as export).
+app.get('/api/characters/archived/inline', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    try {
+        const result = await queueStorageOperation(async () => {
+            await flushPendingDb();
+            if (!(await loadDbCacheIfMissing())) return { characters: [] };
+            const shell = { characters: [], nodeOnlyArchivedCharacters: archivedStubsOf(dbCache[DB_HEX_KEY]) };
+            await inlineArchivedCharacters(shell);
+            return { characters: shell.characters };
+        });
+        res.setHeader('Content-Type', 'application/octet-stream');
+        res.send(Buffer.from(encodeRisuSaveLegacy(result)));
+    } catch (err) {
+        if (err?.code === 'ARCHIVE_PAYLOAD_MISSING') {
+            return res.status(409).json({ error: err.message, code: err.code });
+        }
+        next(err);
+    }
+});
+
+// Explicit reclaim of archive rows the live database no longer references.
+// Refuses when the database cannot be loaded — without it every row would
+// look orphaned.
+app.post('/api/db/archive/purge-orphans', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    try {
+        const result = await queueStorageOperation(async () => {
+            await flushPendingDb();
+            if (!(await loadDbCacheIfMissing())) return { error: 'Database unavailable — refusing to purge' };
+            const db = dbCache[DB_HEX_KEY];
+            if (!db || !Array.isArray(db.characters)) return { error: 'Database decode failed — refusing to purge' };
+            return { ok: true, ...await purgeOrphanArchiveRows(db) };
+        });
+        if (result.error) return res.status(400).json(result);
+        logger.info(`[Archive] purged ${result.deleted} orphan row(s), ${result.metas} index row(s), ${result.bytes} bytes`);
+        res.json(result);
+    } catch (err) { next(err); }
+});
+
+// Permanent deletion of a deactivated (trashed) character: every archive row
+// and index row of the chaId. The client drops the stub from its database
+// itself; a chaId that is still active is refused so a stale trash view can
+// never delete rows a live character may be re-deactivated against.
+app.delete('/api/characters/:chaId/archive', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    const chaId = req.params.chaId;
+    if (!isArchivableChaId(chaId)) {
+        return res.status(400).json({ error: 'Invalid character id', code: 'ARCHIVE_BAD_ID' });
+    }
+    try {
+        const result = await queueStorageOperation(async () => {
+            await flushPendingDb();
+            if (!(await loadDbCacheIfMissing())) return { status: 404, error: 'No database', code: 'ARCHIVE_NO_DB' };
+            const db = dbCache[DB_HEX_KEY];
+            if ((Array.isArray(db.characters) ? db.characters : []).some((c) => c?.chaId === chaId)) {
+                return { status: 409, error: 'Character is active', code: 'ARCHIVE_ALREADY_ACTIVE' };
+            }
+            const payloadKeys = listArchivePayloadKeysFor(chaId);
+            const metaKeys = kvList(ARCHIVE_META_PREFIX + chaId + '/');
+            let bytes = 0;
+            for (const key of payloadKeys) bytes += kvSize(key) || 0;
+            sqliteDb.transaction(() => {
+                for (const key of payloadKeys) kvDel(key);
+                for (const key of metaKeys) kvDel(key);
+            })();
+            return { ok: true, deleted: payloadKeys.length, metas: metaKeys.length, bytes };
+        });
+        if (result.error) return res.status(result.status).json({ error: result.error, code: result.code });
+        logger.info(`[Archive] deleted ${chaId}: ${result.deleted} row(s), ${result.metas} index row(s), ${result.bytes} bytes`);
+        res.json(result);
+    } catch (err) { next(err); }
+});
+
 // ── Storage dashboard endpoints ──────────────────────────────────────────────
 
 const DB_BLOB_KEY = 'database/database.bin';
@@ -7130,7 +8343,7 @@ const DB_BACKUP_PREFIX = 'database/dbbackup-';
 // createBackupAndRotate names snapshots `${DB_BACKUP_PREFIX}${digits}.bin`;
 // the digits double as the plugin-storage snapshot id.
 const DB_BACKUP_KEY_RE = /^database\/dbbackup-(\d+)\.bin$/;
-const ASSET_PREFIXES = ['assets/', 'remotes/', 'inlay/', 'inlay_thumb/', 'inlay_meta/', 'inlay_info/', 'coldstorage/'];
+const ASSET_PREFIXES = ['assets/', 'remotes/', 'inlay/', 'inlay_thumb/', 'inlay_meta/', 'inlay_info/', 'coldstorage/', 'archive/', 'archive-meta/'];
 const AUTO_SWEEP_GRACE_MS = 7 * 24 * 60 * 60 * 1000;
 
 function statsBasename(s) {
@@ -7173,17 +8386,46 @@ function collectPluginStorageAssetRefs() {
 
 // The persisted blob is currently hydrated for upstream compatibility, but
 // manifests are authoritative for the lazy client view and will remain so
-// after a future slim-database cutover. Union live manifest paths so a
-// partial/stripped object (the warm dbCache always is) can never make
-// referenced assets look orphaned. Throws when a manifest fails to verify —
-// callers must then refuse to purge / report the count as unavailable.
-function addLiveManifestRefs(uncleanable) {
-    for (const descriptor of assetManifestStore.listLiveDescriptors()) {
-        const verified = assetManifestStore.verifyManifest(descriptor.id);
+// after a future slim-database cutover. Union the manifests of the owners
+// `dbObj` still has, so a partial/stripped object (the warm dbCache always is)
+// can never make referenced assets look orphaned. Live rows are never deleted
+// when an owner goes away, so unioning every live row kept a deleted module's
+// or character's assets referenced forever; an owner whose array is empty
+// references nothing either. Per owner both the descriptor it carries and its
+// current live pointer count (a stale descriptor must not under-count).
+// Deactivated characters are covered by addArchivedCharacterRefs. Throws when
+// a manifest fails to verify — callers must then refuse to purge / report the
+// count as unavailable.
+function addLiveManifestRefs(uncleanable, dbObj) {
+    const manifestIds = new Set();
+    const addOwner = (kind, ownerId, descriptor, inlineItems) => {
+        const hasDescriptor = !!descriptor && typeof descriptor.id === 'string';
+        if (!hasDescriptor && !(Array.isArray(inlineItems) && inlineItems.length > 0)) return;
+        if (hasDescriptor) manifestIds.add(descriptor.id);
+        const live = assetManifestStore.getLiveDescriptor(kind, ownerId);
+        if (live) manifestIds.add(live.id);
+    };
+    (Array.isArray(dbObj?.modules) ? dbObj.modules : []).forEach((module, index) => {
+        if (!module) return;
+        addOwner('module', module.assetManifest?.ownerId || moduleOwnerId(module, index), module.assetManifest, module.assets);
+    });
+    (Array.isArray(dbObj?.characters) ? dbObj.characters : []).forEach((character, index) => {
+        if (!character) return;
+        addOwner('character', character.additionalAssetManifest?.ownerId || characterOwnerId(character, index),
+            character.additionalAssetManifest, character.additionalAssets);
+    });
+    (Array.isArray(dbObj?.personas) ? dbObj.personas : []).forEach((persona, index) => {
+        const embedded = persona?.embeddedModule;
+        if (!embedded) return;
+        addOwner('persona-module', embedded.assetManifest?.ownerId || personaOwnerId(persona, index),
+            embedded.assetManifest, embedded.assets);
+    });
+    for (const id of manifestIds) {
+        const verified = assetManifestStore.verifyManifest(id);
         if (!verified.ok) {
-            throw new Error(`Asset manifest verification failed: ${descriptor.id} (${verified.error})`);
+            throw new Error(`Asset manifest verification failed: ${id} (${verified.error})`);
         }
-        for (const item of assetManifestStore.loadItems(descriptor.id) || []) {
+        for (const item of assetManifestStore.loadItems(id) || []) {
             const basename = statsBasename(item?.[1]);
             if (basename) uncleanable.add(basename);
         }
@@ -7495,8 +8737,9 @@ app.get('/api/db/stats', async (req, res, next) => {
         const backupKeys = kvList(DB_BACKUP_PREFIX);
         let backupTotal = 0;
         let backupOldest = null, backupNewest = null;
+        const pluginSize = snapshotPluginSizer();
         for (const k of backupKeys) {
-            const sz = (kvSize(k) || 0) + snapshotPluginBytes(k);
+            const sz = (kvSize(k) || 0) + (isSnapshotKey(k) ? pluginSize(k).bytes : 0);
             backupTotal += sz;
             const tsRaw = parseInt(k.slice(DB_BACKUP_PREFIX.length, -4), 10);
             if (Number.isFinite(tsRaw)) {
@@ -7511,6 +8754,14 @@ app.get('/api/db/stats', async (req, res, next) => {
         const assets = await assetsPromise;
         const { assetFileBytes, fileSize } = await assetStatsPromise;
         for (const p of ASSET_PREFIXES) {
+            if (p === ARCHIVE_PREFIX) {
+                // Chunk-routed rows hold only a marker in kv; report logical size.
+                const keys = kvList(p);
+                let total = 0;
+                for (const k of keys) total += kvSize(k) || 0;
+                prefixes[p] = { totalSize: total, count: keys.length };
+                continue;
+            }
             const items = p === 'assets/' ? assets : kvListWithSizes(p);
             let total = 0;
             for (const it of items) total += it.size;
@@ -7535,17 +8786,24 @@ app.get('/api/db/stats', async (req, res, next) => {
         } catch { /* backups dir may not exist */ }
 
         // Quick estimates from in-memory cache only — never decode the BLOB just for stats.
-        let trashed = { count: 0, expiredCount: 0, available: false };
+        let trashed = { count: 0, available: false };
         let orphan = { count: 0, totalSize: 0, available: false };
+        let archiveOrphan = { count: 0, totalSize: 0, available: false };
         const stripped = dbCache[DB_HEX_KEY];
+        if (stripped && Array.isArray(stripped.characters)) {
+            try {
+                const rows = await listOrphanArchiveRows(stripped);
+                archiveOrphan = { count: rows.payloads.length, totalSize: rows.bytes, available: true };
+            } catch (error) {
+                logger.warn(`[Stats] archive orphan scan skipped: ${error?.message || error}`);
+            }
+        }
         if (stripped?.characters) {
-            const now = Date.now();
-            const GRACE = 1000 * 60 * 60 * 24 * 3;
             for (const c of stripped.characters) {
-                if (c?.trashTime) {
-                    trashed.count++;
-                    if (c.trashTime + GRACE < now) trashed.expiredCount++;
-                }
+                if (c?.trashTime) trashed.count++;
+            }
+            for (const stub of archivedStubsOf(stripped)) {
+                if (isValidArchivedAt(stub.trashedAt)) trashed.count++;
             }
             trashed.available = true;
         }
@@ -7559,7 +8817,8 @@ app.get('/api/db/stats', async (req, res, next) => {
         if (!ASSET_SWEEP_DISABLED_REASON && stripped && Array.isArray(stripped.characters)) {
             try {
                 const uncleanable = buildUncleanableSet(stripped);
-                addLiveManifestRefs(uncleanable);
+                addLiveManifestRefs(uncleanable, stripped);
+                addArchivedCharacterRefs(uncleanable, stripped);
                 for (const bn of collectPluginStorageAssetRefs()) uncleanable.add(bn);
                 for (const it of assets) {
                     if (!uncleanable.has(statsBasename(it.key))) {
@@ -7599,6 +8858,7 @@ app.get('/api/db/stats', async (req, res, next) => {
             },
             trashed,
             orphan,
+            archiveOrphan,
             etag: dbEtag,
         });
     } catch (err) { next(err); }
@@ -7680,21 +8940,63 @@ app.get('/api/db/stats/characters', async (req, res, next) => {
             });
         }
 
-        const uncleanable = buildUncleanableSet(dbObj);
-        addLiveManifestRefs(uncleanable);
-        for (const bn of collectPluginStorageAssetRefs()) uncleanable.add(bn);
-        let orphanCount = 0, orphanTotal = 0;
-        for (const it of (await assetFileStore.list())) {
-            if (!uncleanable.has(statsBasename(it.key))) {
-                orphanCount++;
-                orphanTotal += it.size;
+        // Deactivated characters are not in dbObj.characters; list them from
+        // their stubs so the dashboard shows where the bytes went and can
+        // offer to re-activate. Sizes come from the archive-meta index.
+        for (const stub of archivedStubsOf(dbObj)) {
+            let meta = null;
+            try { meta = readArchiveMeta(stub.chaId, stub.archivedAt); } catch { meta = null; }
+            const refs = meta ? meta.assetRefs : [stub.image];
+            let imgBytes = remoteSize.get(stub.chaId) || 0;
+            for (const ref of refs) {
+                const bn = statsBasename(ref);
+                if (!bn || claimed.has(bn)) continue;
+                const sz = assetSize.get(bn);
+                if (sz != null) {
+                    imgBytes += sz;
+                    claimed.add(bn);
+                }
             }
+            const cardBytes = meta?.cardBytes ?? 0;
+            const chatBytes = meta?.chatBytes ?? 0;
+            characters.push({
+                chaId: stub.chaId,
+                name: stub.name || '',
+                image: stub.image || '',
+                trashed: isValidArchivedAt(stub.trashedAt),
+                archived: true,
+                archiveMissing: !meta || !hasArchivePayload(stub.chaId, stub.archivedAt),
+                cardBytes,
+                imgBytes,
+                chatBytes,
+                totalBytes: cardBytes + imgBytes + chatBytes,
+            });
+        }
+
+        // Same fail-closed rule as /api/db/stats: an unreadable reference
+        // source must not make the whole library look orphaned.
+        let orphan = { count: 0, totalSize: 0, available: false };
+        try {
+            const uncleanable = buildUncleanableSet(dbObj);
+            addLiveManifestRefs(uncleanable, dbObj);
+            addArchivedCharacterRefs(uncleanable, dbObj);
+            for (const bn of collectPluginStorageAssetRefs()) uncleanable.add(bn);
+            let orphanCount = 0, orphanTotal = 0;
+            for (const it of (await assetFileStore.list())) {
+                if (!uncleanable.has(statsBasename(it.key))) {
+                    orphanCount++;
+                    orphanTotal += it.size;
+                }
+            }
+            orphan = { count: orphanCount, totalSize: orphanTotal, available: true };
+        } catch (error) {
+            logger.warn(`[Stats] per-character orphan scan skipped: ${error?.message || error}`);
         }
 
         characters.sort((a, b) => b.totalBytes - a.totalBytes);
         res.json({
             characters,
-            orphan: { count: orphanCount, totalSize: orphanTotal },
+            orphan,
             chatBytesNote: 'JSON.stringify estimate; on-disk msgpack ~0.6×',
             etag: dbEtag,
         });
@@ -7929,6 +9231,7 @@ app.put('/api/db/snapshots/limits', async (req, res, next) => {
 app.get('/api/db/snapshots', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     try {
+        const pluginSize = snapshotPluginSizer();
         const out = listSnapshotKeys().map((key) => {
             const tsRaw = parseInt(key.slice(DB_BACKUP_PREFIX.length, -4), 10);
             const ts = Number.isFinite(tsRaw) ? tsRaw * 100 : null;
@@ -7938,7 +9241,7 @@ app.get('/api/db/snapshots', async (req, res, next) => {
             // (kvSize reassembles via the manifest; the marker's 13 bytes are not
             // what a user wants to see for a full backup.) Trimming still sizes by
             // snapshotFootprint in db.cjs, so this display change can't over-trim.
-            return { key, size: (kvSize(key) || 0) + snapshotPluginBytes(key), timestamp: ts };
+            return { key, size: (kvSize(key) || 0) + pluginSize(key).bytes, timestamp: ts };
         }).sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
         res.json({ snapshots: out });
     } catch (err) { next(err); }
@@ -7971,7 +9274,13 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
         if (!blob) {
             return res.status(404).json({ error: 'Snapshot not found' });
         }
+        let snapshotMissing = false;
         await withComfyWorldReplacementGate(async () => {
+            restoringSnapshotKey = key;
+            try {
+                await flushPendingDb();
+            } finally { restoringSnapshotKey = null; }
+            if (kvSize(key) === null) { snapshotMissing = true; return; }
             // Drain any pending debounced persist first — same pattern as
             // /api/db/optimize. Without this, an in-flight save could land
             // after kvCopyValue and overwrite the restored snapshot.
@@ -7983,6 +9292,9 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
                 kvCopyValue(key, DB_BLOB_KEY);
                 pluginStorage.restoreFrom(snapshotPluginId(key));
             })();
+            // The flush above may have left one snapshot over the limits
+            // while the restored one was protected.
+            trimSnapshotsToLimits();
             invalidateDbCache();
             // A snapshot rewinds the chat blob but plugin_atomic keeps moving
             // forward, so its CAS revisions would end up describing chats that
@@ -8007,16 +9319,20 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
                     const dbObj = await decodeDatabaseWithPersistentChatIds(raw, {
                         createBackup: false,
                     });
-                    initChatStore(dbObj);
+                    await initChatStoreFromDisk(dbObj);
                     // Migration may have rewritten database.bin — etag must
                     // reflect the post-migration bytes the next /api/read sends.
-                    const finalRaw = kvGet(DB_BLOB_KEY);
-                    if (finalRaw) dbEtag = computeBufferEtag(Buffer.from(finalRaw));
+                    const clientView = stripDatabaseForClient(dbObj, { reconcileManifests: true });
+                    dbCache[DB_HEX_KEY] = clientView;
+                    dbEtag = computeDatabaseEtagFromObject(clientView);
                 }
             } catch (e) {
                 logger.warn('[Snapshot restore] post-restore decode failed:', e?.message || e);
             }
         });
+        if (snapshotMissing) {
+            return res.status(404).json({ error: 'Snapshot not found' });
+        }
         res.json({ ok: true });
     } catch (err) { next(err); }
 });
@@ -8339,13 +9655,18 @@ app.post('/api/self-update', async (req, res) => {
         const isWin = process.platform === 'win32';
         const updateTmp = path.join(appDir, '.update-tmp');
 
-        // Restore from a previous interrupted update if leftover exists
+        // Restore from a previous interrupted update only when its in-progress
+        // marker is still there. A leftover backup/ alone is not proof of an
+        // interrupted update: on Windows the running launcher exe keeps
+        // backup/PocketRisu.exe locked, so the restart script's rmdir leaves
+        // the folder behind after a SUCCESSFUL update — restoring from it
+        // would roll the app back to the previous version.
         const prevBackup = path.join(updateTmp, 'backup');
-        try {
-            await fs.access(prevBackup);
+        const inProgressMarker = path.join(updateTmp, 'in-progress');
+        if (existsSync(inProgressMarker) && existsSync(prevBackup)) {
             console.log('[Update] Restoring files from previous interrupted update...');
             await restoreBackup(prevBackup, appDir);
-        } catch { /* no leftover */ }
+        }
         await fs.rm(updateTmp, { recursive: true, force: true }).catch(() => {});
         await fs.mkdir(updateTmp, { recursive: true });
 
@@ -8397,6 +9718,10 @@ app.post('/api/self-update', async (req, res) => {
         // Phase 1: move old files to backup — rollback immediately on any failure
         const backupDir = path.join(updateTmp, 'backup');
         await fs.mkdir(backupDir, { recursive: true });
+        // Marks "app files are mid-replacement": present from the first move
+        // until the new files are verified in place. Only then does a leftover
+        // backup/ mean an interrupted update (see the restore check above).
+        await fs.writeFile(inProgressMarker, `v${targetVersion}`);
 
         const preserved = [];
         const oldEntries = await fs.readdir(appDir);
@@ -8468,6 +9793,10 @@ app.post('/api/self-update', async (req, res) => {
         // entries are app-managed and leaves everything else alone.
         await fs.writeFile(manifestPath, newEntries.join('\n') + '\n').catch(() => {});
 
+        // App files are complete and verified: a leftover backup/ from here on
+        // must never be restored over them.
+        await fs.rm(inProgressMarker, { force: true }).catch(() => {});
+
         // Phase 4 (Windows): stage bin/ for restart script to apply after exit
         if (isWin) {
             const newBin = path.join(sourceDir, 'bin');
@@ -8503,42 +9832,54 @@ app.post('/api/self-update', async (req, res) => {
                 // Windows: use a .bat script to apply bin/, finalize version, and restart.
                 // A bat script can replace bin/node.exe after the Node process exits,
                 // avoiding file-lock issues that a Node child process would hit.
+                //
+                // cmd.exe parses .bat files in the OEM code page (e.g. CP949 on Korean
+                // Windows), not UTF-8, so any non-ASCII path (Korean user name, "바탕 화면")
+                // written literally into the script would be mangled and every command
+                // would fail. Keep the script pure ASCII and pass paths through environment
+                // variables, which reach cmd.exe as UTF-16 via CreateProcessW.
                 const batScript = path.join(os.tmpdir(), `risu-restart-${Date.now()}.bat`);
                 const utmp = path.join(appDir, '.update-tmp');
-                const binDir = path.join(appDir, 'bin');
-                const binBackup = path.join(utmp, 'old-bin');
                 const batLines = [
                     '@echo off',
-                    'timeout /t 3 /nobreak >nul',
+                    // Wait ~3s for the Node process to exit before touching
+                    // bin/. Not `timeout`: with stdio ignored, stdin is NUL
+                    // and timeout exits at once ("input redirection is not
+                    // supported"); ping does not read stdin.
+                    'ping -n 4 127.0.0.1 >nul',
                     // Apply staged bin/: backup current → copy new → on failure restore backup
-                    `if exist "${path.join(utmp, 'new-bin')}\\" (`,
-                    `  if exist "${binDir}\\" (`,
-                    `    xcopy /E /I /Y "${binDir}\\*" "${binBackup}\\" >nul`,
-                    `  )`,
-                    `  xcopy /E /I /Y "${path.join(utmp, 'new-bin')}\\*" "${binDir}\\" >nul`,
-                    `  if errorlevel 1 (`,
-                    `    echo [Update] bin/ copy failed, restoring backup...`,
-                    `    if exist "${binBackup}\\" (`,
-                    `      xcopy /E /I /Y "${binBackup}\\*" "${binDir}\\" >nul`,
-                    `    )`,
-                    `    echo [Update] bin/ restored. Staged files kept for retry.`,
-                    `    goto start`,
-                    `  )`,
-                    `)`,
+                    'if exist "%RISU_UTMP%\\new-bin\\" (',
+                    '  if exist "%RISU_APP_DIR%\\bin\\" (',
+                    '    xcopy /E /I /Y "%RISU_APP_DIR%\\bin\\*" "%RISU_UTMP%\\old-bin\\" >nul',
+                    '  )',
+                    '  xcopy /E /I /Y "%RISU_UTMP%\\new-bin\\*" "%RISU_APP_DIR%\\bin\\" >nul',
+                    '  if errorlevel 1 (',
+                    '    echo [Update] bin/ copy failed, restoring backup...',
+                    '    if exist "%RISU_UTMP%\\old-bin\\" (',
+                    '      xcopy /E /I /Y "%RISU_UTMP%\\old-bin\\*" "%RISU_APP_DIR%\\bin\\" >nul',
+                    '    )',
+                    '    echo [Update] bin/ restored. Staged files kept for retry.',
+                    '    goto start',
+                    '  )',
+                    ')',
                     // Finalize version marker only after successful bin/ copy
-                    `if exist "${path.join(utmp, 'latest-version')}" (`,
-                    `  copy /Y "${path.join(utmp, 'latest-version')}" "${path.join(appDir, '.installed-version')}" >nul`,
-                    `)`,
+                    'if exist "%RISU_UTMP%\\latest-version" (',
+                    '  copy /Y "%RISU_UTMP%\\latest-version" "%RISU_APP_DIR%\\.installed-version" >nul',
+                    ')',
                     // Cleanup .update-tmp (includes old-bin backup)
-                    `rmdir /s /q "${utmp}" 2>nul`,
+                    'rmdir /s /q "%RISU_UTMP%" 2>nul',
                     ':start',
                     // Start server with correct working directory
-                    `cd /d "${appDir}"`,
-                    `start "" "${path.join(appDir, 'bin', 'node.exe')}" "${path.join(appDir, 'server', 'node', 'server.cjs')}"`,
+                    'cd /d "%RISU_APP_DIR%"',
+                    'start "" "%RISU_APP_DIR%\\bin\\node.exe" "%RISU_APP_DIR%\\server\\node\\server.cjs"',
                     'exit /b 0',
                 ];
-                writeFileSync(batScript, batLines.join('\r\n'));
-                spawn('cmd.exe', ['/c', batScript], { detached: true, stdio: 'ignore' }).unref();
+                writeFileSync(batScript, batLines.join('\r\n'), 'ascii');
+                spawn('cmd.exe', ['/c', batScript], {
+                    detached: true,
+                    stdio: 'ignore',
+                    env: Object.assign({}, process.env, { RISU_APP_DIR: appDir, RISU_UTMP: utmp }),
+                }).unref();
             } else {
                 // Unix: Node restart helper with port-check to avoid clashing with process managers
                 const restartScript = path.join(os.tmpdir(), `risu-restart-${Date.now()}.cjs`);

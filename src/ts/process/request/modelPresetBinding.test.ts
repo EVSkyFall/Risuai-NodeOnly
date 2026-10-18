@@ -11,12 +11,14 @@ vi.mock('src/ts/storage/database.svelte', () => ({
 import {
     resolveChatModelBinding,
     resolveEffectiveChatModelIds,
+    resolveClassicModelId,
+    classicModelIdFor,
     resolvePresetMaxOutputTokens,
     resolveChatMaxResponseTokens,
     applyPromptPresetParams,
     presetSupportsVision,
 } from './modelPresetBinding'
-import { emptyModelBinding } from 'src/ts/preset/types'
+import { emptyModelBinding, legacySlotValue, parseLegacySlot } from 'src/ts/preset/types'
 
 const PRESET = { id: 'p-main', name: 'Main' } as any
 
@@ -421,5 +423,105 @@ describe('presetSupportsVision — ModelPreset image input gate', () => {
             capabilities: ['vision'],
             imageInput: true,
         }))).toBe(false)
+    })
+})
+
+describe('legacy model slots (@legacy / @legacy:<model>)', () => {
+    const SUBP = { id: 'p-sub', name: 'Sub' } as any
+    const AUXP = { id: 'p-aux', name: 'Aux' } as any
+    beforeEach(() => {
+        mockDb.modelPresets = [PRESET, SUBP, AUXP]
+        mockDb.aiModel = 'gemini-main'
+        mockDb.subModel = 'gemini-sub'
+        mockDb.seperateModelsForAxModels = false
+        mockDb.seperateModels = { memory: '', emotion: '', translate: '', otherAx: '' }
+    })
+    const chatWith = (b: Partial<ReturnType<typeof emptyModelBinding>>) =>
+        ({ useModelPreset: true, modelBinding: { ...emptyModelBinding(), ...b, aux: { ...emptyModelBinding().aux, ...(b.aux ?? {}) } } }) as any
+
+    test('slot value helpers round-trip', () => {
+        expect(parseLegacySlot(legacySlotValue())).toEqual({})
+        expect(parseLegacySlot(legacySlotValue('pluginmodel:::Mine'))).toEqual({ model: 'pluginmodel:::Mine' })
+        expect(parseLegacySlot('p-main')).toBeNull()
+        expect(parseLegacySlot('')).toBeNull()
+        expect(parseLegacySlot(undefined)).toBeNull()
+    })
+
+    test('main legacy (pinned) + sub preset: main goes classic to the pinned model, sub to the preset', () => {
+        const chat = chatWith({ main: legacySlotValue('pluginmodel:::Mine'), sub: 'p-sub' })
+        expect(resolveChatModelBinding(chat, 'model')).toEqual({ kind: 'classic', fromSlot: true, model: 'pluginmodel:::Mine' })
+        expect(resolveClassicModelId(chat, 'model')).toBe('pluginmodel:::Mine')
+        expect(resolveChatModelBinding(chat, 'submodel')).toEqual({ kind: 'modelPreset', preset: SUBP })
+        expect(resolveChatModelBinding(chat, 'translate')).toEqual({ kind: 'modelPreset', preset: SUBP })
+    })
+
+    test('main preset + sub legacy (global): aux tasks fall back to the global sub model, not the global aux switch', () => {
+        mockDb.seperateModelsForAxModels = true
+        mockDb.seperateModels.memory = 'global-memory-model'
+        const chat = chatWith({ main: 'p-main', sub: legacySlotValue() })
+        expect(resolveChatModelBinding(chat, 'model')).toEqual({ kind: 'modelPreset', preset: PRESET })
+        expect(resolveClassicModelId(chat, 'submodel')).toBe('gemini-sub')
+        // separateAux is off in the binding: the chat's own setting decides.
+        expect(resolveClassicModelId(chat, 'memory')).toBe('gemini-sub')
+    })
+
+    test('main global legacy follows db.aiModel live', () => {
+        const chat = chatWith({ main: legacySlotValue(), sub: 'p-sub' })
+        expect(resolveClassicModelId(chat, 'model')).toBe('gemini-main')
+        mockDb.aiModel = 'claude-x'
+        expect(resolveClassicModelId(chat, 'model')).toBe('claude-x')
+    })
+
+    test('separateAux: an aux legacy slot uses the global task model, or the sub model when the task has none', () => {
+        mockDb.seperateModels.memory = 'global-memory-model'
+        const chat = chatWith({ main: 'p-main', sub: 'p-sub', separateAux: true, aux: { memory: legacySlotValue(), translate: legacySlotValue(), emotion: legacySlotValue('pinned-emo'), otherAx: 'p-aux' } })
+        expect(resolveClassicModelId(chat, 'memory')).toBe('global-memory-model')
+        expect(resolveClassicModelId(chat, 'translate')).toBe('gemini-sub')
+        expect(resolveClassicModelId(chat, 'emotion')).toBe('pinned-emo')
+        expect(resolveChatModelBinding(chat, 'otherAx')).toEqual({ kind: 'modelPreset', preset: AUXP })
+        // submodel ignores aux slots
+        expect(resolveChatModelBinding(chat, 'submodel')).toEqual({ kind: 'modelPreset', preset: SUBP })
+    })
+
+    test('blank aux slot under separateAux falls back to a legacy sub slot', () => {
+        const chat = chatWith({ main: 'p-main', sub: legacySlotValue('pinned-sub'), separateAux: true })
+        expect(resolveClassicModelId(chat, 'translate')).toBe('pinned-sub')
+    })
+
+    test("classic chats keep the global classic config (seperateModels override), unchanged", () => {
+        mockDb.seperateModelsForAxModels = true
+        mockDb.seperateModels.translate = 'global-translate'
+        const chat = { useModelPreset: false } as any
+        expect(resolveChatModelBinding(chat, 'translate')).toEqual({ kind: 'classic' })
+        expect(resolveClassicModelId(chat, 'translate')).toBe('global-translate')
+        expect(resolveClassicModelId(chat, 'submodel')).toBe('gemini-sub')
+        expect(resolveClassicModelId(chat, 'model')).toBe('gemini-main')
+        expect(classicModelIdFor({ kind: 'classic' }, 'memory', mockDb)).toBe('gemini-sub')
+    })
+
+    test("lock 'legacy' still forces the global classic config over legacy slots", () => {
+        mockDb.nodeOnlyModelModeLock = 'legacy'
+        const chat = chatWith({ main: legacySlotValue('pinned-main') })
+        expect(resolveClassicModelId(chat, 'model')).toBe('gemini-main')
+    })
+
+    test("lock 'preset': the global default binding may carry legacy slots", () => {
+        mockDb.nodeOnlyModelModeLock = 'preset'
+        mockDb.defaultModelBinding = { ...emptyModelBinding(), main: legacySlotValue('pinned-main'), sub: 'p-sub' }
+        const chat = { useModelPreset: false } as any
+        expect(resolveClassicModelId(chat, 'model')).toBe('pinned-main')
+    })
+
+    test('a module binding still wins over a legacy main slot', () => {
+        mockDb.moduleModelBindingsEnabled = true
+        mockDb.moduleModelBindings = { mod1: 'p-aux' }
+        const chat = chatWith({ main: legacySlotValue('pinned-main') })
+        expect(resolveChatModelBinding(chat, 'model', 'mod1')).toEqual({ kind: 'modelPreset', preset: AUXP })
+    })
+
+    test('preset-only output budgeting ignores legacy slots (classic path keeps db.maxResponse)', () => {
+        mockDb.maxResponse = 777
+        const chat = chatWith({ main: legacySlotValue('pinned-main') })
+        expect(resolveChatMaxResponseTokens(chat)).toBe(777)
     })
 })

@@ -1,5 +1,6 @@
 import { alertError, alertStore, alertWait, alertMd, alertConfirm, alertConfirmMulti, alertClear, waitAlert, notifySuccess, notifyInfo, notifyError } from "../alert";
-import { downloadFile, LocalWriter, forageStorage, loadAssetManifestItems } from "../globalApi.svelte";
+import { fetchArchivedCharactersInline } from "../characterArchive"
+import { LocalWriter, forageStorage, loadAssetManifestItems } from "../globalApi.svelte";
 import { encodeRisuSaveLegacy } from "../storage/risuSave";
 import { getDatabase, type Chat } from "../storage/database.svelte";
 import { fetchChatFromServer } from "../storage/chatStorage";
@@ -13,44 +14,10 @@ function formatBytes(bytes: number): string {
     return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`
 }
 
-async function streamBackupToDisk(response: Response, fallbackName: string){
-    const disposition = response.headers.get('content-disposition') ?? ''
-    const fileName = disposition.match(/filename=\"?([^"]+)\"?/)?.[1] ?? fallbackName
-    const totalBytes = Number(response.headers.get('content-length') ?? '0')
-
-    if (response.body) {
-        const streamSaver = await import('streamsaver')
-        const writableStream = streamSaver.createWriteStream(fileName)
-        const writer = writableStream.getWriter()
-        const reader = response.body.getReader()
-        let downloadedBytes = 0
-
-        while (true) {
-            const { done, value } = await reader.read()
-            if (done) {
-                break
-            }
-            downloadedBytes += value.length
-            if (totalBytes > 0) {
-                const progress = ((downloadedBytes / totalBytes) * 100).toFixed(2)
-                alertWait(`Saving local backup... (${progress}%)`)
-            } else {
-                alertWait(`Saving local backup... (${(downloadedBytes / (1024 * 1024)).toFixed(1)} MB)`)
-            }
-            await writer.write(value)
-        }
-        await writer.close()
-    } else {
-        await downloadFile(fileName, new Uint8Array(await response.arrayBuffer()))
-    }
-}
-
 export async function SaveLocalBackup(){
     try {
-        alertWait("Saving local backup...")
-        const response = await forageStorage.exportBackup()
-        await streamBackupToDisk(response, `risu-backup-${Date.now()}.bin`)
-        notifySuccess('Success')
+        await forageStorage.downloadBackupExport()
+        notifyInfo(language.backupBrowserDownloadStarted)
     } catch (error) {
         console.error(error)
         alertError('Failed')
@@ -111,13 +78,11 @@ export async function SaveSettingsOnlyBackup(){
     }
 
     try {
-        alertWait("Saving settings backup...")
-        const response = await forageStorage.exportBackup({ mode: 'settings', moduleAssets: includeModuleAssets })
-        await streamBackupToDisk(response, `risu-settings-${Date.now()}.bin`)
+        await forageStorage.downloadBackupExport({ mode: 'settings', moduleAssets: includeModuleAssets })
         if (!includeModuleAssets) {
             alertMd(language.backupSettingsOnlyModuleAssetsSkipped)
         } else {
-            notifySuccess('Success')
+            notifyInfo(language.backupBrowserDownloadStarted)
         }
     } catch (error) {
         console.error(error)
@@ -127,10 +92,8 @@ export async function SaveSettingsOnlyBackup(){
 
 export async function SaveLocalBackupForUpstream(){
     try {
-        alertWait("Saving local backup...")
-        const response = await forageStorage.exportBackup({ target: 'upstream' })
-        await streamBackupToDisk(response, `risu-backup-${Date.now()}-upstream.bin`)
-        notifySuccess('Success')
+        await forageStorage.downloadBackupExport({ target: 'upstream' })
+        notifyInfo(language.backupBrowserDownloadStarted)
     } catch (error) {
         console.error(error)
         alertError('Failed')
@@ -187,6 +150,12 @@ export async function SavePartialLocalBackup(){
         }
     }
     
+    // Deactivated characters are not in db.characters; keep their profile images too.
+    for (const stub of db.nodeOnlyArchivedCharacters ?? []) {
+        if (stub?.image) {
+            assetMap.set(stub.image, { charName: stub.name ?? 'Unknown Character', assetName: 'Profile Image' })
+        }
+    }
     // User icon
     if (db.userIcon) {
         assetMap.set(db.userIcon, { charName: 'User Settings', assetName: 'User Icon' })
@@ -289,6 +258,18 @@ export async function SavePartialLocalBackup(){
             }
         }
     }
+    // Deactivated characters live server-side; the .bin must carry them as
+    // complete records exactly like the server export does. A missing payload
+    // aborts the backup instead of silently dropping the character.
+    if ((dbCopy.nodeOnlyArchivedCharacters ?? []).length > 0) {
+        alertWait(`Saving partial local backup... (Deactivated characters)`)
+        const inline = await fetchArchivedCharactersInline()
+        const present = new Set(dbCopy.characters.map((c) => c?.chaId))
+        for (const c of inline) {
+            if (!present.has(c.chaId)) dbCopy.characters.push(c)
+        }
+    }
+    delete dbCopy.nodeOnlyArchivedCharacters
     // Plugin values live in the server kv, never in the client DB (the field
     // is always {}). Importing a .bin replaces plugin storage wholesale, so
     // the backup must carry every key or a restore wipes them.
@@ -330,10 +311,23 @@ export function LoadLocalBackup(){
             const file = input.files[0];
             input.remove();
             alertWait(`Loading local Backup... (Uploading ${file.name})`);
-            const result = await forageStorage.importBackup(file, (loaded, total) => {
-                const progress = total > 0 ? ((loaded / total) * 100).toFixed(2) : '0.00'
-                alertWait(`Loading local Backup... (${progress}%)`)
-            })
+            let result: Awaited<ReturnType<typeof forageStorage.importBackup>>
+            try {
+                result = await forageStorage.importBackup(file, (loaded, total) => {
+                    const progress = total > 0 ? ((loaded / total) * 100).toFixed(2) : '0.00'
+                    alertWait(`Loading local Backup... (${progress}%)`)
+                })
+            } catch (error) {
+                // The server rejected the file before replacing the database
+                // (encrypted upstream account backup, corrupt payload, ...).
+                // Explain why instead of surfacing it as an uncaught error.
+                console.error(error)
+                const code = (error as { code?: unknown })?.code
+                alertError(code === 'BACKUP_ENCRYPTED'
+                    ? language.errors.backupEncryptedAccount
+                    : String((error as Error)?.message ?? error))
+                return
+            }
             if (result.coldStorageFailed && result.coldStorageFailed > 0) {
                 alertError(`Warning: ${result.coldStorageFailed} character(s) could not be restored from cold storage. The imported save may be incomplete. The app will now reload.`)
                 await waitAlert()

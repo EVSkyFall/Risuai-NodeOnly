@@ -2,7 +2,8 @@ import { get, writable } from "svelte/store";
 import { saveImage, setDatabase, type character, type Chat, defaultSdDataFunc, type loreBook, getDatabase, getCharacterByIndex, setCharacterByIndex, getCurrentChat, loadTogglesFromChat, normalizeChat, newChatModelDefaults } from "./storage/database.svelte";
 import { ensureChatHydrated } from "./storage/chatStorage";
 import { alertAddCharacter, alertConfirm, alertError, alertSelect, alertStore, alertWait, notifySuccess, notifyInfo } from "./alert";
-import { loadingOverlayStore, chatDeselected } from "./stores.svelte";
+import { archiveCharacter } from "./characterArchive";
+import { claimLoadingOverlay, chatDeselected } from "./stores.svelte";
 import { language } from "../lang";
 import { checkNullish, findCharacterbyId, findCharacterIndexbyId, getUserName, selectMultipleFile, selectSingleFile } from "./util";
 import { v4 as uuidv4, v4 } from 'uuid';
@@ -432,9 +433,10 @@ export async function importChat(){
                 const chats = json.data
                 if(Array.isArray(chats) && chats.length > 0){
                     db.characters[selectedID].chats.unshift(...(chats.map((v) => {
-                        if(!v.id){
-                            v.id = uuidv4()
-                        }
+                        // Always a fresh id, like the other chat imports: the
+                        // export's ids still belong to the chats it came from,
+                        // and a duplicate makes two chats share one body.
+                        v.id = uuidv4()
                         if(!v.localLore){
                             v.localLore = []
                         }
@@ -472,6 +474,8 @@ export async function importChat(){
             const chat = doc.querySelector('.idat').textContent
             const json = JSON.parse(chat)
             if(json.message && json.note && json.name && json.localLore){
+                // Fresh id: the exported one still belongs to the original chat.
+                json.id = uuidv4()
                 db.characters[selectedID].chats.unshift(normalizeChat(json))
                 notifySuccess(language.successImport)
             }
@@ -653,6 +657,8 @@ export function createBlankChar():character{
             note: '',
             name: 'Chat 1',
             localLore: [],
+            // An id from the start: the save path uploads only chats that have one.
+            id: v4(),
             ...newChatModelDefaults()
         }],
         chatFolders: [],
@@ -707,16 +713,20 @@ export function deselectCharacter() {
     selectedCharID.set(-1)
 }
 
-export async function removeChar(identifier:string|number,name:string, type:'normal'|'permanent'|'permanentForce' = 'normal'){
+export async function removeChar(identifier:string|number,name:string, type:'normal'|'permanent'|'permanentForce' = 'normal', arg:{ skipConfirm?: boolean } = {}){
     const db = getDatabase()
-    if(type !== 'permanentForce'){
-        const conf = await alertConfirm(language.removeConfirm + name)
+    // skipConfirm: bulk callers (character manager) confirm once for the whole set.
+    // Moving to the trash is reversible, so it asks once; permanent deletion asks twice.
+    if(type !== 'permanentForce' && !arg.skipConfirm){
+        const conf = await alertConfirm((type === 'normal' ? language.moveToTrashConfirm : language.removeConfirm) + name)
         if(!conf){
             return
         }
-        const conf2 = await alertConfirm(language.removeConfirm2 + name)
-        if(!conf2){
-            return
+        if(type === 'permanent'){
+            const conf2 = await alertConfirm(language.removeConfirm2 + name)
+            if(!conf2){
+                return
+            }
         }
     }
     let chars = db.characters
@@ -729,11 +739,13 @@ export async function removeChar(identifier:string|number,name:string, type:'nor
         return
     }
     if(type === 'normal'){
-        chars[index].trashTime = Date.now()
+        // Trash = deactivate + marker: the character leaves memory and the
+        // database blob like any deactivation (src/ts/characterArchive.ts).
+        // Bulk callers confirmed once already; they also get one summary instead of a toast per character.
+        await archiveCharacter(index, { skipConfirm: true, trash: true, silent: arg.skipConfirm })
+        return
     }
-    else{
-        chars.splice(index, 1)
-    }
+    chars.splice(index, 1)
     checkCharOrder()
     db.characters = chars
     requiresFullEncoderReload.state = true
@@ -806,11 +818,11 @@ export function changeChar(index: number, arg:{
             const capturedChatId = chat.id
             if(char){
                 let cancelled = false
-                loadingOverlayStore.set({ active: true, text: language.loading ?? '', onCancel: () => {
+                const releaseOverlay = claimLoadingOverlay(language.loading ?? '', () => {
                     cancelled = true
                     chatDeselected.set(true)
-                    loadingOverlayStore.set({ active: false, text: '', onCancel: null })
-                }})
+                    releaseOverlay()
+                })
                 void ensureChatHydrated(char.chats, char.chatPage, char.chaId).then((hydrated) => {
                     if(cancelled) return
                     const currentChar = getDatabase().characters[capturedIndex]
@@ -821,7 +833,7 @@ export function changeChar(index: number, arg:{
                 }).catch((e) => {
                     console.error('[selectCharacter] hydration failed:', e)
                 }).finally(() => {
-                    if(!cancelled) loadingOverlayStore.set({ active: false, text: '', onCancel: null })
+                    if(!cancelled) releaseOverlay()
                 })
             }
         } else {

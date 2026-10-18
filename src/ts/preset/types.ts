@@ -394,6 +394,33 @@ export interface ModelBindingSet {
     }
 }
 
+/**
+ * A binding slot can also name a legacy (classic) model instead of a preset:
+ *  - `@legacy`          → the global legacy model for that slot (db.aiModel /
+ *                         db.subModel / db.seperateModels[task]) — the classic
+ *                         regime's behavior, per slot.
+ *  - `@legacy:<model>`  → that classic model id, pinned to this chat's slot.
+ * Builds without this support find no preset for these ids: a main/sub slot
+ * blocks ("unset") instead of calling another model, while an aux slot falls
+ * back to the sub slot there (their "use default sub model" rule).
+ */
+export const LEGACY_SLOT = '@legacy'
+const LEGACY_SLOT_PREFIX = '@legacy:'
+
+export function legacySlotValue(modelId?: string): string {
+    return modelId ? LEGACY_SLOT_PREFIX + modelId : LEGACY_SLOT
+}
+
+/** `{}` for the global legacy slot, `{ model }` for a pinned one, null otherwise. */
+export function parseLegacySlot(value: string | undefined): { model?: string } | null {
+    if (value === LEGACY_SLOT) return {}
+    if (value?.startsWith(LEGACY_SLOT_PREFIX)) {
+        const model = value.slice(LEGACY_SLOT_PREFIX.length)
+        return model ? { model } : {}
+    }
+    return null
+}
+
 /** A fully-normalized empty binding bundle (every slot a defined primitive, so
  * `bind:value` / `bind:checked` on a $bindable never sees undefined). Shared by
  * the sidebar seeder and the new-chat default seeder. */

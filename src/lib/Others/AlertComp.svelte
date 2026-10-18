@@ -79,6 +79,17 @@
         y:number,
         content:string,
     } = $state(null)
+    // Branch tree rows: y=0 is the greeting (not part of chat.message), the
+    // rest map to message[y-1]. Indexing message[-1] for the first row threw
+    // a TypeError on every hover.
+    function branchNodeContent(obj: { chatId: number, y: number }): string {
+        const char = getCurrentCharacter()
+        const chat = char.chats[obj.chatId]
+        if(obj.y === 0){
+            return (chat.fmIndex === -1 ? char.firstMessage : char.alternateGreetings?.[chat.fmIndex ?? 0]) ?? ''
+        }
+        return chat.message[obj.y - 1]?.data ?? ''
+    }
     let copiedKey: string | null = $state(null)
     let togglePresetShowAll = $state(false)
 
@@ -188,7 +199,7 @@
     }
 }}></svelte:window>
 
-{#if $alertStore.type !== 'none' &&  $alertStore.type !== 'cardexport' && $alertStore.type !== 'branches' && $alertStore.type !== 'selectModule' && $alertStore.type !== 'pukmakkurit' && $alertStore.type !== 'error' && $alertStore.type !== 'normal' && $alertStore.type !== 'markdown' && $alertStore.type !== 'ask' && $alertStore.type !== 'pluginconfirm' && $alertStore.type !== 'tos' && $alertStore.type !== 'input' && $alertStore.type !== 'select' && $alertStore.type !== 'wait' && $alertStore.type !== 'wait2' && $alertStore.type !== 'progress' && $alertStore.type !== 'confirmMulti'}
+{#if $alertStore.type !== 'none' &&  $alertStore.type !== 'cardexport' && $alertStore.type !== 'branches' && $alertStore.type !== 'selectModule' && $alertStore.type !== 'pukmakkurit' && $alertStore.type !== 'error' && $alertStore.type !== 'normal' && $alertStore.type !== 'markdown' && $alertStore.type !== 'ask' && $alertStore.type !== 'pluginconfirm' && $alertStore.type !== 'input' && $alertStore.type !== 'select' && $alertStore.type !== 'wait' && $alertStore.type !== 'wait2' && $alertStore.type !== 'progress' && $alertStore.type !== 'confirmMulti'}
     <div class="absolute w-full h-full z-50 bg-black/50 flex justify-center items-center">
         <div class="bg-darkbg p-4 break-any rounded-md flex flex-col max-w-3xl  max-h-full overflow-y-auto">
             {#if $alertStore.type === 'selectChar'}
@@ -496,7 +507,7 @@
                     <span class="text-textcolor2 text-sm">{language.risuMDesc}</span>
                 {:else if $alertStore.submsg === 'preset'}
                     <span class="text-textcolor2 text-sm">{language.risupresetDesc}</span>
-                    {#if cardExportType2 === 'preset' && (DBState.db.botPresets[DBState.db.botPresetsId].image || DBState.db.botPresets[DBState.db.botPresetsId].regex?.length > 0)}
+                    {#if cardExportType2 === 'preset' && (DBState.db.botPresets[DBState.db.botPresetsId]?.image || DBState.db.botPresets[DBState.db.botPresetsId]?.regex?.length > 0)}
                         <span class="text-red-500 text-sm">Use RisuRealm to share the preset. Preset with image or regexes cannot be exported for now.</span>
                     {/if}
                 {:else}
@@ -590,21 +601,19 @@
                 style="top: {obj.y * 80 + 24}px; left: {obj.x * 80 + 24}px"
                 onmouseenter={() => {
                     if(branchHover === null){
-                        const char = getCurrentCharacter()
                         branchHover = {
                             x: obj.x,
                             y: obj.y,
-                            content: char.chats[obj.chatId].message[obj.y - 1].data
+                            content: branchNodeContent(obj)
                         }
                     }
                 }}
                 onclick={() => {
                     if(branchHover === null){
-                        const char = getCurrentCharacter()
                         branchHover = {
                             x: obj.x,
                             y: obj.y,
-                            content: char.chats[obj.chatId].message[obj.y - 1].data
+                            content: branchNodeContent(obj)
                         }
                     }
                 }}
@@ -904,26 +913,7 @@
     progress={$alertStore.type === 'progress' ? parseFloat($alertStore.submsg ?? '0') : null}
 />
 
-<ShAlertDialog
-    open={$alertStore.type === 'tos'}
-    onOpenChange={(v) => {
-        if (!v && $alertStore.type === 'tos') {
-            alertStore.set({ type: 'none', msg: 'no' })
-        }
-    }}
->
-    <!-- svelte-ignore a11y_missing_attribute -->
-    <!-- svelte-ignore a11y_click_events_have_key_events -->
-    <div class="text-textcolor">
-        You should accept
-        <a role="button" tabindex="0" class="text-borderc hover:underline cursor-pointer" onclick={() => openURL('https://sv.risuai.xyz/hub/tos')}>Terms of Service</a>
-        to continue.
-    </div>
-    {#snippet footer()}
-        <ShButton variant="outline" onclick={() => alertStore.set({ type: 'none', msg: 'no' })}>Do not Accept</ShButton>
-        <ShButton onclick={() => alertStore.set({ type: 'none', msg: 'yes' })}>Accept</ShButton>
-    {/snippet}
-</ShAlertDialog>
+
 
 <!-- tier="base" puts this below default ShDialog/ShAlertDialog tier so
      nested alertConfirm/alertInput (overwrite, rename, delete) paint on

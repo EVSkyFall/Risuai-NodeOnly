@@ -45,9 +45,9 @@ export class AutoStorage{
     }
 
 
-    async exportBackup(opts?: ExportBackupOptions) {
+    async downloadBackupExport(opts?: ExportBackupOptions) {
         await this.Init()
-        return this.realStorage.exportBackup(opts)
+        return this.realStorage.downloadBackupExport(opts)
     }
 
     async settingsBackupEstimate() {

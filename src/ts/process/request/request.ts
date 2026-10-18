@@ -38,9 +38,9 @@ import { resolveWireModelId } from "src/ts/preset/adapter/wireInvariants";
 import { pumpPresetStream } from "./presetStreamPump";
 import { shouldStageMainRequestSnapshot, stageMainRequestSnapshot } from "./requestReplay";
 import { formatReasoningParts } from "src/ts/preset/adapter/reasoning";
-import { makeJobFetch, type JobClaimHandle } from "./jobFetch";
+import { makeJobFetch, ModelJobBusyError, type JobClaimHandle } from "./jobFetch";
 import { toLogSource, toRequestKind } from "./logSource";
-import { resolveChatModelBinding, buildModelPresetCredential, applyPromptPresetParams, presetSupportsVision } from "./modelPresetBinding";
+import { resolveChatModelBinding, classicModelIdFor, buildModelPresetCredential, applyPromptPresetParams, presetSupportsVision } from "./modelPresetBinding";
 import { expandAdapterMessages, toAdapterMessage, toolResponseText } from "./modelPresetMessages";
 import { isLocalNetworkUrl } from "src/ts/network/localNetwork";
 import { createRequestLogScope, recordRequestLog, stripInlineMedia, type RequestLogRoute, type RequestLogSource, type RequestLogUsage } from "src/ts/requestLog";
@@ -505,6 +505,7 @@ export async function requestChatDataMain(arg:requestDataArgument, model:ModelMo
     // binding BEFORE any classic model selection so a binding chat never touches
     // db.aiModel / db.seperateModels. Skipped when a staticModel (fallback retry)
     // is forced — fallbacks are classic model ids.
+    let classicModel: string | undefined
     if(!arg.staticModel){
         const currentChat = getCurrentChat()
         const binding = resolveChatModelBinding(currentChat, model, arg.moduleId)
@@ -520,17 +521,13 @@ export async function requestChatDataMain(arg:requestDataArgument, model:ModelMo
                     : language.modelPresetBindingSubUnset,
             }
         }
-        // binding.kind === 'classic' → fall through to the classic path below.
+        // binding.kind === 'classic' → fall through to the classic path below,
+        // with the model a legacy slot names (or the global classic config).
+        classicModel = classicModelIdFor(binding, model, db)
     }
 
-    targ.aiModel = arg.staticModel ? arg.staticModel : (model === 'model' ? db.aiModel : db.subModel)
+    targ.aiModel = arg.staticModel ? arg.staticModel : (classicModel ?? db.aiModel)
     targ.modelInfo = getModelInfo(targ.aiModel)
-    if(db.seperateModelsForAxModels && !arg.staticModel){
-        if(db.seperateModels[model]){
-            targ.aiModel = db.seperateModels[model]
-            targ.modelInfo = getModelInfo(targ.aiModel)
-        }
-    }
 
     if(arg.blockPlugins && targ.modelInfo.id.startsWith('pluginmodel:::')){
         return {
@@ -1200,6 +1197,9 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
             result: err instanceof Error ? err.message : String(err),
             model: wireModel,
             modelLabel: preset.name,
+            // Another generation owns the chat; a lost connection to our own
+            // job remains retryable so the next attempt can reattach.
+            noRetry: err instanceof ModelJobBusyError,
         }
     }
 }

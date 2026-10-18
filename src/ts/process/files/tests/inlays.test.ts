@@ -986,6 +986,9 @@ describe('inlay asset integrity', () => {
         expect(nodeStorageMap.has('inlay_meta/missing-id')).toBe(true)
     })
 })
+// These properties run 100 samples with two asynchronous FileReader conversions
+// each. Allow slower Windows timers without reducing the sample coverage.
+const blobPropertyTestTimeout = 15_000
 
 describe('set -> get round-trip', () => {
     test('preserves metadata through setInlayAsset -> getInlayAsset', async () => {
@@ -1023,7 +1026,7 @@ describe('set -> get round-trip', () => {
                 },
             ),
         )
-    })
+    }, blobPropertyTestTimeout)
 })
 
 describe('set -> remove -> get', () => {
@@ -1048,7 +1051,7 @@ describe('set -> remove -> get', () => {
                 expect(await getInlayAsset(id)).toBeNull()
             }),
         )
-    })
+    }, blobPropertyTestTimeout)
 })
 
 

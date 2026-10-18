@@ -22,6 +22,7 @@ export interface GenState {
     // for up to the job-poll deadline).
     kind: 'live' | 'background'
     abortController?: AbortController
+    startedAt: number
 }
 
 export const generationStates = writable<Map<string, GenState>>(new Map())
@@ -73,7 +74,7 @@ export function startGeneration(chatKey: string, generationId: string, kind: 'li
     const abortController = pendingAborts.get(chatKey)
     generationStates.update((m) => {
         const next = new Map(m)
-        next.set(chatKey, { generationId, kind, abortController })
+        next.set(chatKey, { generationId, kind, abortController, startedAt: Date.now() })
         return next
     })
     syncDoingChat()
@@ -89,10 +90,20 @@ export function setGenerationStage(_chatKey: string, stage: number): void {
 // restart the generation under the same key mid-send; they keep the pending
 // controller so the restarted entry re-adopts it. Terminal ends (the default)
 // drop it so it cannot be adopted by a later unrelated generation.
-export function endGeneration(chatKey: string, opts?: { keepPendingAbort?: boolean }): void {
+//
+// generationId / controller scope the end to its owner: a send that was
+// cancelled and wakes up later must not tear down the
+// entry of a NEWER generation that took the same chat key meanwhile. Returns
+// false when the entry belongs to someone else (nothing was touched).
+export function endGeneration(chatKey: string, opts?: { keepPendingAbort?: boolean, generationId?: string, controller?: AbortController }): boolean {
+    const entry = get(generationStates).get(chatKey)
+    if (entry && opts?.generationId && entry.generationId !== opts.generationId) return false
+    if (entry && opts?.controller && entry.abortController && entry.abortController !== opts.controller) return false
+    if (!entry && opts?.controller && pendingAborts.has(chatKey) && pendingAborts.get(chatKey) !== opts.controller) return false
     if (!opts?.keepPendingAbort) {
         pendingAborts.delete(chatKey)
     }
+    rebaseListeners.delete(chatKey)
     generationStates.update((m) => {
         if (!m.has(chatKey)) return m
         const next = new Map(m)
@@ -100,6 +111,7 @@ export function endGeneration(chatKey: string, opts?: { keepPendingAbort?: boole
         return next
     })
     syncDoingChat()
+    return true
 }
 
 // Blanket reset — replaces the old external `doingChat.set(false)` cleanup
@@ -120,7 +132,27 @@ export function endAllGenerations(): void {
     for (const key of [...pendingAborts.keys()]) {
         if (!survivors.has(key)) pendingAborts.delete(key)
     }
+    for (const key of [...rebaseListeners.keys()]) {
+        if (!survivors.has(key)) rebaseListeners.delete(key)
+    }
     syncDoingChat()
+}
+
+// A save conflict can replace the whole database (rebase on another device's
+// revision) while a send is streaming into it. The send pipeline addresses
+// its target by numeric character/chat index captured at start, so it must
+// re-resolve those against the new database or it would write into whatever
+// now sits at the old index. Listeners live as long as the generation entry.
+const rebaseListeners = new Map<string, () => void>()
+
+export function onDatabaseRebased(chatKey: string, listener: () => void): void {
+    rebaseListeners.set(chatKey, listener)
+}
+
+export function notifyDatabaseRebased(): void {
+    for (const listener of [...rebaseListeners.values()]) {
+        try { listener() } catch (e) { console.error('[Save] rebase listener failed', e) }
+    }
 }
 
 // Called by the UI right before sendChat, while the map entry does not exist

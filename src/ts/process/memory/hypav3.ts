@@ -14,10 +14,11 @@ import {
     type character,
     getDatabase,
     getCurrentCharacter,
+    getCurrentChat,
 } from "src/ts/storage/database.svelte";
 import { type OpenAIChat } from "../index.svelte";
 import { requestChatData } from "../request/request";
-import { resolveChatMaxResponseTokens } from "../request/modelPresetBinding";
+import { resolveChatMaxResponseTokens, resolveClassicModelId } from "../request/modelPresetBinding";
 import { isLocalNetworkUrl } from "src/ts/network/localNetwork";
 import { chatCompletion, unloadEngine } from "../webllm";
 import { hypaV3ProgressStore } from "src/ts/stores.svelte";
@@ -1709,11 +1710,10 @@ export async function summarize(oaiMessages: OpenAIChat[], isResummarize: boolea
     if (settings.summarizationModel === "subModel") {
         console.log(logPrefix, `Using ax model ${db.subModel} for summarization.`);
 
-        // Match requestChatDataMain's model resolution: when seperateModelsForAxModels
-        // is on, the 'memory' slot overrides db.subModel for this request.
-        const actualModel = (db.seperateModelsForAxModels && db.seperateModels?.memory)
-            ? db.seperateModels.memory
-            : db.subModel;
+        // Match requestChatDataMain's model resolution (a legacy model bound
+        // to the chat's memory slot included). A ModelPreset memory slot sends
+        // no classic request, so no local-network URL applies.
+        const actualModel = resolveClassicModelId(getCurrentChat(), 'memory');
         let subModelUrl = '';
         if (actualModel === 'reverse_proxy') {
             subModelUrl = db.forceReplaceUrl ?? '';

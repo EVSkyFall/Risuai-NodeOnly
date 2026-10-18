@@ -8,7 +8,7 @@ const fake = vi.hoisted(() => {
         lastBulkKeys: [] as string[],
     }
     let bulkRows: ((keys: string[]) => { key: string; value: Uint8Array | null }[]) | null = null
-    const holds = { read: null as Promise<void> | null, bulk: null as Promise<void> | null }
+    const holds = { read: null as Promise<void> | null, bulk: null as Promise<void> | null, write: null as Promise<void> | null }
     return { storageMap, counters, holds, get bulkRows() { return bulkRows }, set bulkRows(v) { bulkRows = v } }
 })
 
@@ -40,6 +40,9 @@ vi.mock('../globalApi.svelte', () => ({
             return rows
         },
         setItem: async (key: string, value: Uint8Array) => {
+            const hold = fake.holds.write
+            fake.holds.write = null
+            if (hold) await hold
             fake.storageMap.set(key, value)
         },
         removeItem: async (key: string) => {
@@ -82,6 +85,7 @@ beforeEach(() => {
     fake.bulkRows = null
     fake.holds.read = null
     fake.holds.bulk = null
+    fake.holds.write = null
 })
 
 describe('SafeLocalPluginStorage.getMany', () => {
@@ -202,4 +206,39 @@ describe('late storage reads', () => {
         expect(await pending).toEqual(['new', 'new'])
         expect(await store.getItem(key)).toBe('new')
     })
+})
+
+
+test('binary bulk reads preserve duplicate slots and cannot detach the cached buffer', async () => {
+    const storage = new SafeLocalPluginStorage()
+    const key = uniqueKey('binary-transfer')
+    await storage.setItem(key, { bytes: new Uint8Array([1, 2, 3]) })
+    const [one, two] = await storage.getMany<{ bytes: Uint8Array }>([key, key])
+    structuredClone(one, { transfer: [one.bytes.buffer] })
+    expect(one.bytes.byteLength).toBe(0)
+    expect([...two.bytes]).toEqual([1, 2, 3])
+    expect([...(await storage.getItem<{ bytes: Uint8Array }>(key)).bytes]).toEqual([1, 2, 3])
+})
+
+
+test('same-tick write submission cannot let a late bulk read replace the acknowledged value', async () => {
+    const key = uniqueKey('barrier-token-gap')
+    seed(key, 'old')
+    let releaseBulk!: () => void, releaseWrite!: () => void
+    fake.holds.bulk = new Promise<void>(r => { releaseBulk = r })
+    fake.holds.write = new Promise<void>(r => { releaseWrite = r })
+    const storage = new SafeLocalPluginStorage()
+    const read = storage.getMany([key])
+    const write = storage.setItem(key, 'new')
+    try {
+        await vi.waitFor(() => expect(fake.holds.bulk).toBeNull())
+        releaseWrite()
+        await write
+        releaseBulk()
+        expect(await read).toEqual(['new'])
+        expect(await storage.getItem(key)).toBe('new')
+    } finally {
+        releaseWrite(); releaseBulk()
+        await Promise.allSettled([read, write])
+    }
 })

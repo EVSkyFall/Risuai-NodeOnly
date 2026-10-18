@@ -532,8 +532,10 @@ async function processScriptFullInner(char:character|simpleCharacterArgument, da
             assetNames.push(...items.map((item) => item[0]))
         }
 
-        const processer = new HypaProcesser()
-        await raceAbort(() => (processer.addText(assetNames)), signal)
+        // The embedding index over every asset name is built only when a tag
+        // actually needs a fuzzy match — building it for each reply (asset
+        // tags or not) stalled replies on phones over a remote link.
+        let processer: HypaProcesser | null = null
         const matches = data.matchAll(assetRegex)
 
         for(const match of matches){
@@ -545,8 +547,20 @@ async function processScriptFullInner(char:character|simpleCharacterArgument, da
                     data = data.replaceAll(match[0], `{{${type}::${bestMatchCache.get(cacheKey)}}}`)
                 }
                 else if(!assetNames.includes(assetName)){
-                    const searched = await raceAbort(() => (processer.similaritySearch(assetName)), signal)
-                    const bestMatch = searched[0]
+                    let bestMatch: string | undefined
+                    try {
+                        if(!processer){
+                            processer = new HypaProcesser()
+                            await raceAbort(() => processer.addText(assetNames), signal)
+                        }
+                        bestMatch = (await raceAbort(() => processer.similaritySearch(assetName), signal))[0]
+                    } catch (error) {
+                        if (signal?.aborted) throw error
+                        // Embedding unavailable (model load / WebGPU / network):
+                        // keep the tag as written rather than block the reply.
+                        console.warn('[DynamicAssets] fuzzy match failed; leaving the tag as is', error)
+                        break
+                    }
                     if(bestMatch){
                         data = data.replaceAll(match[0], `{{${type}::${bestMatch}}}`)
                         bestMatchCache.set(cacheKey, bestMatch)

@@ -1,12 +1,12 @@
 import { get } from 'svelte/store';
-import { checkNullish, decryptBuffer, encryptBuffer, selectSingleFile } from '../util';
+import { checkNullish, decryptBuffer, encryptBuffer, parseToggleSyntax, selectSingleFile } from '../util';
 import { changeLanguage, language } from '../../lang';
 import { DEFAULT_CHAT_LOAD_ADDITIONAL_PAGES, DEFAULT_CHAT_LOAD_INITIAL_PAGES, normalizeChatLoadPages } from '../chatLoadPages';
 import type { RisuPlugin } from '../plugins/plugins.svelte';
 import type {triggerscript as triggerscriptMain} from '../process/triggers';
 import { downloadFile, saveAsset as saveImageGlobal } from '../globalApi.svelte';
 import { defaultAutoSuggestPrompt, defaultJailbreak, defaultMainPrompt } from './defaultPrompts';
-import { notifySuccess } from '../alert';
+import { notifySuccess, notifyWarning } from '../alert';
 import type { NAISettings } from '../process/models/nai';
 import { prebuiltNAIpresets, prebuiltPresets } from '../process/templates/templates';
 import { defaultColorScheme, type ColorScheme } from '../gui/colorscheme';
@@ -790,8 +790,21 @@ export function setDatabase(data:Database){
     data.saveSignatures ??= false
     data.nodeOnlyScrollButtonType ??= 'four'
     data.nodeOnlyHideRecentChats ??= false
+    data.nodeOnlyArchivedCharacters ??= []
+    data.nodeOnlyHideArchivedCharacters ??= false
+    data.nodeOnlyHiddenCharacterIds ??= []
+    // One-time migration: the global "show folder name in icon" toggle became
+    // a per-folder display mode. A truthy global value marks folders that
+    // have no mode yet as 'name' and is then cleared, so this never runs twice.
+    if (data.showFolderName && Array.isArray(data.characterOrder)) {
+        for (const entry of data.characterOrder) {
+            if (entry && typeof entry !== 'string' && !entry.nodeOnlyDisplay) entry.nodeOnlyDisplay = 'name'
+        }
+        data.showFolderName = false
+    }
     data.nodeOnlyRestoreLastChat ??= false
     data.nodeOnlyAutoCleanAssets ??= false
+    data.nodeOnlyTransferSizeWarning ??= true
     data.keepSessionAlive ??= 'off'
     data.localNetworkMode ??= false
     if (typeof data.localNetworkMode !== 'boolean') data.localNetworkMode = false
@@ -917,14 +930,15 @@ export function setCurrentChat(chat:Chat){
  * literals. Do NOT call for hydration placeholders or chats being restored with
  * their own mode.
  */
-export function newChatModelDefaults(): Partial<Pick<Chat, 'useModelPreset' | 'modelBinding' | 'memoryPresetId' | 'savedToggleValues'>> {
+export function newChatModelDefaults(): Partial<Pick<Chat, 'useModelPreset' | 'modelBinding' | 'memoryPresetId' | 'savedToggleValues' | 'savedToggleUnsetKeys'>> {
     const db = getDatabase()
     // New chats follow the character / global memory preset; chats without a
     // value are legacy and resolve from `supaMemory` instead (memoryPresets.ts).
     // A saved toggle default starts the chat pinned to those values.
-    const memory: Partial<Pick<Chat, 'memoryPresetId' | 'savedToggleValues'>> = { memoryPresetId: MEMORY_PRESET_DEFAULT }
+    const memory: Partial<Pick<Chat, 'memoryPresetId' | 'savedToggleValues' | 'savedToggleUnsetKeys'>> = { memoryPresetId: MEMORY_PRESET_DEFAULT }
     if (db.defaultToggleValues && !db.disableToggleBinding) {
         memory.savedToggleValues = structuredClone($state.snapshot(db.defaultToggleValues))
+        if (db.defaultToggleUnsetKeys) memory.savedToggleUnsetKeys = [...db.defaultToggleUnsetKeys]
     }
     if (!db.useModelPresetByDefault) return memory
     const def = db.defaultModelBinding
@@ -1000,6 +1014,19 @@ export function getToggleKeys(db:Database = getDatabase(), char:character = getC
     return parseToggleKeysFromTemplate(`${db.customPromptTemplateToggle ?? ''}\n${moduleToggleTemplate}`)
 }
 
+// For comparing only: a select bound to an unset value writes its first
+// option ('0') as soon as it renders, so unset cannot be told apart from '0'
+// there. Never written back — CBS reads unset as 'null', not '0'.
+export function getToggleUnsetValues(template:string):Record<string, string>{
+    const values:Record<string, string> = {}
+    for(const toggle of parseToggleSyntax(template)){
+        if(toggle.key && toggle.type === 'select'){
+            values[`toggle_${toggle.key}`] = '0'
+        }
+    }
+    return values
+}
+
 export function snapshotToggleValues(db:Database = getDatabase()):Record<string, string>{
     const values:Record<string, string> = {}
     for(const [key, value] of Object.entries(db.globalChatVariables)){
@@ -1022,13 +1049,18 @@ export function snapshotCurrentToggleValues(db:Database = getDatabase()):Record<
     return values
 }
 
-export function applyToggleValues(values:Record<string, string>, db:Database = getDatabase()):void{
+// Toggles the values do not name: a toggle preset is applied as a whole and
+// clears them (default). A chat's pin clears only the keys it recorded as
+// unset (`unsetKeys`); any other key is a toggle added after the pin (a newly
+// imported preset or module) and keeps its value — clearing those on every
+// chat entry lost them.
+export function applyToggleValues(values:Record<string, string>, db:Database = getDatabase(), { unsetKeys }: { unsetKeys?: readonly string[] } = {}):void{
     const keys = getToggleKeys(db)
-    // Apply current preset's keys (reset if not in saved values)
+    const clear = unsetKeys ? new Set(unsetKeys) : null
     for(const key of keys){
         const value = values[key]
         if(value === undefined){
-            delete db.globalChatVariables[key]
+            if(!clear || clear.has(key)) delete db.globalChatVariables[key]
             continue
         }
         db.globalChatVariables[key] = value
@@ -1041,17 +1073,27 @@ export function applyToggleValues(values:Record<string, string>, db:Database = g
     }
 }
 
+// What a pin (or the default) records: the current toggle values, and the
+// current template's keys that are unset so loading the pin can clear them.
+export function snapshotToggleBinding(db:Database = getDatabase()):{ values: Record<string, string>, unsetKeys: string[] }{
+    const values = snapshotToggleValues(db)
+    const unsetKeys = getToggleKeys(db).filter((key) => values[key] === undefined)
+    return { values, unsetKeys }
+}
+
 export function saveTogglesToChat():void{
     if(getDatabase().disableToggleBinding) return
     const chat = getCurrentChat()
     if(!chat) return
-    chat.savedToggleValues = snapshotToggleValues()
+    const { values, unsetKeys } = snapshotToggleBinding()
+    chat.savedToggleValues = values
+    chat.savedToggleUnsetKeys = unsetKeys
 }
 
 export function loadTogglesFromChat(chat:Chat):void{
     if(getDatabase().disableToggleBinding) return
     if(!chat?.savedToggleValues) return
-    applyToggleValues(chat.savedToggleValues)
+    applyToggleValues(chat.savedToggleValues, getDatabase(), { unsetKeys: chat.savedToggleUnsetKeys ?? [] })
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1539,6 +1581,8 @@ export interface Database{
     defaultModelBinding?: ModelBindingSet
     /** Toggle values (`toggle_*`) new chats start pinned to. Absent => new chats start unpinned as before. */
     defaultToggleValues?: Record<string, string>
+    /** Toggle keys that were unset when `defaultToggleValues` was saved (see `savedToggleUnsetKeys`). */
+    defaultToggleUnsetKeys?: string[]
     // Global model-mode lock. 'legacy'/'preset' force every chat into that
     // regime (the per-chat dropdown is hidden); 'none' lets each chat decide,
     // falling back to useModelPresetByDefault for chats that never chose. Read
@@ -1659,6 +1703,17 @@ export interface Database{
     dynamicModelRegistry?:boolean
     nodeOnlyScrollButtonType?:'four'|'two'|'off'
     nodeOnlyHideRecentChats?:boolean
+    // Deactivated characters (src/ts/characterArchive.ts). Their bodies live
+    // server-side in kv archive/<chaId>/<archivedAt>; only these stubs stay in the database
+    // so the lists can render them in place. Never exposed to plugins.
+    nodeOnlyArchivedCharacters?:ArchivedCharacterStub[]
+    // Hide deactivated characters from the character lists (the storage
+    // dashboard still lists them).
+    nodeOnlyHideArchivedCharacters?:boolean
+    // Characters hidden from the sidebar rail (display only, no data impact;
+    // the character manager still lists them). chaIds, kept at DB level so
+    // the flag survives deactivation and never rides along in .charx exports.
+    nodeOnlyHiddenCharacterIds?:string[]
     // Reopen the last active character on boot instead of landing on Home.
     // Default OFF — an unexpected jump into a chat surprises users who open
     // the app to browse. Toggled in accessibility settings (Others tab).
@@ -1668,6 +1723,10 @@ export interface Database{
     // unrecoverable, so orphan removal is a deliberate act from the storage
     // dashboard instead. Remote-character caches are swept regardless.
     nodeOnlyAutoCleanAssets?:boolean
+    // Main-menu banner when the full-write payload passes the recommended size
+    // (transferSize.ts). Default ON; servers reached without a body-size cap
+    // (no Cloudflare in front, etc.) can turn it off. The dashboard row stays.
+    nodeOnlyTransferSizeWarning?:boolean
     // Route main-chat model-preset requests through server-side jobs
     // (/api/model-jobs) so generation survives client disconnects.
     // Default OFF (undefined is falsy) — no migration needed. Toggled in
@@ -1731,6 +1790,26 @@ export interface loreBook{
     bookVersion?:number
     id?:string
     folder?:string
+}
+
+/** Stub kept in `nodeOnlyArchivedCharacters` for a deactivated character. Built by the server (/api/characters/:chaId/archive). */
+export interface ArchivedCharacterStub{
+    chaId: string
+    name: string
+    image: string
+    nickname?: string
+    tags: string[]
+    creation_date?: number
+    lastInteraction: number
+    archivedAt: number
+    /** Set when the character sits in the trash (trash = deactivated + this marker). Exported as `trashTime`. */
+    trashedAt?: number
+    /** Folder the character sat in when it went to the trash; restoring puts it back there if the folder still exists. */
+    trashedFromFolder?: string
+    /** Encoded payload size on the server. */
+    bytes: number
+    chatCount: number
+    chatIds: string[]
 }
 
 export interface character{
@@ -1907,6 +1986,10 @@ export function purgeUnsupportedGroupChats(db: Database): number {
     db.characters = db.characters.filter((char): char is character => (char as any)?.type !== 'group')
     if (db.characterOrder?.length) {
         const validIds = new Set(db.characters.map((char) => char.chaId))
+        // Deactivated characters keep their slot (and folder) in the order list.
+        for (const stub of db.nodeOnlyArchivedCharacters ?? []) {
+            if (stub?.chaId) validIds.add(stub.chaId)
+        }
         const nextOrder: (string | folder)[] = []
         for (const entry of db.characterOrder) {
             if (typeof entry === 'string') {
@@ -2110,6 +2193,19 @@ export interface folder{
     id:string
     imgFile?:string
     img?:string
+    // NodeOnly additive fields (ignored by upstream). How the rail slot is
+    // drawn: 'icon' (nodeOnlyIcon or the default glyph), 'image' (imgFile) or
+    // 'name'. Missing → 'image' when imgFile is set, else 'icon'.
+    nodeOnlyDisplay?:FolderDisplayMode
+    nodeOnlyIcon?:string
+}
+
+export type FolderDisplayMode = 'icon' | 'image' | 'name'
+
+/** Resolve a folder's display mode, tolerating folders written before the field existed. */
+export function folderDisplayMode(f: folder): FolderDisplayMode {
+    if (f.nodeOnlyDisplay === 'icon' || f.nodeOnlyDisplay === 'image' || f.nodeOnlyDisplay === 'name') return f.nodeOnlyDisplay
+    return f.imgFile ? 'image' : 'icon'
 }
 
 
@@ -2272,6 +2368,13 @@ export interface Chat{
     /** Memory preset id, 'off' or 'default' (inherit). Absent => derived from `supaMemory`. */
     memoryPresetId?: string
     savedToggleValues?: Record<string, string>
+    /**
+     * Toggle keys of the template that were unset when `savedToggleValues`
+     * was pinned; loading the pin clears them. Keys in neither (a toggle added
+     * after the pin) keep their current value. Absent on pins made before
+     * 1.14 — those leave every unnamed key as it is.
+     */
+    savedToggleUnsetKeys?: string[]
     // P4 dual-regime: per-chat model preset binding (plan v6 §7). useModelPreset
     // is the regime toggle; modelBinding (the bundle) persists across toggling so
     // it is restored on re-enable. Off (or absent) => classic global model path.
@@ -2632,11 +2735,16 @@ export function saveCurrentPreset(){
     if(db.botPresetsId === -1){
         return
     }
+    if(!Array.isArray(pres)){
+        pres = []
+    }
+    // The selected index can point past the list (#100). Every preset action
+    // saves first, so throwing here locked preset management for good. Keep
+    // the active settings as a new preset rather than overwrite another one.
+    const current = pres[db.botPresetsId]
     const savedPreset:botPreset =  {
-        id: pres[db.botPresetsId]?.id || uuidv4(),
-        // Out-of-bounds is a supported state below (the slot gets pushed as a
-        // new preset) — the name read must not be the one thing that crashes.
-        name: pres[db.botPresetsId]?.name ?? 'New Preset',
+        id: current?.id || uuidv4(),
+        name: current ? current.name : language.recoveredPresetName,
         apiType: db.apiType,
         openAIKey: db.openAIKey,
         localNetworkMode: db.localNetworkMode,
@@ -2701,10 +2809,10 @@ export function saveCurrentPreset(){
         customFlags: safeStructuredClone(db.customFlags),
         enableCustomFlags: db.enableCustomFlags,
         regex: db.presetRegex,
-        image: pres?.[db.botPresetsId]?.image ?? '',
+        image: current?.image ?? '',
         // Folder membership lives only on the stored preset (not mirrored to
         // top-level db fields), so carry it over or it is lost on every save.
-        folderId: pres?.[db.botPresetsId]?.folderId,
+        folderId: current?.folderId,
         reasonEffort: db.reasoningEffort ?? 0,
         thinkingTokens: db.thinkingTokens ?? null,
         thinkingType: db.thinkingType ?? 'budget',
@@ -2718,13 +2826,12 @@ export function saveCurrentPreset(){
         verbosity: db.verbosity ?? 1,
         dynamicOutput: db.dynamicOutput ?? null
     }
-    
-    if(!Array.isArray(pres)){
-        pres = []
-    }
-    //if out of bounds, create a new preset
-    if(db.botPresetsId >= pres.length){
+
+    if(!current){
+        console.warn('[Preset] Active preset index has no preset; saving current settings as a new preset', { botPresetsId: db.botPresetsId, length: pres.length })
         pres.push(savedPreset)
+        db.botPresetsId = pres.length - 1
+        notifyWarning(language.recoveredPresetNotice)
     }
     else{
         pres[db.botPresetsId] = savedPreset
@@ -2748,7 +2855,11 @@ export function changeToPreset(id =0, savecurrent = true){
     }
     let db = getDatabase()
     let pres = db.botPresets
-    const newPres = pres[id]
+    const newPres = pres?.[id]
+    if(!newPres){
+        console.warn('[Preset] changeToPreset target has no preset', { id, length: pres?.length })
+        return
+    }
     db.botPresetsId = id
     db = setPreset(db, newPres)
     const chat = getCurrentChat()

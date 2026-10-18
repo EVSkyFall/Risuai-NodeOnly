@@ -642,6 +642,8 @@ export class MCPClient{
             }
         }
 
+        // A fresh login relays the authorization code through RisuAI's account
+
         const OauthDiscovery = new URL(this.url)
         OauthDiscovery.pathname = "/.well-known/oauth-authorization-server"
         const oauthResponse = await fetchNative(OauthDiscovery.toString(), {

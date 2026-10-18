@@ -1,3 +1,4 @@
+import { migrateLegacyTrash } from "./characterArchive";
 import { changeFullscreen, checkNullish } from "./util"
 import { installDynamicViewportHeight } from "./viewportHeight"
 import { v4 as uuidv4 } from 'uuid';
@@ -7,9 +8,10 @@ import { chatDraftKey, sweepOrphanDrafts } from "./storage/chatDraft";
 import { checkRisuUpdate } from "./update";
 import { fetchPublicStats } from "./publicStats";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, DBState, LoadingStatusState, bootBackupPromptStore } from "./stores.svelte";
+import { recordDbTransferSize } from "./transferSize";
 import { loadPlugins } from "./plugins/plugins.svelte";
 import { pluginBlobKv } from "./plugins/pluginKvStorage";
-import { alertError, alertMd, alertTOS, waitAlert, alertConfirm, alertInput } from "./alert";
+import { alertError, alertMd, waitAlert, alertConfirm, alertInput } from "./alert";
 import { characterURLImport } from "./characterCards";
 import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from "./storage/defaultPrompts";
 import { decodeRisuSave, encodeRisuSaveLegacy } from "./storage/risuSave";
@@ -59,6 +61,10 @@ export async function loadData() {
                     // both call sites briefly held two full DB copies at boot.
                     setPatchSyncBaseline(decoded)
                     setDatabase(decoded)
+                    // /api/read serves the chat-stripped blob — the same shape a
+                    // full write sends — so its length is a first estimate of the
+                    // transfer size until the first save measures the real payload.
+                    if (!createdFreshDatabase) recordDbTransferSize(gotStorage.byteLength, 'boot')
                 } catch (error) {
                     console.error(error)
                     const backups = await getDbBackups()
@@ -236,13 +242,6 @@ export async function loadData() {
             // Installs the return triggers (visibility / online) and runs the
             // first pass. Fire-and-forget — never throws, no-op without jobs.
             initModelJobRecovery()
-            if (import.meta.env.VITE_RISU_TOS === 'TRUE') {
-                alertTOS().then((a) => {
-                    if (a === false) {
-                        location.reload()
-                    }
-                })
-            }
         } catch (error) {
             alertError(error)
         }
@@ -530,16 +529,15 @@ async function checkNewFormat(): Promise<void> {
     if (db.mainPrompt === oldJailbreak) {
         db.mainPrompt = defaultJailbreak;
     }
-    for (let i = 0; i < db.characters.length; i++) {
-        const trashTime = db.characters[i].trashTime;
-        const targetTrashTime = trashTime ? trashTime + 1000 * 60 * 60 * 24 * 3 : 0;
-        if (trashTime && targetTrashTime < Date.now()) {
-            db.characters.splice(i, 1);
-            i--;
-        }
-    }
+    // The trash no longer expires: trashed characters are deactivated (kept
+    // server-side) and stay until the user deletes them. Legacy live trash
+    // (`trashTime` on a character) is migrated to that shape shortly after
+    // boot, best effort — see characterArchive.migrateLegacyTrash.
     setDatabase(db);
     checkCharOrder();
+    if (db.characters.some((c) => c?.trashTime)) {
+        setTimeout(() => { void migrateLegacyTrash() }, 5000);
+    }
 
     // One-pass cleanup of composer drafts whose chat no longer exists (deleted
     // chats/characters, trash purge, plugin/script removals). Replaces per-delete
@@ -550,6 +548,11 @@ async function checkNewFormat(): Promise<void> {
         for (const chat of char.chats ?? []) {
             if (chat?.id) validDraftKeys.add(chatDraftKey(char.chaId, chat.id));
         }
+    }
+    // Deactivated characters keep their chats server-side; their drafts stay too.
+    for (const stub of db.nodeOnlyArchivedCharacters ?? []) {
+        if (!stub?.chaId) continue;
+        for (const id of stub.chatIds ?? []) validDraftKeys.add(chatDraftKey(stub.chaId, id));
     }
     void sweepOrphanDrafts(validDraftKeys);
 }

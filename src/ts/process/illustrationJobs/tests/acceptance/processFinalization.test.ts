@@ -165,6 +165,7 @@ vi.mock('src/ts/model/modellist', () => ({
     LLMFlags: { hasImageInput: 'hasImageInput' },
 }))
 vi.mock('src/ts/process/request/modelPresetBinding', () => ({
+    resolveClassicModelId: vi.fn(() => undefined),
     resolveChatModelBinding: vi.fn(() => ({ kind: 'legacy' })),
     resolvePresetMaxOutputTokens: vi.fn(() => undefined),
 }))

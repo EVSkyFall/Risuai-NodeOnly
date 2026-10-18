@@ -5,7 +5,7 @@
     // three backends a plugin can write to:
     //   - save:  pluginCustomKv / plugin-custom-storage (normal pluginStorage)
     //   - local: localStorage `safe_plugin_*`  (device-local, strings only)
-    //   - idb:   SafeLocalPluginStorage  (IndexedDB, device-local, JSON)
+    //   - idb:   SafeLocalPluginStorage  (server KV, JSON or binary)
     // Origin plugin is best-effort: new V3 writes are tagged into a sidecar
     // meta store (pluginStorageMeta), but legacy/V2 keys have no record and show
     // as unknown. Edit/delete are allowed directly, guarded by confirm.
@@ -38,6 +38,8 @@
         type PluginStorageValuePreview,
     } from 'src/ts/plugins/pluginStorageViewer'
     import { language } from 'src/lang'
+    import { describePluginStorageValue, type PluginStorageDisplay } from './pluginStorageDisplay'
+    import { isLocalPluginStorageJsonEditable } from 'src/ts/plugins/localPluginStorageValue'
 
     type BackendId = PluginStorageViewerBackend
 
@@ -49,6 +51,7 @@
         size: number | null
         type: string
         owner?: string
+        display?: PluginStorageDisplay
     }
 
     interface DetailState extends PluginStorageDetailGuard, PluginStorageValuePreview {}
@@ -250,6 +253,16 @@
                 || selected?.key !== entry.key
             ) return
             const preview = createBoundedValuePreview(raw)
+            if (requestedBackend === 'idb' && !isLocalPluginStorageJsonEditable(raw)) {
+                const display = describePluginStorageValue(raw, value => createBoundedValuePreview(value).text)
+                entry.display = display
+                entry.type = display.type
+                entry.size = display.binarySize ? display.size : entry.size
+                preview.text = display.str
+                preview.type = display.type
+                preview.editable = false
+                preview.totalCharsExact = false
+            }
             detailState = {
                 ...preview,
                 backend: requestedBackend,
@@ -590,7 +603,10 @@
                      information — the real type is resolved in the detail dialog. -->
                 {#if entry.type && entry.type !== 'unknown'}
                     <span class="text-textcolor2 text-[10px] uppercase tracking-wide shrink-0 opacity-70">{entry.type}</span>
+                {:else}
+                    <span class="text-textcolor2 text-xs">{language.pluginStorageNotLoaded}</span>
                 {/if}
+                {#if entry.display?.mimeType}<span class="text-textcolor2 text-xs">{entry.display.mimeType}</span>{/if}
                 <span class="text-textcolor2 text-xs shrink-0 tabular-nums"
                     title={entry.size === null ? language.pluginStorageSizeUnknown : undefined}>{formatSize(entry.size)}</span>
                 <button
@@ -615,7 +631,10 @@
     {#if selected}
         <div class="flex flex-wrap gap-x-6 gap-y-1 text-xs mb-3">
             <span class="text-textcolor2">{language.pluginStorageMetaType}: <span class="text-textcolor font-mono">{detailState?.type ?? selected.type}</span></span>
-            <span class="text-textcolor2">{language.pluginStorageMetaSize}: <span class="text-textcolor font-mono">{detailState ? detailSize() : formatSize(selected.size)}</span></span>
+            <span class="text-textcolor2">{selected.display?.binarySize ? language.pluginStorageMetaBinarySize : language.pluginStorageMetaSize}: <span class="text-textcolor font-mono">{selected.display?.binarySize ? formatSize(selected.display.size) : detailState ? detailSize() : formatSize(selected.size)}</span></span>
+            {#if selected.display?.mimeType}<span>{language.pluginStorageMetaMime}: {selected.display.mimeType}</span>{/if}
+            {#if selected.display?.fileName !== undefined}<span>{language.pluginStorageMetaFileName}: {selected.display.fileName}</span>{/if}
+            {#if !selected.display?.binarySize}
             <span class="text-textcolor2">
                 {language.pluginStorageMetaChars}:
                 <span class="text-textcolor font-mono">
@@ -624,6 +643,7 @@
                         : '—'}
                 </span>
             </span>
+            {/if}
             <span class="text-textcolor2">{language.pluginStorageOwner}: <span class="text-textcolor font-mono">{selected.owner ?? language.pluginStorageOwnerUnknown}</span></span>
         </div>
 

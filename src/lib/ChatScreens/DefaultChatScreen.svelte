@@ -11,7 +11,7 @@
     import { tick, untrack } from 'svelte';
     import Chat from "./Chat.svelte";
     import { getAdditionalChatLoadPages, getInitialChatLoadPages } from 'src/ts/chatLoadPages';
-    import { type Chat as ChatData, type Message } from "../../ts/storage/database.svelte";
+    import { type Chat as ChatData, type Message, loadTogglesFromChat } from "../../ts/storage/database.svelte";
     import { DBState } from 'src/ts/stores.svelte';
     import { getCharImage } from "../../ts/characters";
     import { chatProcessStage, sendChat } from "../../ts/process/index.svelte";
@@ -19,7 +19,7 @@
     import { raceAbort, throwIfAborted } from "../../ts/process/abort";
     import { abortGeneration, chatGenKey, endGeneration, generationStates, registerAbort, startGeneration } from "../../ts/process/generationState";
     import { clearPendingSend, resumableSends, resumePendingSend, takeResumable } from "../../ts/process/request/pendingSends";
-    import { ensureCurrentChatReady } from "../../ts/storage/chatStorage";
+    import { chatLoadFailures, ensureCurrentChatReady } from "../../ts/storage/chatStorage";
     import { sleep } from "../../ts/util";
     import { language } from "../../lang";
     import { isExpTranslator, translate } from "../../ts/translator/translator";
@@ -163,6 +163,18 @@ import { isMobile } from 'src/ts/platform'
         if (!chat) return null
         if (!chat._placeholder) return chat
         return await ensureCurrentChatReady(char.chats, char.chatPage, char.chaId)
+    }
+
+    // The load that failed never applied this chat's saved toggles (the
+    // select/change paths do that only on success), so apply them here.
+    async function retryChatLoad() {
+        const char = DBState.db.characters[$selectedCharID]
+        const chatId = char?.chats[char.chatPage]?.id
+        const hydrated = await ensureActiveChatReady().catch(() => null)
+        const now = DBState.db.characters[$selectedCharID]
+        if (hydrated && now?.chaId === char?.chaId && now?.chats[now.chatPage]?.id === chatId) {
+            loadTogglesFromChat(hydrated)
+        }
     }
 
     function scrollToBottom() {
@@ -604,7 +616,11 @@ import { isMobile } from 'src/ts/platform'
             console.error(error)
             alertError(error)
         }
-        endGeneration(genKey)
+        // Owner-scoped: after cancellation this send may
+        // conclude long after a newer send took the chat; leave that one alone.
+        if(!endGeneration(genKey, { controller: abortController })){
+            return generated
+        }
         // Send concluded on THIS client (success, failure or abort alike) —
         // drop the resumable-send tombstone so no later boot re-runs it.
         if (chatId && generationId) clearPendingSend(chatId, generationId)
@@ -757,23 +773,42 @@ import { isMobile } from 'src/ts/platform'
             // multiline until the input is fully cleared. Reflow is therefore a
             // one-way latch (cleared only on empty), so the layout toggle can never
             // feed back into the width measurement and flip-flop 1↔2 lines.
+            // Locals instead of re-reading the state just written: a state the
+            // effect read and then changed makes it run (and measure) again.
+            let isMultiline = multiline
+            let inlineHeight: number | undefined
             if(messageInput === ''){
-                multiline = false
-            } else if(!multiline && measureHeightAt(ref) > 50){
-                multiline = true
+                isMultiline = false
+            } else if(!isMultiline){
+                inlineHeight = measureHeightAt(ref)
+                if(inlineHeight > 50) isMultiline = true
             }
-            // Height for the width that will actually be shown.
-            const sh = measureHeightAt(multiline ? "100%" : ref)
+            multiline = isMultiline
+            // Height for the width that will actually be shown; a composer that
+            // stays inline already measured it above.
+            const sh = isMultiline ? measureHeightAt("100%") : (inlineHeight ?? measureHeightAt(ref))
             // Cap the composer at ~60% of the viewport; beyond that it scrolls.
             const maxH = Math.round(window.innerHeight * 0.6)
-            inputHeight = Math.min(sh, maxH) + "px"
-            inputEle.style.height = inputHeight
+            const height = Math.min(sh, maxH) + "px"
+            inputHeight = height
+            inputEle.style.height = height
             inputOverflow = sh > maxH
         }
     }
 
-    $effect.pre(() => {
-        updateInputSizeAll()
+    // Typing reaches the composer through bind:value, so this effect is the
+    // one place a keystroke measures it (an extra call in oninput measured the
+    // same text twice, translate box included). It runs after the DOM update:
+    // text set from code (a translation, an inserted sticker or file) is only
+    // in the textarea by then, and a pre-effect measured the old text.
+    $effect(() => {
+        updateInputSize()
+    });
+    // The translate box is measured after its DOM value updates, which covers
+    // both typing in it and a translation written into it.
+    $effect(() => {
+        messageInputTranslate
+        if(inputTranslateEle) untrack(() => updateInputTranslateSize())
     });
 
     async function updateInputTransateMessage(reverse: boolean) {
@@ -1161,7 +1196,7 @@ import { isMobile } from 'src/ts/platform'
                             }
                         }
                     }}
-                          oninput={()=>{updateInputSizeAll();updateInputTransateMessage(false)}}
+                          oninput={()=>{updateInputTransateMessage(false)}}
                           onblur={persistDraftNow}
                           style:height={inputHeight}
                 ></textarea>
@@ -1218,7 +1253,7 @@ import { isMobile } from 'src/ts/platform'
                                 e.preventDefault()
                             }
                         }}
-                              oninput={()=>{updateInputSizeAll();updateInputTransateMessage(true)}}
+                              oninput={()=>{updateInputTransateMessage(true)}}
                               placeholder={language.enterMessageForTranslateToEnglish}
                               style:height={inputTranslateHeight}
                     ></textarea>
@@ -1323,9 +1358,19 @@ import { isMobile } from 'src/ts/platform'
             {/if}
 
             {#if !currentChatReady}
-                <div class="w-full flex justify-center text-textcolor2 italic mb-12">
-                    {language.loadingChatData}
-                </div>
+                {@const loadFailure = $chatLoadFailures.get(`${currentCharacter?.chaId}/${currentChatSlot?.id}`)}
+                {#if loadFailure}
+                    <div role="alert" class="w-full flex flex-col items-center gap-2 text-textcolor2 mb-12 px-4 text-center">
+                        <span>{loadFailure === 'missing' ? language.errors.chatBodyMissing : language.errors.chatLoadFailed}</span>
+                        <Button size="sm" onclick={() => { void retryChatLoad() }}>
+                            {language.errors.chatLoadRetry}
+                        </Button>
+                    </div>
+                {:else}
+                    <div class="w-full flex justify-center text-textcolor2 italic mb-12">
+                        {language.loadingChatData}
+                    </div>
+                {/if}
             {:else}
 
             {#if chatFoldedStateMessageIndex.index !== -1}

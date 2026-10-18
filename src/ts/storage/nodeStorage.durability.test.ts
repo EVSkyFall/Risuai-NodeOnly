@@ -164,3 +164,44 @@ test.each([
     await vi.advanceTimersByTimeAsync(1)
     expect(fetch).toHaveBeenCalledTimes(2)
 })
+
+
+test('delta fallback, direct full and strict saves share one queue and retain durable ACK', async () => {
+    const { createChatDeltaSync } = await import('./chatDeltaSync')
+    const { encodeRisuSaveLegacy } = await import('./risuSave')
+    vi.mocked(encodeRisuSaveLegacy).mockImplementation(() => new Uint8Array([1]) as any)
+    const s = storage()
+    s.authChecked = true
+    vi.spyOn(s, 'createAuth').mockResolvedValue('synthetic')
+    let release!: () => void
+    let entered!: () => void
+    const started = new Promise<void>(r => { entered = r })
+    const order: string[] = []
+    let hold = false
+    vi.spyOn(s as any, 'authFetch').mockImplementation(async (_url: any, init: RequestInit) => {
+        const h = new Headers(init.headers)
+        const kind = h.has('x-chat-base-count') ? 'delta' : h.get('x-strict-flush') === '1' ? 'strict' : 'full'
+        order.push(kind)
+        if (kind === 'delta' && hold) { entered(); await new Promise<void>(r => { release = r }); return json(409, { code: 'CHAT_DELTA_BASE_MISMATCH' }) }
+        return json(200, kind === 'strict' ? { success: true, durable: true } : { success: true })
+    })
+    const sync = createChatDeltaSync({
+        enqueueChatSave: (chaId, chatId, save) => s.enqueueChatSave(chaId, chatId, save),
+        fetchChatContentDelta: async () => null,
+        saveChatContentDelta: (...args) => s.saveChatContentDeltaUnqueued(...args),
+    }, { get: async () => null, put: async () => {} })
+    const chat: any = { id: 'x', message: [{ role: 'user', data: 'old' }] }
+    await sync.saveChat('c', 0, 'x', chat)
+    order.length = 0
+    hold = true
+    const delta = sync.saveChat('c', 0, 'x', { ...chat, message: [...chat.message, { role: 'char', data: 'new' }] })
+    await started
+    const full = s.saveChatContent('c', 0, 'x', chat)
+    const strict = s.saveChatContentStrict('c', 0, 'x', chat)
+    await Promise.resolve()
+    expect(order).toEqual(['delta'])
+    release()
+    await Promise.all([delta, full])
+    await expect(strict).resolves.toEqual({ success: true, durable: true })
+    expect(order).toEqual(['delta', 'full', 'full', 'strict'])
+})

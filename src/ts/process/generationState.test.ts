@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { get } from 'svelte/store'
 import {
     abortGeneration,
@@ -211,3 +211,39 @@ describe('syncDoingChat', () => {
         expect(get(doingChat)).toBe(true)
     })
 })
+
+describe('owner-scoped endGeneration', () => {
+    it('ignores an end from a generation that no longer owns the key', () => {
+        startGeneration('c1', 'new')
+        expect(endGeneration('c1', { generationId: 'old' })).toBe(false)
+        expect(isChatGenerating('c1')).toBe(true)
+        expect(endGeneration('c1', { generationId: 'new' })).toBe(true)
+        expect(isChatGenerating('c1')).toBe(false)
+    })
+
+    it('ignores an end from a caller whose controller is not the registered one', () => {
+        const oldCtl = new AbortController()
+        const newCtl = new AbortController()
+        registerAbort('c1', newCtl)
+        startGeneration('c1', 'g-new')
+        expect(endGeneration('c1', { controller: oldCtl })).toBe(false)
+        expect(isChatGenerating('c1')).toBe(true)
+        expect(endGeneration('c1', { controller: newCtl })).toBe(true)
+        expect(isChatGenerating('c1')).toBe(false)
+    })
+
+    it('does not drop a newer pending controller registered before its generation starts', () => {
+        const oldCtl = new AbortController()
+        const newCtl = new AbortController()
+        registerAbort('c1', newCtl)
+        expect(endGeneration('c1', { controller: oldCtl })).toBe(false)
+        startGeneration('c1', 'g-new')
+        expect(get(generationStates).get('c1')?.abortController).toBe(newCtl)
+    })
+
+    it('an owner end after the entry is gone still reports success', () => {
+        const ctl = new AbortController()
+        expect(endGeneration('c1', { controller: ctl })).toBe(true)
+    })
+})
+
