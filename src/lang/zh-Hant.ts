@@ -772,6 +772,8 @@ export const languageChineseTraditional = {
     "presetImported": "已匯入預設集",
     "presetDeleted": "已刪除預設集",
     "presetDeleteConfirm": "要刪除此預設集嗎？",
+    "recoveredPresetName": "已復原的預設集",
+    "recoveredPresetNotice": "找不到所選的提示詞預設集，已將目前設定儲存為「已復原的預設集」",
     "iconRemove": "移除圖示",
     "otherBots": "其他 Bot",
     "user": "使用者",
@@ -1919,6 +1921,8 @@ export const languageChineseTraditional = {
     "transferSizeWarningBody": "目前約為 {{size}}；透過遠端存取儲存時可能失敗。停用不再使用的角色可減少傳輸資料大小",
     "transferSizeOpenCharacterManager": "管理角色",
     "transferSizeDismiss": "本次工作階段不再顯示",
+    "transferSizeWarningToggle": "超過建議上限時在主畫面顯示警告",
+    "transferSizeWarningToggleDesc": "若連線方式沒有上傳大小限制，可以關閉。經過 Cloudflare（Quick Tunnel，或開啟代理的自有網域）時有 100 MB 上限，請保持開啟",
 
     // 系統頁面
     "system": "系統",
