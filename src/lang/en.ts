@@ -1940,6 +1940,9 @@ export const languageEnglish = {
     transferSizeWarningBody: "Currently about {{size}}; saving may fail over remote access. Deactivating characters you no longer use reduces the transfer data size.",
     transferSizeOpenCharacterManager: "Manage Characters",
     transferSizeDismiss: "Hide for this session",
+    transferSizeWarningToggle: "Warn on the main screen when over the recommended size",
+    transferSizeWarningToggleDesc:
+        "You can turn this off if your connection has no upload size limit. Anything behind Cloudflare (Quick Tunnel, or your own domain with the proxy on) is capped at 100 MB, so keep it on there.",
 
     // System page
     system: "System",

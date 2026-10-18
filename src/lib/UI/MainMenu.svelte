@@ -85,7 +85,7 @@
           </ShButton>
         </div>
       {/if}
-      {#if $dbTransferSizeStore.overLimit && !$transferSizeWarningDismissed}
+      {#if $dbTransferSizeStore.overLimit && DBState.db.nodeOnlyTransferSizeWarning !== false && !$transferSizeWarningDismissed}
         <div class="mt-4 w-full bg-yellow-900/30 border border-yellow-700/40 rounded-md px-4 py-3 flex items-center justify-between gap-3 flex-wrap text-yellow-300">
           <div class="flex items-start gap-2.5 min-w-0 flex-1">
             <TriangleAlertIcon class="size-4 shrink-0 mt-0.5 text-yellow-400" />

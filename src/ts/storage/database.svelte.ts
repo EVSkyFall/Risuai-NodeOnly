@@ -792,6 +792,7 @@ export function setDatabase(data:Database){
     }
     data.nodeOnlyRestoreLastChat ??= false
     data.nodeOnlyAutoCleanAssets ??= false
+    data.nodeOnlyTransferSizeWarning ??= true
     data.keepSessionAlive ??= 'off'
     data.localNetworkMode ??= false
     if (typeof data.localNetworkMode !== 'boolean') data.localNetworkMode = false
@@ -1669,6 +1670,10 @@ export interface Database{
     // unrecoverable, so orphan removal is a deliberate act from the storage
     // dashboard instead. Remote-character caches are swept regardless.
     nodeOnlyAutoCleanAssets?:boolean
+    // Main-menu banner when the full-write payload passes the recommended size
+    // (transferSize.ts). Default ON; servers reached without a body-size cap
+    // (no Cloudflare in front, etc.) can turn it off. The dashboard row stays.
+    nodeOnlyTransferSizeWarning?:boolean
     // Route main-chat model-preset requests through server-side jobs
     // (/api/model-jobs) so generation survives client disconnects.
     // Default OFF (undefined is falsy) — no migration needed. Toggled in

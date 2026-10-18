@@ -2106,6 +2106,9 @@ export const languageKorean = {
     "현재 약 {{size}}로, 원격 접속 시 저장이 실패할 수 있습니다. 사용하지 않는 캐릭터를 비활성화하면 전송 데이터 용량이 줄어듭니다.",
   transferSizeOpenCharacterManager: "캐릭터 관리",
   transferSizeDismiss: "이번 세션에서 숨기기",
+  transferSizeWarningToggle: "권장 크기를 넘으면 메인 화면에 경고 표시",
+  transferSizeWarningToggleDesc:
+    "업로드 크기 제한이 없는 방식으로 접속한다면 꺼도 됩니다. Cloudflare를 거치면(Quick Tunnel, 프록시를 켠 자체 도메인 포함) 100 MB 제한이 있으니 켜 두세요.",
 
   // 시스템 페이지
   system: "시스템",
