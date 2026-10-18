@@ -869,6 +869,8 @@ export const languageKorean = {
   presetImported: "프리셋을 불러왔습니다",
   presetDeleted: "프리셋을 삭제했습니다",
   presetDeleteConfirm: "이 프리셋을 삭제하시겠습니까?",
+  recoveredPresetName: "복구된 프리셋",
+  recoveredPresetNotice: "선택된 프롬프트 프리셋을 찾을 수 없어 현재 설정을 '복구된 프리셋'으로 저장했습니다.",
   iconRemove: "아이콘 삭제",
   otherBots: "기타 봇",
   user: "유저",

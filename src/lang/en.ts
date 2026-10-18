@@ -785,6 +785,8 @@ export const languageEnglish = {
     presetImported: "Preset imported",
     presetDeleted: "Preset deleted",
     presetDeleteConfirm: "Delete this preset?",
+    recoveredPresetName: "Recovered Preset",
+    recoveredPresetNotice: "The selected prompt preset was missing, so the current settings were saved as \"Recovered Preset\".",
     iconRemove: "Remove Icon",
     otherBots: "Other Bots",
     user: "User",

@@ -507,7 +507,7 @@
                     <span class="text-textcolor2 text-sm">{language.risuMDesc}</span>
                 {:else if $alertStore.submsg === 'preset'}
                     <span class="text-textcolor2 text-sm">{language.risupresetDesc}</span>
-                    {#if cardExportType2 === 'preset' && (DBState.db.botPresets[DBState.db.botPresetsId].image || DBState.db.botPresets[DBState.db.botPresetsId].regex?.length > 0)}
+                    {#if cardExportType2 === 'preset' && (DBState.db.botPresets[DBState.db.botPresetsId]?.image || DBState.db.botPresets[DBState.db.botPresetsId]?.regex?.length > 0)}
                         <span class="text-red-500 text-sm">Use RisuRealm to share the preset. Preset with image or regexes cannot be exported for now.</span>
                     {/if}
                 {:else}
