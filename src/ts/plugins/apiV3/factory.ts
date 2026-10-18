@@ -17,6 +17,7 @@ interface RpcMessage {
     result?: any;
     error?: string;
     abortId?: string;
+    relay?: 1;
 }
 
 interface RemoteRef {
@@ -487,9 +488,16 @@ await (async function() {
             const relays = [];
             try {
                 if (payload.args) payload.args = payload.args.map(serializeArg);
-                const transfers = new Set();
-                const message = portifyStreams({ type, reqId, ...payload }, relays, transfers);
-                send(message, [...transfers]);
+                const message = { type, reqId, ...payload };
+                try {
+                    send(message);
+                } catch (error) {
+                    if (error?.name !== 'DataCloneError') throw error;
+                    const transfers = new Set();
+                    const prepared = portifyStreams(message, relays, transfers);
+                    prepared.relay = 1;
+                    send(prepared, [...transfers]);
+                }
                 for (const relay of relays) relay.start();
             } catch (error) {
                 for (const relay of relays) relay.abandon(true);
@@ -514,7 +522,7 @@ await (async function() {
             if (req) {
                 if (data.error) req.reject(new Error(data.error));
                 else {
-                    try { req.resolve(deserializeResult(reviveStreamPorts(data.result))); }
+                    try { req.resolve(deserializeResult(data.relay === 1 ? reviveStreamPorts(data.result) : data.result)); }
                     catch (error) { req.reject(error); }
                 }
                 pendingRequests.delete(data.reqId);
@@ -545,7 +553,7 @@ await (async function() {
             const usedAbortIds = [];
             try {
                 if (!fn) throw new Error("Callback not found or released");
-                const deserializedArgs = reviveStreamPorts(data.args || []).map(function(a) {
+                const deserializedArgs = (data.relay === 1 ? reviveStreamPorts(data.args || []) : data.args || []).map(function(a) {
                     if (a && typeof a === 'object' && a.__type === 'ABORT_SIGNAL_REF') {
                         const controller = new AbortController();
                         abortControllers.set(a.abortId, controller);
@@ -567,9 +575,15 @@ await (async function() {
             const relays = [];
             let relayed = false;
             try {
-                const transfers = new Set();
-                response.result = portifyStreams(original, relays, transfers);
-                send(response, [...transfers]);
+                try {
+                    send(response);
+                } catch (error) {
+                    if (error?.name !== 'DataCloneError') throw error;
+                    const transfers = new Set();
+                    response.result = portifyStreams(original, relays, transfers);
+                    response.relay = 1;
+                    send(response, [...transfers]);
+                }
                 if (relays.length) {
                     relayed = true;
                     void Promise.all(relays.map((relay) => relay.finished)).then(cleanup);
@@ -581,6 +595,7 @@ await (async function() {
                     // Provider callbacks consume content as text when it is
                     // not a stream; keep that existing fallback contract.
                     response.result = await bufferStreams(original, original && original.content);
+                    delete response.relay;
                     send(response, collectTransferables(response));
                 } catch (err2) {
                     send({ type: 'CALLBACK_RETURN', reqId: data.reqId, error: 'plugin bridge transfer failed: ' + (err2 && err2.message || err2) });
@@ -817,9 +832,15 @@ export class SandboxHost {
                         // rejects the promise but would leak the pendingCallbacks entry.
                         const relays: StreamRelay[] = [];
                         try {
-                            const transfers = new Set<Transferable>();
-                            const prepared = this.streamBridge.portifyStreams(message, relays, transfers);
-                            this.iframe.contentWindow.postMessage(prepared, '*', [...transfers]);
+                            try {
+                                this.iframe.contentWindow.postMessage(message, '*', []);
+                            } catch (error) {
+                                if ((error as Error)?.name !== 'DataCloneError') throw error;
+                                const transfers = new Set<Transferable>();
+                                const prepared = this.streamBridge.portifyStreams(message, relays, transfers);
+                                prepared.relay = 1;
+                                this.iframe.contentWindow.postMessage(prepared, '*', [...transfers]);
+                            }
                             for (const relay of relays) relay.start();
                         } catch (e) {
                             for (const relay of relays) relay.abandon(true);
@@ -901,7 +922,7 @@ export class SandboxHost {
                 if (req) {
                     if (data.error) req.reject(new Error(data.error));
                     else {
-                        try { req.resolve(this.streamBridge.reviveStreamPorts(data.result)); }
+                        try { req.resolve(data.relay === 1 ? this.streamBridge.reviveStreamPorts(data.result) : data.result); }
                         catch (error) { req.reject(error); }
                     }
                     this.pendingCallbacks.delete(data.reqId!);
@@ -934,7 +955,7 @@ export class SandboxHost {
                 };
                 try {
 
-                    const args = this.deserializeArgs(this.streamBridge.reviveStreamPorts(data.args || []), usedAbortIds);
+                    const args = this.deserializeArgs(data.relay === 1 ? this.streamBridge.reviveStreamPorts(data.args || []) : data.args || [], usedAbortIds);
                     let result: any;
 
 
@@ -960,14 +981,21 @@ export class SandboxHost {
                 const original = response.result;
                 try {
                     try {
-                        const transfers = new Set<Transferable>();
-                        response.result = this.streamBridge.portifyStreams(original, relays, transfers);
-                        this.iframe.contentWindow!.postMessage(response, '*', [...transfers]);
+                        try {
+                            this.iframe.contentWindow!.postMessage(response, '*', []);
+                        } catch (error) {
+                            if ((error as Error)?.name !== 'DataCloneError') throw error;
+                            const transfers = new Set<Transferable>();
+                            response.result = this.streamBridge.portifyStreams(original, relays, transfers);
+                            response.relay = 1;
+                            this.iframe.contentWindow!.postMessage(response, '*', [...transfers]);
+                        }
                     } catch (error) {
                         // Pumps have not started: release the readers before
                         // buffering, so fallback cannot lose any body bytes.
                         for (const relay of relays) relay.abandon();
                         response.result = await this.streamBridge.bufferStreams(original);
+                        delete response.relay;
                         this.iframe.contentWindow!.postMessage(response, '*', this.collectTransferables(response));
                         return;
                     }

@@ -38,6 +38,8 @@ function hostHarness(api: any, failPost?: (message: any) => void, Host = Sandbox
     let guestHandler: (event: any) => void;
     const guestEvents = new Map<string, () => void>();
     const answers: any[] = [];
+    const hostPosts: { message: any, transfer: Transferable[] }[] = [];
+    const guestPosts: { message: any, transfer: Transferable[] }[] = [];
     class Frame {
         style = {};
         sandbox = { add() {} };
@@ -51,6 +53,7 @@ function hostHarness(api: any, failPost?: (message: any) => void, Host = Sandbox
         }
         contentWindow = {
             postMessage(message: any, _origin: string, transfer: Transferable[] = []) {
+                hostPosts.push({ message: { ...message }, transfer: [...transfer] });
                 failPost?.(message);
                 const received = structuredClone(message, { transfer });
                 answers.push(received);
@@ -69,10 +72,11 @@ function hostHarness(api: any, failPost?: (message: any) => void, Host = Sandbox
     host.run(frame as unknown as HTMLIFrameElement, '');
     const dispatch = (data: any) => handler({ source: frame.contentWindow, data });
     return {
-        host, frame, answers, dispatch,
+        host, frame, answers, dispatch, hostPosts, guestPosts,
         controllers: (host as any).abortControllers as Map<string, AbortController>,
         async guest(script = GUEST_BRIDGE_SCRIPT, failSend?: (message: any) => void) {
             const guestWindow: any = {
+                walkCalls: 0,
                 postMessage() {},
                 addEventListener(name: string, fn: any) {
                     if (name === 'message') guestHandler = fn;
@@ -80,6 +84,7 @@ function hostHarness(api: any, failPost?: (message: any) => void, Host = Sandbox
                 },
                 parent: {
                     postMessage(message: any, _origin: string, transfer: Transferable[] = []) {
+                        guestPosts.push({ message: { ...message }, transfer: [...transfer] });
                         failSend?.(message);
                         const data = structuredClone(message, { transfer });
                         queueMicrotask(() => { void dispatch(data); });
@@ -87,6 +92,7 @@ function hostHarness(api: any, failPost?: (message: any) => void, Host = Sandbox
                 }
             };
             const instrumented = script
+                .replace(/function mapValue[^\n]*\{/, '$& window.walkCalls++;')
                 .replace('const abortControllers = new Map();', 'const abortControllers = new Map(); window.controllers = abortControllers;')
                 .replace('const pendingRequests = new Map();', 'const pendingRequests = new Map(); window.pendingRequests = pendingRequests;');
             await new Function('window', 'return (async () => {' + instrumented + '})()')(guestWindow);
@@ -94,6 +100,7 @@ function hostHarness(api: any, failPost?: (message: any) => void, Host = Sandbox
                 api: guestWindow.Risuai,
                 controllers: guestWindow.controllers as Map<string, AbortController>,
                 pendingRequests: guestWindow.pendingRequests as Map<string, unknown>,
+                get walkCalls() { return guestWindow.walkCalls as number; },
                 teardown: (event: string) => guestEvents.get(event)?.()
             };
         }
@@ -384,8 +391,10 @@ describe('SandboxHost RESPONSE lifecycle', () => {
         });
         const harness = hostHarness({ fetch: () => new Response(bytes([0, 255], [128, 9]), { status: 201, statusText: 'Created', headers: { 'x-test': 'kept' } }) }, post);
         await harness.dispatch(call('fetch', abortArgs));
-        expect(post).toHaveBeenCalledTimes(2);
+        expect(post).toHaveBeenCalledTimes(3);
         expect(harness.answers).toHaveLength(1);
+        expect(harness.hostPosts.map(({ message }) => message.relay)).toEqual([undefined, 1, undefined]);
+        expect(harness.answers[0]).not.toHaveProperty('relay');
         const result = harness.answers[0].result;
         expect(result.value).toBeInstanceOf(ArrayBuffer);
         const response = new Response(result.value, result.init);
@@ -473,7 +482,9 @@ describe('SandboxHost RESPONSE lifecycle', () => {
         } });
         expect(await guest.callback(() => ({ content }))).toEqual({ content: text });
         expect(received).toEqual({ content: text });
-        expect(failSend.mock.calls.filter(([message]) => message.type === 'CALLBACK_RETURN')).toHaveLength(2);
+        expect(failSend.mock.calls.filter(([message]) => message.type === 'CALLBACK_RETURN')).toHaveLength(3);
+        expect(harness.guestPosts.filter(({ message }) => message.type === 'CALLBACK_RETURN')
+            .map(({ message }) => message.relay)).toEqual([undefined, 1, undefined]);
         expect(content.locked).toBe(false);
     });
 
@@ -533,6 +544,147 @@ describe('SandboxHost RESPONSE lifecycle', () => {
         const harness = hostHarness({ _getPropertiesForInitialization: () => ({ list: [] }), _getAliases: () => ({}), fetch: () => new Response(bytes([6, 7])) }, undefined, built.SandboxHost);
         const { api: guest } = await harness.guest(built.GUEST_BRIDGE_SCRIPT);
         expect(new Uint8Array(await (await guest.fetch()).arrayBuffer())).toEqual(new Uint8Array([6, 7]));
+    });
+});
+
+describe('RPC structured-clone fast path', () => {
+    function trackHostWalks(host: SandboxHost) {
+        const streamBridge = (host as any).streamBridge;
+        return ['portifyStreams', 'reviveStreamPorts', 'bufferStreams', 'transferables']
+            .map((method) => vi.spyOn(streamBridge, method));
+    }
+
+    test.each(['root', 'instance'])('a large %s result posts the original 200k-object graph without any bridge walk', async (kind) => {
+        const result = { rows: Array.from({ length: 100_000 }, (_, index) => ({ index, nested: { value: index } })) };
+        const getDatabase = () => result;
+        const harness = hostHarness({ ...initialization, getDatabase,
+            getInstance: () => ({ __classType: 'REMOTE_REQUIRED', getDatabase })
+        });
+        const walks = trackHostWalks(harness.host);
+        const guest = await harness.guest();
+        const target = kind === 'root' ? guest.api : await guest.api.getInstance();
+        const received = await target.getDatabase();
+        const posts = harness.hostPosts.filter(({ message }) => message.result === result);
+        expect(posts).toHaveLength(1);
+        expect(posts[0].message).not.toHaveProperty('relay');
+        expect(posts[0].message.result.rows).toBe(result.rows);
+        expect(posts[0].transfer).toEqual([]);
+        expect(received.rows).toHaveLength(100_000);
+        expect(received.rows[99_999]).toEqual({ index: 99_999, nested: { value: 99_999 } });
+        for (const walk of walks) expect(walk).not.toHaveBeenCalled();
+        expect(guest.walkCalls).toBe(0);
+    });
+
+    test('stream-free args and callback returns preserve graphs and buffers with zero walks in either direction', async () => {
+        const buffer = new Uint8Array([1, 2, 255]);
+        const shared = { value: 7 };
+        const input: any = { buffer, shared, alias: shared, map: new Map([[shared, shared]]), set: new Set([shared]) };
+        input.self = input;
+        let hostInput: any, callbackInput: any;
+        const harness = hostHarness({ ...initialization, callback: async (value: any, fn: any) => {
+            hostInput = value;
+            const result = await fn(value);
+            expect(value.buffer.byteLength).toBe(3);
+            return result;
+        } });
+        const walks = trackHostWalks(harness.host);
+        const guest = await harness.guest();
+        const result = await guest.api.callback(input, (value: any) => { callbackInput = value; return value; });
+        for (const value of [input, hostInput, callbackInput, result]) {
+            expect(value.self).toBe(value);
+            expect(value.alias).toBe(value.shared);
+            expect(value.map.get(value.shared)).toBe(value.shared);
+            expect(value.set.has(value.shared)).toBe(true);
+            expect(value.buffer).toEqual(new Uint8Array([1, 2, 255]));
+        }
+        const request = harness.guestPosts.find(({ message }) => message.method === 'callback')!;
+        const invocation = harness.hostPosts.find(({ message }) => message.type === 'INVOKE_CALLBACK')!;
+        const returned = harness.guestPosts.find(({ message }) => message.type === 'CALLBACK_RETURN')!;
+        expect(request.message.args[0]).toBe(input);
+        expect(invocation.message.args[0]).toBe(hostInput);
+        expect(returned.message.result).toBe(callbackInput);
+        for (const post of [...harness.hostPosts, ...harness.guestPosts]) {
+            expect(post.message).not.toHaveProperty('relay');
+            expect(post.transfer).toEqual([]);
+        }
+        for (const walk of walks) expect(walk).not.toHaveBeenCalled();
+        expect(guest.walkCalls).toBe(0);
+        expect(guest.pendingRequests.size).toBe(0);
+        expect((harness.host as any).pendingCallbacks.size).toBe(0);
+    });
+
+    test('stream args, callback returns and Response bodies use flagged retries and deliver one answer per request', async () => {
+        const harness = hostHarness({ ...initialization, callback: async (value: any, fn: any) => {
+            const result = await fn(value);
+            return new Response(result.body, { status: 202, headers: { 'x-test': 'kept' } });
+        } });
+        const guest = await harness.guest();
+        const source = bytes([0, 255], [3, 4]);
+        const response = await guest.api.callback({ body: source, alias: source }, (value: any) => {
+            expect(value.body).toBeInstanceOf(ReadableStream);
+            expect(value.alias).toBe(value.body);
+            return value;
+        });
+        expect(response.status).toBe(202);
+        expect(response.headers.get('x-test')).toBe('kept');
+        expect(new Uint8Array(await response.arrayBuffer())).toEqual(new Uint8Array([0, 255, 3, 4]));
+        const calls = harness.guestPosts.filter(({ message }) => message.method === 'callback');
+        const invocations = harness.hostPosts.filter(({ message }) => message.type === 'INVOKE_CALLBACK');
+        const returns = harness.guestPosts.filter(({ message }) => message.type === 'CALLBACK_RETURN');
+        const responses = harness.hostPosts.filter(({ message }) => message.reqId === calls[0].message.reqId);
+        for (const attempts of [calls, invocations, returns, responses]) {
+            expect(attempts.map(({ message }) => message.relay)).toEqual([undefined, 1]);
+            expect(attempts[0].transfer).toEqual([]);
+            expect(attempts[1].transfer).toHaveLength(1);
+            expect(attempts[1].transfer[0]).toBeInstanceOf(MessagePort);
+        }
+        expect(harness.answers.filter((message) => message.reqId === calls[0].message.reqId)).toHaveLength(1);
+        expect(guest.walkCalls).toBeGreaterThan(0);
+        expect(guest.pendingRequests.size).toBe(0);
+        expect((harness.host as any).pendingCallbacks.size).toBe(0);
+        await vi.waitFor(() => expect(source.locked).toBe(false));
+    });
+
+    test('a transfer-only MessagePort triggers the flagged path without a ReadableStream', async () => {
+        const channel = new NativeMessageChannel();
+        const harness = hostHarness({ ...initialization, echo: (value: any) => value });
+        const guest = await harness.guest();
+        let received: MessagePort | undefined;
+        try {
+            received = await guest.api.echo(channel.port1);
+            expect(received).toBeInstanceOf(MessagePort);
+            const requests = harness.guestPosts.filter(({ message }) => message.method === 'echo');
+            const responses = harness.hostPosts.filter(({ message }) => message.reqId === requests[0].message.reqId);
+            for (const attempts of [requests, responses]) {
+                expect(attempts.map(({ message }) => message.relay)).toEqual([undefined, 1]);
+                expect(attempts[1].transfer).toHaveLength(1);
+            }
+        } finally {
+            received?.close();
+            channel.port1.close();
+            channel.port2.close();
+        }
+    });
+
+    test.each(['guest', 'host'])('a non-clone %s argument post failure does not start a walk', async (side) => {
+        const cancel = vi.fn();
+        const source = new ReadableStream({ cancel });
+        const harness = hostHarness({ ...initialization, upload: vi.fn(), callback: (fn: any) => fn({ body: source }) }, (message) => {
+            if (side === 'host' && message.type === 'INVOKE_CALLBACK') throw new Error('post unavailable');
+        });
+        const walks = trackHostWalks(harness.host);
+        const guest = await harness.guest(GUEST_BRIDGE_SCRIPT, (message) => {
+            if (side === 'guest' && message.method === 'upload') throw new Error('post unavailable');
+        });
+        const result = side === 'guest' ? guest.api.upload({ body: source }) : guest.api.callback(() => 1);
+        await expect(result).rejects.toThrow('post unavailable');
+        for (const walk of walks) expect(walk).not.toHaveBeenCalled();
+        expect(guest.walkCalls).toBe(0);
+        expect(source.locked).toBe(false);
+        expect(cancel).not.toHaveBeenCalled();
+        expect(guest.pendingRequests.size).toBe(0);
+        expect((harness.host as any).pendingCallbacks.size).toBe(0);
+        await source.cancel();
     });
 });
 
@@ -737,7 +889,11 @@ describe('round 2 RPC relay regressions', () => {
         const target = kind === 'root' ? guest.api : await guest.api.getInstance();
         const response = await target.nativeFetch('https://example.invalid/upload', { body: bytes([0, 255], [7]) });
         expect(new Uint8Array(await response.arrayBuffer())).toEqual(new Uint8Array([0, 255, 7]));
-        expect(requests[0].args[1].body.__type).toBe('STREAM_PORT');
+        expect(requests).toHaveLength(2);
+        expect(requests[0]).not.toHaveProperty('relay');
+        expect(requests[0].args[1].body).toBeInstanceOf(ReadableStream);
+        expect(requests[1].relay).toBe(1);
+        expect(requests[1].args[1].body.__type).toBe('STREAM_PORT');
     });
 
     test('host callback arguments revive nested streams and aliases', async () => {
@@ -757,10 +913,10 @@ describe('round 2 RPC relay regressions', () => {
         const harness = hostHarness({ ...initialization,
             nativeFetch: vi.fn(), callback: (fn: any) => fn({ body: source })
         }, (message) => {
-            if (side === 'host' && message.type === 'INVOKE_CALLBACK') throw new Error('argument post failed');
+            if (side === 'host' && message.type === 'INVOKE_CALLBACK' && message.relay === 1) throw new Error('argument post failed');
         });
         const guest = await harness.guest(GUEST_BRIDGE_SCRIPT, (message) => {
-            if (side === 'guest' && message.method === 'nativeFetch') throw new Error('argument post failed');
+            if (side === 'guest' && message.method === 'nativeFetch' && message.relay === 1) throw new Error('argument post failed');
         });
         const result = side === 'guest' ? guest.api.nativeFetch('url', { body: source }) : guest.api.callback(() => 1);
         await expect(result).rejects.toThrow('argument post failed');
