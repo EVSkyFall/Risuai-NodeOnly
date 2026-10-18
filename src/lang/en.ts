@@ -547,6 +547,7 @@ export const languageEnglish = {
     deactivateCharacterLostChats: (name: string, count: number, list: string) =>
         `${count} chat(s) of "${name}" have no content on the server or in this browser, so they open as empty chats.\n\n${list}\n\nThey will be kept as empty chats. Deactivate?`,
     deactivateCharacterFailed: "Deactivation failed: ",
+    archiveGuardSaveWaiting: "Saving is waiting: the server refused a change involving an archived character. Your edits are kept and will be retried.",
     archiveSavePending: "Deactivated, but not saved to the server yet. Saving is retried automatically.",
 
     bulkArchiveProgress: (done: number, total: number, trash: boolean) =>

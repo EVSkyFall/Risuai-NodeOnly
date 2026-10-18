@@ -439,7 +439,7 @@ export let requiresFullEncoderReload = $state({
 let requestImmediateSaveImpl: ((options?: {
     forceFullWrite?: boolean
 }) => Promise<void> | void) = () => {}
-let flushSavesImpl: () => Promise<boolean> = async () => false
+let flushSavesImpl: (signal?: AbortSignal) => Promise<boolean> = async () => false
 let trackCharacterForSaveImpl: (chaId: string) => void = () => {}
 let patchSyncBaseline: Database | null = null
 let activeSavePatcher: RisuSavePatcher | null = null
@@ -553,10 +553,17 @@ export function requestImmediateSave(options?: {
 
 /**
  * Resolves true once every change made before the call has reached the
- * server; false when saving keeps failing (the changes stay queued).
+ * server; false when this wait is cancelled (the changes stay queued).
  */
-export function flushSaves(): Promise<boolean> {
-    return flushSavesImpl()
+export function flushSaves(signal?: AbortSignal): Promise<boolean> {
+    if (!signal) return flushSavesImpl()
+    if (signal.aborted) return Promise.resolve(false)
+    return new Promise((resolve, reject) => {
+        const cancel = () => resolve(false)
+        signal.addEventListener('abort', cancel, { once: true })
+        const cleanup = () => signal.removeEventListener('abort', cancel)
+        flushSavesImpl(signal).then(value => { cleanup(); resolve(value) }, error => { cleanup(); reject(error) })
+    })
 }
 
 /** Include this character in the next save even if nothing tracked it. */
@@ -582,6 +589,7 @@ export async function saveDb() {
     let lastSavedSeq = 0
     let savetrys = 0
     let saveRetryDelay = 500
+    let archiveGuardNoticeShown = false
     const knownChatIdsByCharacter = new Map<string, Set<string>>(
         (getDatabase()?.characters ?? [])
             .filter(character => character?.chaId)
@@ -969,9 +977,10 @@ export async function saveDb() {
         return byChar
     }
 
-    async function abortGenerationsAndWait(keys: string[]): Promise<void> {
+    async function abortGenerationsAndWait(keys: string[]): Promise<boolean> {
         for (const key of keys) abortGeneration(key)
-        while (keys.some(key => get(generationStates).has(key))) await sleep(50)
+        for (let poll = 0; poll < 5 && keys.some(key => get(generationStates).has(key)); poll++) await sleep(50)
+        return !keys.some(key => get(generationStates).has(key))
     }
 
     async function rebaseTrackedLocalChangesOnLatestServerDb(
@@ -979,6 +988,7 @@ export async function saveDb() {
         syncedBaselineDb: Database | null = null,
     ) {
         const etagBeforeRebase = forageStorage.getDbEtag()
+        const baselineBeforeRebase = supportsPatchSync ? (syncedBaselineDb ?? patcher.baselineDb()) : null
         try {
             const latestData = await forageStorage.getItem('database/database.bin') as unknown as Uint8Array
             if (latestData && latestData.length > 0) {
@@ -991,7 +1001,17 @@ export async function saveDb() {
                     latestDb, db, toSave, safeStructuredClone, convertStubsToPlaceholders,
                     syncedArchivedIds, syncedBaselineDb, normalizeJSON,
                 )
-                await abortGenerationsAndWait(skippedArchivedCharIds.flatMap(id => generating.get(id) ?? []))
+                if (await abortGenerationsAndWait(skippedArchivedCharIds.flatMap(id => generating.get(id) ?? [])) === false) {
+                    forageStorage.setDbEtag(etagBeforeRebase)
+                    if (supportsPatchSync && baselineBeforeRebase) {
+                        patcher = new RisuSavePatcher()
+                        await patcher.init(baselineBeforeRebase)
+                        activeSavePatcher = patcher
+                    }
+                    requeueTrackedChanges(toSave)
+                    changed = true
+                    return
+                }
                 const mergedCharacters = mergedDb.characters ?? []
                 for (const char of mergedCharacters) {
                     const local = localCharacters.find(c => c?.chaId === char?.chaId)
@@ -1062,6 +1082,16 @@ export async function saveDb() {
             forageStorage.setDbEtag(etagBeforeRebase)
             throw error
         }
+    }
+
+    function queueArchiveGuardRetry(toSave: toSaveType): 'retry' {
+        requeueTrackedChanges(toSave)
+        changed = true
+        if (!archiveGuardNoticeShown) {
+            archiveGuardNoticeShown = true
+            notifyError(language.archiveGuardSaveWaiting)
+        }
+        return 'retry'
     }
 
     async function persistTrackedChanges(
@@ -1352,6 +1382,9 @@ export async function saveDb() {
                     })
 
                 }
+                if (!patchResult.success && patchResult.conflictCode === 'ARCHIVE_GUARD_REJECTED' && patchResult.etag === syncedEtag) {
+                    return queueArchiveGuardRetry(toSave)
+                }
                 if (!patchResult.success && patchResult.etag && patchResult.etag !== syncedEtag && attemptedIdsAmbiguous) {
                     // Rebase attributes edits by chaId; with a missing or
                     // repeated one the hash-detected widening could misplace
@@ -1397,6 +1430,7 @@ export async function saveDb() {
                 await forageStorage.setItem('database/database.bin', dbData, currentEtag ?? undefined)
             } catch (conflictErr) {
                 if (conflictErr instanceof ConflictError) {
+                    if (conflictErr.code === 'ARCHIVE_GUARD_REJECTED' && conflictErr.currentEtag === currentEtag) return queueArchiveGuardRetry(toSave)
                     console.warn('[Save] Full-write conflict detected, rebasing tracked local changes on latest server DB...')
                     await rebaseTrackedLocalChangesOnLatestServerDb(conflictErr.currentEtag ?? null, db, attemptedIdsAmbiguous ? toSave : withTrackedCharacters(toSave, attemptedChangedCharIds), syncedArchivedIds, syncedBaselineDb)
                     return 'retry'
@@ -1414,6 +1448,7 @@ export async function saveDb() {
             }
         }
 
+        archiveGuardNoticeShown = false
         updateKnownChatsAfterSuccessfulSave(db, toSave)
 
         if (newEtag) {
@@ -1489,9 +1524,10 @@ export async function saveDb() {
         return saveInFlight
     }
 
-    flushSavesImpl = async () => {
+    flushSavesImpl = async (signal) => {
         await tick()
         for (;;) {
+            if (signal?.aborted) return false
             if (saveInFlight) { await saveInFlight; continue }
             const before = saveSeq
             await triggerSave()

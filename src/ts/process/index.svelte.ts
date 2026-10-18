@@ -299,12 +299,9 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             const chars = DBState.db.characters ?? []
             const charIdx = chars.findIndex((c) => c?.chaId === sendChaId)
             if (charIdx === -1) {
-                // Deactivated on another device mid-generation. The rebase
-                // aborts such generations and waits for them to end BEFORE
-                // swapping the database (globalApi), so this branch is only
-                // reached if that wait timed out; abort again as a last
-                // resort and leave the indices (the old target object is
-                // gone either way).
+                // A rebase normally waits for deactivated generations to leave
+                // the registry, deferring the merge if they are still running.
+                // Abort defensively if this callback sees a removed character.
                 abortGeneration(genKey)
                 return
             }

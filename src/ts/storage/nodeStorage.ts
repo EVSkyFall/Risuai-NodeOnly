@@ -1017,7 +1017,7 @@ export class NodeStorage{
 
     async saveServerBackup(
         onProgress?: (current: number, total: number, bytes: number, totalBytes: number) => void
-    ): Promise<{ok: boolean, filename: string, size: number, dir?: string}> {
+    ): Promise<{ok: boolean, filename: string, size: number, dir?: string, warnings?: string[]}> {
         const da = await this.authFetch('/api/backup/server/save', {
             method: 'POST',
             headers: {
@@ -1032,7 +1032,7 @@ export class NodeStorage{
         const reader = da.body!.getReader()
         const decoder = new TextDecoder()
         let buffer = ''
-        let result: {ok: boolean, filename: string, size: number, dir?: string} | null = null
+        let result: {ok: boolean, filename: string, size: number, dir?: string, warnings?: string[]} | null = null
 
         while (true) {
             const { done, value } = await reader.read()
@@ -1201,8 +1201,8 @@ export class NodeStorage{
     }
 
     async saveChatContent(chaId: string, chatIndex: number, chatId: string, chat: any): Promise<void> {
-        const encoded = encodeRisuSaveLegacy(chat)
         return this.enqueueChatSave(chaId, chatId, async () => {
+            const encoded = encodeRisuSaveLegacy(chat)
             const da = await this.authFetch(`/api/chat-content/${encodeURIComponent(chaId)}/${chatIndex}`, {
                 method: 'POST',
                 headers: {
@@ -1216,8 +1216,8 @@ export class NodeStorage{
     }
 
     async saveChatContentStrict(chaId: string, chatIndex: number, chatId: string, chat: any): Promise<DurableChatSaveResult> {
-        const encoded = encodeRisuSaveLegacy(chat)
         return this.enqueueChatSave(chaId, chatId, async () => {
+            const encoded = encodeRisuSaveLegacy(chat)
             let da: Response
             try {
                 da = await this.authFetch(`/api/chat-content/${encodeURIComponent(chaId)}/${chatIndex}`, {
@@ -1284,7 +1284,7 @@ export class NodeStorage{
         })
         const body = await da.json().catch(() => ({})) as { ok?: boolean; results?: ArchiveBatchResult[]; error?: string; code?: string }
         if (da.status < 200 || da.status >= 300 || !Array.isArray(body?.results)) {
-            throw new CharacterArchiveError(body?.code ?? `HTTP_${da.status}`, body?.error ?? `archive error: ${da.status}`)
+            throw new CharacterArchiveError(body?.code ?? `HTTP_${da.status}`, body?.error ?? `archive error: ${da.status}`, [], da.status)
         }
         return body.results
     }
@@ -1303,7 +1303,7 @@ export class NodeStorage{
         return body.character
     }
 
-    /** Permanently delete every archive row of a deactivated character (the caller drops the stub). */
+    /** Delete unreferenced archive rows (the caller drops the stub; retained references keep their rows). */
     async deleteArchivedCharacter(chaId: string): Promise<void> {
         const da = await this.authFetch(`/api/characters/${encodeURIComponent(chaId)}/archive`, { method: 'DELETE' })
         if (da.status < 200 || da.status >= 300) {
@@ -1323,14 +1323,18 @@ export class NodeStorage{
     }
 
     /** Every deactivated character as a full legacy record (partial backup). */
-    async fetchArchivedCharactersInline(): Promise<any[]> {
+    async fetchArchivedCharactersInline(): Promise<{ characters: any[]; nodeOnlyArchivedCharacters: any[]; warnings: string[] }> {
         const da = await this.authFetch('/api/characters/archived/inline')
         if (da.status < 200 || da.status >= 300) {
             const body = await da.json().catch(() => ({})) as { error?: string; code?: string }
             throw new CharacterArchiveError(body?.code ?? `HTTP_${da.status}`, body?.error ?? `archived inline error: ${da.status}`)
         }
-        const decoded = await decodeRisuSave(new Uint8Array(await da.arrayBuffer())) as { characters?: any[] }
-        return Array.isArray(decoded?.characters) ? decoded.characters : []
+        const decoded = await decodeRisuSave(new Uint8Array(await da.arrayBuffer())) as { characters?: any[]; nodeOnlyArchivedCharacters?: any[]; warnings?: string[] }
+        return {
+            characters: Array.isArray(decoded?.characters) ? decoded.characters : [],
+            nodeOnlyArchivedCharacters: Array.isArray(decoded?.nodeOnlyArchivedCharacters) ? decoded.nodeOnlyArchivedCharacters : [],
+            warnings: Array.isArray(decoded?.warnings) ? decoded.warnings : [],
+        }
     }
 
     // ── Save-folder migration ─────────────────────────────────────────────────
@@ -1449,7 +1453,7 @@ export class CharacterArchiveError extends Error {
     code: string
     /** Names of the chats the failure is about (ARCHIVE_CHATS_UNAVAILABLE). */
     chats: string[]
-    constructor(code: string, message: string, chats: string[] = []) {
+    constructor(code: string, message: string, chats: string[] = [], public status?: number) {
         super(message)
         this.name = 'CharacterArchiveError'
         this.code = code

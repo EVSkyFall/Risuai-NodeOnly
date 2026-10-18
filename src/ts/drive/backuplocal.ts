@@ -259,17 +259,20 @@ export async function SavePartialLocalBackup(){
         }
     }
     // Deactivated characters live server-side; the .bin must carry them as
-    // complete records exactly like the server export does. A missing payload
-    // aborts the backup instead of silently dropping the character.
+    // complete records exactly like the server export does. Unavailable
+    // characters keep their recovery stubs.
     if ((dbCopy.nodeOnlyArchivedCharacters ?? []).length > 0) {
         alertWait(`Saving partial local backup... (Deactivated characters)`)
         const inline = await fetchArchivedCharactersInline()
         const present = new Set(dbCopy.characters.map((c) => c?.chaId))
-        for (const c of inline) {
+        for (const c of inline.characters) {
             if (!present.has(c.chaId)) dbCopy.characters.push(c)
+            present.add(c.chaId)
         }
+        dbCopy.nodeOnlyArchivedCharacters = dbCopy.nodeOnlyArchivedCharacters.filter(stub => !present.has(stub.chaId))
+        for (const warning of inline.warnings) notifyInfo(warning)
     }
-    delete dbCopy.nodeOnlyArchivedCharacters
+    if (!dbCopy.nodeOnlyArchivedCharacters?.length) delete dbCopy.nodeOnlyArchivedCharacters
     // Plugin values live in the server kv, never in the client DB (the field
     // is always {}). Importing a .bin replaces plugin storage wholesale, so
     // the backup must carry every key or a restore wipes them.
@@ -425,6 +428,7 @@ export async function SaveServerBackup() {
             alertWait(`${language.serverBackupSaving} (${pct}% - ${bytesStr})`)
         })
         notifySuccess(language.serverBackupSaveSuccess(result.filename, formatBytes(result.size), result.dir))
+        for (const warning of result.warnings ?? []) notifyInfo(warning)
         return true
     } catch (error) {
         console.error(error)

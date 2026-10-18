@@ -51,9 +51,12 @@ export function isArchivedCharacter(chaId: string): boolean {
     return !!findArchivedStub(chaId)
 }
 
-function withOverlay<T>(fn: () => Promise<T>): Promise<T> {
-    loadingOverlayStore.set({ active: true, text: language.loading ?? '', onCancel: null })
-    return fn().finally(() => {
+class ArchiveWaitCancelled extends Error {}
+
+function withOverlay<T>(fn: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    const controller = new AbortController()
+    loadingOverlayStore.set({ active: true, text: language.loading ?? '', onCancel: () => controller.abort() })
+    return fn(controller.signal).finally(() => {
         loadingOverlayStore.set({ active: false, text: '', onCancel: null })
     })
 }
@@ -82,7 +85,7 @@ export async function archiveCharacter(index: number, arg: { skipConfirm?: boole
     // acceptLostChats: chats whose body the server no longer has (lost before
     // this build) are stored as the empty chats they already show as. The
     // trash accepts that outright; a deactivation asks first.
-    const run = async (acceptLostChats: boolean) => {
+    const run = async (acceptLostChats: boolean, signal?: AbortSignal) => {
         // A chat without an id is never uploaded by the save path; give it
         // one so its body reaches the server with the save below.
         let assignedIds = false
@@ -96,7 +99,7 @@ export async function archiveCharacter(index: number, arg: { skipConfirm?: boole
         // The server builds the payload from its own view: every edit (and
         // every chat body this browser holds) must have reached it first,
         // or the archived copy would silently miss them.
-        if (!await flushSaves()) throw new Error(language.archiveSaveFailed)
+        await waitForArchiveSave(signal)
         const stub = await storage().archiveCharacter(char.chaId, { acceptLostChats })
         // Re-resolve both: a save above may have rebased the database object,
         // and the array may have shifted while the server worked.
@@ -119,17 +122,16 @@ export async function archiveCharacter(index: number, arg: { skipConfirm?: boole
         // The overlay stays up meanwhile; activation also waits for it.
         if (arg.silent) {
             void requestImmediateSave()
-        } else if (await flushSaves()) {
-            notifySuccess(arg.trash ? language.trashCharacterDone : language.deactivateCharacterDone)
         } else {
-            // Done here, not yet on the server; the save queue keeps retrying.
-            notifyError(language.archiveSavePending)
+            await waitForArchiveSave(signal)
+            notifySuccess(arg.trash ? language.trashCharacterDone : language.deactivateCharacterDone)
         }
         return true
     }
     // silent: no overlay, no dialogs — the caller reports (migration logs).
-    const attempt = (acceptLostChats: boolean) => arg.silent ? run(acceptLostChats) : withOverlay(() => run(acceptLostChats))
+    const attempt = (acceptLostChats: boolean) => arg.silent ? run(acceptLostChats) : withOverlay(signal => run(acceptLostChats, signal))
     const fail = (error: unknown) => {
+        if (error instanceof ArchiveWaitCancelled) return isArchivedCharacter(char.chaId)
         alertError(language.deactivateCharacterFailed + (error instanceof Error ? error.message : String(error)))
         return false
     }
@@ -153,7 +155,7 @@ export interface BulkArchiveOutcome {
     failed: { chaId: string; name: string; reason: string }[]
     /** Refused because some chats have no content anywhere (only without acceptLostChats). */
     lost: { chaId: string; name: string; chats: string[] }[]
-    /** Retained for callers; queued runs keep waiting for pending saves. */
+    /** The archive wait was cancelled; completed moves stay in the save queue. */
     stopped: boolean
 }
 
@@ -204,19 +206,49 @@ export function archiveCharacters(chaIds: string[], arg: { trash?: boolean; acce
     return run
 }
 
-async function waitForArchiveSave(): Promise<void> {
+function waitForArchiveStep<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+    if (!signal) return promise
+    return new Promise((resolve, reject) => {
+        const cancel = () => reject(new ArchiveWaitCancelled())
+        if (signal.aborted) cancel()
+        else signal.addEventListener('abort', cancel, { once: true })
+        const cleanup = () => signal.removeEventListener('abort', cancel)
+        promise.then(value => { cleanup(); resolve(value) }, error => { cleanup(); reject(error) })
+    })
+}
+
+async function waitForArchiveSave(signal?: AbortSignal): Promise<void> {
     for (;;) {
-        try { if (await flushSaves()) return }
-        catch (error) { console.warn('[Archive] Saving pending edits failed; retrying', error) }
-        await new Promise(resolve => setTimeout(resolve, 500))
+        if (signal?.aborted) throw new ArchiveWaitCancelled()
+        try { if (await waitForArchiveStep(flushSaves(signal), signal)) return }
+        catch (error) {
+            if (error instanceof ArchiveWaitCancelled) throw error
+            console.warn('[Archive] Saving pending edits failed; retrying', error)
+        }
+        await waitForArchiveStep(new Promise<void>(resolve => setTimeout(resolve, 500)), signal)
+    }
+}
+
+async function requestArchiveChunk(ids: string[], acceptLostChats: boolean, signal: AbortSignal): Promise<ArchiveBatchResult[]> {
+    for (;;) {
+        if (signal.aborted) throw new ArchiveWaitCancelled()
+        try { return await storage().archiveCharacters(ids, { acceptLostChats }) }
+        catch (error) {
+            const status = error instanceof CharacterArchiveError ? (error.status ?? Number(error.code.match(/^HTTP_(\d+)$/)?.[1])) : 0
+            if (!(error instanceof TypeError || status === 408 || status === 425 || status === 429 || status >= 500)) throw error
+            console.warn('[Archive] Chunk request failed; retrying', error)
+            await waitForArchiveStep(new Promise<void>(resolve => setTimeout(resolve, 500)), signal)
+        }
     }
 }
 
 async function runArchiveCharacters(chaIds: string[], arg: { trash?: boolean; acceptLostChats?: boolean }): Promise<BulkArchiveOutcome> {
     const outcome: BulkArchiveOutcome = { done: 0, failed: [], lost: [], stopped: false }
     const trash = !!arg.trash
+    const controller = new AbortController()
+    const signal = controller.signal
     const progress = (done: number, total: number) =>
-        loadingOverlayStore.set({ active: true, text: language.bulkArchiveProgress(done, total, trash), onCancel: null })
+        loadingOverlayStore.set({ active: true, text: language.bulkArchiveProgress(done, total, trash), onCancel: () => controller.abort() })
     try {
         const names = new Map<string, string>()
         const targets: string[] = []
@@ -238,10 +270,10 @@ async function runArchiveCharacters(chaIds: string[], arg: { trash?: boolean; ac
         }
         if (targets.length === 0) return outcome
         progress(0, targets.length)
-        await waitForArchiveSave()
+        await waitForArchiveSave(signal)
         for (let i = 0; i < targets.length; i += BULK_ARCHIVE_CHUNK) {
             const chunk = targets.slice(i, i + BULK_ARCHIVE_CHUNK)
-            const results: ArchiveBatchResult[] = await storage().archiveCharacters(chunk, { acceptLostChats: arg.acceptLostChats ?? trash })
+            const results: ArchiveBatchResult[] = await requestArchiveChunk(chunk, arg.acceptLostChats ?? trash, signal)
             const successes: { chaId: string; stub: any }[] = []
             for (const r of results) {
                 const name = names.get(r.chaId) ?? r.chaId
@@ -254,9 +286,13 @@ async function runArchiveCharacters(chaIds: string[], arg: { trash?: boolean; ac
                 else outcome.failed.push({ chaId: f.chaId, name, reason: f.error })
             }
             outcome.done += applyArchived(successes, trash)
-            await waitForArchiveSave()
+            await waitForArchiveSave(signal)
             progress(Math.min(i + chunk.length, targets.length), targets.length)
         }
+        return outcome
+    } catch (error) {
+        if (!(error instanceof ArchiveWaitCancelled)) throw error
+        outcome.stopped = true
         return outcome
     } finally {
         loadingOverlayStore.set({ active: false, text: '', onCancel: null })
@@ -269,7 +305,7 @@ async function runArchiveCharacters(chaIds: string[], arg: { trash?: boolean; ac
  * removed (one save tick). Resolves to the new index, or -1 when there was
  * nothing to activate. Throws CharacterArchiveError on server failure.
  */
-export async function activateCharacter(chaId: string): Promise<number> {
+export async function activateCharacter(chaId: string, signal?: AbortSignal): Promise<number> {
     const list = DBState.db.nodeOnlyArchivedCharacters ?? []
     const stubIndex = list.findIndex((s) => s?.chaId === chaId)
     const existing = DBState.db.characters.findIndex((c) => c?.chaId === chaId)
@@ -291,7 +327,7 @@ export async function activateCharacter(chaId: string): Promise<number> {
         // still lists the character as active. Dropping the stub here used to
         // make the save that followed delete the character outright. Finish
         // saving, then ask again; the stub stays whatever happens.
-        if (!await flushSaves()) throw new CharacterArchiveError(error.code, language.archiveSaveFailed)
+        await waitForArchiveSave(signal)
         try {
             restored = await storage().activateCharacter(chaId, archivedAt)
         } catch (retryError) {
@@ -397,11 +433,12 @@ export async function promptActivateCharacter(chaId: string, arg: { reseter?: ()
     if (!stub) return false
     if (!await alertConfirm(language.activateCharacterConfirm(stub.name || 'Unnamed'))) return false
     try {
-        const index = await withOverlay(() => activateCharacter(chaId))
+        const index = await withOverlay(signal => activateCharacter(chaId, signal))
         if (index < 0) return false
         changeChar(index, arg)
         return true
     } catch (error) {
+        if (error instanceof ArchiveWaitCancelled) return false
         if (error instanceof CharacterArchiveError
             && (error.code === 'ARCHIVE_PAYLOAD_MISSING' || error.code === 'ARCHIVE_PAYLOAD_INVALID')) {
             // Nothing to restore from: offer to drop the stub so the dashboard,
@@ -417,8 +454,8 @@ export async function promptActivateCharacter(chaId: string, arg: { reseter?: ()
 }
 
 /** Every deactivated character as a full record (for the client-assembled partial backup). */
-export async function fetchArchivedCharactersInline(): Promise<character[]> {
-    if (getArchivedStubs().length === 0) return []
+export async function fetchArchivedCharactersInline(): Promise<{ characters: character[]; nodeOnlyArchivedCharacters: ArchivedCharacterStub[]; warnings: string[] }> {
+    if (getArchivedStubs().length === 0) return { characters: [], nodeOnlyArchivedCharacters: [], warnings: [] }
     return await storage().fetchArchivedCharactersInline()
 }
 

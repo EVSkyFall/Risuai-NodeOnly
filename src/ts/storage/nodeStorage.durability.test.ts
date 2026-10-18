@@ -205,3 +205,36 @@ test('delta fallback, direct full and strict saves share one queue and retain du
     await expect(strict).resolves.toEqual({ success: true, durable: true })
     expect(order).toEqual(['delta', 'full', 'full', 'strict'])
 })
+
+
+test('C2: strict save encodes the current chat after earlier queued delta work finishes', async () => {
+    const { encodeRisuSaveLegacy } = await import('./risuSave')
+    vi.mocked(encodeRisuSaveLegacy).mockImplementation(chat => new TextEncoder().encode(JSON.stringify(chat)) as any)
+    const s = storage()
+    let release!: () => void
+    const hold = s.enqueueChatSave('c', 'x', () => new Promise<void>(r => { release = r }))
+    await Promise.resolve()
+    const bodies: any[] = []
+    vi.spyOn(s as any, 'authFetch').mockImplementation(async (_url: any, init: any) => {
+        bodies.push(JSON.parse(new TextDecoder().decode(init.body)))
+        return json(200, { success: true, durable: true })
+    })
+    const chat = { id: 'x', message: [{ data: 'old' }] }
+    const strict = s.saveChatContentStrict('c', 0, 'x', chat)
+    chat.message.push({ data: 'new from delta queue' })
+    release()
+    await hold
+    await expect(strict).resolves.toEqual({ success: true, durable: true })
+    expect(bodies[0].message).toEqual([{ data: 'old' }, { data: 'new from delta queue' }])
+})
+
+test('S2: server backup completion and partial archive response preserve warning notes and recovery stubs', async () => {
+    const s = storage()
+    const warnings = ['gone: stub retained']
+    vi.spyOn(s as any, 'authFetch').mockResolvedValueOnce(new Response(JSON.stringify({ type: 'done', ok: true, filename: 'backup.bin', size: 1, warnings }) + '\n'))
+        .mockResolvedValueOnce(new Response(new Uint8Array([1])))
+    expect(await s.saveServerBackup()).toMatchObject({ ok: true, warnings })
+    const { decodeRisuSave } = await import('./risuSave')
+    vi.mocked(decodeRisuSave).mockResolvedValueOnce({ characters: [{ chaId: 'good' }], nodeOnlyArchivedCharacters: [{ chaId: 'gone', archivedAt: 1 }], warnings } as any)
+    expect(await s.fetchArchivedCharactersInline()).toEqual({ characters: [{ chaId: 'good' }], nodeOnlyArchivedCharacters: [{ chaId: 'gone', archivedAt: 1 }], warnings })
+})

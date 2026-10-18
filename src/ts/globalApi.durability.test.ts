@@ -18,10 +18,10 @@ function extract(name: string) {
 function run(code: string, deps: Record<string, any>) {
     deps = { newSaveTiming, recordSaveSample: vi.fn(), recordDbTransferSize: vi.fn(),
         mergeServerDbWithTrackedLocalChanges, withTrackedCharacters, hasAmbiguousCharacterIds,
-        generatingCharacters: () => new Map(), abortGenerationsAndWait: async () => {},
+        supportsPatchSync: false, generatingCharacters: () => new Map(), abortGenerationsAndWait: async () => {},
         normalizeJSON: (x: any) => x, convertStubsToPlaceholders: (x: any) => x,
         notifyDatabaseRebased: () => {}, notifyError: vi.fn(), ...deps }
-    code = 'let saveSeq = 0, lastSavedSeq = 0; ' + code
+    code = 'let saveSeq = 0, lastSavedSeq = 0, archiveGuardNoticeShown = false; ' + code
 
     const js = ts.transpileModule(`const { ${Object.keys(deps).join(',')} } = deps; ${code}`, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText
     return new Function('deps', js)(deps)
@@ -277,4 +277,112 @@ test.each(['download', 'decode'])('failed rebase %s preserves the pre-conflict E
     })
     await expect(rebase('foreign-revision', { characters: [] }, { character: [], chat: [] })).rejects.toBe(offline)
     expect(etag).toBe('our-synced-revision')
+})
+
+
+test.each(['patch', 'full'])('C1: own-revision archive guard queues %s without rebase or fallback and notifies once until success', async mode => {
+    const local = { characters: [{ chaId: 'c', chats: [] }], botPresets: [], modules: [] }
+    const requeue = vi.fn(), notify = vi.fn(), rebase = vi.fn(), commit = vi.fn()
+    let rejected = true
+    class GuardConflict extends Error { currentEtag = 'ours'; code = 'ARCHIVE_GUARD_REJECTED' }
+    class Encoder { async init() {} async set() {} encode() { return new Uint8Array([1]) } }
+    class Patcher {
+        baselineArchivedCharacterIds() { return new Set() }
+        baselineDb() { return local }
+        estimatePayloadBytes() { return 0 }
+        async init() {}
+        async prepare() { return { changedCharacterIds: ['c'], patchData: { patch: [], expectedHash: 'h' }, commit } }
+    }
+    const storage = {
+        getDbEtag: () => 'ours', setDbEtag: vi.fn(),
+        patchItem: vi.fn(async () => ({ success: !rejected, etag: 'ours', conflictCode: 'ARCHIVE_GUARD_REJECTED' })),
+        setItem: vi.fn(async () => { if (rejected) throw new GuardConflict() }),
+    }
+    const persist = run(`
+        let changed = false, patcher = new RisuSavePatcher(), activeSavePatcher, savetrys = 0;
+        ${extract('queueArchiveGuardRetry')}
+        ${extract('persistTrackedChanges')}
+        return changes => persistTrackedChanges(changes, newSaveTiming(), { forceFullWrite: ${mode === 'full'} });
+    `, { forageStorage: storage, getDatabase: () => local, supportsPatchSync: true,
+        RisuSaveEncoder: Encoder, RisuSavePatcher: Patcher, safeStructuredClone: structuredClone,
+        collectChatsToPersist: () => [], findDangerousChatOps: () => [],
+        requeueTrackedChanges: requeue, notifyError: notify, language: { archiveGuardSaveWaiting: 'waiting' },
+        rebaseTrackedLocalChangesOnLatestServerDb: rebase, updateKnownChatsAfterSuccessfulSave: vi.fn(),
+        resyncBaselineAfterFullWrite: vi.fn(), decodeRisuSave: async () => local, ConflictError: GuardConflict,
+        addLog: vi.fn(), console: { warn: vi.fn() },
+    })
+    const changes = { character: ['c'], chat: [], root: false }
+    for (let i = 0; i < 3; i++) expect(await persist(changes)).toBe('retry')
+    expect(notify).toHaveBeenCalledTimes(1)
+    expect(requeue).toHaveBeenCalledTimes(3)
+    expect(rebase).not.toHaveBeenCalled()
+    expect(commit).not.toHaveBeenCalled()
+    if (mode === 'patch') expect(storage.setItem).not.toHaveBeenCalled()
+    rejected = false
+    expect(await persist(changes)).toBe('saved')
+    rejected = true
+    expect(await persist(changes)).toBe('retry')
+    expect(notify).toHaveBeenCalledTimes(2)
+})
+
+test('C5: lingering generation defers rebase, restores revision and baseline, then later merges', async () => {
+    const local = { characters: [{ chaId: 'c', chats: [{ id: 'x', message: [] }] }] }
+    const baseline = structuredClone(local)
+    const latest = { characters: [], nodeOnlyArchivedCharacters: [{ chaId: 'c', archivedAt: 1000 }] }
+    let etag = 'ours', lingering = true
+    const setDatabase = vi.fn(), requeue = vi.fn(), seeded: any[] = [], notified = vi.fn()
+    class Patcher { baselineDb() { return baseline } async init(db) { seeded.push(db) } }
+    const rebase = run(`
+        let changed = false, patcher = new RisuSavePatcher(), activeSavePatcher;
+        const knownChatIdsByCharacter = new Map();
+        ${extract('rebaseTrackedLocalChangesOnLatestServerDb')}
+        return rebaseTrackedLocalChangesOnLatestServerDb;
+    `, { supportsPatchSync: true, forageStorage: {
+        getDbEtag: () => etag, setDbEtag: v => { etag = v },
+        getItem: async () => { etag = 'theirs'; return new Uint8Array([1]) },
+    }, RisuSavePatcher: Patcher, decodeRisuSave: async () => latest,
+        safeStructuredClone: structuredClone, setDatabase, requeueTrackedChanges: requeue,
+        generatingCharacters: () => new Map([['c', ['chat:x']]]), abortGenerationsAndWait: async () => !lingering,
+        notifyDatabaseRebased: notified, restoreChatShapeAfterRebase: vi.fn(),
+        reanchorRebasedSelection: () => ({ botPresetsId: 0, selectedCharIndex: -1 }),
+        selectedCharID: { subscribe: cb => { cb(-1); return () => {} }, set: vi.fn() },
+        language: { rebaseSkippedArchived: () => 'skipped' },
+    })
+    const changes = { character: ['c'], chat: [] }
+    await rebase('theirs', local, changes, new Set(), baseline)
+    expect(etag).toBe('ours')
+    expect(seeded).toEqual([baseline])
+    expect(setDatabase).not.toHaveBeenCalled()
+    expect(notified).not.toHaveBeenCalled()
+    expect(requeue).toHaveBeenCalledOnce()
+    lingering = false
+    await rebase('theirs', local, changes, new Set(), baseline)
+    expect(setDatabase).toHaveBeenCalledOnce()
+    expect(seeded.at(-1)).toEqual(latest)
+})
+
+test('C5: abort wait yields after a short cooperative wait when a generation stays registered', async () => {
+    const abort = vi.fn(), sleep = vi.fn(async () => {})
+    const wait = run(`${extract('abortGenerationsAndWait').replaceAll('abortGenerationsAndWait', 'waitForGeneration')}; return waitForGeneration;`, {
+        abortGeneration: abort, generationStates: new Map([['x', {}]]), get: x => x, sleep,
+    })
+    expect(await wait(['x'])).toBe(false)
+    expect(abort).toHaveBeenCalledWith('x')
+    expect(sleep).toHaveBeenCalledTimes(5)
+    expect(await wait([])).toBe(true)
+})
+
+
+test('C4: cancelling flushSaves ends the waiter while its background save continues', async () => {
+    let complete!: (saved: boolean) => void
+    const saving = new Promise<boolean>(resolve => { complete = resolve })
+    const flushSavesImpl = vi.fn(() => saving)
+    const flush = run(`${extract('flushSaves')}; return flushSaves;`, { flushSavesImpl })
+    const controller = new AbortController()
+    const pending = flush(controller.signal)
+    controller.abort()
+    expect(await pending).toBe(false)
+    expect(flushSavesImpl).toHaveBeenCalledWith(controller.signal)
+    complete(true)
+    expect(await flush()).toBe(true)
 })

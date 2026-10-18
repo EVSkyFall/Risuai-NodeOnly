@@ -50,6 +50,7 @@ vi.mock('./alert', () => ({
     alertConfirm: async () => true,
     alertError: vi.fn(),
     notifySuccess: () => {},
+    notifyError: vi.fn(),
 }))
 vi.mock('./characters', () => ({ changeChar: () => {}, deselectCharacter: () => deselectCharacter() }))
 vi.mock('./storage/chatStorage', () => ({ convertStubsToPlaceholders: (chats: any[]) => chats }))
@@ -89,11 +90,12 @@ describe('activateCharacter', () => {
         expect(state.db.characters).toEqual([])
     })
 
-    test('keeps the stub when the pending save cannot be completed', async () => {
+    test('can cancel the activation wait while keeping its stub', async () => {
         state.db = { characters: [], nodeOnlyArchivedCharacters: [{ ...stub }] }
-        flushSaves.mockResolvedValue(false)
+        const controller = new AbortController()
+        flushSaves.mockImplementation(async () => { controller.abort(); return false })
         storage.activateCharacter.mockRejectedValue(new CharacterArchiveError('ARCHIVE_ALREADY_ACTIVE', 'Character is already active'))
-        await expect(activateCharacter('c1')).rejects.toMatchObject({ code: 'ARCHIVE_ALREADY_ACTIVE' })
+        await expect(activateCharacter('c1', controller.signal)).rejects.toBeInstanceOf(Error)
         expect(storage.activateCharacter).toHaveBeenCalledTimes(1)
         expect(state.db.nodeOnlyArchivedCharacters).toEqual([stub])
     })
@@ -113,12 +115,19 @@ describe('activateCharacter', () => {
 })
 
 describe('archiveCharacter', () => {
-    test('does not archive while earlier edits are still unsaved', async () => {
+    test('cancels the archive wait while earlier edits remain queued', async () => {
         state.db = { characters: [{ chaId: 'c1', name: 'One', chats: [] }], nodeOnlyArchivedCharacters: [] }
-        flushSaves.mockResolvedValue(false)
-        expect(await archiveCharacter(0, { skipConfirm: true })).toBe(false)
+        let finish!: (ok: boolean) => void
+        flushSaves.mockImplementation(() => new Promise(r => { finish = r }))
+        const pending = archiveCharacter(0, { skipConfirm: true })
+        await vi.waitFor(() => expect(flushSaves).toHaveBeenCalled())
+        const active = overlay.mock.calls.find(call => call[0].active)![0]
+        expect(active.onCancel).toBeTypeOf('function')
+        active.onCancel()
+        expect(await pending).toBe(false)
         expect(storage.archiveCharacter).not.toHaveBeenCalled()
         expect(state.db.characters).toHaveLength(1)
+        finish(true)
     })
 
     test('gives an id-less chat an id and saves it before the server builds the payload', async () => {
@@ -229,6 +238,31 @@ describe('archiveCharacters (bulk)', () => {
         expect(await first).toMatchObject({ message: 'request failed' })
         expect(await second).toMatchObject({ done: 1 })
         expect(state.db.characters.map((c: any) => c.chaId)).toEqual(['c0'])
+    })
+
+    test('retries a transient failed middle chunk, then completes every remaining chunk', async () => {
+        state.db = { characters: chars(45), nodeOnlyArchivedCharacters: [] }
+        storage.archiveCharacters.mockImplementationOnce(async ids => okFor(ids))
+            .mockRejectedValueOnce(new TypeError('network down'))
+            .mockRejectedValueOnce(new CharacterArchiveError('HTTP_503', 'busy'))
+            .mockImplementation(async ids => okFor(ids))
+        const ids = state.db.characters.map(c => c.chaId)
+        expect(await archiveCharacters(ids)).toMatchObject({ done: 45, stopped: false })
+        expect(storage.archiveCharacters.mock.calls.map(c => c[0])).toEqual([ids.slice(0, 20), ids.slice(20, 40), ids.slice(20, 40), ids.slice(20, 40), ids.slice(40)])
+    })
+
+    test('cancel after a submitted chunk keeps its successes and leaves later chunks active', async () => {
+        state.db = { characters: chars(25), nodeOnlyArchivedCharacters: [] }
+        let finish!: () => void
+        storage.archiveCharacters.mockImplementationOnce(ids => new Promise(resolve => { finish = () => resolve(okFor(ids)) }))
+        const pending = archiveCharacters(state.db.characters.map(c => c.chaId))
+        await vi.waitFor(() => expect(storage.archiveCharacters).toHaveBeenCalledTimes(1))
+        overlay.mock.calls.find(call => call[0].active)![0].onCancel()
+        finish()
+        expect(await pending).toMatchObject({ done: 20, stopped: true })
+        expect(state.db.characters.map(c => c.chaId)).toEqual(['c20', 'c21', 'c22', 'c23', 'c24'])
+        expect(state.db.nodeOnlyArchivedCharacters).toHaveLength(20)
+        expect(storage.archiveCharacters).toHaveBeenCalledTimes(1)
     })
 
     test('keeps the selected character selected by id, and deselects an archived one', async () => {

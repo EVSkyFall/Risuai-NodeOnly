@@ -56,7 +56,7 @@ describe('NodeStorage authFetch transient retry', () => {
         await failed
         await expect(final).resolves.toMatchObject({ durable: true })
         expect(fetchMock).toHaveBeenCalledTimes(2)
-        expect(new TextDecoder().decode(fetchMock.mock.calls[1][1].body)).toBe('final')
+        expect(new TextDecoder().decode(fetchMock.mock.calls[1][1].body)).toBe('later local edit')
         expect(fetchMock.mock.calls[1][1].headers.get('x-strict-flush')).toBe('1')
     })
 

@@ -278,8 +278,7 @@
     function reportBulk(outcome: BulkArchiveOutcome, trash: boolean, extraDone = 0) {
         const done = outcome.done + extraDone;
         const failed = [...outcome.failed, ...outcome.lost.map((l) => ({ ...l, reason: '' }))];
-        if (outcome.stopped) alertError(language.bulkArchiveStopped);
-        else if (failed.length > 0) alertError(language.bulkArchiveFailed(done, failed.length, bulkList(failed)));
+        if (failed.length > 0) alertError(language.bulkArchiveFailed(done, failed.length, bulkList(failed)));
         else if (done > 0) notifySuccess(language.bulkArchiveDone(done, trash));
     }
 
@@ -309,7 +308,7 @@
             } catch (error) {
                 alertError(language.deactivateCharacterFailed + (error instanceof Error ? error.message : String(error)));
             } finally {
-                const processed = new Set(targets.map(e => e.chaId));
+                const processed = new Set(targets.filter(e => !DBState.db.characters.some(c => c?.chaId === e.chaId)).map(e => e.chaId));
                 selectedIds = new Set([...selectedIds].filter(id => !processed.has(id)));
             }
         });
@@ -334,7 +333,7 @@
             } catch (error) {
                 alertError(language.deactivateCharacterFailed + (error instanceof Error ? error.message : String(error)));
             } finally {
-                const processed = new Set(targets.map(e => e.chaId));
+                const processed = new Set(targets.filter(e => !DBState.db.characters.some(c => c?.chaId === e.chaId)).map(e => e.chaId));
                 selectedIds = new Set([...selectedIds].filter(id => !processed.has(id)));
             }
         });

@@ -308,7 +308,7 @@ describe('character archive', () => {
     // Both rows exist: the first is now an orphan (kept for snapshot restores).
     const s = await stats()
     expect(s.prefixes['archive/'].count).toBe(2)
-    expect(s.archiveOrphan).toMatchObject({ available: true, count: 0 })
+    expect(s.archiveOrphan).toMatchObject({ available: false, count: 0 })
     expect(s.orphan).toMatchObject({ available: false, count: 0 })
 
     const db = await exportDb()
@@ -334,7 +334,7 @@ describe('character archive', () => {
     // Not moving it back into `characters` here: the database still points at stub2.
   })
 
-  test('a deactivated character whose payload vanished fails closed everywhere', async () => {
+  test('a missing archive payload keeps its stub in an otherwise successful export', async () => {
     // Simulate loss of the referenced row (manual kv deletion); the orphan row stays.
     const del = await client.fetch('/api/remove', { headers: { 'file-path': hex(`archive/${ARCH}/${stub2.archivedAt}`) } })
     expect(del.status).toBe(200)
@@ -353,7 +353,23 @@ describe('character archive', () => {
     }
 
     const exp = await client.fetch('/api/backup/export')
-    expect(exp.status).toBe(500)
+    expect(exp.status).toBe(200)
+    expect(decodeURIComponent(exp.headers.get('x-risu-backup-warnings')!)).toContain('Archived One')
+    const exported = decodeBackup(Buffer.from(await exp.arrayBuffer()))
+    const exportedDb = decodeRisuDat(exported.find(e => e.name === 'database.risudat')!.data) as any
+    expect(exportedDb.characters.some(c => c.chaId === KEEP)).toBe(true)
+    expect(exportedDb.nodeOnlyArchivedCharacters).toEqual([expect.objectContaining({ chaId: ARCH, archivedAt: stub2.archivedAt })])
+
+    const partial = await client.fetch('/api/characters/archived/inline')
+    expect(partial.status).toBe(200)
+    const partialDb = await utils.decodeRisuSave(Buffer.from(await partial.arrayBuffer())) as any
+    expect(partialDb.nodeOnlyArchivedCharacters).toEqual([expect.objectContaining({ chaId: ARCH })])
+    expect(partialDb.warnings[0]).toContain('Archived One')
+
+    const saved = await client.fetch('/api/backup/server/save', { method: 'POST' })
+    expect(saved.status).toBe(200)
+    const frames = (await saved.text()).trim().split('\n').map(line => JSON.parse(line))
+    expect(frames.find(f => f.type === 'done')).toMatchObject({ ok: true, warnings: [expect.stringContaining('Archived One')] })
 
     const act = await client.fetch(`/api/characters/${ARCH}/activate`, { method: 'POST' })
     expect(act.status).toBe(404)
@@ -367,10 +383,14 @@ describe('character archive', () => {
     let s = await stats()
     expect(s.prefixes['archive/'].count).toBe(1)        // the surviving first row
     expect(s.prefixes['archive-meta/'].count).toBe(2)   // both index rows
-    expect(s.archiveOrphan).toMatchObject({ available: true, count: 0 })
+    expect(s.archiveOrphan).toMatchObject({ available: false, count: 0 })
     expect(s.orphan.available).toBe(false)               // nothing referenced is missing
     const db = (await readDb()).db
     expect(db.nodeOnlyArchivedCharacters ?? []).toEqual([])
+
+    const retainedDelete = await client.fetch(`/api/characters/${ARCH}/archive`, { method: 'DELETE' })
+    expect(retainedDelete.status).toBe(200)
+    expect(await retainedDelete.json()).toMatchObject({ ok: true, deleted: 0, metas: 0 })
 
     const purge = await client.fetch('/api/db/archive/purge-orphans', { method: 'POST' })
     expect(purge.status).toBe(200)

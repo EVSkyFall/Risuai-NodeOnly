@@ -26,7 +26,7 @@ const getVips = () => {
     return _vipsPromise
 }
 const { kvGet, kvSet, kvDel, kvList,
-        kvDelPrefix, kvListWithSizes, kvListWithSizesAndUpdatedAt, kvSize, kvGetUpdatedAt, kvCopyValue, clearEntities, checkpointWal,
+        kvDelPrefix, kvListWithSizes, kvSize, kvGetUpdatedAt, kvCopyValue, clearEntities, checkpointWal,
         gcChunks, reclaimableChunkBytes, isDbBlobChunked, snapshotFootprint, illustrationAtomic,
         pluginAtomic, comfyStore, assetFileStore, storageReady,
         db: sqliteDb } = require('./db.cjs');
@@ -3456,6 +3456,7 @@ async function importBackupFromSourceUnlocked(dataSource, { maxBytes = 0, totalB
         try { sqliteDb.exec('ROLLBACK'); } catch (_) {}
         await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => {});
         await fs.rm(backupInlayDir, { recursive: true, force: true }).catch(() => {});
+        error.message = `${error.message} Assets, cold chats, remotes and plugin data may have been partially replaced.`;
         throw error;
     } finally {
         sqliteDb.pragma('synchronous = NORMAL');
@@ -6266,7 +6267,7 @@ async function buildSettingsOnlyPlan({ includeModuleAssets = true } = {}) {
 }
 
 /** Native backups carry KV rows once; upstream-target exports embed custom values. */
-async function buildFullExportDbValue({ embedPluginStorage = false } = {}) {
+async function buildFullExportDbValue({ embedPluginStorage = false, warnings = [] } = {}) {
     const raw = kvGet('database/database.bin');
     if (!raw) return null;
     const hasPluginRows = embedPluginStorage && pluginStorage.list().length > 0;
@@ -6288,9 +6289,8 @@ async function buildFullExportDbValue({ embedPluginStorage = false } = {}) {
     }
     // Deactivated characters travel inline: a .bin must be a complete legacy
     // database for upstream RisuAI and older PocketRisu builds, which know
-    // nothing about the archive. Throws when a payload is missing rather than
-    // shipping a backup that would import as a lost character.
-    await inlineArchivedCharacters(dbObj);
+    // nothing about the archive. Missing payloads retain their recovery stubs.
+    await inlineArchivedCharacters(dbObj, warnings);
     return Buffer.from(encodeRisuSaveLegacy(dbObj));
 }
 
@@ -6347,8 +6347,9 @@ app.get('/api/backup/export', async (req, res, next) => {
         }
         // Native full/settings exports carry custom/blob KV entries below. Only
         // the explicit upstream full-export target embeds custom values in the DB.
+        const exportWarnings = [];
         const exportDbValue = settingsOnly ? settingsDbValue
-            : await buildFullExportDbValue({ embedPluginStorage: target === 'upstream' });
+            : await buildFullExportDbValue({ embedPluginStorage: target === 'upstream', warnings: exportWarnings });
 
         // Inlay images only ever attach to chat messages, so a settings-only
         // export skips those namespaces for the same reason upstream does.
@@ -6454,6 +6455,7 @@ app.get('/api/backup/export', async (req, res, next) => {
         res.setHeader('content-disposition', `attachment; filename="${filenameBase}-${Date.now()}${filenameSuffix}.bin"`);
         res.setHeader('content-length', totalBytes);
         res.setHeader('x-risu-backup-assets', namespacedEntries.length);
+        if (exportWarnings.length) res.setHeader('x-risu-backup-warnings', encodeURIComponent(JSON.stringify(exportWarnings)));
 
         let closed = false;
         res.once('close', () => { closed = true; });
@@ -6629,6 +6631,7 @@ app.post('/api/backup/import', async (req, res, next) => {
 app.post('/api/backup/server/save', async (req, res, next) => {
     if (!await checkAuth(req, res)) { return; }
     let capturedAssets, capturedEntries;
+    const warnings = [];
     try {
         await flushPendingDb();
 
@@ -6713,7 +6716,8 @@ app.post('/api/backup/server/save', async (req, res, next) => {
                     }
                     if (closed) throw new Error('Client disconnected during backup save');
                     // Custom/blob values already travelled as their native KV entries.
-                    const dbValue = await buildFullExportDbValue();
+                    const dbValue = await buildFullExportDbValue({ warnings });
+                    for (const message of warnings) res.write(JSON.stringify({ type: 'warning', message }) + '\n');
                     if (dbValue) {
                         const ok = writeStream.write(encodeBackupEntry('database.risudat', dbValue));
                         if (!ok) await new Promise(r => writeStream.once('drain', r));
@@ -6730,7 +6734,7 @@ app.post('/api/backup/server/save', async (req, res, next) => {
 
             const stat = await fs.stat(finalPath);
             console.log(`[Server Backup] Saved: ${filename} (${(stat.size / 1024 / 1024).toFixed(1)} MB)`);
-            res.write(JSON.stringify({ type: 'done', ok: true, filename, size: stat.size, dir: backupsDir }) + '\n');
+            res.write(JSON.stringify({ type: 'done', ok: true, filename, size: stat.size, dir: backupsDir, warnings }) + '\n');
             res.end();
         } catch (innerError) {
             // Clean up incomplete temp file
@@ -7734,7 +7738,7 @@ const ARCHIVE_ORPHAN_GRACE_MS = process.env.POCKETRISU_ARCHIVE_ORPHAN_GRACE_MS
     ? Number(process.env.POCKETRISU_ARCHIVE_ORPHAN_GRACE_MS)
     : 10 * 60 * 1000; // override for tests that purge rows they just wrote
 
-async function listOrphanArchiveRows(dbObj) {
+async function retainedArchiveRowIds(dbObj) {
     const referenced = referencedArchiveRowIds(dbObj);
     for (const [chaId, archivedAt] of pendingActivations) referenced.add(archiveRowId(chaId, archivedAt));
     for (const key of [...listSnapshotKeys(), ...kvList('migration-backup/')]) {
@@ -7743,21 +7747,30 @@ async function listOrphanArchiveRows(dbObj) {
             for (const rowId of referencedArchiveRowIds(snapshot)) referenced.add(rowId);
         } catch (error) {
             logger.warn(`[Archive] Retaining rows: snapshot ${key} could not be read`, error);
-            return { payloads: [], metas: [], bytes: 0 };
+            return null;
         }
     }
+    return referenced;
+}
+
+async function listOrphanArchiveRows(dbObj) {
+    const archiveKeys = kvList(ARCHIVE_PREFIX);
+    const metaKeys = kvList(ARCHIVE_META_PREFIX);
+    if (archiveKeys.length === 0) return { payloads: [], metas: [], bytes: 0 };
+    const referenced = await retainedArchiveRowIds(dbObj);
+    if (!referenced) return { payloads: [], metas: [], bytes: 0 };
     const payloads = [];
     const metas = [];
     let bytes = 0;
     const youngestOrphan = Date.now() - ARCHIVE_ORPHAN_GRACE_MS;
-    for (const key of kvList(ARCHIVE_PREFIX)) {
+    for (const key of archiveKeys) {
         const parsed = parseArchiveRowKey(key, ARCHIVE_PREFIX);
         if (parsed && (referenced.has(parsed.rowId) || parsed.archivedAt > youngestOrphan)) continue;
         const size = kvSize(key) || 0;
         payloads.push({ key, size });
         bytes += size;
     }
-    for (const key of kvList(ARCHIVE_META_PREFIX)) {
+    for (const key of metaKeys) {
         const parsed = parseArchiveRowKey(key, ARCHIVE_META_PREFIX);
         if (parsed && (referenced.has(parsed.rowId) || parsed.archivedAt > youngestOrphan)) continue;
         metas.push(key);
@@ -7814,8 +7827,8 @@ async function hydrateCharacterForArchive(character, { acceptLostChats = false }
 }
 
 // Re-inline deactivated characters into a decoded database (export path).
-// Mutates and returns dbObj. Throws when any referenced row is missing.
-async function inlineArchivedCharacters(dbObj) {
+// Mutates and returns dbObj; unavailable characters keep their recovery stubs.
+async function inlineArchivedCharacters(dbObj, warnings = []) {
     const stubs = archivedStubsOf(dbObj);
     if (stubs.length > 0) {
         if (!Array.isArray(dbObj.characters)) dbObj.characters = [];
@@ -7826,7 +7839,7 @@ async function inlineArchivedCharacters(dbObj) {
             let decoded = null;
             try { decoded = await decodeArchivePayload(stub.chaId, stub.archivedAt); } catch { decoded = null; }
             if (!decoded) {
-                missing.push(stub.name || stub.chaId);
+                missing.push(stub);
                 continue;
             }
             const inlined = decoded.payload.character;
@@ -7838,12 +7851,13 @@ async function inlineArchivedCharacters(dbObj) {
             present.add(stub.chaId);
         }
         if (missing.length > 0) {
-            const err = new Error(`Deactivated character data missing: ${missing.join(', ')}`);
-            err.code = 'ARCHIVE_PAYLOAD_MISSING';
-            throw err;
+            const warning = `Deactivated character data missing or unreadable: ${missing.map(s => s.name || s.chaId).join(', ')}. Their archive stubs were retained.`;
+            logger.warn(`[Archive] ${warning}`);
+            warnings.push(warning);
         }
+        dbObj.nodeOnlyArchivedCharacters = missing;
     }
-    if ('nodeOnlyArchivedCharacters' in dbObj) delete dbObj.nodeOnlyArchivedCharacters;
+    if (archivedStubsOf(dbObj).length === 0) delete dbObj.nodeOnlyArchivedCharacters;
     return dbObj;
 }
 
@@ -7887,8 +7901,10 @@ function findUnmergedArchivedChats(fullDb) {
 // Only chats the server holds no body for are filled, so nothing newer can be
 // overwritten. A chat no row holds has no body anywhere and stays a stub —
 // refusing to persist over it would block every save of the whole database
-// and recover nothing. Throws when a row cannot be read (fail closed).
+// and recover nothing. An unreadable row is skipped so other rows can recover it.
 // Returns a new database object; `fullDb`'s branches are never mutated.
+const missingArchiveChatRows = new Map();
+
 async function restoreUnmergedArchivedChats(fullDb) {
     // Only a stub with no message array lacks its body. A legacy hybrid
     // (`_stub: true` and a real message array) carries the body itself and
@@ -7906,11 +7922,18 @@ async function restoreUnmergedArchivedChats(fullDb) {
             .filter((row) => row && row.chaId === c.chaId)
             .sort((a, b) => b.archivedAt - a.archivedAt);
         if (rows.length === 0) continue;
-        const wanted = new Set(c.chats.filter((ch) => lacksBody(ch) && ch.id).map((ch) => ch.id));
+        const rowSignature = rows.map(row => row.rowId).join('\n');
+        const wanted = new Set(c.chats.filter((ch) => lacksBody(ch) && ch.id
+            && missingArchiveChatRows.get(`${c.chaId}/${ch.id}`) !== rowSignature).map((ch) => ch.id));
         const found = new Map();
         for (const row of rows) {
             if (found.size === wanted.size) break;
-            const decoded = await decodeArchivePayload(c.chaId, row.archivedAt);
+            let decoded;
+            try { decoded = await decodeArchivePayload(c.chaId, row.archivedAt); }
+            catch (error) {
+                logger.warn(`[Archive] Skipping unreadable row ${row.rowId}: ${error?.message || error}`);
+                continue;
+            }
             for (const chat of decoded?.payload.character.chats || []) {
                 if (chat?.id && wanted.has(chat.id) && !found.has(chat.id) && Array.isArray(chat.message)) {
                     found.set(chat.id, chat);
@@ -7922,6 +7945,11 @@ async function restoreUnmergedArchivedChats(fullDb) {
                     found.set(alias, { ...chat, id: alias });
                 }
             }
+        }
+        for (const id of wanted) {
+            const key = `${c.chaId}/${id}`;
+            if (found.has(id)) missingArchiveChatRows.delete(key);
+            else missingArchiveChatRows.set(key, rowSignature);
         }
         const chats = c.chats.map((ch) => {
             if (!lacksBody(ch)) return ch;
@@ -7947,7 +7975,7 @@ async function restoreUnmergedArchivedChats(fullDb) {
 const reportedUnresolvedArchiveChats = new Set();
 
 // persistDbCacheWithChats / /api/write: restore what the archive rows hold
-// and log what they do not. Throws only when a row is unreadable.
+// and log what they do not. Individual unreadable rows do not stop persistence.
 async function restoreArchivedChatsForDisk(fullDb, source) {
     const r = await restoreUnmergedArchivedChats(fullDb);
     if (r.restored.length > 0) {
@@ -7972,8 +8000,19 @@ const INLAY_REF_RE = /\{\{(?:inlay|inlayed|inlayeddata)::(.+?)\}\}/g;
 function addInlayRefCounts(refCounts, chats) {
     let messages = 0;
     for (const chat of Array.isArray(chats) ? chats : []) {
-        if (!Array.isArray(chat?.message)) continue;
-        for (const msg of chat.message) {
+        let message = chat?.message;
+        if (isColdStorageChat(chat)) {
+            const key = chat.message[0].data.slice(COLD_STORAGE_HEADER.length);
+            try {
+                const entry = readColdStorageJsonEntry(key);
+                message = Array.isArray(entry?.coldData) ? entry.coldData : entry?.coldData?.message;
+                if (!Array.isArray(message)) throw new Error('missing or malformed cold chat');
+            } catch (error) {
+                throw new Error(`Cold chat inlay references could not be read (${key}): ${error?.message || error}`);
+            }
+        }
+        if (!Array.isArray(message)) continue;
+        for (const msg of message) {
             if (typeof msg?.data !== 'string') continue;
             messages++;
             INLAY_REF_RE.lastIndex = 0;
@@ -7984,6 +8023,17 @@ function addInlayRefCounts(refCounts, chats) {
         }
     }
     return messages;
+}
+
+function archiveInlayRefCounts(chats) {
+    const counts = Object.create(null);
+    try {
+        addInlayRefCounts(counts, chats);
+        return counts;
+    } catch (error) {
+        logger.warn(`[Archive] Inlay references unavailable: ${error?.message || error}`);
+        return null;
+    }
 }
 
 // Which inlay images are still referenced by a chat message. The client
@@ -8009,7 +8059,15 @@ app.get('/api/inlays/references', async (req, res, next) => {
             let archived = 0;
             for (const meta of listArchiveMetas()) {
                 archived++;
-                const refs = meta.inlayRefs;
+                let refs = meta.inlayRefs;
+                // Older indices counted only the COLD header. Read their payload
+                // as well as rows known to contain cold chats on every scan.
+                if (!Array.isArray(meta.coldStorageKeys) || meta.coldStorageKeys.length > 0) {
+                    const decoded = await decodeArchivePayload(meta.chaId, meta.archivedAt);
+                    if (!decoded) throw new Error(`archive payload missing: ${archiveRowId(meta.chaId, meta.archivedAt)}`);
+                    refs = Object.create(null);
+                    addInlayRefCounts(refs, decoded.payload.character.chats);
+                }
                 // Fail closed: an index row without inlay counts cannot vouch
                 // for its chats, and skipping it would under-count.
                 if (!refs || typeof refs !== 'object') {
@@ -8089,7 +8147,8 @@ async function writeArchiveRow(db, chaId, { acceptLostChats = false } = {}) {
         // about which fields hold asset references.
         assetRefs: Array.from(buildUncleanableSet({ characters: [full] })),
         // Inlay references of the archived chats, for /api/inlays/references.
-        inlayRefs: (() => { const counts = Object.create(null); addInlayRefCounts(counts, fullChats); return counts; })(),
+        coldStorageKeys: (fullChats || []).filter(isColdStorageChat).map(chat => chat.message[0].data.slice(COLD_STORAGE_HEADER.length)),
+        inlayRefs: archiveInlayRefCounts(fullChats),
     };
     kvSet(archiveMetaKey(chaId, archivedAt), Buffer.from(JSON.stringify(meta), 'utf-8'));
     logger.info(`[Archive] deactivated ${chaId}@${archivedAt} (${encoded.length} bytes, ${meta.chatCount} chats, ${meta.assetRefs.length} asset refs)`);
@@ -8254,7 +8313,7 @@ app.post('/api/characters/:chaId/activate', async (req, res, next) => {
 
 // Every deactivated character as a full legacy-shaped object — for the
 // client-assembled partial backup, which must carry them like the server
-// export does. Missing rows fail the whole request (same rule as export).
+// export does. Missing rows retain their recovery stubs and warning notes.
 app.get('/api/characters/archived/inline', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     try {
@@ -8262,8 +8321,9 @@ app.get('/api/characters/archived/inline', async (req, res, next) => {
             await flushPendingDb();
             if (!(await loadDbCacheIfMissing())) return { characters: [] };
             const shell = { characters: [], nodeOnlyArchivedCharacters: archivedStubsOf(dbCache[DB_HEX_KEY]) };
-            await inlineArchivedCharacters(shell);
-            return { characters: shell.characters };
+            const warnings = [];
+            await inlineArchivedCharacters(shell, warnings);
+            return { ...shell, warnings };
         });
         res.setHeader('Content-Type', 'application/octet-stream');
         res.send(Buffer.from(encodeRisuSaveLegacy(result)));
@@ -8294,8 +8354,9 @@ app.post('/api/db/archive/purge-orphans', async (req, res, next) => {
     } catch (err) { next(err); }
 });
 
-// Permanent deletion of a deactivated (trashed) character: every archive row
-// and index row of the chaId. The client drops the stub from its database
+// Permanent deletion of a deactivated (trashed) character: unreferenced rows
+// of the chaId. Retained snapshots and pending activations keep their rows.
+// The client drops the stub from its database
 // itself; a chaId that is still active is refused so a stale trash view can
 // never delete rows a live character may be re-deactivated against.
 app.delete('/api/characters/:chaId/archive', async (req, res, next) => {
@@ -8312,8 +8373,13 @@ app.delete('/api/characters/:chaId/archive', async (req, res, next) => {
             if ((Array.isArray(db.characters) ? db.characters : []).some((c) => c?.chaId === chaId)) {
                 return { status: 409, error: 'Character is active', code: 'ARCHIVE_ALREADY_ACTIVE' };
             }
-            const payloadKeys = listArchivePayloadKeysFor(chaId);
-            const metaKeys = kvList(ARCHIVE_META_PREFIX + chaId + '/');
+            const referenced = await retainedArchiveRowIds(db);
+            const unreferenced = (key, prefix) => {
+                const row = parseArchiveRowKey(key, prefix);
+                return referenced && row && !referenced.has(row.rowId);
+            };
+            const payloadKeys = listArchivePayloadKeysFor(chaId).filter(key => unreferenced(key, ARCHIVE_PREFIX));
+            const metaKeys = kvList(ARCHIVE_META_PREFIX + chaId + '/').filter(key => unreferenced(key, ARCHIVE_META_PREFIX));
             let bytes = 0;
             for (const key of payloadKeys) bytes += kvSize(key) || 0;
             sqliteDb.transaction(() => {
@@ -8533,7 +8599,8 @@ async function computeAssetSweep({ includeAssets, assetGraceMs = 0, includeRemot
     const assets = includeAssets ? (await assetFileStore.list()) : [];
 
     try {
-        addLiveManifestRefs(uncleanable);
+        addLiveManifestRefs(uncleanable, dbObj);
+        addArchivedCharacterRefs(uncleanable, dbObj);
     } catch (error) {
         return { error: `Manifest reference scan failed — refusing to purge: ${error?.message || error}` };
     }
@@ -8560,8 +8627,8 @@ async function computeAssetSweep({ includeAssets, assetGraceMs = 0, includeRemot
     const remoteMetaCreates = [];
     let remotesScanned = 0;
     if (includeRemotes) {
-        const characterIds = new Set(dbObj.characters.map((v) => v?.chaId).filter(Boolean));
-        const remoteRows = kvListWithSizesAndUpdatedAt('remotes/');
+        const characterIds = new Set([...dbObj.characters, ...archivedStubsOf(dbObj)].map((v) => v?.chaId).filter(Boolean));
+        const remoteRows = kvListWithSizes('remotes/').map(it => ({ ...it, updated_at: kvGetUpdatedAt(it.key) }));
         const remoteByKey = new Map(remoteRows.map((it) => [it.key, it]));
         for (const it of remoteRows) {
             if (it.key.endsWith('.meta')) continue;
@@ -8588,6 +8655,8 @@ async function computeAssetSweep({ includeAssets, assetGraceMs = 0, includeRemot
         for (const it of remoteRows) {
             if (!it.key.endsWith('.meta')) continue;
             const remoteKey = it.key.slice(0, -'.meta'.length);
+            const base = statsBasename(remoteKey);
+            if (base.endsWith('.local.bin') && characterIds.has(base.slice(0, -'.local.bin'.length))) continue;
             if (!remoteByKey.has(remoteKey)) {
                 remoteVictims.push(it);
             }
@@ -8782,14 +8851,7 @@ app.get('/api/db/stats', async (req, res, next) => {
         let orphan = { count: 0, totalSize: 0, available: false };
         let archiveOrphan = { count: 0, totalSize: 0, available: false };
         const stripped = dbCache[DB_HEX_KEY];
-        if (stripped && Array.isArray(stripped.characters)) {
-            try {
-                const rows = await listOrphanArchiveRows(stripped);
-                archiveOrphan = { count: rows.payloads.length, totalSize: rows.bytes, available: true };
-            } catch (error) {
-                logger.warn(`[Stats] archive orphan scan skipped: ${error?.message || error}`);
-            }
-        }
+        if (kvList(ARCHIVE_PREFIX).length === 0) archiveOrphan.available = true;
         if (stripped?.characters) {
             for (const c of stripped.characters) {
                 if (c?.trashTime) trashed.count++;

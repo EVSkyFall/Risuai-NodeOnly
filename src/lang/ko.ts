@@ -618,6 +618,7 @@ export const languageKorean = {
   deactivateCharacterLostChats: (name: string, count: number, list: string) =>
       `"${name}"의 채팅 ${count}개는 서버에도 이 브라우저에도 내용이 없어 열면 빈 채팅으로 보입니다.\n\n${list}\n\n이 채팅들은 빈 채팅으로 보관됩니다. 비활성화할까요?`,
   deactivateCharacterFailed: "비활성화에 실패했습니다: ",
+    archiveGuardSaveWaiting: "저장 대기 중: 보관된 캐릭터와 관련된 변경을 서버가 거부했어요. 편집 내용은 보존되며 계속 재시도합니다.",
   archiveSavePending: "비활성화했지만 아직 서버에 저장하지 못했습니다. 자동으로 다시 저장을 시도합니다.",
 
   bulkArchiveProgress: (done: number, total: number, trash: boolean) =>

@@ -681,6 +681,25 @@ describe('unreadable database payloads', () => {
     expect(after.normalized.characters).toEqual(before.normalized.characters)
   })
 
+  test('S5: late encrypted verdict after an intermediate commit reports partial replacement truthfully', async () => {
+    const srv = await spawnServer()
+    servers.push(srv)
+    const client = await createClient(srv.port, srv.password)
+    await client.importBackup(createSeedBackup({ characterCount: 1 }))
+    const before = normalizeBackup(await client.exportBackup())
+    const entries = Array.from({ length: 5001 }, (_, i) => ({ name: `batch-${i}.png`, data: Buffer.from('replacement') }))
+    const ndjson = await importViaNdjson(client, encodeBackup([
+      ...entries,
+      { name: 'encryption.risudat', data: Buffer.from(JSON.stringify({ type: 'account' })) },
+      { name: 'database.risudat', data: pseudoRandomBytes(4096) },
+    ]))
+    expect(ndjson.errors[0].code).toBe('BACKUP_ENCRYPTED')
+    expect(ndjson.errors[0].message).toContain('Your existing database was not replaced.')
+    expect(ndjson.errors[0].message).toContain('Assets, cold chats, remotes and plugin data may have been partially replaced.')
+    const after = normalizeBackup(await client.exportBackup())
+    expect(after.normalized.characters).toEqual(before.normalized.characters)
+  }, 60000)
+
   test('undecodable database.risudat without a marker is rejected before it replaces the live database', async () => {
     const srv = await spawnServer()
     servers.push(srv)

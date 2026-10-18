@@ -112,22 +112,31 @@ describe('character trash (deactivated + marker)', () => {
     expect(s.prefixes['archive/'].count).toBe(1)
   })
 
-  test('permanent delete removes every archive row; an active character is refused', async () => {
+  test('permanent delete retains referenced rows until the stub and snapshots release them', async () => {
     const refused = await client.fetch(`/api/characters/${KEEP}/archive`, { method: 'DELETE' })
     expect(refused.status).toBe(409)
     expect((await refused.json() as any).code).toBe('ARCHIVE_ALREADY_ACTIVE')
 
     const del = await client.fetch(`/api/characters/${TRASH}/archive`, { method: 'DELETE' })
     expect(del.status).toBe(200)
-    expect(await del.json()).toMatchObject({ ok: true, deleted: 1, metas: 1 })
+    expect(await del.json()).toMatchObject({ ok: true, deleted: 0, metas: 0 })
 
     const s = await stats()
-    expect(s.prefixes['archive/'].count).toBe(0)
-    expect(s.prefixes['archive-meta/'].count).toBe(0)
+    expect(s.prefixes['archive/'].count).toBe(1)
+    expect(s.prefixes['archive-meta/'].count).toBe(1)
 
-    // The client drops the stub afterwards; until then the live DB still
-    // points at a missing row, which export must refuse rather than fake.
     const exp = await client.fetch('/api/backup/export')
-    expect([409, 500]).toContain(exp.status)
+    expect(exp.status).toBe(200)
+    await exp.arrayBuffer()
+
+    const before = await readDb()
+    expect((await sendPatch([{ op: 'remove', path: '/nodeOnlyArchivedCharacters' }], before.hash)).status).toBe(200)
+    const snapshots = await (await client.fetch('/api/db/snapshots')).json() as any
+    for (const snapshot of snapshots.snapshots) {
+      expect((await client.fetch(`/api/db/snapshots?key=${encodeURIComponent(snapshot.key)}`, { method: 'DELETE' })).status).toBe(200)
+    }
+    const released = await client.fetch(`/api/characters/${TRASH}/archive`, { method: 'DELETE' })
+    expect(await released.json()).toMatchObject({ ok: true, deleted: 1, metas: 1 })
+    expect((await stats()).prefixes['archive/'].count).toBe(0)
   })
 })
