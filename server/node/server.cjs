@@ -4253,11 +4253,7 @@ const reverseProxyFunc = async (req, res, next) => {
             if (res.destroyed) return;
             if (!res.headersSent) {
                 res.status(504).send({
-                    error: idle.idle()
-                        ? `Proxy upstream sent nothing for ${idleMs}ms`
-                        : timeoutMs
-                            ? `Proxy request timed out after ${timeoutMs}ms`
-                            : 'Proxy request aborted'
+                    error: timeoutMs ? `Proxy request timed out after ${timeoutMs}ms` : 'Proxy request aborted'
                 });
             } else {
                 res.end();
@@ -4355,11 +4351,7 @@ const reverseProxyFunc_get = async (req, res, next) => {
             if (res.destroyed) return;
             if (!res.headersSent) {
                 res.status(504).send({
-                    error: idle.idle()
-                        ? `Proxy upstream sent nothing for ${idleMs}ms`
-                        : timeoutMs
-                            ? `Proxy request timed out after ${timeoutMs}ms`
-                            : 'Proxy request aborted'
+                    error: timeoutMs ? `Proxy request timed out after ${timeoutMs}ms` : 'Proxy request aborted'
                 });
             } else {
                 res.end();
