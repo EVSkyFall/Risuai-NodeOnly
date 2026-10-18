@@ -34,7 +34,7 @@
     import Help from "./Help.svelte";
     import { getChatBranches } from "src/ts/gui/branches";
     import { getCurrentCharacter, type TogglePreset, applyToggleValues, snapshotCurrentToggleValues } from "src/ts/storage/database.svelte";
-    import { alertInput, alertConfirm, alertError, alertNormalWait, notifySuccess } from "src/ts/alert";
+    import { alertInput, alertConfirm, alertError, alertNormalWait, notifySuccess, RISU_TOS_ACCEPT_RESULT } from "src/ts/alert";
     import { selectSingleFile } from "src/ts/util";
     import { translateStackTrace } from "../../ts/sourcemap";
     import { getDetailedOSLabel, getFallbackOSLabel, getRisuEnvironmentLabel } from "src/ts/platform";
@@ -938,7 +938,7 @@
     </div>
     {#snippet footer()}
         <ShButton variant="outline" onclick={() => alertStore.set({ type: 'none', msg: 'no' })}>{language.risuTosDecline}</ShButton>
-        <ShButton onclick={() => alertStore.set({ type: 'none', msg: 'yes' })}>{language.risuTosAccept}</ShButton>
+        <ShButton onclick={() => alertStore.set({ type: 'none', msg: RISU_TOS_ACCEPT_RESULT })}>{language.risuTosAccept}</ShButton>
     {/snippet}
 </ShAlertDialog>
 

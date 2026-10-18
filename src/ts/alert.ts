@@ -67,6 +67,11 @@ function readRisuTosAccepted(){
 // for acceptance without popping the dialog themselves.
 export const risuTosAccepted = writable(readRisuTosAccepted())
 
+// The result only the terms dialog's accept button writes. Alerts share one
+// store, so a plain 'yes' could come from another dialog that replaced this
+// one while it was open — that must not count as accepting the terms.
+export const RISU_TOS_ACCEPT_RESULT = 'risu-tos-accepted'
+
 // Normalize any value (string / Error / plain object / primitive) into a
 // human-readable message and an optional stack trace. Shared by alertError
 // and the notify* family so callers can pass raw catch() values safely —
@@ -380,7 +385,7 @@ export async function alertTOS(){
 
     await waitAlert()
 
-    if(get(alertStoreImported).msg === 'yes'){
+    if(get(alertStoreImported).msg === RISU_TOS_ACCEPT_RESULT){
         try {
             localStorage.setItem(RISU_TOS_STORAGE_KEY, RISU_TOS_REVISION)
         } catch {}
