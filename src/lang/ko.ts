@@ -713,6 +713,7 @@ export const languageKorean = {
   SpacedView: "멀티플",
   emphasizedView: "더블",
   pluginWarn: "악성 플러그인 설치 시 문제가 생길 수 있습니다.",
+  pluginSandboxDied: '플러그인 "{}"의 실행 환경이 종료됐어요(주로 메모리 부족). 페이지를 새로고침할 때까지 이 플러그인의 기능은 건너뜁니다.',
   pluginConfirm:
     "이 플러그인을 정말로 가져오시겠습니까? 신뢰할 수 있는 출처의 플러그인만 가져오세요.",
   pluginContainsExternalMedia:

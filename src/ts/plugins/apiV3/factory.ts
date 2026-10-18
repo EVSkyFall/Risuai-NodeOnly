@@ -6,6 +6,7 @@ type MsgType =
     | 'RESPONSE'
     | 'RELEASE_INSTANCE'
     | 'ABORT_SIGNAL'
+    | 'SANDBOX_READY'
     | 'SANDBOX_TERMINATED';
 
 interface RpcMessage {
@@ -53,8 +54,8 @@ export function createStreamRelayBridge() {
         if (terminated) stop(terminated);
         return () => active.delete(stop);
     }
-    function terminate() {
-        terminated ??= new Error('plugin sandbox terminated');
+    function terminate(error = new Error('plugin sandbox terminated')) {
+        terminated ??= error;
         for (const stop of active) stop(terminated);
         active.clear();
     }
@@ -384,8 +385,11 @@ await (async function() {
     const callbackIdByFunction = new WeakMap();
     const proxyRefRegistry = new Map();
     const abortControllers = new Map();
+    // Keep the guest endpoint alive for the entire document lifetime.
+    let livenessPort;
 
     function teardown() {
+        livenessPort?.close();
         terminate();
         for (const controller of abortControllers.values()) controller.abort();
         abortControllers.clear();
@@ -514,6 +518,11 @@ await (async function() {
         const data = event.data;
         if (!data) return;
 
+        if (data.type === 'SANDBOX_LIVENESS') {
+            livenessPort = data.port;
+            livenessPort.start();
+            return;
+        }
 
         if (data.type === 'SANDBOX_TERMINATED') { teardown(); return; }
 
@@ -610,6 +619,8 @@ await (async function() {
 
 
 
+    send({ type: 'SANDBOX_READY' });
+
     const propertyCache = new Map();
 
     window.risuai = new Proxy({}, {
@@ -686,12 +697,17 @@ export class SandboxHost {
 
     private pendingCallbacks = new Map<string, { resolve: Function, reject: Function }>();
     private pendingExecutions = new Set<(error: Error) => void>();
+    private pendingOperations = new Set<(error: Error) => void>();
+    private stopped: Error | undefined;
+    private livenessPort: MessagePort;
+    private guestLivenessPort: MessagePort | undefined;
 
-    constructor(apiFactory: any) {
+    constructor(apiFactory: any, private onDied?: (error: Error) => void) {
         this.apiFactory = apiFactory;
     }
 
     public executeInIframe(code: string): Promise<any> {
+        if (this.stopped) return Promise.reject(this.stopped);
         return new Promise((resolve, reject) => {
             const reqId = 'exec_' + Math.random().toString(36).substring(2);
 
@@ -723,6 +739,30 @@ export class SandboxHost {
                 reqId,
                 code
             }, '*');
+        });
+    }
+
+    private awaitOperation(operation: any): Promise<any> {
+        return new Promise((resolve, reject) => {
+            this.pendingOperations.add(reject);
+            Promise.resolve(operation).then((result) => {
+                this.pendingOperations.delete(reject);
+                if (this.stopped) {
+                    // An API may finish after its caller died, even after abort.
+                    this.streamBridge.mapValue(result instanceof Response ? result.body : result, (value) => {
+                        if (value instanceof ReadableStream) void value.cancel(this.stopped).catch(() => {});
+                        return value;
+                    });
+                    reject(this.stopped);
+                } else resolve(result);
+            }, (error) => {
+                this.pendingOperations.delete(reject);
+                reject(error);
+            }).catch(reject);
+            if (this.stopped) {
+                this.pendingOperations.delete(reject);
+                reject(this.stopped);
+            }
         });
     }
 
@@ -782,6 +822,7 @@ export class SandboxHost {
                 if (cached) return cached;
 
                 const wrapper = async (...innerArgs: any[]) => {
+                    if (this.stopped) throw this.stopped;
                     return new Promise((resolve, reject) => {
                         // Stale-stub guard (D2): after a plugin reload the old factory's
                         // iframe is gone — its stubs may still sit in host Sets (e.g.
@@ -808,6 +849,7 @@ export class SandboxHost {
                                 };
                                 if (!arg.aborted) {
                                     arg.addEventListener('abort', () => {
+                                        if (this.stopped) return;
                                         try {
                                             this.iframe.contentWindow?.postMessage({
                                                 type: 'ABORT_SIGNAL',
@@ -904,13 +946,33 @@ export class SandboxHost {
 
         this.iframe.setAttribute('csp', this.csp);
 
+        const liveness = new MessageChannel();
+        this.livenessPort = liveness.port1;
+        this.guestLivenessPort = liveness.port2;
+        this.livenessPort.addEventListener('close', () => {
+            if (this.stopped) return;
+            const error = new Error('plugin sandbox died');
+            this.stop(error);
+            this.onDied?.(error);
+        });
+        this.livenessPort.start();
+
         const messageHandler = async (event: MessageEvent) => {
+            if (this.stopped) return;
             if (event.source !== this.iframe.contentWindow) return;
             const data = event.data as RpcMessage;
             // event.data can be null when the sender transferred something this
             // realm cannot deserialize (e.g. a ReadableStream from the sandboxed
             // iframe) — guard instead of crashing the whole RPC handler.
             if (!data || typeof data.type !== 'string') return;
+
+            if (data.type === 'SANDBOX_READY') {
+                if (this.guestLivenessPort) {
+                    this.iframe.contentWindow!.postMessage({ type: 'SANDBOX_LIVENESS', port: this.guestLivenessPort }, '*', [this.guestLivenessPort]);
+                    this.guestLivenessPort = undefined;
+                }
+                return;
+            }
 
             if (data.type === 'SANDBOX_TERMINATED') {
                 this.terminate();
@@ -962,12 +1024,12 @@ export class SandboxHost {
                     if (data.type === 'CALL_ROOT') {
                         const fn = this.apiFactory[data.method!];
                         if (typeof fn !== 'function') throw new Error(`API method ${data.method} not found`);
-                        result = await fn(...args);
+                        result = await this.awaitOperation(fn(...args));
                     } else {
                         const instance = this.instanceRegistry.get(data.id!);
                         if (!instance) throw new Error("Instance not found or released");
                         if (typeof instance[data.method!] !== 'function') throw new Error(`Method ${data.method} missing on instance`);
-                        result = await instance[data.method!](...args);
+                        result = await this.awaitOperation(instance[data.method!](...args));
                     }
 
 
@@ -980,6 +1042,7 @@ export class SandboxHost {
 
                 const original = response.result;
                 try {
+                    if (this.stopped) return;
                     try {
                         try {
                             this.iframe.contentWindow!.postMessage(response, '*', []);
@@ -995,6 +1058,7 @@ export class SandboxHost {
                         // buffering, so fallback cannot lose any body bytes.
                         for (const relay of relays) relay.abandon();
                         response.result = await this.streamBridge.bufferStreams(original);
+                        if (this.stopped) return;
                         delete response.relay;
                         this.iframe.contentWindow!.postMessage(response, '*', this.collectTransferables(response));
                         return;
@@ -1005,6 +1069,7 @@ export class SandboxHost {
                         for (const relay of relays) relay.start();
                     }
                 } catch (error) {
+                    if (this.stopped) return;
                     console.error('Failed to post message to iframe:', error);
                     this.iframe.contentWindow?.postMessage({
                         type: 'RESPONSE',
@@ -1058,27 +1123,37 @@ export class SandboxHost {
     // D2 of the replacer hardening request: a bare pendingCallbacks.clear()
     // abandons in-flight callback awaits — whatever request was awaiting that
     // replacer freezes forever. Reject them so guarded callers fail open.
-    private rejectPendingCallbacks(reason: string) {
+    private rejectPendingCallbacks(error: Error) {
         for (const { reject } of this.pendingCallbacks.values()) {
-            try { reject(new Error(reason)); } catch (_) { /* already settled */ }
+            try { reject(error); } catch (_) { /* already settled */ }
         }
         this.pendingCallbacks.clear();
     }
 
     public terminate() {
-        this.streamBridge.terminate();
+        if (!this.stopped) {
+            this.stop(new Error('plugin sandbox terminated'));
+            try { this.iframe?.contentWindow?.postMessage({ type: 'SANDBOX_TERMINATED' }, '*'); } catch (_) {}
+        }
+        this.iframe?.remove();
+    }
+
+    private stop(error: Error) {
+        this.stopped = error;
+        this.livenessPort?.close();
+        this.guestLivenessPort?.close();
+        this.guestLivenessPort = undefined;
+        this.rejectPendingCallbacks(error);
+        for (const abandon of [...this.pendingExecutions]) abandon(error);
+        for (const reject of this.pendingOperations) reject(error);
+        this.pendingOperations.clear();
+        this.streamBridge.terminate(error);
         for (const controller of this.abortControllers.values()) controller.abort();
-        try { this.iframe?.contentWindow?.postMessage({ type: 'SANDBOX_TERMINATED' }, '*'); } catch (_) {}
         if (this.messageHandlerRef) {
             window.removeEventListener('message', this.messageHandlerRef);
             this.messageHandlerRef = null;
         }
-        if (this.iframe) {
-            this.iframe.remove();
-        }
         this.instanceRegistry.clear();
-        this.rejectPendingCallbacks('plugin sandbox terminated');
-        for (const abandon of [...this.pendingExecutions]) abandon(new Error('plugin sandbox terminated'));
         this.abortControllers.clear();
         this.callbackWrapperCache.clear();
     }

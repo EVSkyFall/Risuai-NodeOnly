@@ -641,6 +641,7 @@ export const languageEnglish = {
     SpacedView: "Multiple Character View",
     emphasizedView: "Double Character View",
     pluginWarn: "Installing malicious plugins can cause problems.",
+    pluginSandboxDied: 'Plugin "{}" stopped (its sandbox process ended, usually from running out of memory). Its features are skipped until you reload the page.',
     pluginConfirm: "Do you really want to import this plugin? Only import plugins from trusted sources.",
     pluginContainsExternalMedia: "This plugin contains external media.",
     pluginContainsExternalJS: "This plugin contains external Javascript.",

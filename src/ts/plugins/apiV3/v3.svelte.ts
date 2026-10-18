@@ -9,7 +9,7 @@ import DOMPurify from 'dompurify';
 import { additionalChatMenu, additionalFloatingActionButtons, additionalHamburgerMenu, additionalSettingsMenu, bodyIntercepterStore, chatPanelStore, DBState, selectedCharID, type MenuDef } from "src/ts/stores.svelte";
 import { v4 } from "uuid";
 import { sleep } from "src/ts/util";
-import { alertConfirm, alertError, alertNormal, alertNormalWait } from "src/ts/alert";
+import { alertConfirm, alertError, alertNormal, alertNormalWait, notifyWarning } from "src/ts/alert";
 import { language } from "src/lang";
 import { checkCharOrder, forageStorage, getFetchLogs } from "src/ts/globalApi.svelte";
 import { changeColorScheme, updateColorScheme, updateTextThemeAndCSS, type ColorScheme } from "src/ts/gui/colorscheme";
@@ -1744,7 +1744,11 @@ export async function executePluginV3(plugin:RisuPlugin, loadGeneration = v3Load
         const iframe = document.createElement('iframe');
         iframe.style.display = "none";
         document.body.appendChild(iframe);
-        const host = new SandboxHost(makeRisuaiAPIV3(iframe, pluginSnapshot, illustrationBridge));
+        const host = new SandboxHost(makeRisuaiAPIV3(iframe, pluginSnapshot, illustrationBridge), (error) => {
+            const name = pluginSnapshot.displayName || pluginSnapshot.name;
+            console.error(`[RisuAI Plugin: ${name}] sandbox died`, error);
+            notifyWarning(language.pluginSandboxDied.replace('{}', () => name));
+        });
         v3PluginInstances.push({
             name: pluginSnapshot.name,
             host,

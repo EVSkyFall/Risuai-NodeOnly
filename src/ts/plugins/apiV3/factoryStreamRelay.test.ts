@@ -4,6 +4,7 @@ import { createStreamRelayBridge, GUEST_BRIDGE_SCRIPT, SandboxHost } from './fac
 
 const bridge = createStreamRelayBridge();
 const NativeMessageChannel = MessageChannel;
+const hosts: SandboxHost[] = [];
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 const bytes = (...chunks: number[][]) => new ReadableStream<Uint8Array>({
     start(controller) {
@@ -34,7 +35,7 @@ function captureChannels() {
 }
 
 function hostHarness(api: any, failPost?: (message: any) => void, Host = SandboxHost) {
-    let handler: (event: any) => Promise<void>;
+    const handlers = new Set<(event: any) => void | Promise<void>>();
     let guestHandler: (event: any) => void;
     const guestEvents = new Map<string, () => void>();
     const answers: any[] = [];
@@ -64,15 +65,24 @@ function hostHarness(api: any, failPost?: (message: any) => void, Host = Sandbox
     vi.stubGlobal('HTMLIFrameElement', Frame);
     vi.stubGlobal('ImageBitmap', class {});
     vi.stubGlobal('window', {
-        addEventListener(_name: string, fn: typeof handler) { handler = fn; },
-        removeEventListener() {}
+        addEventListener(_name: string, fn: (event: any) => void) { handlers.add(fn); },
+        removeEventListener(_name: string, fn: (event: any) => void) { handlers.delete(fn); }
     });
-    const host = new Host(api);
+    const warning = vi.fn();
+    const host = new Host(api, warning);
+    hosts.push(host);
     const frame = new Frame();
     host.run(frame as unknown as HTMLIFrameElement, '');
-    const dispatch = (data: any) => handler({ source: frame.contentWindow, data });
+    const dispatch = (data: any) => Promise.all([...handlers].map((handler) => handler({ source: frame.contentWindow, data })));
     return {
-        host, frame, answers, dispatch, hostPosts, guestPosts,
+        host, frame, answers, dispatch, hostPosts, guestPosts, warning, handlers,
+        async crash() {
+            const closed = new Promise<void>((resolve) => {
+                (host as any).livenessPort.addEventListener('close', () => resolve(), { once: true });
+            });
+            answers.find((message) => message.type === 'SANDBOX_LIVENESS').port.close();
+            await closed;
+        },
         controllers: (host as any).abortControllers as Map<string, AbortController>,
         async guest(script = GUEST_BRIDGE_SCRIPT, failSend?: (message: any) => void) {
             const guestWindow: any = {
@@ -110,7 +120,127 @@ function hostHarness(api: any, failPost?: (message: any) => void, Host = Sandbox
 const call = (method = 'fetch', args: any[] = []) => ({ type: 'CALL_ROOT', reqId: 'request', method, args });
 const abortArgs = [{ signal: { __type: 'ABORT_SIGNAL_REF', abortId: 'signal', aborted: false } }];
 const initialization = { _getPropertiesForInitialization: () => ({ list: [] }), _getAliases: () => ({}) };
-afterEach(() => vi.unstubAllGlobals());
+afterEach(async () => {
+    for (const host of hosts.splice(0)) host.terminate();
+    await tick();
+    vi.unstubAllGlobals();
+});
+
+describe('sandbox process death', () => {
+    test('peer close rejects all callbacks and executions, and stale wrappers never post again', async () => {
+        let callback: (signal?: AbortSignal) => Promise<unknown>;
+        const harness = hostHarness({ ...initialization, register(fn: typeof callback) { callback = fn; } });
+        const guest = await harness.guest();
+        await guest.api.register(() => new Promise(() => {}));
+        const controller = new AbortController();
+        const first = expect(callback!(controller.signal)).rejects.toThrow('plugin sandbox died');
+        const second = expect(callback!()).rejects.toThrow('plugin sandbox died');
+        const execution = expect(harness.host.executeInIframe('await new Promise(() => {})')).rejects.toThrow('plugin sandbox died');
+        await harness.crash();
+        await Promise.all([first, second, execution]);
+        expect(harness.frame.removed).toBe(false);
+        expect(harness.frame.contentWindow).toBeTruthy();
+        expect((harness.host as any).pendingCallbacks.size).toBe(0);
+        expect((harness.host as any).pendingExecutions.size).toBe(0);
+        expect(harness.handlers.size).toBe(0);
+        const posts = harness.hostPosts.length;
+        controller.abort();
+        await expect(callback!()).rejects.toThrow('plugin sandbox died');
+        await expect(harness.host.executeInIframe('return 1')).rejects.toThrow('plugin sandbox died');
+        expect(harness.hostPosts).toHaveLength(posts);
+        expect(harness.warning).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ message: 'plugin sandbox died' }));
+        (harness.host as any).livenessPort.dispatchEvent(new Event('close'));
+        harness.host.terminate();
+        await expect(callback!()).rejects.toThrow('plugin sandbox died');
+        expect(harness.warning).toHaveBeenCalledOnce();
+        expect(harness.hostPosts).toHaveLength(posts);
+    });
+
+    test.each([false, true])('intentional termination never warns (guest initialized: %s)', async (initialized) => {
+        const harness = hostHarness(initialization);
+        if (initialized) await harness.guest();
+        harness.host.terminate();
+        await tick();
+        (harness.host as any).livenessPort.dispatchEvent(new Event('close'));
+        expect(harness.warning).not.toHaveBeenCalled();
+        expect(harness.frame.removed).toBe(true);
+    });
+
+    test('a live sandbox retains its port and continues callbacks, executions, and streams', async () => {
+        let callback: (value: number) => Promise<number>;
+        const harness = hostHarness({ ...initialization, register(fn: typeof callback) { callback = fn; }, fetch: () => new Response(bytes([1, 2])) });
+        const guest = await harness.guest();
+        await guest.api.register((value: number) => value + 1);
+        await expect(callback!(41)).resolves.toBe(42);
+        await expect(harness.host.executeInIframe('return 7')).resolves.toBe(7);
+        expect(new Uint8Array(await (await guest.api.fetch()).arrayBuffer())).toEqual(new Uint8Array([1, 2]));
+        expect(harness.answers.filter((message) => message.type === 'SANDBOX_LIVENESS')).toHaveLength(1);
+        expect(harness.warning).not.toHaveBeenCalled();
+    });
+
+    test.each(['root', 'instance'])('death settles a stalled %s API dispatch, aborts it, and discards its late stream', async (kind) => {
+        let finish!: (value: unknown) => void;
+        let signal!: AbortSignal;
+        const fetch = (options: { signal: AbortSignal }) => {
+            signal = options.signal;
+            return new Promise((resolve) => { finish = resolve; });
+        };
+        const harness = hostHarness({ ...initialization, fetch });
+        await harness.guest();
+        if (kind === 'instance') (harness.host as any).instanceRegistry.set('instance', { fetch });
+        const dispatch = harness.dispatch({ ...call('fetch', abortArgs), ...(kind === 'instance' ? { type: 'CALL_INSTANCE', id: 'instance' } : {}) });
+        expect(harness.controllers.size).toBe(1);
+        expect((harness.host as any).pendingOperations.size).toBe(1);
+        const posts = harness.hostPosts.length;
+        await harness.crash();
+        await dispatch;
+        expect(signal.aborted).toBe(true);
+        expect(harness.controllers.size).toBe(0);
+        expect((harness.host as any).pendingOperations.size).toBe(0);
+        const cancel = vi.fn();
+        finish(new Response(new ReadableStream({ cancel })));
+        await tick();
+        expect(cancel).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ message: 'plugin sandbox died' }));
+        expect(harness.hostPosts).toHaveLength(posts);
+    });
+
+    test('death errors incoming streams and cancels outgoing relays with the death reason', async () => {
+        const cancel = vi.fn();
+        const source = new ReadableStream({ cancel });
+        const harness = hostHarness({ ...initialization, fetch: () => new Response(source) });
+        await harness.guest();
+        await harness.dispatch(call('fetch', abortArgs));
+        const incomingChannel = new NativeMessageChannel();
+        const incoming = (harness.host as any).streamBridge.reviveStreamPorts({ __type: 'STREAM_PORT', port: incomingChannel.port1 });
+        const reading = expect(incoming.getReader().read()).rejects.toThrow('plugin sandbox died');
+        await harness.crash();
+        await reading;
+        expect(cancel).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ message: 'plugin sandbox died' }));
+        expect(source.locked).toBe(false);
+        expect(harness.controllers.size).toBe(0);
+        incomingChannel.port2.close();
+    });
+
+    test('death cancels a stalled host buffering fallback without posting a late error', async () => {
+        const cancel = vi.fn();
+        let started!: () => void;
+        const buffering = new Promise<void>((resolve) => { started = resolve; });
+        const source = new ReadableStream({ pull() { started(); }, cancel }, { highWaterMark: 0 });
+        const harness = hostHarness({ ...initialization, fetch: () => new Response(source) }, (message) => {
+            if (message.result?.value?.__type === 'STREAM_PORT') throw new Error('force buffering');
+        });
+        await harness.guest();
+        const dispatch = harness.dispatch(call('fetch', abortArgs));
+        await buffering;
+        const posts = harness.hostPosts.length;
+        await harness.crash();
+        await dispatch;
+        expect(cancel).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ message: 'plugin sandbox died' }));
+        expect(source.locked).toBe(false);
+        expect(harness.controllers.size).toBe(0);
+        expect(harness.hostPosts).toHaveLength(posts);
+    });
+});
 
 describe('shared MessagePort stream relay', () => {
     test('transfers a multi-chunk body byte-identically without detaching producer buffers', async () => {
@@ -603,7 +733,7 @@ describe('RPC structured-clone fast path', () => {
         expect(request.message.args[0]).toBe(input);
         expect(invocation.message.args[0]).toBe(hostInput);
         expect(returned.message.result).toBe(callbackInput);
-        for (const post of [...harness.hostPosts, ...harness.guestPosts]) {
+        for (const post of [...harness.hostPosts, ...harness.guestPosts].filter(({ message }) => message.type !== 'SANDBOX_LIVENESS')) {
             expect(post.message).not.toHaveProperty('relay');
             expect(post.transfer).toEqual([]);
         }
