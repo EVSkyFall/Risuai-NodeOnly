@@ -611,10 +611,10 @@ export const allowedDbKeys = [
     'characterOrder'
 ]
 
-// V3 getDatabase returns these too, but they stay out of allowedDbKeys so
-// setDatabase / setDatabaseLite / the V2 proxy cannot write them. Lore CBS
-// reads toggles (toggle_*), {{getglobalvar}} values and preset default
-// variables from here.
+// V3 getDatabase returns these too. They stay out of allowedDbKeys and
+// setDatabase / setDatabaseLite skip them, so plugins can read them but not
+// write them. Lore CBS reads toggles (toggle_*), {{getglobalvar}} values and
+// preset default variables from here.
 export const pluginReadOnlyDbKeys = [
     'globalChatVariables',
     'templateDefaultVariables'
@@ -877,6 +877,11 @@ export const getV2PluginAPIs = () => {
         setDatabaseLite: (newDb: any) => {
             const db = getDatabase();
             for (const key of Object.keys(newDb)) {
+                // A read-modify-write hands back what getDatabase returned;
+                // without this the read-only keys land in plugin storage.
+                if (pluginReadOnlyDbKeys.includes(key)) {
+                    continue;
+                }
                 if (applyPluginDbKey(key, newDb[key])) {
                     continue;
                 }
@@ -892,6 +897,9 @@ export const getV2PluginAPIs = () => {
         setDatabase: async (newDb: any) => {
             const db = getDatabase();
             for (const key of Object.keys(newDb)) {
+                if (pluginReadOnlyDbKeys.includes(key)) {
+                    continue;
+                }
                 if (key === 'plugins') {
                     console.warn('[WARN] Plugin attempted to access plugin directly. this would be blocked in future versions. Instead, use the provided APIs to manage plugins. Attempting to handle plugin installation via plugin for new plugins in the provided database object.')
                     // handlePluginInstallViaPlugin returns ONLY the newly

@@ -26,8 +26,18 @@ describe('plugin read-only database keys', () => {
         const writable = between(plugins, 'export const allowedDbKeys', ']')
         expect(writable).not.toContain('globalChatVariables')
         expect(writable).not.toContain('templateDefaultVariables')
-        // declaration only in plugins.svelte.ts; import + getDatabase loop in v3
-        expect(count(plugins, 'pluginReadOnlyDbKeys')).toBe(1)
+        // setDatabase(getDatabase()) must not copy them into plugin storage
+        // through the else branch of either write loop.
+        const skip = 'if (pluginReadOnlyDbKeys.includes(key)) {\n                    continue;'
+        for (const [start, end] of [['setDatabaseLite:', 'setDatabase: async'], ['setDatabase: async', 'SafeFunction:']]) {
+            const loop = between(plugins, start, end).replace(/\r\n/g, '\n')
+            const first = loop.indexOf('for (const key of Object.keys(newDb)) {')
+            expect(first).toBeGreaterThan(-1)
+            expect(loop.indexOf(skip)).toBeGreaterThan(first)
+            expect(loop.indexOf(skip)).toBeLessThan(loop.indexOf('pluginStorageStore.setItemSync'))
+        }
+        // declaration + the two write-loop skips; import + getDatabase loop in v3
+        expect(count(plugins, 'pluginReadOnlyDbKeys')).toBe(3)
         expect(count(v3, 'pluginReadOnlyDbKeys')).toBe(2)
     })
 })
