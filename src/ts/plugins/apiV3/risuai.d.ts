@@ -421,6 +421,16 @@ interface DatabaseSubset {
     guiHTML?: string;
     /** Color scheme name */
     colorSchemeName?: string;
+    /** Global chat variables, including toggle values under `toggle_<name>`. Read-only: setDatabase ignores it. */
+    readonly globalChatVariables?: {[key: string]: string};
+    /** Preset default variables (`key=value` lines). Read-only: setDatabase ignores it. */
+    readonly templateDefaultVariables?: string;
+    /** Lorebook scan depth. Read-only: setDatabase ignores it. */
+    readonly loreBookDepth?: number;
+    /** Lorebook token budget. Read-only: setDatabase ignores it. */
+    readonly loreBookToken?: number;
+    /** User name used when no persona is bound. Read-only: setDatabase ignores it. */
+    readonly username?: string;
 }
 
 // ============================================================================
@@ -2106,14 +2116,18 @@ interface RisuaiPluginAPI {
 
     /**
      * Gets the database with limited access
-     * @param includeOnly - Array of keys to include or 'all' for all allowed keys. defaults to 'all'.
-     * @returns DatabaseSubset object (limited to allowed keys) or null if consent not given
+     * @param includeOnly - Array of keys to include or 'all' for every allowed and read-only key. defaults to 'all'.
+     * @returns DatabaseSubset object (limited to allowed and read-only keys) or null if consent not given
      *
      * Allowed keys: characters, modules, enabledModules, moduleIntergration,
      * pluginV2, personas, plugins, pluginCustomStorage, temperature,
      * maxContext, maxResponse, frequencyPenalty, PresensePenalty, theme,
      * textTheme, lineHeight, seperateModelsForAxModels, seperateModels,
      * customCSS, guiHTML, colorSchemeName, characterOrder, selectedPersona
+     *
+     * Read-only keys (returned, but setDatabase / setDatabaseLite ignore them):
+     * globalChatVariables, templateDefaultVariables, loreBookDepth,
+     * loreBookToken, username
      *
      * Use includeOnly to limit which keys to retrieve for better performance.
      *

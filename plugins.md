@@ -756,6 +756,13 @@ await Risuai.setDatabaseLite(db);
 - `characterOrder`
 - `selectedPersona`
 
+**Read-only database keys** (returned by `getDatabase()`, but `setDatabase()` and `setDatabaseLite()` ignore them, so handing back the object you read leaves them untouched):
+- `globalChatVariables` (toggle values are stored here as `toggle_<name>`)
+- `templateDefaultVariables`
+- `loreBookDepth`
+- `loreBookToken`
+- `username`
+
 ### Character Operations
 
 Convenient methods for working with the current character:

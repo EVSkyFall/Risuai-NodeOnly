@@ -13,10 +13,11 @@ describe('plugin read-only database keys', () => {
     const plugins = source('src/ts/plugins/plugins.svelte.ts')
     const v3 = source('src/ts/plugins/apiV3/v3.svelte.ts')
 
-    test('V3 getDatabase reads toggles, global variables and preset default variables', () => {
+    const readOnlyKeys = ['globalChatVariables', 'templateDefaultVariables', 'loreBookDepth', 'loreBookToken', 'username']
+
+    test('V3 getDatabase reads what host-equivalent lore rendering needs', () => {
         const readOnly = between(plugins, 'export const pluginReadOnlyDbKeys', ']')
-        expect(readOnly).toContain("'globalChatVariables'")
-        expect(readOnly).toContain("'templateDefaultVariables'")
+        for (const key of readOnlyKeys) expect(readOnly).toContain(`'${key}'`)
         const read = between(v3, 'getDatabase: async', 'installPlugin: handlePluginInstallViaPlugin')
         expect(read).toContain('for(const key of [...allowedDbKeys, ...pluginReadOnlyDbKeys])')
         expect(read).toContain('includeOnly.includes(key)')
@@ -24,8 +25,7 @@ describe('plugin read-only database keys', () => {
 
     test('no write path can reach the read-only keys', () => {
         const writable = between(plugins, 'export const allowedDbKeys', ']')
-        expect(writable).not.toContain('globalChatVariables')
-        expect(writable).not.toContain('templateDefaultVariables')
+        for (const key of readOnlyKeys) expect(writable).not.toContain(`'${key}'`)
         // setDatabase(getDatabase()) must not copy them into plugin storage
         // through the else branch of either write loop.
         const skip = 'if (pluginReadOnlyDbKeys.includes(key)) {\n                    continue;'

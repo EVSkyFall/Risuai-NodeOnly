@@ -613,11 +613,15 @@ export const allowedDbKeys = [
 
 // V3 getDatabase returns these too. They stay out of allowedDbKeys and
 // setDatabase / setDatabaseLite skip them, so plugins can read them but not
-// write them. Lore CBS reads toggles (toggle_*), {{getglobalvar}} values and
-// preset default variables from here.
+// write them. A plugin that renders lore the way the host does needs them:
+// toggles (toggle_*) and {{getglobalvar}} values, preset default variables,
+// the lorebook scan depth and token budget, and the {{user}} fallback name.
 export const pluginReadOnlyDbKeys = [
     'globalChatVariables',
-    'templateDefaultVariables'
+    'templateDefaultVariables',
+    'loreBookDepth',
+    'loreBookToken',
+    'username'
 ]
 
 export const getV2PluginAPIs = () => {
