@@ -611,6 +611,15 @@ export const allowedDbKeys = [
     'characterOrder'
 ]
 
+// V3 getDatabase returns these too, but they stay out of allowedDbKeys so
+// setDatabase / setDatabaseLite / the V2 proxy cannot write them. Lore CBS
+// reads toggles (toggle_*), {{getglobalvar}} values and preset default
+// variables from here.
+export const pluginReadOnlyDbKeys = [
+    'globalChatVariables',
+    'templateDefaultVariables'
+]
+
 export const getV2PluginAPIs = () => {
     return {
         risuFetch: (url: string, options?: Parameters<typeof globalFetch>[1]) =>
