@@ -16,6 +16,7 @@ import { characterURLImport, hubURL } from "./characterCards";
 import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from "./storage/defaultPrompts";
 import { decodeRisuSave, encodeRisuSaveLegacy, findDangerousChatOps, normalizeJSON, RisuSaveEncoder, RisuSavePatcher, type toSaveType } from "./storage/risuSave";
 import { isHydrating, saveChatToServer, ensureChatHydrated, chatToStub, classifyChat, convertStubsToPlaceholders, restoreChatShapeAfterRebase } from "./storage/chatStorage";
+import { refreshOpenChat } from "./storage/chatSyncHost";
 import { reanchorRebasedSelection } from "./storage/rebaseSelection";
 import { AutoStorage } from "./storage/autoStorage";
 import {
@@ -3411,6 +3412,8 @@ export function changeChatTo(IdOrIndex: string | number) {
             })
         } else {
             loadTogglesFromChat(newChat)
+            // Already loaded here: another tab may have saved it since.
+            refreshOpenChat()
         }
     }
     ReloadGUIPointer.set(Math.random())

@@ -73,3 +73,82 @@ export function prefixFingerprint(fingerprints: readonly string[], count: number
     return hash64(`${count}|` + fingerprints.slice(0, count).join(''));
 }
 
+
+// ── Whole-chat content fingerprint (multi-tab sync) ─────────────────────────
+// Client-only: compared only with another fingerprint computed here, never
+// with anything the server computes.
+//
+// It covers what a chat-content save owns: the messages and every chat field
+// except the ones the server takes from the database stub and the runtime
+// flags. Message ids (`chatId`) are left out, so ids minted while loading
+// (normalizeChat) never make two copies of the same content differ.
+
+const NOT_OWNED_CHAT_FIELDS = new Set(['id', 'name', 'lastDate', 'folderId', 'modules', 'isStreaming', '_placeholder', '_stub', 'message'])
+
+// canon(message) and the same rendering without the `chatId` entry, in one
+// walk. The first must stay equal to canon(message) (a unit test checks).
+function canonMessagePair(message: unknown): [withId: string, withoutId: string] {
+    if (message === null || typeof message !== 'object' || Array.isArray(message) || ArrayBuffer.isView(message)) {
+        const rendered = canon(message)
+        return [rendered, rendered]
+    }
+    const record = message as Record<string, unknown>
+    const keys = Object.keys(record).sort()
+    let withId = '{'
+    let withoutId = '{'
+    let firstWith = true
+    let firstWithout = true
+    for (const key of keys) {
+        const v = record[key]
+        if (v === undefined || v === null || typeof v === 'function') continue
+        const part = JSON.stringify(key) + ':' + canon(v)
+        withId += (firstWith ? '' : ',') + part
+        firstWith = false
+        if (key !== 'chatId') {
+            withoutId += (firstWithout ? '' : ',') + part
+            firstWithout = false
+        }
+    }
+    return [withId + '}', withoutId + '}']
+}
+
+export interface ChatFingerprints {
+    /** Per message, ids included: the delta-sync fingerprints (messageFingerprints). */
+    messages: string[]
+    /** Per message, ids left out. */
+    bare: string[]
+    /** The whole owned content, ids left out. */
+    content: string
+}
+
+export function chatFingerprints(chat: unknown): ChatFingerprints {
+    const record = (chat !== null && typeof chat === 'object' ? chat : {}) as Record<string, unknown>
+    const list = Array.isArray(record.message) ? record.message : []
+    const messages = new Array<string>(list.length)
+    const bare = new Array<string>(list.length)
+    for (let i = 0; i < list.length; i++) {
+        const [withId, withoutId] = canonMessagePair(list[i])
+        messages[i] = hash64(withId)
+        bare[i] = hash64(withoutId)
+    }
+    const rest: Record<string, unknown> = {}
+    for (const key of Object.keys(record)) {
+        if (!NOT_OWNED_CHAT_FIELDS.has(key)) rest[key] = record[key]
+    }
+    // Two independent 64-bit hashes of the same rendering: this value decides
+    // whether content is replaced, so it gets more than the delta base does.
+    const rendering = `${list.length}|${bare.join('')}|${canon(rest)}`
+    const content = hash64(rendering) + hash64(`content:${rendering}`)
+    return { messages, bare, content }
+}
+
+export function chatContentFingerprint(chat: unknown): string {
+    return chatFingerprints(chat).content
+}
+
+/** True when two lists of per-message fingerprints describe the same messages. */
+export function sameFingerprintList(a: readonly string[], b: readonly string[]): boolean {
+    if (a.length !== b.length) return false
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false
+    return true
+}

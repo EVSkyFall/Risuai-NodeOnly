@@ -3,7 +3,7 @@ import { allowedDbKeys, pluginReadOnlyDbKeys, customProviderStore, getV2PluginAP
 import { SandboxHost } from "./factory";
 import { getCurrentChat, getCurrentContextLite, getDatabase, normalizeChat } from "src/ts/storage/database.svelte";
 import { resolveClassicModelId } from "src/ts/process/request/modelPresetBinding";
-import { fetchChatFromServer, saveChatToServer } from "src/ts/storage/chatStorage";
+import { fetchChatForPlugin, savePluginChat } from "src/ts/storage/chatStorage";
 import { SafeLocalPluginStorage, tagWhitelist } from "../pluginSafeClass";
 import { recordOwner, removeOwner, clearOwners } from "../pluginStorageMeta";
 import * as pluginStorageStore from "../pluginStorageStore";
@@ -1067,7 +1067,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
                     // it into the app, like exports do; a fetch error throws.
                     if(slot._placeholder){
                         if(!slot.id) return null;
-                        return await fetchChatFromServer(db.characters[charId].chaId, chatIndex, slot.id);
+                        return await fetchChatForPlugin(db.characters[charId].chaId, chatIndex, slot.id);
                     }
                     return $state.snapshot(slot);
                 }
@@ -1135,6 +1135,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
                     if(chat && typeof chat === 'object' && !chat.id && chats[chatIndex].id){
                         chat.id = chats[chatIndex].id
                     }
+                    const wasLoaded = chats[chatIndex]._placeholder !== true
                     DBState.db.characters[charId].chats[chatIndex] = normalizeChat(chat)
                     // Only the open chat is saved by change tracking; save any
                     // other chat directly or the write is lost on reload.
@@ -1142,7 +1143,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin,illustration
                     const isOpen = Number(charId) === get(selectedCharID) && char.chatPage === chatIndex
                     if(!isOpen){
                         const saved = char.chats[chatIndex]
-                        await saveChatToServer(char.chaId, chatIndex, saved.id, $state.snapshot(saved) as any)
+                        await savePluginChat(char.chaId, chatIndex, saved.id, $state.snapshot(saved) as any, wasLoaded)
                     }
                 }
             }

@@ -286,7 +286,7 @@ describe('character archive', () => {
     chat.message.push({ role: 'user', data: 'seventh message, written after re-activation' })
     const saved = await client.fetch(`/api/chat-content/${ARCH}/0`, {
       method: 'POST',
-      headers: { 'content-type': 'application/octet-stream', 'x-chat-id': 'a-chat-0' },
+      headers: { 'content-type': 'application/octet-stream', 'x-chat-id': 'a-chat-0', 'x-chat-base-rev': chatRes.headers.get('x-chat-rev')! },
       body: new Uint8Array(encodeDb(chat)),
     })
     expect(saved.status).toBe(200)

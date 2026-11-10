@@ -6,6 +6,7 @@ const path = require('path');
 const net = require('net');
 const compression = require('compression');
 const { messageFingerprints, prefixFingerprint } = require('./chatFingerprint.cjs');
+const { chatRevision, STUB_OWNED_FIELDS } = require('./chatRevision.cjs');
 const htmlparser = require('node-html-parser');
 const { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, unlinkSync, statSync } = require('fs');
 const fs = require('fs/promises')
@@ -7102,7 +7103,12 @@ function chatPrefixMatches(chat, base) {
 function sendChatContent(req, res, chat) {
     // The body depends on the base headers, so a cached response must never
     // be reused for a request with different ones.
-    res.setHeader('Vary', 'x-chat-base-count, x-chat-base-fp');
+    res.setHeader('Vary', 'x-chat-base-count, x-chat-base-fp, x-chat-base-rev');
+    // The caller restored cold storage first, so this is the revision of the
+    // content the client is about to hold.
+    const revision = chatRevision(chat);
+    res.setHeader('x-chat-rev', revision);
+    if (req.headers['x-chat-base-rev'] === revision) return res.status(204).end();
     res.setHeader('Content-Type', 'application/octet-stream');
     const base = readChatDeltaBase(req);
     if (base && chatPrefixMatches(chat, base)) {
@@ -7163,6 +7169,26 @@ app.get('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
     }
 });
 
+// Append a stub for a forked chat to its character's chat list in the cached
+// database. Runs inside the storage operation of the save that carries the
+// fork's body. Appending keeps every existing chat index where it is.
+async function listForkedChat(chaId, chatId, chatData) {
+    if (!(await loadDbCacheIfMissing())) return;
+    const character = dbCache[DB_HEX_KEY]?.characters?.find((c) => c?.chaId === chaId);
+    if (!character) return;
+    if (!Array.isArray(character.chats)) character.chats = [];
+    if (character.chats.some((chat) => chat?.id === chatId)) return;
+    const stub = { _stub: true };
+    for (const field of STUB_OWNED_FIELDS) {
+        if (field in chatData) stub[field] = chatData[field];
+    }
+    stub.id = chatId;
+    stub.name = typeof chatData.name === 'string' ? chatData.name : '';
+    character.chats.push(normalizeJSON(stub));
+    dbDirty = true;
+    dbEtag = computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(dbCache[DB_HEX_KEY])));
+}
+
 // POST /api/chat-content/:chaId/:chatIndex — save chat content to server
 app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
     if (!await checkAuth(req, res)) { return; }    try {
@@ -7210,6 +7236,26 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
 
             await ensureChatStore();
 
+            // Compare-and-swap: an existing chat is replaced only by a writer
+            // whose base is the revision stored now. Without this a tab holding
+            // an older copy cut off or replaced what another tab had saved. A
+            // chat whose cold storage cannot be restored has no readable
+            // content to protect, so it stays writable.
+            const existing = fullChatStore.get(chaId)?.get(expectedChatId);
+            const existingReadable = !!existing && Array.isArray(existing.message) && restoreColdStorageChat(existing);
+            if (existingReadable) {
+                const currentRevision = chatRevision(existing);
+                if (req.headers['x-chat-base-rev'] !== currentRevision) {
+                    res.setHeader('x-chat-rev', currentRevision);
+                    return res.status(409).json({
+                        success: false,
+                        error: 'Chat changed since the base revision',
+                        code: 'CHAT_REV_CONFLICT',
+                        revision: currentRevision,
+                    });
+                }
+            }
+
             // Delta save: the body holds only the messages after a prefix the
             // client says the server already has. Splice it onto the stored
             // chat only when that prefix verifies; otherwise ask for a full
@@ -7217,11 +7263,18 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
             // the user sees, never a partial write).
             const deltaBase = readChatDeltaBase(req);
             if (deltaBase) {
-                const stored = fullChatStore.get(chaId)?.get(expectedChatId);
-                if (!stored || !restoreColdStorageChat(stored) || !Array.isArray(chatData.message) || !chatPrefixMatches(stored, deltaBase)) {
+                if (!existingReadable || !Array.isArray(chatData.message) || !chatPrefixMatches(existing, deltaBase)) {
                     return res.status(409).json({ error: 'Chat delta base does not match', code: 'CHAT_DELTA_BASE_MISMATCH' });
                 }
-                chatData.message = stored.message.slice(0, deltaBase.count).concat(chatData.message);
+                chatData.message = existing.message.slice(0, deltaBase.count).concat(chatData.message);
+            }
+
+            // A fork is a chat the client made out of its own version of
+            // another chat after a conflict. List it here, in the same storage
+            // operation as its body, so it exists for every tab and survives a
+            // restart from the moment this request is acknowledged.
+            if (typeof req.headers['x-chat-fork-of'] === 'string' && req.headers['x-chat-fork-of']) {
+                await listForkedChat(chaId, expectedChatId, chatData);
             }
 
             // Update fullChatStore
@@ -7230,6 +7283,8 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
             }
             fullChatStore.get(chaId).set(expectedChatId, chatData);
             dbDirty = true;
+            const savedRevision = chatRevision(chatData);
+            res.setHeader('x-chat-rev', savedRevision);
 
             if (strictFlush) {
                 const pendingTimer = saveTimers[DB_HEX_KEY];
@@ -7247,6 +7302,7 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
                     return res.json({
                         success: true,
                         durable: true,
+                        revision: savedRevision,
                         ...(backupWarning ? { backupWarning } : {}),
                     });
                 } catch (error) {
@@ -7261,7 +7317,7 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
 
             // Keep the legacy path debounced: its 200 is not a durable ACK.
             scheduleChatContentPersist();
-            res.json({ success: true });
+            res.json({ success: true, revision: savedRevision });
         });
     } catch (error) {
         next(error);
@@ -10857,11 +10913,14 @@ function mcpAuthMiddleware(req, res, next) {
 /** Load decoded database object (uses dbCache if available) */
 async function loadDatabase() {
     if (dbCache[DB_HEX_KEY]) return dbCache[DB_HEX_KEY]
-    const raw = kvGet('database/database.bin')
-    if (!raw) throw new Error('database/database.bin not found')
-    const decoded = normalizeJSON(await decodeRisuSave(raw))
-    dbCache[DB_HEX_KEY] = decoded
-    return decoded
+    // Same cold load as /api/read: the cache holds chat stubs and the bodies
+    // go to fullChatStore. Caching the decoded database whole made reassembly
+    // prefer its stale inline chats over later chat-content saves.
+    const loaded = storageOperationContext.getStore()?.active
+        ? await loadDbCacheIfMissing()
+        : await queueStorageOperation(() => loadDbCacheIfMissing())
+    if (!loaded) throw new Error('database/database.bin not found')
+    return dbCache[DB_HEX_KEY]
 }
 
 /** Persist database changes with debounce (same pattern as /api/patch) */
@@ -11095,7 +11154,11 @@ app.post('/api/mcp/chats/get', mcpAuthMiddleware, async (req, res) => {
         const chats = char.chats || []
         const currentChat = chats[char.chatPage || 0]
         if (!currentChat) return res.json({ messages: [], total: 0 })
-        const msgs = (currentChat.message || []).slice().reverse()
+        // The cached database holds chat stubs; the messages are in the store.
+        await ensureChatStore()
+        const storedChat = currentChat.id ? fullChatStore.get(char.chaId)?.get(currentChat.id) : null
+        if (storedChat && !restoreColdStorageChat(storedChat)) return res.status(500).json({ error: 'Cold storage restore failed' })
+        const msgs = ((storedChat || currentChat).message || []).slice().reverse()
         const slice = msgs.slice(offset, offset + Math.min(count, 20))
         res.json({ messages: slice, total: msgs.length, chatPage: char.chatPage || 0 })
     } catch (e) {

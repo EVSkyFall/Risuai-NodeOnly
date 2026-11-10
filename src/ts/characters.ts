@@ -1,6 +1,7 @@
 import { get, writable } from "svelte/store";
 import { saveImage, setDatabase, type character, type Chat, defaultSdDataFunc, type loreBook, getDatabase, getCharacterByIndex, setCharacterByIndex, getCurrentChat, loadTogglesFromChat, normalizeChat, newChatModelDefaults } from "./storage/database.svelte";
 import { ensureChatHydrated } from "./storage/chatStorage";
+import { refreshOpenChat } from "./storage/chatSyncHost";
 import { alertAddCharacter, alertConfirm, alertError, alertSelect, alertStore, alertWait, notifySuccess, notifyInfo } from "./alert";
 import { archiveCharacter } from "./characterArchive";
 import { claimLoadingOverlay, chatDeselected } from "./stores.svelte";
@@ -838,6 +839,8 @@ export function changeChar(index: number, arg:{
             }
         } else {
             loadTogglesFromChat(chat)
+            // Already loaded here: another tab may have saved it since.
+            refreshOpenChat()
         }
     }
 }

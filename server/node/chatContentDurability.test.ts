@@ -6,6 +6,7 @@ import path from 'node:path'
 import { spawnServer, type ServerHandle } from '../../test/compat/helpers/spawnServer.js'
 import { createClient, type RisuClient } from '../../test/compat/helpers/client.js'
 import { createSeedBackup } from '../../test/compat/helpers/seed.js'
+import { chatBaseRevHeader } from '../../test/compat/helpers/chatRev.js'
 import utils from './utils.cjs'
 
 const { decodeRisuSave, encodeRisuSaveLegacy } = utils as {
@@ -105,6 +106,8 @@ async function postChat(
         'x-session-id': options.sessionId ?? context.sessionId,
     }
     if (options.strict) headers['x-strict-flush'] = '1'
+    // A save replaces a stored chat only on top of the revision the server holds.
+    Object.assign(headers, await chatBaseRevHeader(context.client, charId, chatIndex, headers['x-chat-id']))
     return context.client.fetch(`/api/chat-content/${charId}/${chatIndex}`, {
         method: 'POST',
         headers,
@@ -241,7 +244,7 @@ describe('strict durable chat-content flush', { timeout: 30_000 }, () => {
 
         const legacyResponse = await postChat(context, makeChat('legacy acknowledged value'))
         expect(legacyResponse.status).toBe(200)
-        expect(await legacyResponse.json()).toEqual({ success: true })
+        expect(await legacyResponse.json()).toEqual({ success: true, revision: expect.any(String) })
 
         await new Promise((resolve) => setTimeout(resolve, 5_500))
         const persistedChat = await readPersistedChat(context.server)
@@ -414,7 +417,7 @@ describe('strict durable chat-content flush', { timeout: 30_000 }, () => {
             ])
 
             expect(response.status).toBe(200)
-            expect(await response.json()).toEqual({ success: true })
+            expect(await response.json()).toEqual({ success: true, revision: expect.any(String) })
             const persistedChat = await readPersistedChat(context.server)
             expect(persistedChat.message[0].data).toBe('Message 0 in chat 0 of char 0')
         } finally {

@@ -1,5 +1,6 @@
 import type { Chat } from './database.svelte'
 import { messageFingerprints, prefixFingerprint } from './chatFingerprint'
+import type { ChatPostOptions, ChatPostOutcome, DurableChatSaveResult } from './nodeStorage'
 
 // Chat delta sync — transfer only what changed for long chats.
 //
@@ -21,8 +22,28 @@ import { messageFingerprints, prefixFingerprint } from './chatFingerprint'
 
 export interface ChatDeltaTransport {
     enqueueChatSave?<T>(chaId: string, chatId: string, save: () => Promise<T>): Promise<T>
-    fetchChatContentDelta(chaId: string, chatIndex: number, chatId: string, base: { count: number, fp: string } | null): Promise<{ chat: any, deltaBase: number | null } | null>
+    fetchChatContentDelta(chaId: string, chatIndex: number, chatId: string, base: { count: number, fp: string } | null, baseRev?: string | null): Promise<{ chat: any, deltaBase: number | null, revision?: string | null } | { notModified: true, revision?: string | null } | null>
     saveChatContentDelta(chaId: string, chatIndex: number, chatId: string, chat: any, base: { count: number, fp: string } | null): Promise<'ok' | 'base-mismatch'>
+    /** Revision-aware POST. Without it saves go through saveChatContentDelta and carry no revision. */
+    postChatContent?(chaId: string, chatIndex: number, chatId: string, chat: any, options: ChatPostOptions): Promise<ChatPostOutcome>
+}
+
+export type ChatFetchResult =
+    | { kind: 'ok', chat: Chat, revision: string | null }
+    /** The server still holds the revision the caller named. */
+    | { kind: 'same', revision: string | null }
+    | { kind: 'missing' }
+
+export type ChatSaveOutcome =
+    | { status: 'ok', revision: string | null, durable?: DurableChatSaveResult }
+    | { status: 'conflict', revision: string | null }
+
+export interface ChatSaveOptions {
+    baseRev?: string | null
+    forkOf?: string
+    strict?: boolean
+    /** messageFingerprints(chat.message), when the caller already has them. */
+    fingerprints?: string[]
 }
 
 export interface ChatCopyStore {
@@ -46,21 +67,34 @@ export function createChatDeltaSync(transport: ChatDeltaTransport, copies: ChatC
     const serverFingerprints = new Map<string, string[]>()
 
     async function fetchChat(chaId: string, chatIndex: number, chatId: string): Promise<Chat | null> {
+        const result = await fetchChatRev(chaId, chatIndex, chatId)
+        return result.kind === 'ok' ? result.chat : null
+    }
+
+    // The chat with the revision the server holds it under. With `baseRev`,
+    // an unchanged chat comes back as 'same' and nothing is transferred.
+    async function fetchChatRev(chaId: string, chatIndex: number, chatId: string, baseRev?: string | null): Promise<ChatFetchResult> {
         const key = chatCopyKey(chaId, chatId)
         let copy: Chat | null = null
-        try {
-            const stored = await copies.get(key)
-            if (isUsableCopy(stored)) copy = stored
-        } catch {
-            copy = null
+        // A check against a known revision is expected to answer "unchanged":
+        // reading and fingerprinting the local copy first would cost more
+        // than the body it could save.
+        if (!baseRev) {
+            try {
+                const stored = await copies.get(key)
+                if (isUsableCopy(stored)) copy = stored
+            } catch {
+                copy = null
+            }
         }
         const copyFingerprints = copy ? messageFingerprints(copy.message) : null
         const base = copy && copyFingerprints
             ? { count: copy.message.length, fp: prefixFingerprint(copyFingerprints, copy.message.length) }
             : null
 
-        const result = await transport.fetchChatContentDelta(chaId, chatIndex, chatId, base)
-        if (!result) return null
+        const result = await transport.fetchChatContentDelta(chaId, chatIndex, chatId, base, baseRev ?? null)
+        if (!result) return { kind: 'missing' }
+        if ('notModified' in result) return { kind: 'same', revision: result.revision ?? null }
 
         let full: Chat = result.chat
         let fingerprints: string[]
@@ -83,7 +117,7 @@ export function createChatDeltaSync(transport: ChatDeltaTransport, copies: ChatC
             }
             if (snapshot) void copies.put(key, snapshot).catch(() => {})
         }
-        return full
+        return { kind: 'ok', chat: full, revision: result.revision ?? null }
     }
 
     // Saves of one chat run one at a time, in call order: autosave, job
@@ -109,12 +143,33 @@ export function createChatDeltaSync(transport: ChatDeltaTransport, copies: ChatC
     }
 
     async function saveChatNow(chaId: string, chatIndex: number, chatId: string, chat: Chat): Promise<void> {
+        const outcome = await postChat(chaId, chatIndex, chatId, chat)
+        if (outcome.status === 'conflict') throw new Error('saveChatContent error: 409')
+    }
+
+    async function post(chaId: string, chatIndex: number, chatId: string, body: any, base: { count: number, fp: string } | null, options: ChatSaveOptions): Promise<ChatPostOutcome> {
+        if (transport.postChatContent) {
+            return transport.postChatContent(chaId, chatIndex, chatId, body, {
+                deltaBase: base,
+                baseRev: options.baseRev ?? null,
+                forkOf: options.forkOf,
+                strict: options.strict,
+            })
+        }
+        const legacy = await transport.saveChatContentDelta(chaId, chatIndex, chatId, body, base)
+        return legacy === 'ok' ? { status: 'ok', revision: null } : { status: 'base-mismatch' }
+    }
+
+    // One save, not queued: the caller holds the chat's queue slot. A revision
+    // conflict is returned, not thrown, and leaves the remembered server
+    // fingerprints as they were.
+    async function postChat(chaId: string, chatIndex: number, chatId: string, chat: Chat, options: ChatSaveOptions = {}): Promise<ChatSaveOutcome> {
         const key = chatCopyKey(chaId, chatId)
         const messages = chat.message ?? []
         // Fingerprints, delta body and encoding are all taken synchronously
         // below, so they describe the same chat content even if it keeps
         // changing (streaming) while the request is in flight.
-        const fingerprints = messageFingerprints(messages)
+        const fingerprints = options.fingerprints ?? messageFingerprints(messages)
         const known = serverFingerprints.get(key)
         let shared = 0
         if (known) {
@@ -123,22 +178,26 @@ export function createChatDeltaSync(transport: ChatDeltaTransport, copies: ChatC
         }
         if (shared > 0) {
             const delta = { ...chat, message: messages.slice(shared) }
-            const outcome = await transport.saveChatContentDelta(chaId, chatIndex, chatId, delta, {
+            const outcome = await post(chaId, chatIndex, chatId, delta, {
                 count: shared,
                 fp: prefixFingerprint(fingerprints, shared),
-            })
-            if (outcome === 'ok') {
+            }, options)
+            if (outcome.status === 'ok') {
                 serverFingerprints.set(key, fingerprints)
-                return
+                return outcome
             }
-            // The server holds something else (another device, a server-side
-            // write): fall through to a full save, as before delta sync.
+            if (outcome.status === 'conflict') return outcome
+            // The delta prefix did not verify (a server-side write under the
+            // same revision is not possible, but a base remembered from a
+            // different copy is): fall through to a full save.
         }
-        await transport.saveChatContentDelta(chaId, chatIndex, chatId, chat, null)
+        const outcome = await post(chaId, chatIndex, chatId, chat, null, options)
+        if (outcome.status === 'conflict') return outcome
         serverFingerprints.set(key, fingerprints)
+        return outcome.status === 'ok' ? outcome : { status: 'ok', revision: null }
     }
 
-    return { fetchChat, saveChat }
+    return { fetchChat, fetchChatRev, saveChat, postChat }
 }
 
 // ── IndexedDB copy store ────────────────────────────────────────────────────

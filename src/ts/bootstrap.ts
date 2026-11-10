@@ -32,7 +32,8 @@ import {
 } from "./globalApi.svelte";
 import { registerModelDynamic } from "./model/modellist";
 import { initModelJobRecovery } from "./process/request/jobRecovery";
-import { convertStubsToPlaceholders } from "./storage/chatStorage";
+import { convertStubsToPlaceholders, noteInlineChats } from "./storage/chatStorage";
+import { initChatSyncHost } from "./storage/chatSyncHost";
 import { isChatStub, purgeUnsupportedGroupChats } from "./storage/database.svelte";
 
 /**
@@ -152,6 +153,8 @@ export async function loadData() {
                 for (const char of dbForConvert.characters) {
                     char.chats = convertStubsToPlaceholders(char.chats)
                 }
+                noteInlineChats(dbForConvert.characters)
+                initChatSyncHost()
             }
 
             const db = getDatabase();

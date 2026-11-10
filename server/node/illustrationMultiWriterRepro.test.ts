@@ -1,16 +1,16 @@
 // @vitest-environment node
 
-// Gate 0 RED reproduction — request §4.4: two writers append illustration request
-// markers to DIFFERENT messages of the SAME chat concurrently, and the second
-// (stale) full-chat save wipes the first writer's marker. This exercises the REAL
-// spawned server.cjs over real SQLite (chatContentDurability.test.ts pattern): the
-// strict chat-content endpoint replaces the whole chat object with no per-message /
-// per-marker reconciliation (server.cjs:5527, unconditional full replace), so a
-// stale full-object save silently discards another writer's marker.
+// Request §4.4: two writers append illustration request markers to DIFFERENT
+// messages of the SAME chat concurrently. The strict chat-content endpoint used
+// to replace the whole chat object unconditionally, so the second (stale)
+// full-chat save silently discarded the first writer's marker. This exercises the
+// REAL spawned server.cjs over real SQLite (chatContentDurability.test.ts pattern).
 //
-// The desired invariant (targeted marker patch, S3) is that both markers survive.
-// It does NOT hold today, so this is a `test.fails`. Kept lean: ONE spawned server,
-// both writes inside one test, to limit spawn-contention flake.
+// Since chat saves are compare-and-swap on the chat's revision, the stale save is
+// refused and the first marker stays. Getting the second writer's marker onto the
+// server as well is the client's part (chatSync.ts); a targeted marker patch (S3)
+// would make both land in one chat. Kept lean: ONE spawned server, both writes
+// inside one test, to limit spawn-contention flake.
 
 import { afterEach, expect, test } from 'vitest'
 import Database from 'better-sqlite3'
@@ -18,6 +18,7 @@ import path from 'node:path'
 import { spawnServer, type ServerHandle } from '../../test/compat/helpers/spawnServer.js'
 import { createClient, type RisuClient } from '../../test/compat/helpers/client.js'
 import { createSeedBackup } from '../../test/compat/helpers/seed.js'
+import { chatRevisionOf } from '../../test/compat/helpers/chatRev.js'
 import utils from './utils.cjs'
 
 const { decodeRisuSave, encodeRisuSaveLegacy } = utils as {
@@ -93,7 +94,7 @@ function makeTwoMessageChat(m1: string, m2: string) {
     }
 }
 
-async function strictSave(context: TestContext, chat: ReturnType<typeof makeTwoMessageChat>, sessionId: string) {
+async function strictSave(context: TestContext, chat: ReturnType<typeof makeTwoMessageChat>, sessionId: string, baseRev: string | null) {
     const registered = await context.client.fetch('/api/session', {
         method: 'POST',
         headers: { 'x-session-id': sessionId },
@@ -106,6 +107,7 @@ async function strictSave(context: TestContext, chat: ReturnType<typeof makeTwoM
             'x-chat-id': 'chat-0-0',
             'x-session-id': sessionId,
             'x-strict-flush': '1',
+            ...(baseRev ? { 'x-chat-base-rev': baseRev } : {}),
         },
         body: new Uint8Array(encodeRisuSaveLegacy(chat)),
     })
@@ -127,11 +129,14 @@ async function readPersistedChat(server: ServerHandle) {
     return persisted.characters.find((character: any) => character.chaId === 'test-char-0').chats[0]
 }
 
-test.fails(
-    'Repro 4 (marker LWW wipe): a stale full-chat save wipes another writer\'s illustration marker',
+test(
+    'Repro 4 (marker LWW wipe): a stale full-chat save can no longer wipe another writer\'s illustration marker',
     { timeout: 30_000 },
     async () => {
         const context = await boot()
+        // Both writers read the chat at the same revision.
+        const baseRev = await chatRevisionOf(context.client, 'test-char-0', 0, 'chat-0-0')
+        expect(baseRev).toBeTruthy()
 
         // Both writers start from the same base (M1, M2 plain).
         const M1_BASE = 'Message one plain text'
@@ -139,22 +144,23 @@ test.fails(
 
         // Session A marks message 1 (appends MARKER_A at a line boundary) and saves.
         const chatA = makeTwoMessageChat(`${M1_BASE}\n${MARKER_A}`, M2_BASE)
-        const respA = await strictSave(context, chatA, 'illus-session-a')
+        const respA = await strictSave(context, chatA, 'illus-session-a', baseRev)
         expect(respA.status).toBe(200)
         expect(await respA.json()).toMatchObject({ success: true, durable: true })
 
-        // Session B holds a STALE copy (no MARKER_A), marks message 2, and full-saves.
-        // This replaces the whole chat object, discarding session A's marker on M1.
+        // Session B holds a STALE copy (no MARKER_A), marks message 2, and full-saves
+        // on the revision it read. The server refuses it instead of replacing the
+        // whole chat object: session A's marker on M1 stays.
         const chatBStale = makeTwoMessageChat(M1_BASE, `${M2_BASE}\n${MARKER_B}`)
-        const respB = await strictSave(context, chatBStale, 'illus-session-b')
-        expect(respB.status).toBe(200)
-        expect(await respB.json()).toMatchObject({ success: true, durable: true })
+        const respB = await strictSave(context, chatBStale, 'illus-session-b', baseRev)
+        expect(respB.status).toBe(409)
+        expect(await respB.json()).toMatchObject({ success: false, code: 'CHAT_REV_CONFLICT' })
 
-        // DESIRED INVARIANT (targeted marker patch, S3): both markers survive on
-        // their respective messages. Today MARKER_A is wiped by B's full replace.
+        // B's marker is not on the server; settling that is the client's job
+        // (chatSync.ts). What matters here is that nothing was wiped.
         const persisted = await readPersistedChat(context.server)
         const allText = persisted.message.map((message: any) => message.data).join('\n')
         expect(allText).toContain(MARKER_A)
-        expect(allText).toContain(MARKER_B)
+        expect(allText).not.toContain(MARKER_B)
     },
 )

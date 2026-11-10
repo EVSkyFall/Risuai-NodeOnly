@@ -3,7 +3,9 @@ import { type Chat, type ChatStub, type ChatOrStub, isChatStub } from "./databas
 import type { DurableChatSaveResult } from "./nodeStorage"
 import { tick } from "svelte"
 import { writable } from "svelte/store"
+import { v4 } from "uuid"
 import { createChatDeltaSync, indexedDbChatCopies } from "./chatDeltaSync"
+import { ChatSyncError, createChatSync, type LiveChat, type RefreshResult } from "./chatSync"
 
 // ── Stub ↔ Placeholder conversion ───────────────────────────────────────────
 
@@ -104,6 +106,9 @@ export function restoreChatShapeAfterRebase(
     for (const char of mergedCharacters ?? []) {
         if (!char || !Array.isArray(char.chats)) continue
         char.chats = convertStubsToPlaceholders(char.chats)
+        // Before local chats are grafted in: whatever is a full chat here came
+        // from the server.
+        noteInlineChats([char])
         const localChar = char.chaId ? localByChaId.get(char.chaId) : undefined
         if (!localChar || !Array.isArray(localChar.chats)) continue
         for (let i = 0; i < char.chats.length; i++) {
@@ -168,12 +173,61 @@ export async function fetchChatFromServer(chaId: string, chatIndex: number, chat
 // fetchChatFromServer above, which always transfers the whole chat.
 const chatDeltaSync = createChatDeltaSync({
     enqueueChatSave: (chaId, chatId, save) => forageStorage.realStorage.enqueueChatSave(chaId, chatId, save),
-    fetchChatContentDelta: (chaId, chatIndex, chatId, base) => forageStorage.realStorage.fetchChatContentDelta(chaId, chatIndex, chatId, base),
+    fetchChatContentDelta: (chaId, chatIndex, chatId, base, baseRev) => forageStorage.realStorage.fetchChatContentDelta(chaId, chatIndex, chatId, base, baseRev),
     saveChatContentDelta: (chaId, chatIndex, chatId, chat, base) => forageStorage.realStorage.saveChatContentDeltaUnqueued(chaId, chatIndex, chatId, chat, base),
+    postChatContent: (chaId, chatIndex, chatId, chat, options) => forageStorage.realStorage.postChatContent(chaId, chatIndex, chatId, chat, options),
 }, indexedDbChatCopies)
 
+// ── Sync between tabs (chatSync.ts) ──────────────────────────────────────────
+
+/**
+ * What chat sync needs from the running app: the live database, the
+ * generation registry and the notices. Set once at boot (chatSyncHost.ts).
+ * Until then (and in unit tests of this module) saves still carry their
+ * revision; a conflict that would need live state is left for the next save.
+ */
+export interface ChatSyncHost {
+    findLive(chaId: string, chatId: string): LiveChat | null
+    isGenerating(chatId: string): boolean
+    snapshot(chat: Chat): Chat
+    forkName(name: string): string
+    notifyForked(name: string): void
+    trackCharacter(chaId: string): void
+    contentReplaced(chaId: string, chatId: string): void
+}
+
+let chatSyncHost: ChatSyncHost = {
+    findLive: () => null,
+    isGenerating: () => false,
+    snapshot: (chat) => structuredClone(chat),
+    forkName: (name) => name,
+    notifyForked: () => {},
+    trackCharacter: () => {},
+    contentReplaced: () => {},
+}
+
+export function configureChatSyncHost(host: ChatSyncHost): void {
+    chatSyncHost = host
+}
+
+const chatSync = createChatSync({
+    enqueue: (chaId, chatId, run) => forageStorage.realStorage.enqueueChatSave(chaId, chatId, run),
+    fetchChat: (chaId, chatIndex, chatId, baseRev) => chatDeltaSync.fetchChatRev(chaId, chatIndex, chatId, baseRev),
+    postChat: (chaId, chatIndex, chatId, chat, options) => chatDeltaSync.postChat(chaId, chatIndex, chatId, chat, options),
+    findLive: (chaId, chatId) => chatSyncHost.findLive(chaId, chatId),
+    isGenerating: (chatId) => chatSyncHost.isGenerating(chatId),
+    snapshot: (chat) => chatSyncHost.snapshot(chat),
+    placeholderOf: (chat) => stubToPlaceholder(chatToStub(chat)),
+    newId: () => v4(),
+    forkName: (name) => chatSyncHost.forkName(name),
+    notifyForked: (name) => chatSyncHost.notifyForked(name),
+    trackCharacter: (chaId) => chatSyncHost.trackCharacter(chaId),
+    contentReplaced: (chaId, chatId) => chatSyncHost.contentReplaced(chaId, chatId),
+    schedule: (run, delayMs) => { setTimeout(run, delayMs) },
+})
+
 export async function saveChatToServer(chaId: string, chatIndex: number, chatId: string, chat: Chat): Promise<void> {
-    await chatDeltaSync.saveChat(chaId, chatIndex, chatId, chat)
+    await chatSync.save(chaId, chatIndex, chatId, chat, { strict: false })
 }
 
 export async function saveChatToServerStrict(
@@ -183,7 +237,60 @@ export async function saveChatToServerStrict(
     chat: Chat,
 ): Promise<DurableChatSaveResult> {
     await forageStorage.Init()
-    return await forageStorage.realStorage.saveChatContentStrict(chaId, chatIndex, chatId, chat)
+    const durable = await chatSync.save(chaId, chatIndex, chatId, chat, { strict: true })
+    if (!durable) throw new ChatSyncError('no durable acknowledgement')
+    return durable
+}
+
+/**
+ * Bring a loaded chat up to date with what another tab or device saved.
+ * Never throws and never fails anything: on any problem the chat stays as it is.
+ */
+export function refreshChatFromServer(chaId: string, chatId: string): Promise<RefreshResult> {
+    return chatSync.refresh(chaId, chatId)
+}
+
+/** The set of running generations changed (a fork waiting for one may finish). */
+export function chatGenerationsChanged(): void {
+    chatSync.generationsChanged()
+}
+
+/**
+ * Chats that arrived with their content inside the database instead of as
+ * stubs: their content is the server's, at a revision this tab does not know.
+ */
+export function noteInlineChats(characters: { chaId?: string; chats?: ChatOrStub[] }[]): void {
+    for (const char of characters ?? []) {
+        if (!char?.chaId || !Array.isArray(char.chats)) continue
+        for (const chat of char.chats) {
+            const full = chat as Chat | undefined
+            if (!full?.id || full._placeholder === true || (full as any)._stub === true || !Array.isArray(full.message)) continue
+            chatSync.noteInlineContent(char.chaId, full.id, full)
+        }
+    }
+}
+
+/**
+ * A plugin reads a chat that is not loaded in this tab. The copy is handed
+ * out without entering the app; what it was read at is kept for the plugin's
+ * own write-back only (savePluginChat).
+ */
+export async function fetchChatForPlugin(chaId: string, chatIndex: number, chatId: string): Promise<Chat | null> {
+    const result = await forageStorage.realStorage.fetchChatContentWithRevision(chaId, chatIndex, chatId)
+    if (!result) return null
+    chatSync.notePluginRead(chaId, chatId, result.chat, result.revision)
+    return result.chat
+}
+
+/**
+ * Save a chat a plugin put into a slot that is not the open chat.
+ * `wasLoaded`: the slot held a loaded chat before the plugin replaced it; then
+ * this tab's own sync state is the base. Otherwise the base is the plugin's
+ * last read, and a chat it never read is replaced outright.
+ */
+export async function savePluginChat(chaId: string, chatIndex: number, chatId: string, chat: Chat, wasLoaded: boolean): Promise<void> {
+    const hasBase = wasLoaded || chatSync.adoptPluginRead(chaId, chatId)
+    await chatSync.save(chaId, chatIndex, chatId, chat, { strict: false, replace: !hasBase })
 }
 
 // ── Hydration ───────────────────────────────────────────────────────────────
@@ -243,8 +350,11 @@ export async function ensureChatHydrated(
         setChatLoadFailure(key, null)
         try {
             let full: Chat | null
+            let revision: string | null = null
             try {
-                full = await chatDeltaSync.fetchChat(chaId, index, chatId)
+                const fetched = await chatDeltaSync.fetchChatRev(chaId, index, chatId)
+                full = fetched.kind === 'ok' ? fetched.chat : null
+                if (fetched.kind === 'ok') revision = fetched.revision
             } catch (error) {
                 setChatLoadFailure(key, 'error')
                 throw error
@@ -276,6 +386,7 @@ export async function ensureChatHydrated(
 
             // Apply to memory — mark JustApplied to suppress the reactive write-back
             hydrationJustApplied.add(key)
+            chatSync.noteServerContent(chaId, chatId, full, revision)
             chats[currentIndex] = full
 
             // Wait one tick so Svelte reactivity settles before allowing dirty tracking

@@ -24,6 +24,8 @@ const URL_ = `/api/chat-content/${CHA}/0`
 
 let srv: ServerHandle
 let client: RisuClient
+// Revision of the chat as of the last get(); a save has to name it.
+let rev: string | null = null
 
 const base = (messages: any[], count: number) => ({
   'x-chat-base-count': String(count),
@@ -34,6 +36,7 @@ async function get(headers: Record<string, string> = {}) {
   const res = await client.fetch(URL_, { headers: { 'x-chat-id': CHAT, ...headers } })
   expect(res.status).toBe(200)
   const chat = await utils.decodeRisuSave(Buffer.from(await res.arrayBuffer())) as any
+  rev = res.headers.get('x-chat-rev')
   return { chat, delta: res.headers.get('x-chat-delta-base') }
 }
 
@@ -41,7 +44,7 @@ async function post(chat: any, headers: Record<string, string> = {}, gzip = fals
   const body = gzip ? new Uint8Array(gzipSync(encode(chat))) : encode(chat)
   return client.fetch(URL_, {
     method: 'POST',
-    headers: { 'content-type': 'application/octet-stream', 'x-chat-id': CHAT, ...(gzip ? { 'content-encoding': 'gzip' } : {}), ...headers },
+    headers: { 'content-type': 'application/octet-stream', 'x-chat-id': CHAT, ...(rev ? { 'x-chat-base-rev': rev } : {}), ...(gzip ? { 'content-encoding': 'gzip' } : {}), ...headers },
     body,
   })
 }

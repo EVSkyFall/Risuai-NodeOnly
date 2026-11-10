@@ -25,6 +25,38 @@ export function reissueMessageIds(chat: Chat, sourceMessageIds: Iterable<string 
         if (message.chatId) idMap.set(message.chatId, next)
         message.chatId = next
     }
+    return rewriteMessageReferences(chat, idMap, sourceMessageIds)
+}
+
+/**
+ * Same re-keying with a map the caller keeps: a message id already in the map
+ * keeps the new id it was given before, and a message seen for the first time
+ * gets an entry. A chat that is copied over and over while it keeps growing
+ * (a fork that follows a running generation) therefore gets the same new ids
+ * every time. Every message must already have a `chatId`.
+ *
+ * Mutates and returns `chat`. Does not touch `chat.id`.
+ */
+export function reissueMessageIdsWithMap(chat: Chat, idMap: Map<string, string>): Chat {
+    const sourceMessageIds: string[] = []
+    for (const message of chat.message) {
+        const current = message.chatId
+        if (!current) {
+            message.chatId = v4()
+            continue
+        }
+        sourceMessageIds.push(current)
+        let next = idMap.get(current)
+        if (!next) {
+            next = v4()
+            idMap.set(current, next)
+        }
+        message.chatId = next
+    }
+    return rewriteMessageReferences(chat, idMap, sourceMessageIds)
+}
+
+function rewriteMessageReferences(chat: Chat, idMap: Map<string, string>, sourceMessageIds: Iterable<string | undefined>): Chat {
     const source = new Set<string>()
     for (const id of sourceMessageIds) if (id) source.add(id)
 

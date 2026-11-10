@@ -62,6 +62,25 @@ export interface DurableChatSaveResult {
     backupWarning?: ChatContentBackupWarning
 }
 
+/** What a chat-content POST came to (see server POST /api/chat-content). */
+export type ChatPostOutcome =
+    | { status: 'ok', revision: string | null, durable?: DurableChatSaveResult }
+    /** The delta prefix did not verify; send the whole chat. */
+    | { status: 'base-mismatch' }
+    /** The server holds another revision than the base this save named. */
+    | { status: 'conflict', revision: string | null }
+
+export interface ChatPostOptions {
+    /** Delta: the prefix the server is expected to hold; `chat.message` carries the rest. */
+    deltaBase?: { count: number, fp: string } | null
+    /** Revision this save builds on. Absent for a chat the server does not hold yet. */
+    baseRev?: string | null
+    /** Id of the chat this one was forked from; the server then lists the new chat itself. */
+    forkOf?: string
+    /** Resolve only on a durable ACK; anything else throws DurableChatSaveError. */
+    strict?: boolean
+}
+
 export class DurableChatSaveError extends Error {
     status: number
     source?: string
@@ -1150,19 +1169,38 @@ export class NodeStorage{
      * answers with only the messages after it when the prefix verifies —
      * `deltaBase` is then set and `chat.message` holds just the rest.
      */
-    async fetchChatContentDelta(chaId: string, chatIndex: number, chatId: string, base: { count: number, fp: string } | null): Promise<{ chat: any, deltaBase: number | null } | null> {
+    async fetchChatContentDelta(
+        chaId: string, chatIndex: number, chatId: string,
+        base: { count: number, fp: string } | null,
+        baseRev?: string | null,
+    ): Promise<{ chat: any, deltaBase: number | null, revision: string | null } | { notModified: true, revision: string | null } | null> {
         const headers: Record<string, string> = { 'x-chat-id': chatId }
         if (base) {
             headers['x-chat-base-count'] = String(base.count)
             headers['x-chat-base-fp'] = base.fp
         }
+        // With the revision this tab holds, an unchanged chat costs no body.
+        if (baseRev) headers['x-chat-base-rev'] = baseRev
         const da = await this.authFetch(`/api/chat-content/${encodeURIComponent(chaId)}/${chatIndex}`, { headers })
         if (da.status === 404) return null
         if (da.status < 200 || da.status >= 300) throw new Error(`fetchChatContent error: ${da.status}`)
+        const revision = da.headers.get('x-chat-rev')
+        if (da.status === 204) return { notModified: true, revision }
         const deltaHeader = da.headers.get('x-chat-delta-base')
         const deltaBase = deltaHeader !== null && base && Number(deltaHeader) === base.count ? base.count : null
         const buffer = new Uint8Array(await da.arrayBuffer())
-        return { chat: normalizeChat(await decodeRisuSave(buffer)), deltaBase }
+        return { chat: normalizeChat(await decodeRisuSave(buffer)), deltaBase, revision }
+    }
+
+    /** The whole chat with the revision the server holds it under. */
+    async fetchChatContentWithRevision(chaId: string, chatIndex: number, chatId: string): Promise<{ chat: any, revision: string | null } | null> {
+        const da = await this.authFetch(`/api/chat-content/${encodeURIComponent(chaId)}/${chatIndex}`, {
+            headers: { 'x-chat-id': chatId },
+        })
+        if (da.status === 404) return null
+        if (da.status < 200 || da.status >= 300) throw new Error(`fetchChatContent error: ${da.status}`)
+        const buffer = new Uint8Array(await da.arrayBuffer())
+        return { chat: normalizeChat(await decodeRisuSave(buffer)), revision: da.headers.get('x-chat-rev') }
     }
 
     /**
@@ -1176,28 +1214,72 @@ export class NodeStorage{
     }
 
     async saveChatContentDeltaUnqueued(chaId: string, chatIndex: number, chatId: string, chat: any, base: { count: number, fp: string } | null): Promise<'ok' | 'base-mismatch'> {
+        const outcome = await this.postChatContent(chaId, chatIndex, chatId, chat, { deltaBase: base })
+        if (outcome.status === 'conflict') throw new Error('saveChatContent error: 409')
+        return outcome.status
+    }
+
+    /**
+     * One chat-content POST, not queued (callers hold the chat's queue slot).
+     * The body is encoded synchronously at the call, so it is the chat as it
+     * is now even if it keeps changing while the request is in flight. A
+     * revision conflict is an outcome, not an error: the caller resolves it.
+     */
+    async postChatContent(chaId: string, chatIndex: number, chatId: string, chat: any, options: ChatPostOptions = {}): Promise<ChatPostOutcome> {
         const encoded = encodeRisuSaveLegacy(chat)
         const headers: Record<string, string> = {
             'content-type': 'application/octet-stream',
             'x-chat-id': chatId,
         }
-        if (base) {
-            headers['x-chat-base-count'] = String(base.count)
-            headers['x-chat-base-fp'] = base.fp
+        const deltaBase = options.deltaBase ?? null
+        if (deltaBase) {
+            headers['x-chat-base-count'] = String(deltaBase.count)
+            headers['x-chat-base-fp'] = deltaBase.fp
         }
-        const gzipped = await gzipForUpload(encoded)
-        if (gzipped) headers['content-encoding'] = 'gzip'
-        const da = await this.authFetch(`/api/chat-content/${encodeURIComponent(chaId)}/${chatIndex}`, {
-            method: 'POST',
-            headers,
-            body: (gzipped ?? encoded) as BodyInit,
-        })
-        if (base && da.status === 409) {
-            const body = await da.json().catch(() => ({})) as { code?: string }
-            if (body?.code === 'CHAT_DELTA_BASE_MISMATCH') return 'base-mismatch'
+        if (options.baseRev) headers['x-chat-base-rev'] = options.baseRev
+        if (options.forkOf) headers['x-chat-fork-of'] = options.forkOf
+        if (options.strict) headers['x-strict-flush'] = '1'
+        let da: Response
+        try {
+            const gzipped = await gzipForUpload(encoded)
+            if (gzipped) headers['content-encoding'] = 'gzip'
+            da = await this.authFetch(`/api/chat-content/${encodeURIComponent(chaId)}/${chatIndex}`, {
+                method: 'POST',
+                headers,
+                body: (gzipped ?? encoded) as BodyInit,
+            })
+        } catch (error) {
+            if (!options.strict) throw error
+            const message = error instanceof Error ? error.message : String(error)
+            throw new DurableChatSaveError(`saveChatContentStrict request failed: ${message}`, 0)
+        }
+
+        let data: Record<string, unknown> | null = null
+        try {
+            const decoded: unknown = await da.json()
+            if (decoded !== null && typeof decoded === 'object') data = decoded as Record<string, unknown>
+        } catch {
+            if (options.strict) throw new DurableChatSaveError(`saveChatContentStrict invalid response: ${da.status}`, da.status)
+        }
+        if (da.status === 409) {
+            if (data?.code === 'CHAT_REV_CONFLICT') {
+                return { status: 'conflict', revision: typeof data.revision === 'string' ? data.revision : da.headers.get('x-chat-rev') }
+            }
+            if (deltaBase && data?.code === 'CHAT_DELTA_BASE_MISMATCH') return { status: 'base-mismatch' }
+        }
+        const revision = typeof data?.revision === 'string' ? data.revision : da.headers.get('x-chat-rev')
+        if (options.strict) {
+            if (!da.ok || data?.success !== true || data.durable !== true) {
+                const message = typeof data?.error === 'string'
+                    ? data.error
+                    : `saveChatContentStrict did not receive a durable ACK: ${da.status}`
+                const source = typeof data?.source === 'string' ? data.source : undefined
+                throw new DurableChatSaveError(message, da.status, source)
+            }
+            return { status: 'ok', revision, durable: data as unknown as DurableChatSaveResult }
         }
         if (da.status < 200 || da.status >= 300) throw new Error(`saveChatContent error: ${da.status}`)
-        return 'ok'
+        return { status: 'ok', revision }
     }
 
     async saveChatContent(chaId: string, chatIndex: number, chatId: string, chat: any): Promise<void> {

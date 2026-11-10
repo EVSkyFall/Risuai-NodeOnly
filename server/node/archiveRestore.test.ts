@@ -86,6 +86,14 @@ async function stopServer() {
     if (child.exitCode === null) child.kill('SIGKILL')
 }
 
+// A save replaces a stored chat only on top of the revision the server holds.
+async function baseRev(chaId: string, chatId: string): Promise<Record<string, string>> {
+    const res = await fetch(`${base}/api/chat-content/${chaId}/0`, { headers: { ...authHeaders(), 'x-chat-id': chatId } })
+    await res.arrayBuffer()
+    const revision = res.ok ? res.headers.get('x-chat-rev') : null
+    return revision ? { 'x-chat-base-rev': revision } : {}
+}
+
 function authHeaders(): Record<string, string> {
     return {
         'risu-auth': token,
@@ -294,7 +302,7 @@ describe('reactivated characters whose chat bodies only the archive rows hold', 
 
         const res = await fetch(`${base}/api/chat-content/other/0`, {
             method: 'POST',
-            headers: { ...authHeaders(), 'content-type': 'application/json', 'x-chat-id': 'o1' },
+            headers: { ...authHeaders(), 'content-type': 'application/json', 'x-chat-id': 'o1', ...await baseRev('other', 'o1') },
             body: JSON.stringify({ id: 'o1', name: 'o', message: [{ role: 'user', data: 'other, edited' }] }),
         })
         expect(res.status).toBe(200)
@@ -325,7 +333,7 @@ describe('reactivated characters whose chat bodies only the archive rows hold', 
         // The edit the user makes next keeps the history in front of it.
         const saved = await fetch(`${base}/api/chat-content/back/0`, {
             method: 'POST',
-            headers: { ...authHeaders(), 'content-type': 'application/json', 'x-chat-id': 'c1' },
+            headers: { ...authHeaders(), 'content-type': 'application/json', 'x-chat-id': 'c1', 'x-chat-base-rev': opened.headers.get('x-chat-rev')! },
             body: JSON.stringify({ ...chat, message: [...chat.message, { role: 'char', data: 'reply' }] }),
         })
         expect(saved.status).toBe(200)
@@ -383,14 +391,14 @@ describe('a character activated while a persist runs before it is listed again',
         // The returned character's chat is edited before its insert lands…
         const editBack = await fetch(`${base}/api/chat-content/back/0`, {
             method: 'POST',
-            headers: { ...authHeaders(), 'content-type': 'application/json', 'x-chat-id': 'c1' },
+            headers: { ...authHeaders(), 'content-type': 'application/json', 'x-chat-id': 'c1', ...await baseRev('back', 'c1') },
             body: JSON.stringify({ id: 'c1', name: 'One', message: [{ role: 'user', data: 'from the row' }, { role: 'char', data: 'new reply' }] }),
         })
         expect(editBack.status).toBe(200)
         // …and a persist (debounced after this save) rebuilds the store.
         const editOther = await fetch(`${base}/api/chat-content/other/0`, {
             method: 'POST',
-            headers: { ...authHeaders(), 'content-type': 'application/json', 'x-chat-id': 'o1' },
+            headers: { ...authHeaders(), 'content-type': 'application/json', 'x-chat-id': 'o1', ...await baseRev('other', 'o1') },
             body: JSON.stringify({ id: 'o1', name: 'o', message: [{ role: 'user', data: 'other, edited' }] }),
         })
         expect(editOther.status).toBe(200)
