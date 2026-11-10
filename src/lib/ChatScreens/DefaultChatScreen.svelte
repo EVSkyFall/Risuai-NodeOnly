@@ -20,7 +20,7 @@
     import { abortGeneration, chatGenKey, endGeneration, generationStates, registerAbort, startGeneration } from "../../ts/process/generationState";
     import { clearPendingSend, resumableSends, resumePendingSend, takeResumable } from "../../ts/process/request/pendingSends";
     import { chatLoadFailures, ensureCurrentChatReady } from "../../ts/storage/chatStorage";
-    import { refreshOpenChatBeforeSend } from "../../ts/storage/chatSyncHost";
+    import { refreshOpenChatBeforeSend, takeForkMove } from "../../ts/storage/chatSyncHost";
     import { sleep } from "../../ts/util";
     import { language } from "../../lang";
     import { isExpTranslator, translate } from "../../ts/translator/translator";
@@ -105,10 +105,21 @@ import { isMobile } from 'src/ts/platform'
         const chaId = draftChaId
         const chatId = draftChatId
         if (!chaId || !chatId) return
-        untrack(() => { messageInput = ''; messageInputTranslate = ''; draftLoading = true })
+        // A fork moved this tab from another chat to this one: it is the same
+        // conversation, so what is being typed stays (and the draft of the
+        // chat left behind comes along if this view was not showing).
+        const carriedFrom = takeForkMove(chaId, chatId)
+        untrack(() => {
+            if (!carriedFrom) { messageInput = ''; messageInputTranslate = '' }
+            draftLoading = true
+        })
         let active = true
         ;(async () => {
-            const draft = await loadChatDraft(chaId, chatId)
+            let draft = await loadChatDraft(chaId, chatId)
+            if (carriedFrom) {
+                if (!draft) draft = await loadChatDraft(chaId, carriedFrom)
+                removeChatDraft(chaId, carriedFrom)
+            }
             if (!active) return
             untrack(() => {
                 // Don't clobber text the user began typing during the load.
@@ -343,11 +354,19 @@ import { isMobile } from 'src/ts/platform'
         return sendMain(true)
     }
 
+    // True from the press until the generation is registered: the refresh in
+    // between takes a network round trip, and a second press in that time
+    // must not start a second send.
+    let sendPreparing = false
+
     async function sendMain(continueResponse:boolean) {
         let selectedChar = $selectedCharID
-        if($generationStates.has(currentChatGenKey())){
+        if($generationStates.has(currentChatGenKey()) || sendPreparing){
             return
         }
+        sendPreparing = true
+        let activeChat: ChatData | null = null
+        try {
 
         if(!await ensureActiveChatReady(selectedChar)) return
 
@@ -369,8 +388,14 @@ import { isMobile } from 'src/ts/platform'
         }
         if($selectedCharID !== selectedChar || $generationStates.has(currentChatGenKey())) return
         // Read again: the refresh may have changed which chat is open.
-        const activeChat = await ensureActiveChatReady(selectedChar)
+        activeChat = await ensureActiveChatReady(selectedChar)
         if(!activeChat) return
+        if($selectedCharID !== selectedChar || $generationStates.has(currentChatGenKey())) return
+
+        } finally {
+            sendPreparing = false
+        }
+        // Nothing awaits from here to startGeneration.
 
         const inputController = new AbortController()
         const inputGenKey = currentChatGenKey()
@@ -496,8 +521,13 @@ import { isMobile } from 'src/ts/platform'
     }
 
     async function reroll(exact = false) {
-        if($generationStates.has(currentChatGenKey())) return
-        if(!(await refreshOpenChatBeforeSend('reroll')).run) return
+        if($generationStates.has(currentChatGenKey()) || sendPreparing) return
+        sendPreparing = true
+        try {
+            if(!(await refreshOpenChatBeforeSend('reroll')).run) return
+        } finally {
+            sendPreparing = false
+        }
         if($generationStates.has(currentChatGenKey())) return
         const lastMsg = getLastCharMsg()
         if (!lastMsg) return

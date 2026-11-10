@@ -37,6 +37,8 @@ export type ChatFetchResult =
 export type ChatSaveOutcome =
     | { status: 'ok', revision: string | null, durable?: DurableChatSaveResult }
     | { status: 'conflict', revision: string | null }
+    /** Only with `fullOnMismatch: false`: the delta prefix did not verify and nothing was stored. */
+    | { status: 'base-mismatch' }
 
 export interface ChatSaveOptions {
     baseRev?: string | null
@@ -44,6 +46,13 @@ export interface ChatSaveOptions {
     strict?: boolean
     /** messageFingerprints(chat.message), when the caller already has them. */
     fingerprints?: string[]
+    /**
+     * False: when the server refuses the delta prefix, do not send the whole
+     * chat from here but hand that back. For a caller whose `chat` is live and
+     * may have changed during the request: it has to fingerprint again what it
+     * then sends. The next save of this chat goes out in full.
+     */
+    fullOnMismatch?: boolean
 }
 
 export interface ChatCopyStore {
@@ -190,6 +199,10 @@ export function createChatDeltaSync(transport: ChatDeltaTransport, copies: ChatC
             // The delta prefix did not verify (a server-side write under the
             // same revision is not possible, but a base remembered from a
             // different copy is): fall through to a full save.
+            if (options.fullOnMismatch === false) {
+                serverFingerprints.delete(key)
+                return { status: 'base-mismatch' }
+            }
         }
         const outcome = await post(chaId, chatIndex, chatId, chat, null, options)
         if (outcome.status === 'conflict') return outcome

@@ -219,6 +219,17 @@ const chatSync = createChatSync({
     forkName: (name) => chatSyncHost.forkName(name),
     notifyForked: (name) => chatSyncHost.notifyForked(name),
     trackCharacter: (chaId) => chatSyncHost.trackCharacter(chaId),
+    replaceLive: (chaId, chatId, replace) => {
+        // Same guard as hydration: the change-tracking effect that sees this
+        // replacement must not queue a save for it.
+        const key = chatKey(chaId, chatId)
+        hydrationJustApplied.add(key)
+        try {
+            replace()
+        } finally {
+            void tick().then(() => { hydrationJustApplied.delete(key) })
+        }
+    },
     contentReplaced: (chaId, chatId) => chatSyncHost.contentReplaced(chaId, chatId),
     schedule: (run, delayMs) => { setTimeout(run, delayMs) },
     sleep: (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
@@ -290,7 +301,9 @@ export async function fetchChatForPlugin(chaId: string, chatIndex: number, chatI
  * last read, and a chat it never read is replaced outright.
  */
 export async function savePluginChat(chaId: string, chatIndex: number, chatId: string, chat: Chat, wasLoaded: boolean): Promise<void> {
-    const hasBase = wasLoaded || chatSync.adoptPluginRead(chaId, chatId)
+    let hasBase = true
+    if (wasLoaded) chatSync.dropPluginRead(chaId, chatId)
+    else hasBase = chatSync.adoptPluginRead(chaId, chatId)
     await chatSync.save(chaId, chatIndex, chatId, chat, { strict: false, replace: !hasBase })
 }
 

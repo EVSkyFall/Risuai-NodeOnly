@@ -56,6 +56,12 @@ export interface ChatSyncEnv {
     notifyForked(name: string): void
     /** Include the character in the next database save (its chat list changed). */
     trackCharacter(chaId: string): void
+    /**
+     * Runs `replace`, which puts server content into a live chat. The host
+     * keeps this from being taken for an edit by the user (it must not start
+     * a save).
+     */
+    replaceLive(chaId: string, chatId: string, replace: () => void): void
     /** Server content replaced the live content of a chat. */
     contentReplaced(chaId: string, chatId: string): void
     schedule(run: () => void, delayMs: number): void
@@ -181,7 +187,7 @@ export function createChatSync(env: ChatSyncEnv) {
     // ── Server content into live state ──────────────────────────────────────
 
     function applyServerContent(chaId: string, chatId: string, live: LiveChat, server: Chat, revision: string | null, fp: string) {
-        replaceOwnedContent(live.chat, server)
+        env.replaceLive(chaId, chatId, () => replaceOwnedContent(live.chat, server))
         setSynced(keyOf(chaId, chatId), revision, fp)
         env.contentReplaced(chaId, chatId)
     }
@@ -214,11 +220,18 @@ export function createChatSync(env: ChatSyncEnv) {
             state.pending.add(fps.content)
             states.set(key, state)
 
+            // `content` is live and may change while the request is under way.
+            // The body is encoded at the call, so `fps` describes what is
+            // sent; a second request (the whole chat after a refused delta
+            // prefix) is therefore not made from in there but by going round
+            // again, with fingerprints taken anew.
             const outcome = await env.postChat(chaId, index, chatId, content, {
                 baseRev: state.rev,
                 strict,
                 fingerprints: fps.messages,
+                fullOnMismatch: false,
             })
+            if (outcome.status === 'base-mismatch') continue
             if (outcome.status === 'ok') {
                 setSynced(key, outcome.revision, fps.content)
                 if (strict && !outcome.durable) throw new ChatSyncError('no durable acknowledgement')
@@ -375,6 +388,8 @@ export function createChatSync(env: ChatSyncEnv) {
                 divert.attempts.clear()
                 return { divert, outcome, forkChat, sourceFp }
             }
+            // (forkChat is a copy, so a refused delta prefix is followed by
+            // the whole chat inside postChat; 'base-mismatch' does not occur.)
             divert = await divertAfterConflict(chaId, chatId, divert, live.chat.name)
             const again = hydratedLive(chaId, chatId)
             if (!again) throw new ChatSyncError(`chat ${chatId} is no longer loaded`)
@@ -609,15 +624,23 @@ export function createChatSync(env: ChatSyncEnv) {
 
         /**
          * A plugin is about to replace a chat that is not loaded here: its
-         * write builds on what it last read. Returns false when it never read it.
+         * write builds on what it last read. Returns false when it never read
+         * it. Whatever this tab remembered of the chat from an earlier time
+         * it was loaded is dropped either way.
          */
         adoptPluginRead(chaId: string, chatId: string): boolean {
             const key = keyOf(chaId, chatId)
             const read = pluginReads.get(key)
             pluginReads.delete(key)
+            states.delete(key)
             if (!read) return false
             setSynced(key, read.rev, read.fp)
             return true
+        },
+
+        /** A plugin read that will not be used as a base any more. */
+        dropPluginRead(chaId: string, chatId: string) {
+            pluginReads.delete(keyOf(chaId, chatId))
         },
 
         generationsChanged,

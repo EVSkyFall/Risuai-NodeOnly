@@ -23,6 +23,18 @@ export function refreshOpenChat(): void {
     if (open) void refreshChatFromServer(open.chaId, open.chatId)
 }
 
+// A fork moved the chat on screen: `from` is the chat this tab was on, `to`
+// the fork it is on now. Taken once by the chat screen, which keeps the text
+// in the composer for the new chat (the composer is per chat).
+let forkMove: { chaId: string, from: string, to: string } | null = null
+
+export function takeForkMove(chaId: string, chatId: string): string | null {
+    if (!forkMove || forkMove.chaId !== chaId || forkMove.to !== chatId) return null
+    const from = forkMove.from
+    forkMove = null
+    return from
+}
+
 /** What the user asked for when a send-like action starts. */
 export type SendKind = 'send' | 'continue' | 'reroll' | 'resend' | 'resume'
 
@@ -80,7 +92,13 @@ export function initChatSyncHost(): void {
                 index,
                 chat: char.chats[index],
                 isOpen: char.chatPage === index,
-                open: (next) => { char.chatPage = next },
+                open: (next) => {
+                    const from = char.chats[char.chatPage]?.id
+                    const to = char.chats[next]?.id
+                    const onScreen = getDatabase()?.characters?.[get(selectedCharID)] === char
+                    if (onScreen && from && to && from !== to) forkMove = { chaId, from, to }
+                    char.chatPage = next
+                },
             }
         },
         isGenerating: (chatId) => isChatGenerating(chatGenKey(chatId)),
@@ -94,10 +112,10 @@ export function initChatSyncHost(): void {
             if (char?.chaId !== chaId) return
             const chat = char.chats?.[char.chatPage]
             if (chat?.id !== chatId) return
-            // Same as opening the chat: its pinned toggles apply, and views
-            // that render outside the reactive graph redraw.
+            // Same as opening the chat: its pinned toggles apply. Nothing of
+            // the character is touched: that would be a change of this tab's
+            // own and go out with the next database save.
             loadTogglesFromChat(chat)
-            char.reloadKeys = (char.reloadKeys ?? 0) + 1
         },
     })
 

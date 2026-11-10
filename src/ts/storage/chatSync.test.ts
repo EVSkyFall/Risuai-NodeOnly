@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'vitest'
 import { createChatSync, type ChatSyncEnv, type LiveChat } from './chatSync'
-import type { ChatFetchResult, ChatSaveOptions, ChatSaveOutcome } from './chatDeltaSync'
+import { createChatDeltaSync, type ChatFetchResult, type ChatSaveOptions, type ChatSaveOutcome } from './chatDeltaSync'
 import { canon, chatFingerprints, hash64, messageFingerprints } from './chatFingerprint'
 
 // Two tabs on one server, reduced to what chat sync sees: a server that
@@ -42,6 +42,7 @@ function world() {
     const notices: string[] = []
     const tracked: string[] = []
     const replaced: string[] = []
+    const guarded: string[] = []
     const queues = new Map<string, Promise<unknown>>()
     let ids = 0
 
@@ -96,6 +97,7 @@ function world() {
         forkName: (name) => `${name} (diverged)`,
         notifyForked: (name) => { notices.push(name) },
         trackCharacter: (chaId) => { tracked.push(chaId) },
+        replaceLive: (_chaId, chatId, replace) => { guarded.push(chatId); replace() },
         contentReplaced: (_chaId, chatId) => { replaced.push(chatId) },
         schedule: (run) => { scheduled.push(run) },
         sleep: async (delayMs) => { sleeps.push(delayMs) },
@@ -103,7 +105,7 @@ function world() {
     const sync = createChatSync(env)
 
     return {
-        sync, stored, listed, posts, hooks, live, generating, notices, tracked, replaced, sleeps,
+        sync, stored, listed, posts, hooks, live, generating, notices, tracked, replaced, guarded, sleeps,
         /** Open a chat in this tab the way hydration does. */
         open(chat: AnyChat, at = 0) {
             stored.set(chat.id, structuredClone(chat))
@@ -272,6 +274,8 @@ describe('the other tab changed the chat', () => {
         expect(chat.isStreaming).toBeUndefined()
         expect(chat.name).toBe('Chat c')
         expect(w.replaced).toEqual(['c'])
+        // The replacement ran inside the host's guard against being taken for an edit.
+        expect(w.guarded).toEqual(['c'])
         await w.save('c')
         expect(w.posts).toHaveLength(0)
         expect(await w.sync.refresh(CHA, 'c')).toEqual({ status: 'unchanged', messagesChanged: false })
@@ -415,6 +419,82 @@ describe('the other tab changed the chat', () => {
         w.open(chatOf('c', [msg('a')]))
         w.hooks.beforeFetch = () => { throw new Error('offline') }
         expect(await w.sync.refresh(CHA, 'c')).toEqual({ status: 'skipped', messagesChanged: false })
+    })
+})
+
+// Trap 7
+describe('job recovery around a lost answer', () => {
+    test('save stored, answer lost, the other tab appends, recovery reads back and saves again: nothing of either is lost', async () => {
+        const w = world()
+        const chat = w.open(chatOf('c', [msg('question', 'user')]))
+        chat.message.push(msg('recovered reply'))
+        w.hooks.loseAnswer = true
+        await expect(w.save('c', true)).rejects.toThrow()
+        w.otherTab('c', (c) => c.message.push(msg('theirs')))
+        // The read-back is a plain fetch that enters neither live state nor the
+        // sync state (fetchChatFromServer); then recovery saves again.
+        expect(await w.save('c', true)).toEqual({ success: true, durable: true })
+        // The other tab's append stays where it was written.
+        expect(texts(w.stored.get('c'))).toEqual(['question', 'recovered reply', 'theirs'])
+        expect(texts(w.live.chats[0])).toEqual(['question', 'recovered reply', 'theirs'])
+        // This tab cannot tell that its own lost save is what the other tab
+        // built on, so its copy is kept as a fork as well: one chat more than
+        // needed, nothing less.
+        expect(w.live.chats).toHaveLength(2)
+        expect(texts(w.stored.get(w.live.chats[1].id))).toEqual(['question', 'recovered reply'])
+    })
+})
+
+// The save path as wired in the app: chat sync on top of delta sync.
+describe('with delta sync underneath', () => {
+    test('a chat that changes while a refused delta is under way is not recorded as saved in a state it was never sent in', async () => {
+        const server = { chat: chatOf('c', [msg('a'), msg('b')]) as AnyChat, rev: 1 }
+        const live = { chats: [structuredClone(server.chat)] as AnyChat[] }
+        let duringDelta: (() => void) | null = null
+        const bodies: AnyChat[] = []
+        const delta = createChatDeltaSync({
+            fetchChatContentDelta: async () => ({ chat: structuredClone(server.chat), deltaBase: null, revision: String(server.rev) }),
+            saveChatContentDelta: async () => 'ok',
+            postChatContent: async (_a, _i, _c, body, options) => {
+                const sent = structuredClone(body)
+                if (options.deltaBase) {
+                    // The server holds the messages under other ids: the prefix does not verify.
+                    const hook = duringDelta
+                    duringDelta = null
+                    hook?.()
+                    return { status: 'base-mismatch' }
+                }
+                bodies.push(sent)
+                server.chat = sent
+                server.rev += 1
+                return { status: 'ok', revision: String(server.rev) }
+            },
+        }, { get: async () => null, put: async () => {} })
+        const sync = createChatSync({
+            ...({} as ChatSyncEnv),
+            enqueue: (_a, _b, run) => run(),
+            fetchChat: (a, i, c, rev) => delta.fetchChatRev(a, i, c, rev),
+            postChat: (a, i, c, chat, options) => delta.postChat(a, i, c, chat, options),
+            findLive: () => ({ chats: live.chats, index: 0, chat: live.chats[0], isOpen: true, open: () => {} }),
+            isGenerating: () => false,
+            newId: () => 'id',
+        } as ChatSyncEnv)
+        // Opened: delta sync remembers the server's fingerprints, chat sync the revision.
+        const opened = await delta.fetchChatRev(CHA, 0, 'c')
+        if (opened.kind !== 'ok') throw new Error('unreachable')
+        sync.noteServerContent(CHA, 'c', live.chats[0], opened.revision)
+
+        live.chats[0].message.push(msg('first edit'))
+        duringDelta = () => { live.chats[0].message.push(msg('typed during the request')) }
+        await sync.save(CHA, 0, 'c', live.chats[0], { strict: false })
+        expect(texts(bodies.at(-1))).toEqual(['a', 'b', 'first edit', 'typed during the request'])
+        expect(sync.isDirty(CHA, 'c')).toBe(false)
+        // Back to the state at the first attempt: that is a change against what
+        // the server holds, and it is seen as one.
+        live.chats[0].message.pop()
+        expect(sync.isDirty(CHA, 'c')).toBe(true)
+        await sync.save(CHA, 0, 'c', live.chats[0], { strict: false })
+        expect(texts(server.chat)).toEqual(['a', 'b', 'first edit'])
     })
 })
 
@@ -583,6 +663,20 @@ describe('plugin writes to a chat that is not loaded', () => {
         expect((await w.sync.refresh(CHA, 'c')).status).toBe('updated')
         expect(w.live.chats).toHaveLength(1)
         expect(texts(w.live.chats[0])).toEqual(['a', 'added by the plugin', 'theirs'])
+    })
+
+    test('what this tab remembered of a chat from an earlier load does not turn a plugin replacement into a fork', async () => {
+        const w = world()
+        // Loaded once, then unloaded again (character deactivated and reactivated).
+        w.open(chatOf('c', [msg('a')]))
+        w.otherTab('c', (c) => c.message.push(msg('theirs')))
+        const built = chatOf('c', [msg('built from scratch')])
+        w.live.chats[0] = built
+        expect(w.sync.adoptPluginRead(CHA, 'c')).toBe(false)
+        await w.sync.save(CHA, 0, 'c', built, { strict: false, replace: true })
+        expect(texts(w.stored.get('c'))).toEqual(['built from scratch'])
+        expect(w.live.chats).toHaveLength(1)
+        expect(w.notices).toEqual([])
     })
 
     test('a chat the plugin never read is replaced outright', async () => {

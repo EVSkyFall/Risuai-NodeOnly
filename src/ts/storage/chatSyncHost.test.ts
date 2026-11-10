@@ -28,7 +28,7 @@ vi.mock('./chatStorage', () => ({
     chatGenerationsChanged: () => state.generationsChanged(),
 }))
 
-const { initChatSyncHost, refreshOpenChatBeforeSend } = await import('./chatSyncHost')
+const { initChatSyncHost, refreshOpenChatBeforeSend, takeForkMove } = await import('./chatSyncHost')
 const { endGeneration, startGeneration } = await import('../process/generationState')
 
 beforeEach(() => {
@@ -109,6 +109,16 @@ describe('what chat sync gets from the app', () => {
         expect(state.db.characters[0].chatPage).toBe(0)
     })
 
+    test('remembers once that a fork moved the chat on screen, for the composer text to follow', () => {
+        initChatSyncHost()
+        state.db.characters[0].chats.push({ id: 'fork', name: 'Open (diverged)', message: [] })
+        state.host.findLive('cha', 'open')!.open(2)
+        expect(state.db.characters[0].chatPage).toBe(2)
+        expect(takeForkMove('cha', 'first')).toBeNull()
+        expect(takeForkMove('cha', 'fork')).toBe('open')
+        expect(takeForkMove('cha', 'fork')).toBeNull()
+    })
+
     test('names a fork after the chat, whatever characters the name holds', () => {
         initChatSyncHost()
         expect(state.host.forkName('Open $& chat')).toBe('Open $& chat (diverged)')
@@ -122,7 +132,8 @@ describe('what chat sync gets from the app', () => {
         expect(state.loadToggles).not.toHaveBeenCalled()
         state.host.contentReplaced('cha', 'open')
         expect(state.loadToggles).toHaveBeenCalledWith(state.db.characters[0].chats[1])
-        expect(state.db.characters[0].reloadKeys).toBe(1)
+        // Nothing of the character changes: that would go out with the next database save.
+        expect(state.db.characters[0].reloadKeys).toBe(0)
     })
 
     test('reports generations by chat id and passes on every change of the registry', () => {
