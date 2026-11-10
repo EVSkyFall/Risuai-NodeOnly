@@ -24,15 +24,18 @@ describe('mergeServerDbWithTrackedLocalChanges', () => {
         expect(local.characters[0].desc).toBe('local')
     })
 
-    test('with a baseline, only root keys this client changed come from local; the rest keep the server value', () => {
-        // Device A changed `username` on the server; this device changed
-        // `personaPrompt` locally and never touched `username`.
-        const baseline = { username: 'old', personaPrompt: 'old', characterOrder: ['a'], characters: [] } as any
-        const server = { username: 'from-A', personaPrompt: 'old', characterOrder: ['a', 'b'], characters: [] } as any
-        const local = { username: 'old', personaPrompt: 'mine', characterOrder: ['a'], characters: [] } as any
+    test('with a baseline, only shared root keys this client changed come from local; the rest keep the server value while tab-local units stay local', () => {
+        // Device A changed `openAIKey` on the server; this device changed
+        // `customCSS` locally and never touched `openAIKey`. Persona-unit keys
+        // (`username`, `personaPrompt`) stay tab-local even when unchanged from base.
+        const baseline = { openAIKey: 'old', customCSS: 'old', username: 'old-u', personaPrompt: 'old-p', characterOrder: ['a'], characters: [] } as any
+        const server = { openAIKey: 'from-A', customCSS: 'old', username: 'srv-u', personaPrompt: 'srv-p', characterOrder: ['a', 'b'], characters: [] } as any
+        const local = { openAIKey: 'old', customCSS: 'mine', username: 'old-u', personaPrompt: 'mine-p', characterOrder: ['a'], characters: [] } as any
         const { mergedDb } = mergeServerDbWithTrackedLocalChanges(server, local, toSave() as any, clone, passChats, new Set(), baseline)
-        expect(mergedDb.username).toBe('from-A')
-        expect(mergedDb.personaPrompt).toBe('mine')
+        expect(mergedDb.openAIKey).toBe('from-A')
+        expect(mergedDb.customCSS).toBe('mine')
+        expect(mergedDb.username).toBe('old-u')
+        expect(mergedDb.personaPrompt).toBe('mine-p')
         expect(mergedDb.characterOrder).toEqual(['a', 'b'])
         // A key absent from both baseline and local keeps the server value.
         const { mergedDb: m2 } = mergeServerDbWithTrackedLocalChanges({ theme: 'srv', characters: [] } as any, { characters: [] } as any, toSave() as any, clone, passChats, new Set(), { characters: [] } as any)

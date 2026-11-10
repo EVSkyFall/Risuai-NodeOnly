@@ -13,13 +13,17 @@
 // the rebase (which operates on detached merged/local objects, not the global
 // db) can use and test it.
 
-type IdentifiedPreset = { id?: string }
+type IdentifiedEntry = { id?: string }
 type IdentifiedCharacter = { chaId?: string }
+type IdentifiedChat = { id?: string }
 
 export type RebasedSelectionInput = {
-    mergedBotPresets: IdentifiedPreset[] | undefined
-    localBotPresets: IdentifiedPreset[] | undefined
+    mergedBotPresets: IdentifiedEntry[] | undefined
+    localBotPresets: IdentifiedEntry[] | undefined
     localBotPresetsId: number | undefined
+    mergedPersonas?: IdentifiedEntry[] | undefined
+    localPersonas?: IdentifiedEntry[] | undefined
+    localSelectedPersona?: number | undefined
     mergedCharacters: IdentifiedCharacter[] | undefined
     localCharacters: IdentifiedCharacter[] | undefined
     localSelectedCharIndex: number
@@ -27,11 +31,12 @@ export type RebasedSelectionInput = {
 
 export type RebasedSelection = {
     botPresetsId: number
+    selectedPersona?: number
     selectedCharIndex: number
 }
 
 export function reanchorRebasedSelection(input: RebasedSelectionInput): RebasedSelection {
-    return {
+    const out: RebasedSelection = {
         botPresetsId: reanchorPresetIndex(
             input.mergedBotPresets,
             input.localBotPresets,
@@ -43,11 +48,19 @@ export function reanchorRebasedSelection(input: RebasedSelectionInput): RebasedS
             input.localSelectedCharIndex,
         ),
     }
+    if (input.localSelectedPersona !== undefined || input.mergedPersonas !== undefined) {
+        out.selectedPersona = reanchorPersonaIndex(
+            input.mergedPersonas,
+            input.localPersonas,
+            input.localSelectedPersona,
+        )
+    }
+    return out
 }
 
-function reanchorPresetIndex(
-    merged: IdentifiedPreset[] | undefined,
-    local: IdentifiedPreset[] | undefined,
+export function reanchorPresetIndex(
+    merged: IdentifiedEntry[] | undefined,
+    local: IdentifiedEntry[] | undefined,
     localId: number | undefined,
 ): number {
     const mergedLength = Array.isArray(merged) ? merged.length : 0
@@ -65,7 +78,15 @@ function reanchorPresetIndex(
     return Math.min(Math.max(localId, 0), mergedLength - 1)
 }
 
-function reanchorCharacterIndex(
+export function reanchorPersonaIndex(
+    merged: IdentifiedEntry[] | undefined,
+    local: IdentifiedEntry[] | undefined,
+    localId: number | undefined,
+): number {
+    return reanchorPresetIndex(merged, local, localId)
+}
+
+export function reanchorCharacterIndex(
     merged: IdentifiedCharacter[] | undefined,
     local: IdentifiedCharacter[] | undefined,
     localIndex: number,
@@ -74,4 +95,26 @@ function reanchorCharacterIndex(
     const chaId = Array.isArray(local) ? local[localIndex]?.chaId : undefined
     if (!chaId || !Array.isArray(merged)) return -1
     return merged.findIndex((character) => character?.chaId === chaId)
+}
+
+export function reanchorChatPage(
+    mergedChats: IdentifiedChat[] | undefined,
+    localChar: { chatPage?: number; chats?: IdentifiedChat[] } | undefined,
+    remoteChar: { chatPage?: number } | undefined,
+): number {
+    const chatsLen = Array.isArray(mergedChats) ? mergedChats.length : 0
+    if (chatsLen === 0) return 0
+    if (localChar && Array.isArray(localChar.chats) && typeof localChar.chatPage === 'number') {
+        const openChat = localChar.chats[localChar.chatPage]
+        if (openChat?.id) {
+            const byId = mergedChats!.findIndex((c) => c?.id === openChat.id)
+            if (byId >= 0) return byId
+        }
+    }
+    const fallbackPage = typeof remoteChar?.chatPage === 'number' && Number.isFinite(remoteChar.chatPage)
+        ? Math.trunc(remoteChar.chatPage)
+        : (typeof localChar?.chatPage === 'number' && Number.isFinite(localChar.chatPage)
+            ? Math.trunc(localChar.chatPage)
+            : 0)
+    return Math.min(Math.max(fallbackPage, 0), chatsLen - 1)
 }

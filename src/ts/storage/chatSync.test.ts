@@ -422,6 +422,36 @@ describe('the other tab changed the chat', () => {
     })
 })
 
+describe('a chat the server may have dropped', () => {
+    test('is sent again although nothing changed, on the base this tab holds', async () => {
+        const w = world()
+        w.open(chatOf('c', [msg('a')]))
+        await w.save('c')
+        expect(w.posts).toHaveLength(0)
+        // Another tab removed it from the chat list; the server dropped the body.
+        w.stored.delete('c')
+        w.sync.resendOnNextSave(CHA, 'c')
+        await w.save('c')
+        expect(texts(w.stored.get('c'))).toEqual(['a'])
+        await w.save('c')
+        expect(w.postsTo('c')).toHaveLength(1)
+    })
+
+    test('a body the server still holds is not taken for someone else\'s change, also when this tab edited meanwhile', async () => {
+        const w = world()
+        // A chat made here and uploaded; the database save that lists it met a
+        // conflict, and the rebase asks for it to be sent again.
+        w.live.chats.push(chatOf('new', [msg('first')]))
+        await w.save('new')
+        w.sync.resendOnNextSave(CHA, 'new')
+        w.live.chats[0].message.push(msg('reply streamed in before the retry'))
+        await w.save('new')
+        expect(w.live.chats).toHaveLength(1)
+        expect(w.notices).toEqual([])
+        expect(texts(w.stored.get('new'))).toEqual(['first', 'reply streamed in before the retry'])
+    })
+})
+
 // Trap 7
 describe('job recovery around a lost answer', () => {
     test('save stored, answer lost, the other tab appends, recovery reads back and saves again: nothing of either is lost', async () => {

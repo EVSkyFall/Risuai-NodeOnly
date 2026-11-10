@@ -43,11 +43,24 @@ const unpackr = new Unpackr({
  * @param {*} db - decoded database object (may be partial/legacy)
  * @returns {*} the same db, mutated in place
  */
-function ensureBotPresetIds(db) {
+function ensureBotPresetIds(db, onMintId) {
     if (db && Array.isArray(db.botPresets)) {
         for (const preset of db.botPresets) {
             if (preset && !preset.id) {
                 preset.id = randomUUID();
+                if (typeof onMintId === 'function') onMintId();
+            }
+        }
+    }
+    return db;
+}
+
+function ensurePersonaIds(db, onMintId) {
+    if (db && Array.isArray(db.personas)) {
+        for (const persona of db.personas) {
+            if (persona && !persona.id) {
+                persona.id = randomUUID();
+                if (typeof onMintId === 'function') onMintId();
             }
         }
     }
@@ -351,11 +364,13 @@ class RisuSaveDecoder {
         if (!Array.isArray(db.botPresets) || db.botPresets.length === 0) {
             db.botPresets = [{ ...presetTemplate, id: randomUUID() }];
             db.botPresetsId = 0;
+            if (typeof options.onMintId === 'function') options.onMintId();
         }
         // Outer decodeRisuSave also normalizes ids across every decode path
         // (raw/compressed/stream/risusave) — calling it here too keeps the
         // invariant locally true even if a caller constructs a decoder by hand.
-        ensureBotPresetIds(db);
+        ensureBotPresetIds(db, options.onMintId);
+        ensurePersonaIds(db, options.onMintId);
 
         return db;
     }
@@ -375,7 +390,8 @@ async function decodeRisuSave(data, options = {}) {
     // exactly once at the boundary so every header type (raw/compressed/stream/
     // risusave) and the catch-fallback paths all guarantee id-populated presets.
     const result = await _decodeRisuSaveInternal(data, options);
-    return ensureBotPresetIds(result);
+    ensureBotPresetIds(result, options.onMintId);
+    return ensurePersonaIds(result, options.onMintId);
 }
 
 async function _decodeRisuSaveInternal(data, options = {}) {
@@ -600,6 +616,8 @@ module.exports = {
 
     // Functions
     decodeRisuSave,
+    ensureBotPresetIds,
+    ensurePersonaIds,
     encodeRisuSaveLegacy,
     calculateHash,
     normalizeJSON,

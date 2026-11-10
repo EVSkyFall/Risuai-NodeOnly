@@ -96,6 +96,8 @@ interface SyncState {
     fp: string | null
     /** Fingerprints of saves sent since then whose answer never arrived. */
     pending: Set<string>
+    /** Send on the next save even if the content equals `fp`. */
+    resend?: boolean
 }
 
 interface Divert {
@@ -216,7 +218,7 @@ export function createChatSync(env: ChatSyncEnv) {
             ensureMessageIds(content)
             const fps = chatFingerprints(content)
             const state = states.get(key) ?? { rev: null, fp: null, pending: new Set<string>() }
-            if (!strict && state.fp === fps.content) return undefined
+            if (!strict && !state.resend && state.fp === fps.content) return undefined
             state.pending.add(fps.content)
             states.set(key, state)
 
@@ -596,7 +598,9 @@ export function createChatSync(env: ChatSyncEnv) {
             const key = keyOf(chaId, chatId)
             const running = refreshes.get(key)
             if (running) return running
-            const run = env.enqueue(chaId, chatId, () => refreshNow(chaId, chatId))
+            // Inside an async function: a host that cannot queue yet (storage
+            // not initialised) must not make this throw either.
+            const run = (async () => env.enqueue(chaId, chatId, () => refreshNow(chaId, chatId)))()
                 .catch((error): RefreshResult => {
                     console.warn(`[chatSync] refresh of ${chatId} failed:`, error)
                     return { status: 'skipped', messagesChanged: false }
@@ -636,6 +640,18 @@ export function createChatSync(env: ChatSyncEnv) {
             if (!read) return false
             setSynced(key, read.rev, read.fp)
             return true
+        },
+
+        /**
+         * The server may not hold this chat any more (it was removed from the
+         * chat list elsewhere while this tab keeps it): the next save sends it
+         * even if nothing changed here. What this tab last synced stays as the
+         * base, so a body the server does still hold is not taken for someone
+         * else's change.
+         */
+        resendOnNextSave(chaId: string, chatId: string) {
+            const state = states.get(keyOf(chaId, chatId))
+            if (state) state.resend = true
         },
 
         /** A plugin read that will not be used as a base any more. */

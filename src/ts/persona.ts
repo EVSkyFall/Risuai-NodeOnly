@@ -1,4 +1,5 @@
 import { getDatabase, saveImage, setDatabase } from "./storage/database.svelte"
+import { applyPersonaToRoot, liveUnitSyncState } from "./storage/presetPersonaUnits"
 import { selectSingleFile, sleep } from "./util"
 import { alertError, alertStore, notifySuccess, notifyError } from "./alert"
 import { AppendableBuffer, downloadFile, readImage } from "./globalApi.svelte"
@@ -13,25 +14,51 @@ export async function selectUserImg() {
         return
     }
     const img = selected.data
-    let db = getDatabase()
+    const before = getDatabase()
+    const targetId = before.personas?.[before.selectedPersona]?.id
     const imgp = await saveImage(img)
+    // The upload takes a while: a rebase may have replaced the database, and
+    // the user may have moved to another persona. Work on the database that
+    // is live now and on the persona the image was picked for.
+    const db = getDatabase()
+    const index = targetId ? db.personas.findIndex((persona) => persona?.id === targetId) : db.selectedPersona
+    if (index === -1 || !db.personas[index]) {
+        return
+    }
+    if (index !== db.selectedPersona) {
+        db.personas[index].icon = imgp
+        liveUnitSyncState.markPersonaDirtyId(db.personas[index].id)
+        return
+    }
     db.userIcon = imgp
-    db.personas[db.selectedPersona] = {
-        ...db.personas[db.selectedPersona],
+    const nextId = db.personas[index].id ?? v4()
+    db.personas[index] = {
+        ...db.personas[index],
         name: db.username,
         icon: db.userIcon,
         personaPrompt: db.personaPrompt,
         note: db.userNote,
-        id: db.personas[db.selectedPersona].id ?? v4()
+        id: nextId
     }
+    liveUnitSyncState.markPersonaDirtyId(nextId)
+    liveUnitSyncState.retakePersonaSnapshot(db)
 }
 
 export function saveUserPersona() {
     let db = getDatabase()
-    db.personas[db.selectedPersona].name = db.username
-    db.personas[db.selectedPersona].icon = db.userIcon
-    db.personas[db.selectedPersona].personaPrompt = db.personaPrompt
-    db.personas[db.selectedPersona].note = db.userNote
+    const current = db.personas?.[db.selectedPersona]
+    if (!current) {
+        return
+    }
+    if (!liveUnitSyncState.isPersonaDirty(db)) {
+        return
+    }
+    current.name = db.username
+    current.icon = db.userIcon
+    current.personaPrompt = db.personaPrompt
+    current.note = db.userNote
+    liveUnitSyncState.markPersonaDirtyId(current.id)
+    liveUnitSyncState.retakePersonaSnapshot(db)
 }
 
 export function changeUserPersona(id: number, save: 'save' | 'noSave' = 'save') {
@@ -39,12 +66,13 @@ export function changeUserPersona(id: number, save: 'save' | 'noSave' = 'save') 
         saveUserPersona()
     }
     let db = getDatabase()
-    const pr = db.personas[id]
-    db.personaPrompt = pr.personaPrompt
-    db.username = pr.name
-    db.userIcon = pr.icon
-    db.userNote = pr.note
+    const pr = db.personas?.[id]
+    if (!pr) {
+        return
+    }
+    applyPersonaToRoot(db, pr)
     db.selectedPersona = id
+    liveUnitSyncState.retakePersonaSnapshot(db)
 }
 
 interface PersonaCard {

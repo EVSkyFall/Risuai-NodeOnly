@@ -258,6 +258,32 @@ describe('restoreChatShapeAfterRebase', () => {
         expect((merged[0].chats[0] as any).isStreaming).toBe(false)
     })
 
+    test('preserves isStreaming on a chat that is streaming in this tab', () => {
+        const hydrated = { ...fullChat('c1', 'live stream'), isStreaming: true }
+        const merged = [{ chaId: 'A', chats: [rawStub('c1')] }]
+        const local = [{ chaId: 'A', chats: [hydrated] }]
+
+        restoreChatShapeAfterRebase(merged, local, { streamingChatKeys: new Set(['c1']) })
+
+        expect((merged[0].chats[0] as any).isStreaming).toBe(true)
+    })
+
+    test('writes merged stub-level fields onto locally hydrated chats across non-overlaid characters', () => {
+        const baseline = [{ chaId: 'A', chats: [{ id: 'c1', name: 'Old', _stub: true as const }] }]
+        const remoteStub: ChatStub = { id: 'c1', name: 'Renamed Remotely', folderId: 'F1', _stub: true }
+        const hydrated = { ...fullChat('c1', 'hydrated body'), name: 'Old', lastDate: 999 }
+        const merged = [{ chaId: 'A', chats: [remoteStub] }]
+        const local = [{ chaId: 'A', chats: [hydrated] }]
+
+        restoreChatShapeAfterRebase(merged, local, { baselineCharacters: baseline })
+
+        const out = merged[0].chats[0] as any
+        expect(out.message[0].data).toBe('hydrated body')
+        expect(out.name).toBe('Renamed Remotely')
+        expect(out.folderId).toBe('F1')
+        expect(out.lastDate).toBe(999)
+    })
+
     test('never grafts a local stub or placeholder over the slot', () => {
         const merged = [{ chaId: 'A', chats: [rawStub('c1'), rawStub('c2')] }]
         const local = [{

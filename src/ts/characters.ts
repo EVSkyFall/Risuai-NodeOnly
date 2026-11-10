@@ -531,6 +531,7 @@ export function characterFormatUpdate(indexOrCharacter:number|character, arg:{
     updateInteraction?:boolean,
 } = {}){
     let cha = typeof(indexOrCharacter) === 'number' ? getCharacterByIndex(indexOrCharacter) : indexOrCharacter
+    cha.chats ??= []
     if(cha.chats.length === 0){
         cha.chats = [{
             message: [],
@@ -597,7 +598,7 @@ export function characterFormatUpdate(indexOrCharacter:number|character, arg:{
     cha.backgroundHTML ??= ''
     cha.backgroundCSS ??= ''
     cha.creation_date ??= Date.now()
-    cha.globalLore = updateLorebooks(cha.globalLore)
+    cha.globalLore = Array.isArray(cha.globalLore) ? updateLorebooks(cha.globalLore) : []
     if(!cha.newGenData){
         cha = updateInlayScreen(cha)
     }

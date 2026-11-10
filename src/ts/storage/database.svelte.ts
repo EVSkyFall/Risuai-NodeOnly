@@ -21,6 +21,22 @@ import { applyModelPresetDefaults } from '../preset/dbDefaults';
 import type { ApiKeyPoolEntry, ModelBindingFields, ModelBindingSet, ModelPreset, ModelPresetMigrationSummary, RegistryCache } from '../preset/types';
 import { emptyModelBinding } from '../preset/types';
 import { isChatStub } from './chatStub';
+import { chatGenKey, isChatGenerating } from '../process/generationState';
+import {
+    applyBotPresetEntryDefaults,
+    applyPresetToRoot,
+    getPersonaUnitRootKeys,
+    getPresetUnitRootKeys,
+    liveUnitSyncState,
+    normalizePromptTemplate,
+} from './presetPersonaUnits';
+
+export {
+    applyBotPresetEntryDefaults,
+    getPersonaUnitRootKeys,
+    getPresetUnitRootKeys,
+    liveUnitSyncState,
+}
 
 //APP_VERSION_POINT is to locate the app version in the database file for version bumping
 export let appVer = "2026.2.291" //<APP_VERSION_POINT>
@@ -37,7 +53,7 @@ export function normalizeTheme(theme: string | undefined | null): string {
 }
 
 
-export function setDatabase(data:Database){
+export function populateDatabaseDefaults(data:Database):Database{
     if(checkNullish(data.characters)){
         data.characters = []
     }
@@ -561,17 +577,7 @@ export function setDatabase(data:Database){
     }
     if (data.botPresets) {
         for (const preset of data.botPresets) {
-            if(Array.isArray(preset.promptTemplate)){
-                preset.promptTemplate = normalizePromptTemplate(preset.promptTemplate)
-            }
-            if (typeof preset.openrouterProvider === 'string') {
-                const oldProvider = preset.openrouterProvider as unknown as string;
-                preset.openrouterProvider = {
-                    order: oldProvider ? [oldProvider] : [],
-                    only: [],
-                    ignore: []
-                }
-            }
+            applyBotPresetEntryDefaults(preset)
         }
     }
     data.openrouterProvider ??= {
@@ -661,14 +667,7 @@ export function setDatabase(data:Database){
     }
     if (data.botPresets) {
         for (const preset of data.botPresets) {
-            preset.localNetworkMode ??= false
-            preset.localNetworkTimeoutSec ??= 600
-            if (typeof preset.localNetworkMode !== 'boolean') {
-                preset.localNetworkMode = false
-            }
-            if (typeof preset.localNetworkTimeoutSec !== 'number' || Number.isNaN(preset.localNetworkTimeoutSec)) {
-                preset.localNetworkTimeoutSec = 600
-            }
+            applyBotPresetEntryDefaults(preset)
         }
     }
     data.hypaV3PresetId ??= 0
@@ -824,16 +823,41 @@ export function setDatabase(data:Database){
             if(!chat || isChatStub(chat) || chat._placeholder === true){
                 continue
             }
-            chat.isStreaming = false
+            if (!isChatGenerating(chatGenKey(chat.id))) {
+                chat.isStreaming = false
+            }
         }
     }
     applyModelPresetDefaults(data)
+    return data
+}
+
+let cachedDefaultEmptyDatabaseRoot: Database | null = null
+
+export function getDefaultedEmptyDatabaseRoot(): Database {
+    if (!cachedDefaultEmptyDatabaseRoot) {
+        cachedDefaultEmptyDatabaseRoot = populateDatabaseDefaults({} as Database)
+    }
+    return cachedDefaultEmptyDatabaseRoot
+}
+
+export function initUnitSnapshotsAtBoot(
+    db: Database = getDatabase(),
+    rawPreDefaultDb?: Record<string, any> | null,
+): void {
+    liveUnitSyncState.initAtBoot(db, rawPreDefaultDb, getDefaultedEmptyDatabaseRoot())
+}
+
+export function setDatabase(data:Database){
+    populateDatabaseDefaults(data)
     changeLanguage(data.language)
     setDatabaseLite(data)
 }
 
 export function setDatabaseLite(data:Database){
+    const prevDb = DBState.db
     DBState.db = data
+    liveUnitSyncState.rebindOwnerDb(prevDb, DBState.db)
 }
 
 interface getDatabaseOptions{
@@ -2742,6 +2766,9 @@ export function saveCurrentPreset(){
     // saves first, so throwing here locked preset management for good. Keep
     // the active settings as a new preset rather than overwrite another one.
     const current = pres[db.botPresetsId]
+    if (current && !liveUnitSyncState.isPresetDirty(db)) {
+        return
+    }
     const savedPreset:botPreset =  {
         id: current?.id || uuidv4(),
         name: current ? current.name : language.recoveredPresetName,
@@ -2837,6 +2864,8 @@ export function saveCurrentPreset(){
         pres[db.botPresetsId] = savedPreset
     }
     db.botPresets = pres
+    liveUnitSyncState.markPresetDirtyId(savedPreset.id)
+    liveUnitSyncState.retakePresetSnapshot(db)
 }
 
 export function copyPreset(id:number){
@@ -2869,116 +2898,13 @@ export function changeToPreset(id =0, savecurrent = true){
 }
 
 export function setPreset(db:Database, newPres: botPreset){
-    db.apiType = newPres.apiType ?? db.apiType
-    db.localNetworkMode = newPres.localNetworkMode ?? db.localNetworkMode
-    db.localNetworkTimeoutSec = newPres.localNetworkTimeoutSec ?? db.localNetworkTimeoutSec
-    db.mainPrompt = newPres.mainPrompt ?? db.mainPrompt
-    db.jailbreak = newPres.jailbreak ?? db.jailbreak
-    db.globalNote = newPres.globalNote ?? db.globalNote
-    db.temperature = newPres.temperature ?? db.temperature
-    db.maxContext = newPres.maxContext ?? db.maxContext
-    db.maxResponse = newPres.maxResponse ?? db.maxResponse
-    db.frequencyPenalty = newPres.frequencyPenalty ?? db.frequencyPenalty
-    db.PresensePenalty = newPres.PresensePenalty ?? db.PresensePenalty
-    db.formatingOrder = newPres.formatingOrder ?? db.formatingOrder
-    db.aiModel = newPres.aiModel ?? db.aiModel
-    db.subModel = newPres.subModel ?? db.subModel
-    db.subMaxContext = newPres.subMaxContext ?? db.subMaxContext
-    db.subMaxResponse = newPres.subMaxResponse ?? db.subMaxResponse
-    db.currentPluginProvider = newPres.currentPluginProvider ?? db.currentPluginProvider
-    db.textgenWebUIStreamURL = newPres.textgenWebUIStreamURL ?? db.textgenWebUIStreamURL
-    db.textgenWebUIBlockingURL = newPres.textgenWebUIBlockingURL ?? db.textgenWebUIBlockingURL
-    db.forceReplaceUrl = newPres.forceReplaceUrl ?? db.forceReplaceUrl
-    db.promptPreprocess = newPres.promptPreprocess ?? db.promptPreprocess
-    db.bias = newPres.bias ?? db.bias
-    db.koboldURL = newPres.koboldURL ?? db.koboldURL
-    db.proxyKey = newPres.proxyKey ?? db.proxyKey
-    db.ooba = safeStructuredClone(newPres.ooba ?? db.ooba)
-    db.ainconfig = safeStructuredClone(newPres.ainconfig ?? db.ainconfig)
-    db.openrouterRequestModel = newPres.openrouterRequestModel ?? db.openrouterRequestModel
-    db.proxyRequestModel = newPres.proxyRequestModel ?? db.proxyRequestModel
-    db.NAIsettings = newPres.NAISettings ?? db.NAIsettings
-    db.autoSuggestPrompt = newPres.autoSuggestPrompt ?? db.autoSuggestPrompt
-    db.autoSuggestPrefix = newPres.autoSuggestPrefix ?? db.autoSuggestPrefix
-    db.autoSuggestClean = newPres.autoSuggestClean ?? db.autoSuggestClean
-    db.promptTemplate = normalizePromptTemplate(newPres.promptTemplate)
-    db.NAIadventure = newPres.NAIadventure
-    db.NAIappendName = newPres.NAIappendName
-    db.NAIsettings.cfg_scale ??= 1
-    db.NAIsettings.mirostat_tau ??= 0
-    db.NAIsettings.mirostat_lr ??= 1
-    db.localStopStrings = newPres.localStopStrings
-    db.customProxyRequestModel = newPres.customProxyRequestModel ?? ''
-    db.reverseProxyOobaArgs = safeStructuredClone(newPres.reverseProxyOobaArgs) ?? {
-        mode: 'instruct'
-    }
-    db.top_p = newPres.top_p ?? 1
-    db.promptSettings = safeStructuredClone(newPres.promptSettings) ?? {
-        assistantPrefill: '',
-        postEndInnerFormat: '',
-        sendChatAsSystem: false,
-        sendName: false,
-        utilOverride: false,
-    }
-    db.promptSettings.maxThoughtTagDepth ??= -1
-    db.repetition_penalty = newPres.repetition_penalty
-    db.min_p = newPres.min_p
-    db.top_a = newPres.top_a
-    db.openrouterProvider = newPres.openrouterProvider
-    db.useInstructPrompt = newPres.useInstructPrompt ?? false
-    db.customPromptTemplateToggle = newPres.customPromptTemplateToggle ?? ''
-    db.templateDefaultVariables = newPres.templateDefaultVariables ?? ''
-    db.moduleIntergration = newPres.moduleIntergration ?? ''
-    db.top_k = newPres.top_k ?? db.top_k
-    db.instructChatTemplate = newPres.instructChatTemplate ?? db.instructChatTemplate
-    db.JinjaTemplate = newPres.JinjaTemplate ?? db.JinjaTemplate
-    db.jsonSchemaEnabled = newPres.jsonSchemaEnabled ?? false
-    db.jsonSchema = newPres.jsonSchema ?? ''
-    db.strictJsonSchema = newPres.strictJsonSchema ?? true
-    db.extractJson = newPres.extractJson ?? ''
-    db.groupOtherBotRole = newPres.groupOtherBotRole ?? 'user'
-    db.groupTemplate = newPres.groupTemplate ?? ''
-    db.seperateParametersEnabled = newPres.seperateParametersEnabled ?? false
-    db.customAPIFormat = safeStructuredClone(newPres.customAPIFormat) ?? LLMFormat.OpenAICompatible
-    db.systemContentReplacement = newPres.systemContentReplacement ?? ''
-    db.systemRoleReplacement = newPres.systemRoleReplacement ?? 'user'
-    db.customFlags = safeStructuredClone(newPres.customFlags) ?? []
-    db.enableCustomFlags = newPres.enableCustomFlags ?? false
-    db.presetRegex = newPres.regex ?? []
-    db.reasoningEffort = newPres.reasonEffort ?? 0
-    db.thinkingTokens = newPres.thinkingTokens ?? null
-    db.thinkingType = newPres.thinkingType ?? 'budget'
-    db.adaptiveThinkingEffort = newPres.adaptiveThinkingEffort ?? 'high'
-    db.outputImageModal = newPres.outputImageModal ?? false
     // Model config (separated aux models) is decoupled from prompt presets in v6:
     // switching a prompt preset no longer overwrites db.seperateModels. The global
     // db.seperateModels is the single source of truth (preset copies are inert).
-    if(!db.doNotChangeFallbackModels){
-        db.fallbackModels = safeStructuredClone(newPres.fallbackModels) ?? {
-            memory: [],
-            emotion: [],
-            translate: [],
-            otherAx: [],
-            model: []
-        }
-        db.fallbackWhenBlankResponse = newPres.fallbackWhenBlankResponse ?? false
+    applyPresetToRoot(db, newPres)
+    if (db === DBState?.db) {
+        liveUnitSyncState.retakePresetSnapshot(db)
     }
-    if(db.disableSeperateParameterChangeOnPresetChange){
-        db.seperateParameters = safeStructuredClone(db.seperateParameters)
-    }
-    else{
-         db.seperateParameters = newPres.seperateParameters ? safeStructuredClone(newPres.seperateParameters) : {
-            memory: {},
-            emotion: {},
-            translate: {},
-            otherAx: {},
-            overrides: {}
-        }   
-    }
-    db.modelTools = safeStructuredClone(newPres.modelTools ?? [])
-    db.verbosity = newPres.verbosity ?? 1
-    db.dynamicOutput = newPres.dynamicOutput
-
     return db
 }
 
@@ -3401,58 +3327,4 @@ export async function importPreset(f:{
         db.botPresets = []
     }
     db.botPresets.push(pre)
-}
-
-function normalizePromptRole(role: unknown): 'user'|'bot'|'system'|null {
-    if(role === 'user' || role === 'bot' || role === 'system'){
-        return role
-    }
-    if(role === 'assistant' || role === 'char'){
-        return 'bot'
-    }
-    return null
-}
-
-function normalizeCacheRole(role: unknown): 'user'|'assistant'|'system'|'all' {
-    if(role === 'user' || role === 'assistant' || role === 'system' || role === 'all'){
-        return role
-    }
-    if(role === 'bot' || role === 'char'){
-        return 'assistant'
-    }
-    return 'all'
-}
-
-function normalizePromptTemplate(template: PromptItem[]|null|undefined): PromptItem[]|null {
-    if(!Array.isArray(template)){
-        return null
-    }
-    const normalized = safeStructuredClone(template) as any[]
-    for(const item of normalized){
-        if(!item || typeof item !== 'object'){
-            continue
-        }
-        switch(item.type){
-            case 'plain':
-            case 'jailbreak':
-            case 'cot':{
-                item.role = normalizePromptRole(item.role) ?? 'system'
-                break
-            }
-            case 'persona':
-            case 'description':
-            case 'authornote':
-            case 'memory':{
-                if(item.role2 !== undefined && item.role2 !== null){
-                    item.role2 = normalizePromptRole(item.role2) ?? 'system'
-                }
-                break
-            }
-            case 'cache':{
-                item.role = normalizeCacheRole(item.role)
-                break
-            }
-        }
-    }
-    return normalized as PromptItem[]
 }

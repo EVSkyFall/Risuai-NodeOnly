@@ -724,8 +724,12 @@ async function decodeDatabaseWithPersistentChatIds(raw, options = {}) {
         if (fresh) raw = fresh;
     }
 
-    const dbObj = normalizeJSON(await decodeRisuSave(raw, { extractPluginStorage: true }));
-    let needsPersist = false;
+    let hadMintedEntryIds = false;
+    const dbObj = normalizeJSON(await decodeRisuSave(raw, {
+        extractPluginStorage: true,
+        onMintId: () => { hadMintedEntryIds = true; },
+    }));
+    let needsPersist = hadMintedEntryIds;
     const coldPluginResult = restoreColdPluginStorageInDb(dbObj);
     if (coldPluginResult.failed) logger.warn(`[ColdStorage] ${coldPluginResult.failed} plugin value(s) remain recoverable in _coldplugin`);
     const pluginMigration = pluginStorage.migrateFromDb(dbObj, { kvWinsOnRemigration: true });

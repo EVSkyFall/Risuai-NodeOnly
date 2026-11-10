@@ -3,7 +3,8 @@ import { changeFullscreen, checkNullish } from "./util"
 import { installDynamicViewportHeight } from "./viewportHeight"
 import { v4 as uuidv4 } from 'uuid';
 import { get } from "svelte/store";
-import { setDatabase, defaultSdDataFunc, getDatabase, changeToThemePreset } from "./storage/database.svelte";
+import { setDatabase, defaultSdDataFunc, getDatabase, changeToThemePreset, initUnitSnapshotsAtBoot } from "./storage/database.svelte";
+import { captureRawUnitPresence } from "./storage/presetPersonaUnits";
 import { chatDraftKey, sweepOrphanDrafts } from "./storage/chatDraft";
 import { checkRisuUpdate } from "./update";
 import { fetchPublicStats } from "./publicStats";
@@ -45,6 +46,7 @@ export async function loadData() {
         try {
             applyEarlyLanguage()
             let createdFreshDatabase = false
+            let rawUnitPresence: Record<string, boolean | null> | null = null
             {
                 await forageStorage.Init()
 
@@ -58,6 +60,7 @@ export async function loadData() {
                 }
                 try {
                     const decoded = await decodeRisuSave(gotStorage)
+                    rawUnitPresence = captureRawUnitPresence(decoded as any)
                     // setPatchSyncBaseline owns its defensive clone. Cloning at
                     // both call sites briefly held two full DB copies at boot.
                     setPatchSyncBaseline(decoded)
@@ -75,6 +78,7 @@ export async function loadData() {
                             LoadingStatusState.text = `Reading Backup File ${backup}...`
                             const backupData: Uint8Array = await forageStorage.getItem(`database/dbbackup-${backup}.bin`) as unknown as Uint8Array
                             const backupDecoded = await decodeRisuSave(backupData)
+                            rawUnitPresence = captureRawUnitPresence(backupDecoded as any)
                             setPatchSyncBaseline(backupDecoded)
                             setDatabase(backupDecoded)
                             backupLoaded = true
@@ -145,6 +149,7 @@ export async function loadData() {
             }
             LoadingStatusState.text = "Checking For Format Update..."
             await checkNewFormat()
+            initUnitSnapshotsAtBoot(getDatabase(), rawUnitPresence)
 
             // Convert any ChatStubs (from server-stripped database.bin) to placeholder Chats
             // so runtime code only sees Chat objects

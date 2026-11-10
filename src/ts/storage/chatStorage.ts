@@ -1,5 +1,7 @@
 import { forageStorage } from "../globalApi.svelte"
 import { type Chat, type ChatStub, type ChatOrStub, isChatStub } from "./database.svelte"
+import { mergeChatStubFieldsOnto } from "./chatStub"
+import { chatGenKey, isChatGenerating } from "../process/generationState"
 import type { DurableChatSaveResult } from "./nodeStorage"
 import { tick } from "svelte"
 import { writable } from "svelte/store"
@@ -95,32 +97,86 @@ export function convertStubsToPlaceholders(chats: ChatOrStub[]): Chat[] {
  * no-live-sync / per-chat last-writer-wins model. Mutates mergedCharacters
  * in place; localCharacters is read-only.
  */
+export interface RestoreChatShapeOptions {
+    baselineCharacters?: { chaId?: string; chats?: ChatOrStub[] }[] | null
+    remoteCharacters?: { chaId?: string; chats?: ChatOrStub[] }[] | null
+    streamingChatKeys?: ReadonlySet<string>
+    clone?: <T>(value: T) => T
+    normalizeValue?: (value: any) => any
+}
+
 export function restoreChatShapeAfterRebase(
     mergedCharacters: { chaId?: string; chats?: ChatOrStub[] }[],
     localCharacters: { chaId?: string; chats?: ChatOrStub[] }[],
+    options?: RestoreChatShapeOptions,
 ): void {
     const localByChaId = new Map<string, { chaId?: string; chats?: ChatOrStub[] }>()
     for (const char of localCharacters ?? []) {
         if (char?.chaId) localByChaId.set(char.chaId, char)
+    }
+    const baseByChaId = options?.baselineCharacters ? new Map<string, { chaId?: string; chats?: ChatOrStub[] }>() : null
+    if (baseByChaId && options?.baselineCharacters) {
+        for (const char of options.baselineCharacters) {
+            if (char?.chaId) baseByChaId.set(char.chaId, char)
+        }
+    }
+    const remoteByChaId = options?.remoteCharacters ? new Map<string, { chaId?: string; chats?: ChatOrStub[] }>() : null
+    if (remoteByChaId && options?.remoteCharacters) {
+        for (const char of options.remoteCharacters) {
+            if (char?.chaId) remoteByChaId.set(char.chaId, char)
+        }
     }
     for (const char of mergedCharacters ?? []) {
         if (!char || !Array.isArray(char.chats)) continue
         char.chats = convertStubsToPlaceholders(char.chats)
         const localChar = char.chaId ? localByChaId.get(char.chaId) : undefined
         if (!localChar || !Array.isArray(localChar.chats)) continue
+        const baseChar = char.chaId && baseByChaId ? baseByChaId.get(char.chaId) : undefined
+        const remoteChar = char.chaId && remoteByChaId ? remoteByChaId.get(char.chaId) : undefined
         for (let i = 0; i < char.chats.length; i++) {
             const slot = char.chats[i] as Chat | undefined
-            if (!slot || slot._placeholder !== true || !slot.id) continue
-            const localFull = localChar.chats.find((c) =>
-                c
-                && (c as Chat).id === slot.id
-                && (c as Chat)._placeholder !== true
-                && (c as any)._stub !== true
-                && Array.isArray((c as Chat).message))
-            if (localFull) {
-                const hydratedChat = localFull as Chat
-                hydratedChat.isStreaming = false
+            if (!slot || !slot.id) continue
+            const localEntry = localChar.chats.find((c) => c && (c as Chat).id === slot.id)
+            const localFull = localEntry
+                && (localEntry as Chat)._placeholder !== true
+                && (localEntry as any)._stub !== true
+                && Array.isArray((localEntry as Chat).message)
+                ? (localEntry as Chat)
+                : undefined
+            const baseEntry = baseChar && Array.isArray(baseChar.chats)
+                ? baseChar.chats.find((c) => c && (c as any).id === slot.id)
+                : undefined
+            const remoteEntry = remoteChar && Array.isArray(remoteChar.chats)
+                ? remoteChar.chats.find((c) => c && (c as any).id === slot.id)
+                : (slot._placeholder === true ? slot : undefined)
+
+            if (slot._placeholder === true && localFull) {
+                const hydratedChat = localFull
+                const genKey = chatGenKey(hydratedChat.id)
+                const isStreamingHere = isChatGenerating(genKey) || (options?.streamingChatKeys?.has(genKey) ?? false)
+                if (!isStreamingHere) {
+                    hydratedChat.isStreaming = false
+                }
+                if (options?.baselineCharacters && remoteEntry) {
+                    mergeChatStubFieldsOnto(
+                        hydratedChat,
+                        baseEntry,
+                        hydratedChat,
+                        remoteEntry,
+                        options.clone,
+                        options.normalizeValue,
+                    )
+                }
                 char.chats[i] = hydratedChat
+            } else if (options?.baselineCharacters && localEntry && remoteEntry) {
+                mergeChatStubFieldsOnto(
+                    slot,
+                    baseEntry,
+                    localEntry,
+                    remoteEntry,
+                    options.clone,
+                    options.normalizeValue,
+                )
             }
         }
     }
@@ -257,6 +313,14 @@ export async function saveChatToServerStrict(
  */
 export function refreshChatFromServer(chaId: string, chatId: string): Promise<RefreshResult> {
     return chatSync.refresh(chaId, chatId)
+}
+
+/**
+ * A chat this tab keeps although the server does not list it: its content is
+ * sent again with the next save, changed or not.
+ */
+export function resendChatOnNextSave(chaId: string, chatId: string): void {
+    chatSync.resendOnNextSave(chaId, chatId)
 }
 
 /** The set of running generations changed (a fork waiting for one may finish). */

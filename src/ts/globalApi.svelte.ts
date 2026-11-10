@@ -4,7 +4,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { tick } from "svelte";
 import { get } from "svelte/store";
 import streamSaver from 'streamsaver';
-import { setDatabase, type Database, defaultSdDataFunc, getDatabase, appVer, nodeOnlyVer, getCurrentCharacter, loadTogglesFromChat } from "./storage/database.svelte";
+import { setDatabase, type Database, defaultSdDataFunc, getDatabase, appVer, nodeOnlyVer, getCurrentCharacter, loadTogglesFromChat, saveCurrentPreset, initUnitSnapshotsAtBoot } from "./storage/database.svelte";
 import { checkRisuUpdate } from "./update";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, DBState, LoadingStatusState, selIdState, ReloadGUIPointer, bodyIntercepterStore, claimLoadingOverlay, chatDeselected } from "./stores.svelte";
 import { recordDbTransferSize } from "./transferSize";
@@ -15,9 +15,9 @@ import { hasher } from "./parser/parser.svelte";
 import { characterURLImport, hubURL } from "./characterCards";
 import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from "./storage/defaultPrompts";
 import { decodeRisuSave, encodeRisuSaveLegacy, findDangerousChatOps, normalizeJSON, RisuSaveEncoder, RisuSavePatcher, type toSaveType } from "./storage/risuSave";
-import { isHydrating, saveChatToServer, ensureChatHydrated, chatToStub, classifyChat, convertStubsToPlaceholders, restoreChatShapeAfterRebase } from "./storage/chatStorage";
+import { isHydrating, saveChatToServer, ensureChatHydrated, chatToStub, classifyChat, convertStubsToPlaceholders, restoreChatShapeAfterRebase, resendChatOnNextSave } from "./storage/chatStorage";
 import { refreshOpenChat } from "./storage/chatSyncHost";
-import { reanchorRebasedSelection } from "./storage/rebaseSelection";
+import { reanchorChatPage, reanchorRebasedSelection } from "./storage/rebaseSelection";
 import { AutoStorage } from "./storage/autoStorage";
 import {
     ConflictError,
@@ -34,7 +34,9 @@ import { startObserveDom } from "./observer.svelte";
 import { updateGuisize } from "./gui/guisize";
 import { deepTouch } from "./gui/deepTouch.svelte";
 import { pruneHiddenCharacterIds } from "./characterOrder";
-import { updateLorebooks, deselectCharacter } from "./characters";
+import { updateLorebooks, deselectCharacter, characterFormatUpdate } from "./characters";
+import { saveUserPersona } from "./persona";
+import { liveUnitSyncState } from "./storage/presetPersonaUnits";
 import { mergeServerDbWithTrackedLocalChanges, withTrackedCharacters, hasAmbiguousCharacterIds } from "./storage/rebaseMerge";
 import { generationStates, chatGenKey, notifyDatabaseRebased, abortGeneration } from "./process/generationState";
 
@@ -445,6 +447,65 @@ let trackCharacterForSaveImpl: (chaId: string) => void = () => {}
 let patchSyncBaseline: Database | null = null
 let activeSavePatcher: RisuSavePatcher | null = null
 
+const saveUnitLifecycle = {
+    flushDirtyUnits(db: Database, toSave: toSaveType): void {
+        if (!liveUnitSyncState.hasSnapshotsFor(db)) return
+        if (Array.isArray(db.botPresets) && typeof db.botPresetsId === 'number' && db.botPresetsId >= 0 && liveUnitSyncState.isPresetDirty(db)) {
+            saveCurrentPreset()
+            toSave.botPreset = true
+        }
+        if (liveUnitSyncState.peekDirtyPresetIds().size > 0) {
+            toSave.botPreset = true
+        }
+        if (Array.isArray(db.personas) && typeof db.selectedPersona === 'number' && db.selectedPersona >= 0 && db.personas[db.selectedPersona] && liveUnitSyncState.isPersonaDirty(db)) {
+            saveUserPersona()
+            toSave.root = true
+        }
+        if (liveUnitSyncState.peekDirtyPersonaIds().size > 0) {
+            toSave.root = true
+        }
+    },
+    takeCarriedIds(toSave: toSaveType): () => void {
+        const presetIds = toSave.botPreset ? liveUnitSyncState.takeDirtyPresetIds() : new Set<string>()
+        const personaIds = liveUnitSyncState.takeDirtyPersonaIds()
+        let restored = false
+        return () => {
+            if (restored) return
+            restored = true
+            liveUnitSyncState.requeueDirtyPresetIds(presetIds)
+            liveUnitSyncState.requeueDirtyPersonaIds(personaIds)
+        }
+    },
+    mergeOptions(
+        db: Database,
+        liveSelectedCharIndex: number,
+        streamingChatKeys: ReadonlySet<string>,
+        knownChatIdsByCharacter: ReadonlyMap<string, ReadonlySet<string>>,
+    ) {
+        const tracked = liveUnitSyncState.hasSnapshotsFor(db)
+        return {
+            dirtyPresetIds: liveUnitSyncState.peekDirtyPresetIds(),
+            dirtyPersonaIds: liveUnitSyncState.peekDirtyPersonaIds(),
+            isPresetUnitDirty: tracked ? liveUnitSyncState.isPresetDirty(db) : true,
+            isPersonaUnitDirty: tracked ? liveUnitSyncState.isPersonaDirty(db) : true,
+            localSelectedCharIndex: liveSelectedCharIndex,
+            generatingChatKeys: streamingChatKeys,
+            knownChatIdsByCharacter,
+            normalizeCharacter: characterFormatUpdate,
+        }
+    },
+    afterRebaseApplied(appliedRemoteSelectedPreset: boolean, appliedRemoteSelectedPersona: boolean): void {
+        const currentDb = getDatabase()
+        if (!liveUnitSyncState.hasSnapshotsFor(currentDb)) return
+        if (appliedRemoteSelectedPreset) {
+            liveUnitSyncState.retakePresetSnapshot(currentDb)
+        }
+        if (appliedRemoteSelectedPersona) {
+            liveUnitSyncState.retakePersonaSnapshot(currentDb)
+        }
+    },
+}
+
 // Surfaces server-side persist failures (Stage 1 visibility — see issues.md).
 // The same failure is re-attached on every patch response until cleared, so we
 // dedupe by timestamp to fire one toast per distinct failure event.
@@ -627,10 +688,17 @@ export async function saveDb() {
 
     let patcher = new RisuSavePatcher()
     if (supportsPatchSync) {
-        await patcher.init(patchSyncBaseline ?? getDatabase())
+        const bootBaseline = patchSyncBaseline
+        if (!liveUnitSyncState.hasSnapshotsFor(getDatabase())) {
+            initUnitSnapshotsAtBoot(getDatabase(), bootBaseline)
+        }
+        await patcher.init(bootBaseline ?? getDatabase())
         activeSavePatcher = patcher
         patchSyncBaseline = null
     } else {
+        if (!liveUnitSyncState.hasSnapshotsFor(getDatabase())) {
+            initUnitSnapshotsAtBoot(getDatabase(), null)
+        }
         activeSavePatcher = null
     }
 
@@ -990,17 +1058,42 @@ export async function saveDb() {
     ) {
         const etagBeforeRebase = forageStorage.getDbEtag()
         const baselineBeforeRebase = supportsPatchSync ? (syncedBaselineDb ?? patcher.baselineDb()) : null
+        const unitLifecycle = typeof saveUnitLifecycle !== 'undefined' ? saveUnitLifecycle : null
+        unitLifecycle?.flushDirtyUnits(db, toSave)
         try {
             const latestData = await forageStorage.getItem('database/database.bin') as unknown as Uint8Array
             if (latestData && latestData.length > 0) {
                 const latestDb = await decodeRisuSave(latestData) as Database
+                unitLifecycle?.flushDirtyUnits(db, toSave)
                 const localDb = safeStructuredClone(db) as Database
                 const localCharacters = localDb.characters ?? []
+                let liveSelectedCharIndex = -1
+                try { selectedCharID.subscribe(v => { liveSelectedCharIndex = v })() } catch {}
                 const generating = generatingCharacters(db)
+                const streamingChatKeys = new Set<string>([...generating.values()].flat())
                 toSave = withTrackedCharacters(toSave, [...generating.keys()])
-                const { mergedDb, skippedArchivedCharIds } = mergeServerDbWithTrackedLocalChanges(
+                // The chat on screen survives its deletion in another tab. That
+                // rule is part of the per-character merge, which only runs for
+                // tracked characters, so the character on screen is always one
+                // (with a baseline it merges field by field; unchanged fields
+                // take the server's values).
+                const onScreenChaId = liveSelectedCharIndex >= 0 ? db.characters?.[liveSelectedCharIndex]?.chaId : undefined
+                if (baselineBeforeRebase && onScreenChaId) toSave = withTrackedCharacters(toSave, [onScreenChaId])
+                const {
+                    mergedDb,
+                    skippedArchivedCharIds,
+                    appliedRemoteSelectedPreset,
+                    appliedRemoteSelectedPersona,
+                } = mergeServerDbWithTrackedLocalChanges(
                     latestDb, db, toSave, safeStructuredClone, convertStubsToPlaceholders,
-                    syncedArchivedIds, syncedBaselineDb, normalizeJSON,
+                    syncedArchivedIds, baselineBeforeRebase, normalizeJSON,
+                    unitLifecycle
+                        ? unitLifecycle.mergeOptions(db, liveSelectedCharIndex, streamingChatKeys, knownChatIdsByCharacter)
+                        : {
+                            localSelectedCharIndex: liveSelectedCharIndex,
+                            generatingChatKeys: streamingChatKeys,
+                            knownChatIdsByCharacter,
+                        },
                 )
                 if (await abortGenerationsAndWait(skippedArchivedCharIds.flatMap(id => generating.get(id) ?? [])) === false) {
                     forageStorage.setDbEtag(etagBeforeRebase)
@@ -1014,13 +1107,15 @@ export async function saveDb() {
                     return
                 }
                 const mergedCharacters = mergedDb.characters ?? []
+                const baseChars = baselineBeforeRebase?.characters ?? []
                 for (const char of mergedCharacters) {
                     const local = localCharacters.find(c => c?.chaId === char?.chaId)
                     if (!local || skippedArchivedCharIds.includes(char.chaId)) continue
                     const known = knownChatIdsByCharacter.get(char.chaId) ?? new Set<string>()
+                    const baseChatIds = new Set((baseChars.find(c => c?.chaId === char.chaId)?.chats ?? []).map((c: any) => c?.id).filter(Boolean))
                     const localIds = new Set((local.chats ?? []).map(c => c.id))
                     const remoteNew = (latestDb.characters?.find(c => c?.chaId === char.chaId)?.chats ?? [])
-                        .filter(c => c?.id && !known.has(c.id) && !localIds.has(c.id))
+                        .filter(c => c?.id && !known.has(c.id) && !baseChatIds.has(c.id) && !localIds.has(c.id))
                     const mergedIds = new Set((char.chats ?? []).map(c => c.id))
                     char.chats = [...(char.chats ?? []), ...remoteNew.filter(c => !mergedIds.has(c.id))]
                 }
@@ -1031,24 +1126,81 @@ export async function saveDb() {
                 // consumers crash on `message.length` and a stub can flow into the
                 // per-chat save path, poisoning the server's fullChatStore
                 // (2026-07-21 multi-browser incident).
-                restoreChatShapeAfterRebase(mergedCharacters, localCharacters)
+                restoreChatShapeAfterRebase(mergedCharacters, localCharacters, {
+                    baselineCharacters: baselineBeforeRebase?.characters ?? null,
+                    remoteCharacters: latestDb.characters ?? null,
+                    streamingChatKeys,
+                    clone: safeStructuredClone,
+                    normalizeValue: normalizeJSON,
+                })
+                if (baselineBeforeRebase && typeof reanchorChatPage === 'function') {
+                    for (const char of mergedCharacters) {
+                        if (!char) continue
+                        const localChar = char.chaId ? localCharacters.find(c => c?.chaId === char.chaId) : undefined
+                        const remoteChar = char.chaId ? latestDb.characters?.find(c => c?.chaId === char.chaId) : undefined
+                        if (localChar !== undefined || remoteChar !== undefined) {
+                            if (localChar?.chatPage !== undefined || remoteChar?.chatPage !== undefined || char.chatPage !== undefined) {
+                                char.chatPage = reanchorChatPage(char.chats, localChar, remoteChar)
+                            }
+                        }
+                    }
+                }
+                // Refresh known server chat ids from latestDb so chats kept here
+                // after a remote deletion are re-uploaded on retry, while chats
+                // first received through a rebase are known if later deleted locally.
+                knownChatIdsByCharacter.clear()
+                for (const remoteChar of latestDb.characters ?? []) {
+                    if (!remoteChar?.chaId) continue
+                    knownChatIdsByCharacter.set(
+                        remoteChar.chaId,
+                        new Set((remoteChar.chats ?? []).map((c: any) => c?.id).filter(Boolean)),
+                    )
+                }
+                const charsWithKeptUnuploadedChats: string[] = []
+                for (const char of mergedCharacters) {
+                    if (!char?.chaId || !Array.isArray(char.chats)) continue
+                    const remoteKnown = knownChatIdsByCharacter.get(char.chaId)
+                    const unuploadedHydrated = char.chats.filter((c: any) =>
+                        c?.id && !c._placeholder && c._stub !== true && Array.isArray(c.message) && !(remoteKnown?.has(c.id) ?? false),
+                    )
+                    if (unuploadedHydrated.length > 0) {
+                        charsWithKeptUnuploadedChats.push(char.chaId)
+                        // A chat save is skipped when the content equals what
+                        // this tab last synced; the server may have dropped
+                        // these bodies with their list entries.
+                        for (const chat of unuploadedHydrated) resendChatOnNextSave(char.chaId, chat.id)
+                    }
+                }
+                if (charsWithKeptUnuploadedChats.length > 0) {
+                    toSave = withTrackedCharacters(toSave, charsWithKeptUnuploadedChats)
+                }
                 // Index-based selections must be re-derived by identity: the merge
                 // keeps LOCAL root scalars (botPresetsId) while adopting the SERVER
                 // botPresets/characters arrays, so a surviving raw index can point
                 // at the wrong element or out of bounds (saveCurrentPreset crashed
                 // on `botPresets[botPresetsId].name`, 2026-07-21 incident #2).
-                let liveSelectedCharIndex = -1
-                try { selectedCharID.subscribe(v => { liveSelectedCharIndex = v })() } catch {}
                 const rebasedSelection = reanchorRebasedSelection({
                     mergedBotPresets: mergedDb.botPresets,
                     localBotPresets: localDb.botPresets,
                     localBotPresetsId: localDb.botPresetsId,
+                    mergedPersonas: mergedDb.personas,
+                    localPersonas: localDb.personas,
+                    localSelectedPersona: localDb.selectedPersona,
                     mergedCharacters,
                     localCharacters,
                     localSelectedCharIndex: liveSelectedCharIndex,
                 })
-                mergedDb.botPresetsId = rebasedSelection.botPresetsId
+                if (localDb.botPresetsId !== undefined) {
+                    mergedDb.botPresetsId = rebasedSelection.botPresetsId
+                }
+                if (localDb.selectedPersona !== undefined && rebasedSelection.selectedPersona !== undefined) {
+                    mergedDb.selectedPersona = rebasedSelection.selectedPersona
+                }
                 setDatabase(mergedDb)
+                unitLifecycle?.afterRebaseApplied(appliedRemoteSelectedPreset, appliedRemoteSelectedPersona)
+                if (baselineBeforeRebase && typeof checkCharOrder === 'function') {
+                    checkCharOrder()
+                }
                 if (rebasedSelection.selectedCharIndex !== liveSelectedCharIndex) {
                     selectedCharID.set(rebasedSelection.selectedCharIndex)
                 }
@@ -1107,6 +1259,12 @@ export async function saveDb() {
             await sleep(1000)
             return 'noop'
         }
+
+        const unitLifecycle = typeof saveUnitLifecycle !== 'undefined' ? saveUnitLifecycle : null
+        unitLifecycle?.flushDirtyUnits(db, toSave)
+        const restoreCarriedUnitIds = unitLifecycle ? unitLifecycle.takeCarriedIds(toSave) : () => {}
+        let acceptedSave = false
+        try {
 
         // ── Save changed chat content to server ─────────────────────────
         let stageAt = performance.now()
@@ -1384,6 +1542,7 @@ export async function saveDb() {
 
                 }
                 if (!patchResult.success && patchResult.conflictCode === 'ARCHIVE_GUARD_REJECTED' && patchResult.etag === syncedEtag) {
+                    restoreCarriedUnitIds()
                     return queueArchiveGuardRetry(toSave)
                 }
                 if (!patchResult.success && patchResult.etag && patchResult.etag !== syncedEtag && attemptedIdsAmbiguous) {
@@ -1392,6 +1551,7 @@ export async function saveDb() {
                     // an edit, so rebase with the tracked list only (the
                     // pre-existing conflict behaviour) and retry.
                     console.warn('[Save] Foreign revision conflict with ambiguous character ids, rebasing tracked changes only...')
+                    restoreCarriedUnitIds()
                     await rebaseTrackedLocalChangesOnLatestServerDb(patchResult.etag, db, toSave, syncedArchivedIds, syncedBaselineDb)
                     await sleep(Math.min(500 * (savetrys + 1), 3000))
                     return 'retry'
@@ -1402,6 +1562,7 @@ export async function saveDb() {
                     // silently overwrite their changes, so merge theirs first
                     // (the same path a full-write 409 takes) and retry.
                     console.warn('[Save] Patch conflict with a foreign revision, rebasing tracked local changes on latest server DB...')
+                    restoreCarriedUnitIds()
                     await rebaseTrackedLocalChangesOnLatestServerDb(
                         patchResult.etag, db, withTrackedCharacters(toSave, attemptedChangedCharIds), syncedArchivedIds, syncedBaselineDb,
                     )
@@ -1431,6 +1592,7 @@ export async function saveDb() {
                 await forageStorage.setItem('database/database.bin', dbData, currentEtag ?? undefined)
             } catch (conflictErr) {
                 if (conflictErr instanceof ConflictError) {
+                    restoreCarriedUnitIds()
                     if (conflictErr.code === 'ARCHIVE_GUARD_REJECTED' && conflictErr.currentEtag === currentEtag) return queueArchiveGuardRetry(toSave)
                     console.warn('[Save] Full-write conflict detected, rebasing tracked local changes on latest server DB...')
                     await rebaseTrackedLocalChangesOnLatestServerDb(conflictErr.currentEtag ?? null, db, attemptedIdsAmbiguous ? toSave : withTrackedCharacters(toSave, attemptedChangedCharIds), syncedArchivedIds, syncedBaselineDb)
@@ -1457,7 +1619,13 @@ export async function saveDb() {
         }
 
 
+        acceptedSave = true
         return 'saved'
+        } finally {
+            if (!acceptedSave) {
+                restoreCarriedUnitIds()
+            }
+        }
     }
 
     async function triggerSave(options?: {
