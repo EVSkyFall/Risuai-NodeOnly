@@ -28,6 +28,8 @@ function world() {
         afterPost: null as null | ((chatId: string) => void | Promise<void>),
         /** Runs before the next GET answers. */
         beforeFetch: null as null | ((chatId: string) => void | Promise<void>),
+        /** Runs before the next POST is looked at. */
+        beforePost: null as null | ((chatId: string) => void | Promise<void>),
         /** The next POST is stored but its answer is lost. */
         loseAnswer: false,
         /** The next strict POST is stored in memory but answers "not flushed". */
@@ -36,6 +38,7 @@ function world() {
     const live = { chats: [] as AnyChat[], chatPage: 0 }
     const generating = new Set<string>()
     const scheduled: (() => void)[] = []
+    const sleeps: number[] = []
     const notices: string[] = []
     const tracked: string[] = []
     const replaced: string[] = []
@@ -61,6 +64,9 @@ function world() {
         },
         async postChat(_chaId, _index, chatId, chat, options): Promise<ChatSaveOutcome> {
             const body = structuredClone(chat)
+            const before = hooks.beforePost
+            hooks.beforePost = null
+            if (before) await before(chatId)
             posts.push({ chatId, options: { ...options, fingerprints: undefined }, chat: body })
             const existing = stored.get(chatId)
             let outcome: ChatSaveOutcome
@@ -92,11 +98,12 @@ function world() {
         trackCharacter: (chaId) => { tracked.push(chaId) },
         contentReplaced: (_chaId, chatId) => { replaced.push(chatId) },
         schedule: (run) => { scheduled.push(run) },
+        sleep: async (delayMs) => { sleeps.push(delayMs) },
     }
     const sync = createChatSync(env)
 
     return {
-        sync, stored, listed, posts, hooks, live, generating, notices, tracked, replaced,
+        sync, stored, listed, posts, hooks, live, generating, notices, tracked, replaced, sleeps,
         /** Open a chat in this tab the way hydration does. */
         open(chat: AnyChat, at = 0) {
             stored.set(chat.id, structuredClone(chat))
@@ -219,21 +226,36 @@ describe('saving on top of a known revision', () => {
         expect(texts(w.stored.get('c'))).toEqual(['legacy, no id', 'reply', 'new'])
     })
 
-    test('a server that never names a revision does not make the save spin', async () => {
-        const w = world()
-        const chat = w.open(chatOf('c', [msg('a')]))
-        w.otherTab('c', (c) => c.message.push(msg('theirs')))
-        chat.message.push(msg('mine'))
+    test('a refusal that does not name the server revision fails the save instead of spinning', async () => {
         const sync = createChatSync({
             ...({} as ChatSyncEnv),
             enqueue: (_a, _b, run) => run(),
-            fetchChat: async () => ({ kind: 'missing' }),
-            postChat: async () => ({ status: 'conflict', revision: 'r' }),
+            postChat: async () => ({ status: 'conflict', revision: null }),
             findLive: () => null,
             isGenerating: () => false,
             newId: () => 'x',
         } as ChatSyncEnv)
-        await expect(sync.save(CHA, 0, 'c', chat, { strict: false })).rejects.toThrow(/keeps refusing/)
+        await expect(sync.save(CHA, 0, 'c', chatOf('c', [msg('a')]), { strict: false })).rejects.toThrow(/without naming its revision/)
+    })
+
+    test('another writer flipping the chat in step with this save slows it down but never fails it', async () => {
+        const w = world()
+        const chat = w.open(chatOf('c', [msg('a')]))
+        const original = structuredClone(w.stored.get('c'))
+        const flipped = { ...structuredClone(original), note: 'flipped' }
+        chat.message.push(msg('mine'))
+        // POST (base: original) meets "flipped"; the GET sees "original" again;
+        // the second POST meets "flipped" again: the same refusal twice.
+        w.stored.set('c', structuredClone(flipped))
+        w.hooks.beforeFetch = () => {
+            w.stored.set('c', structuredClone(original))
+            w.hooks.beforePost = () => { w.stored.set('c', structuredClone(flipped)) }
+        }
+        await w.save('c')
+        expect(w.sleeps).toEqual([250])
+        // It ends like any other "both changed": nothing lost on either side.
+        expect(w.stored.get('c').note).toBe('flipped')
+        expect(texts(w.live.chats.at(-1))).toEqual(['a', 'mine'])
     })
 })
 
@@ -345,12 +367,34 @@ describe('the other tab changed the chat', () => {
         expect(fork.message.slice(0, firstPass.length).map((m: AnyChat) => m.chatId)).toEqual(firstPass)
     })
 
+    test('a fork save whose answer was lost is not repeated under a second id', async () => {
+        const w = world()
+        const chat = w.open(chatOf('c', [msg('a')]))
+        w.otherTab('c', (c) => c.message.push(msg('theirs')))
+        chat.message.push(msg('mine'))
+        // Order: POST c (refused) -> GET c -> POST fork (stored, answer lost).
+        w.hooks.beforeFetch = () => { w.hooks.loseAnswer = true }
+        await expect(w.save('c')).rejects.toThrow()
+        expect(w.postsTo('new-1')).toHaveLength(1)
+        expect(w.stored.size).toBe(2)
+        expect(w.live.chats).toHaveLength(1)
+        chat.message.push(msg('typed before the retry'))
+        await w.save('c')
+        await w.settle()
+        expect(w.stored.size).toBe(2)
+        expect(w.listed).toEqual(['new-1'])
+        expect(w.live.chats.map((c) => c.id)).toEqual(['c', 'new-1'])
+        expect(texts(w.live.chats[1])).toEqual(['a', 'mine', 'typed before the retry'])
+        expect(texts(w.stored.get('new-1'))).toEqual(['a', 'mine', 'typed before the retry'])
+        expect(texts(w.live.chats[0])).toEqual(['a', 'theirs'])
+    })
+
     test('refresh with changes on both sides forks as well', async () => {
         const w = world()
         const chat = w.open(chatOf('c', [msg('a')]))
         w.otherTab('c', (c) => c.message.push(msg('theirs')))
         chat.note = 'my note'
-        expect(await w.sync.refresh(CHA, 'c')).toEqual({ status: 'forked', messagesChanged: false })
+        expect(await w.sync.refresh(CHA, 'c')).toEqual({ status: 'forked', messagesChanged: false, forkId: 'new-1' })
         expect(w.live.chats[1].note).toBe('my note')
         expect(w.live.chats[0].note).toBe('')
         expect(texts(w.live.chats[0])).toEqual(['a', 'theirs'])
@@ -471,6 +515,32 @@ describe('a conflict while a generation is writing into the chat', () => {
         w.generating.add('c')
         expect((await w.sync.refresh(CHA, 'c')).status).toBe('skipped')
         expect(texts(chat)).toEqual(['a'])
+    })
+
+    test('a fork that was opened and edited here before the swap keeps its edit; the final content gets one new id', async () => {
+        const w = world()
+        const chat = w.open(chatOf('c', [msg('a')]))
+        w.otherTab('c', (c) => c.message.push(msg('theirs')))
+        w.generating.add('c')
+        chat.message.push(msg('mine'))
+        await w.save('c')
+        // A database rebase lists the fork here and the user opens and edits it.
+        w.live.chats.push(structuredClone(w.stored.get('new-1')))
+        expect((await w.sync.refresh(CHA, 'new-1')).status).toBe('unchanged')
+        expect(w.sync.isDirty(CHA, 'new-1')).toBe(false)
+        w.live.chats[1].message.push(msg('typed in the fork'))
+        chat.message.push(msg('reply'))
+        w.generating.delete('c')
+        w.sync.generationsChanged()
+        await w.settle()
+        const ids = w.live.chats.map((c) => c.id)
+        expect(ids).toHaveLength(3)
+        const final = w.live.chats[2]
+        expect(texts(final)).toEqual(['a', 'mine', 'reply'])
+        expect(texts(w.live.chats[1])).toEqual(['a', 'mine', 'typed in the fork'])
+        // The final content went to the new id only.
+        expect(w.postsTo('new-1').every((p) => !texts(p.chat).includes('reply'))).toBe(true)
+        expect(texts(w.stored.get(final.id))).toEqual(['a', 'mine', 'reply'])
     })
 
     test('someone else writing to the fork id moves this tab to a fresh id', async () => {

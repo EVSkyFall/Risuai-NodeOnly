@@ -106,9 +106,6 @@ export function restoreChatShapeAfterRebase(
     for (const char of mergedCharacters ?? []) {
         if (!char || !Array.isArray(char.chats)) continue
         char.chats = convertStubsToPlaceholders(char.chats)
-        // Before local chats are grafted in: whatever is a full chat here came
-        // from the server.
-        noteInlineChats([char])
         const localChar = char.chaId ? localByChaId.get(char.chaId) : undefined
         if (!localChar || !Array.isArray(localChar.chats)) continue
         for (let i = 0; i < char.chats.length; i++) {
@@ -224,6 +221,7 @@ const chatSync = createChatSync({
     trackCharacter: (chaId) => chatSyncHost.trackCharacter(chaId),
     contentReplaced: (chaId, chatId) => chatSyncHost.contentReplaced(chaId, chatId),
     schedule: (run, delayMs) => { setTimeout(run, delayMs) },
+    sleep: (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
 })
 
 export async function saveChatToServer(chaId: string, chatIndex: number, chatId: string, chat: Chat): Promise<void> {
@@ -258,6 +256,9 @@ export function chatGenerationsChanged(): void {
 /**
  * Chats that arrived with their content inside the database instead of as
  * stubs: their content is the server's, at a revision this tab does not know.
+ * Only for a database that came straight from the server (boot). A rebased
+ * database also carries this tab's own chats, among them ones the server has
+ * never seen: marking those as synced would keep them from ever being saved.
  */
 export function noteInlineChats(characters: { chaId?: string; chats?: ChatOrStub[] }[]): void {
     for (const char of characters ?? []) {

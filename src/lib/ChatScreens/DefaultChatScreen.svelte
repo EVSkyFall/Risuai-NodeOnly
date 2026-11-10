@@ -354,7 +354,19 @@ import { isMobile } from 'src/ts/platform'
         // First step of the action, before anything registers a generation or
         // touches the chat: another tab may have saved this chat meanwhile.
         const sendKind = continueResponse ? 'continue' : (messageInput === '' && fileInput.length === 0 ? 'resend' : 'send')
-        if(!await refreshOpenChatBeforeSend(sendKind)) return
+        const typed = { input: messageInput, translate: messageInputTranslate, files: [...fileInput], chaId: draftChaId, chatId: draftChatId }
+        const gate = await refreshOpenChatBeforeSend(sendKind)
+        if(!gate.run) return
+        if(gate.forked){
+            // The composer is kept per chat, so moving to the fork emptied
+            // it. What was typed belongs to this send, not to the chat left
+            // behind.
+            await tick()
+            messageInput = typed.input
+            messageInputTranslate = typed.translate
+            fileInput = typed.files
+            removeChatDraft(typed.chaId, typed.chatId)
+        }
         if($selectedCharID !== selectedChar || $generationStates.has(currentChatGenKey())) return
         // Read again: the refresh may have changed which chat is open.
         const activeChat = await ensureActiveChatReady(selectedChar)
@@ -485,7 +497,7 @@ import { isMobile } from 'src/ts/platform'
 
     async function reroll(exact = false) {
         if($generationStates.has(currentChatGenKey())) return
-        if(!await refreshOpenChatBeforeSend('reroll')) return
+        if(!(await refreshOpenChatBeforeSend('reroll')).run) return
         if($generationStates.has(currentChatGenKey())) return
         const lastMsg = getLastCharMsg()
         if (!lastMsg) return
@@ -656,7 +668,7 @@ import { isMobile } from 'src/ts/platform'
     async function resumeInterruptedSend(chatId: string, generationId?: string) {
         const genKey = chatGenKey(chatId)
         if (currentChatId() === chatId && !$generationStates.has(genKey)) {
-            if (!await refreshOpenChatBeforeSend('resume')) {
+            if ((await refreshOpenChatBeforeSend('resume')).changed) {
                 // The chat is no longer what the interrupted send was made
                 // on: it must not fire by itself later either.
                 clearPendingSend(chatId, generationId)

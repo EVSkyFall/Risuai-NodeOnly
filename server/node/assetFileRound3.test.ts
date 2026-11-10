@@ -63,7 +63,9 @@ describe('round 3 asset regressions', () => {
             const code = `let dbCache = {}, fullChatStore = null, dbEtag = null; const saveTimers = {};
                 const initChatStore = obj => { fullChatStore = obj; };
                 const initChatStoreFromDisk = async obj => { initChatStore(obj); return obj; };
-                ${section('function invalidateDbCache()', '// ─── Chat runtime')}
+                const storageOperationContext = { getStore: () => ({ active: true }) };
+                const stripDatabaseForClient = obj => obj;
+                ${section('async function loadDbCacheIfMissing(', '// ─── Chat runtime')}
                 ${section('async function ensureChatStore()', '// Stub metadata')}
                 ${section('async function loadDatabase()', '/** Persist database changes')}
                 ${section('function clearExistingData', "app.post('/api/migrate/save-folder/scan'")}`

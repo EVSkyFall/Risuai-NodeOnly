@@ -105,7 +105,7 @@ test('delta sync carries the revision through: unchanged, conflict, and a full s
     answers.push(json(404, {}))
     expect(await sync.fetchChatRev('c', 0, 'x', 'r1')).toEqual({ kind: 'missing' })
 
-    const longer = { ...chat, message: [...chat.message, { role: 'char', data: 'reply' }] }
+    const longer: any = { ...chat, message: [...chat.message, { role: 'char', data: 'reply' }] }
     seen.length = 0
     answers.push(json(409, { code: 'CHAT_REV_CONFLICT', revision: 'r9' }))
     expect(await sync.postChat('c', 0, 'x', longer, { baseRev: 'r1' })).toEqual({ status: 'conflict', revision: 'r9' })

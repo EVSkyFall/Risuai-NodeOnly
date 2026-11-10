@@ -59,6 +59,7 @@ export interface ChatSyncEnv {
     /** Server content replaced the live content of a chat. */
     contentReplaced(chaId: string, chatId: string): void
     schedule(run: () => void, delayMs: number): void
+    sleep(delayMs: number): Promise<void>
 }
 
 export class ChatSyncError extends Error {
@@ -78,6 +79,8 @@ export interface RefreshResult {
     status: 'unchanged' | 'updated' | 'forked' | 'skipped'
     /** The list of messages the user is looking at changed. */
     messagesChanged: boolean
+    /** With 'forked': the id of the chat this tab's version went to, once it is in the chat list. */
+    forkId?: string
 }
 
 interface SyncState {
@@ -108,6 +111,7 @@ interface Divert {
 
 const NOT_OWNED = new Set(['id', 'name', 'lastDate', 'folderId', 'modules', 'isStreaming', '_placeholder', '_stub'])
 const FINALISE_RETRY_MAX_MS = 60_000
+const REPEATED_CONFLICT_PAUSE_MAX_MS = 30_000
 
 function isRealChat(chat: Chat | null | undefined): chat is Chat {
     return !!chat && chat._placeholder !== true && (chat as { _stub?: boolean })._stub !== true && Array.isArray(chat.message)
@@ -130,6 +134,8 @@ export function createChatSync(env: ChatSyncEnv) {
     const diverts = new Map<string, Divert>()
     const pluginReads = new Map<string, { rev: string | null, fp: string }>()
     const refreshes = new Map<string, Promise<RefreshResult>>()
+    /** Per chat: the id its last completed fork went to. */
+    const lastForkIds = new Map<string, string>()
 
     const keyOf = (chaId: string, chatId: string) => `${chaId}|${chatId}`
 
@@ -189,6 +195,7 @@ export function createChatSync(env: ChatSyncEnv) {
         const key = keyOf(chaId, chatId)
         const strict = options.strict
         let lastConflict: string | null | undefined
+        let pause = 0
         for (;;) {
             const live = hydratedLive(chaId, chatId)
             const content = live ? live.chat : passed
@@ -218,12 +225,21 @@ export function createChatSync(env: ChatSyncEnv) {
                 return outcome.durable
             }
 
-            // The server and this tab must agree on a revision at some point;
-            // the same refusal twice in a row for the same base means they
-            // cannot, and saving again would only spin.
-            const conflictMark = `${state.rev ?? ''}>${outcome.revision ?? ''}`
-            if (outcome.revision === null || conflictMark === lastConflict) {
-                throw new ChatSyncError(`chat ${chatId}: the server keeps refusing revision ${state.rev ?? '(none)'}`)
+            // Without the revision the server holds there is nothing to
+            // settle the refusal with.
+            if (outcome.revision === null) {
+                throw new ChatSyncError(`chat ${chatId}: the server refused the save without naming its revision`)
+            }
+            // The same refusal for the same base twice in a row: another
+            // writer is flipping the chat between two contents exactly in
+            // step with this save. Keep going, but not in a tight loop.
+            const conflictMark = `${state.rev ?? ''}>${outcome.revision}`
+            if (conflictMark === lastConflict) {
+                pause = Math.min(pause > 0 ? pause * 2 : 250, REPEATED_CONFLICT_PAUSE_MAX_MS)
+                console.warn(`[chatSync] chat ${chatId}: the same save conflict again, trying again in ${pause} ms`)
+                await env.sleep(pause)
+            } else {
+                pause = 0
             }
             lastConflict = conflictMark
 
@@ -293,7 +309,27 @@ export function createChatSync(env: ChatSyncEnv) {
             applyServerContent(chaId, chatId, live, server, fetched.revision, serverFp)
             return strict ? 'again' : { durable: undefined }
         }
-        return { durable: await fork(chaId, chatId, { chat: server, revision: fetched.revision }, strict, newDivert(chaId, chatId, live.chat.name)) }
+        return { durable: await forkNow(chaId, chatId, { chat: server, revision: fetched.revision }, strict, live.chat.name) }
+    }
+
+    // Fork right away. The fork's id is registered first and stays registered
+    // if this attempt fails, so a save that reached the server but whose
+    // answer was lost is recognised on the next attempt instead of being
+    // repeated under a second id.
+    async function forkNow(
+        chaId: string, chatId: string,
+        server: { chat: Chat, revision: string | null },
+        strict: boolean, name: string,
+    ): Promise<DurableChatSaveResult | undefined> {
+        const key = keyOf(chaId, chatId)
+        const divert = diverts.get(key) ?? newDivert(chaId, chatId, name)
+        diverts.set(key, divert)
+        try {
+            return await fork(chaId, chatId, server, strict, divert)
+        } catch (error) {
+            scheduleFinalise(chaId, chatId, 1000)
+            throw error
+        }
     }
 
     // A fork save was refused: someone else wrote to the fork's id. If it is
@@ -371,9 +407,25 @@ export function createChatSync(env: ChatSyncEnv) {
     ): Promise<DurableChatSaveResult | undefined> {
         const key = keyOf(chaId, chatId)
         let durable: DurableChatSaveResult | undefined
+        // The fork may already be open here (it is listed on the server, so a
+        // database rebase can bring it in). With changes of its own in it,
+        // this pass's content needs an id of its own, decided before anything
+        // is posted so the content does not land under two ids.
+        const forkSlotChanged = (chats: Chat[]): boolean => {
+            const slot = chats.find((chat) => chat?.id === divert.targetId)
+            if (!isRealChat(slot)) return false
+            const state = states.get(keyOf(chaId, divert.targetId))
+            return !state?.fp || chatFingerprints(slot).content !== state.fp
+        }
+        const freshTarget = (name: string) => {
+            const fresh = newDivert(chaId, chatId, name)
+            if (diverts.get(key) === divert) diverts.set(key, fresh)
+            divert = fresh
+        }
         for (;;) {
             const live = hydratedLive(chaId, chatId)
             if (!live) throw new ChatSyncError(`chat ${chatId} is no longer loaded`)
+            if (forkSlotChanged(live.chats)) freshTarget(live.chat.name)
             const posted = await postFork(chaId, chatId, live, divert, strict)
             divert = posted.divert
             durable = posted.outcome.durable ?? durable
@@ -403,17 +455,10 @@ export function createChatSync(env: ChatSyncEnv) {
             const forkChat = posted.forkChat
             const forkFp = chatFingerprints(forkChat).content
             let forkIndex = now.chats.findIndex((chat) => chat?.id === divert.targetId)
-            if (forkIndex !== -1 && isRealChat(now.chats[forkIndex])) {
-                // The fork was already opened here. Replace it only if nothing
-                // was changed in it; otherwise this pass's content needs an id
-                // of its own.
-                const state = states.get(forkKey)
-                if (!state?.fp || chatFingerprints(now.chats[forkIndex]).content !== state.fp) {
-                    const fresh = newDivert(chaId, chatId, now.chat.name)
-                    if (diverts.get(key) === divert) diverts.set(key, fresh)
-                    divert = fresh
-                    continue
-                }
+            if (forkSlotChanged(now.chats)) {
+                // Changed in the fork while this pass was posting.
+                freshTarget(now.chat.name)
+                continue
             }
             if (forkIndex === -1) {
                 now.chats.push(forkChat)
@@ -433,6 +478,7 @@ export function createChatSync(env: ChatSyncEnv) {
                 states.delete(key)
             }
             diverts.delete(key)
+            lastForkIds.set(key, divert.targetId)
             env.trackCharacter(chaId)
             env.notifyForked(divert.name)
             return durable
@@ -507,8 +553,10 @@ export function createChatSync(env: ChatSyncEnv) {
             setSynced(key, fetched.revision, serverFps.content)
             return unchanged
         }
-        await fork(chaId, chatId, { chat: server, revision: fetched.revision }, false, newDivert(chaId, chatId, now.chat.name))
-        return { status: 'forked', messagesChanged: false }
+        await forkNow(chaId, chatId, { chat: server, revision: fetched.revision }, false, now.chat.name)
+        // Set when the fork is in the chat list; a generation that started
+        // meanwhile leaves the swap for later and this tab on the original.
+        return { status: 'forked', messagesChanged: false, forkId: diverts.has(key) ? undefined : lastForkIds.get(key) }
     }
 
     return {

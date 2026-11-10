@@ -4,11 +4,11 @@ import type { ChatSyncHost } from './chatStorage'
 const state = vi.hoisted(() => ({
     db: { characters: [] as any[] },
     host: null as unknown as ChatSyncHost,
-    refresh: null as unknown as ReturnType<typeof vi.fn>,
-    generationsChanged: null as unknown as ReturnType<typeof vi.fn>,
-    notifyInfo: null as unknown as ReturnType<typeof vi.fn>,
-    loadToggles: null as unknown as ReturnType<typeof vi.fn>,
-    track: null as unknown as ReturnType<typeof vi.fn>,
+    refresh: null as any,
+    generationsChanged: null as any,
+    notifyInfo: null as any,
+    loadToggles: null as any,
+    track: null as any,
 }))
 state.refresh = vi.fn()
 state.generationsChanged = vi.fn()
@@ -48,14 +48,14 @@ beforeEach(() => {
 describe('refresh before a send', () => {
     test('a send with text always goes out, on the refreshed chat', async () => {
         state.refresh.mockResolvedValue({ status: 'updated', messagesChanged: true })
-        expect(await refreshOpenChatBeforeSend('send')).toBe(true)
+        expect(await refreshOpenChatBeforeSend('send')).toEqual({ run: true, changed: false, forked: false })
         expect(state.refresh).toHaveBeenCalledWith('cha', 'open')
         expect(state.notifyInfo).not.toHaveBeenCalled()
     })
 
     test.each(['continue', 'reroll', 'resend', 'resume'] as const)('%s does not run when the messages changed, and says so once', async (kind) => {
         state.refresh.mockResolvedValue({ status: 'updated', messagesChanged: true })
-        expect(await refreshOpenChatBeforeSend(kind)).toBe(false)
+        expect(await refreshOpenChatBeforeSend(kind)).toEqual({ run: false, changed: true, forked: false })
         expect(state.notifyInfo).toHaveBeenCalledTimes(1)
         expect(state.notifyInfo).toHaveBeenCalledWith('refreshed, try again')
     })
@@ -63,18 +63,35 @@ describe('refresh before a send', () => {
     test.each([
         { status: 'unchanged', messagesChanged: false },
         { status: 'updated', messagesChanged: false },
-        { status: 'forked', messagesChanged: false },
         // A refresh that could not be made (offline, generating) never blocks.
         { status: 'skipped', messagesChanged: false },
     ] as const)('reroll runs after a refresh that ended $status without touching the message list', async (result) => {
         state.refresh.mockResolvedValue(result)
-        expect(await refreshOpenChatBeforeSend('reroll')).toBe(true)
+        expect(await refreshOpenChatBeforeSend('reroll')).toEqual({ run: true, changed: false, forked: false })
+        expect(state.notifyInfo).not.toHaveBeenCalled()
+    })
+
+    test('a fork moves the action to the new chat and says so', async () => {
+        state.refresh.mockImplementation(async () => {
+            state.db.characters[0].chats.push({ id: 'fork', name: 'Open (diverged)', message: [] })
+            state.db.characters[0].chatPage = 2
+            return { status: 'forked', messagesChanged: false, forkId: 'fork' }
+        })
+        expect(await refreshOpenChatBeforeSend('send')).toEqual({ run: true, changed: false, forked: true })
+    })
+
+    test.each(['send', 'reroll'] as const)('%s does not run on a chat the user moved to while the refresh was under way', async (kind) => {
+        state.refresh.mockImplementation(async () => {
+            state.db.characters[0].chatPage = 0
+            return { status: 'unchanged', messagesChanged: false }
+        })
+        expect(await refreshOpenChatBeforeSend(kind)).toEqual({ run: false, changed: false, forked: false })
         expect(state.notifyInfo).not.toHaveBeenCalled()
     })
 
     test('a chat that is still loading is not refreshed', async () => {
         state.db.characters[0].chats[1]._placeholder = true
-        expect(await refreshOpenChatBeforeSend('reroll')).toBe(true)
+        expect(await refreshOpenChatBeforeSend('reroll')).toEqual({ run: true, changed: false, forked: false })
         expect(state.refresh).not.toHaveBeenCalled()
     })
 })

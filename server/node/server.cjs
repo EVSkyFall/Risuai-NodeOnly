@@ -7172,12 +7172,15 @@ app.get('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
 // Append a stub for a forked chat to its character's chat list in the cached
 // database. Runs inside the storage operation of the save that carries the
 // fork's body. Appending keeps every existing chat index where it is.
+// Returns false when the character is not in the database (deleted or
+// deactivated meanwhile): the fork could not be listed, so it must not be
+// acknowledged either.
 async function listForkedChat(chaId, chatId, chatData) {
-    if (!(await loadDbCacheIfMissing())) return;
+    if (!(await loadDbCacheIfMissing())) return false;
     const character = dbCache[DB_HEX_KEY]?.characters?.find((c) => c?.chaId === chaId);
-    if (!character) return;
+    if (!character) return false;
     if (!Array.isArray(character.chats)) character.chats = [];
-    if (character.chats.some((chat) => chat?.id === chatId)) return;
+    if (character.chats.some((chat) => chat?.id === chatId)) return true;
     const stub = { _stub: true };
     for (const field of STUB_OWNED_FIELDS) {
         if (field in chatData) stub[field] = chatData[field];
@@ -7187,6 +7190,7 @@ async function listForkedChat(chaId, chatId, chatData) {
     character.chats.push(normalizeJSON(stub));
     dbDirty = true;
     dbEtag = computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(dbCache[DB_HEX_KEY])));
+    return true;
 }
 
 // POST /api/chat-content/:chaId/:chatIndex — save chat content to server
@@ -7274,7 +7278,16 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
             // operation as its body, so it exists for every tab and survives a
             // restart from the moment this request is acknowledged.
             if (typeof req.headers['x-chat-fork-of'] === 'string' && req.headers['x-chat-fork-of']) {
-                await listForkedChat(chaId, expectedChatId, chatData);
+                if (!(await listForkedChat(chaId, expectedChatId, chatData))) {
+                    // An unlisted body would be answered as saved and be gone
+                    // after the next restart.
+                    return res.status(409).json({
+                        success: false,
+                        error: 'The character this chat belongs to is not in the database',
+                        code: 'CHAT_FORK_OWNER_MISSING',
+                        source: 'chat-content-validation',
+                    });
+                }
             }
 
             // Update fullChatStore

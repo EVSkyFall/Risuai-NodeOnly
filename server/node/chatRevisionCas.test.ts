@@ -248,6 +248,20 @@ describe('chat-content compare-and-swap', { timeout: 60_000 }, () => {
         expect((await getChat(again.client)).chat.message).toEqual(original.chat.message)
     })
 
+    it('refuses a fork whose character is not in the database instead of acknowledging an unlisted body', async () => {
+        const { client } = await boot()
+        const original = await getChat(client)
+        const res = await client.fetch('/api/chat-content/gone-character/0', {
+            method: 'POST',
+            headers: { 'content-type': 'application/octet-stream', 'x-chat-id': 'fork-x', 'x-chat-fork-of': CHAT, 'x-strict-flush': '1' },
+            body: new Uint8Array(encodeRisuSaveLegacy({ ...original.chat, id: 'fork-x', name: 'Fork' })),
+        })
+        expect(res.status).toBe(409)
+        expect(await res.json()).toMatchObject({ success: false, code: 'CHAT_FORK_OWNER_MISSING' })
+        const stored = await client.fetch('/api/chat-content/gone-character/0', { headers: { 'x-chat-id': 'fork-x' } })
+        expect(stored.status).toBe(404)
+    })
+
     it('a cold MCP read before the first chat save does not bring old messages back', async () => {
         const first = await boot()
         // Start from disk with nothing cached, and let the MCP be the first reader.

@@ -26,24 +26,41 @@ export function refreshOpenChat(): void {
 /** What the user asked for when a send-like action starts. */
 export type SendKind = 'send' | 'continue' | 'reroll' | 'resend' | 'resume'
 
+export interface SendGate {
+    /** The action may go ahead. */
+    run: boolean
+    /** Not run because the message list changed under it (the user was told). */
+    changed: boolean
+    /** This tab's version went to a new chat, which is now the open one. */
+    forked: boolean
+}
+
 /**
  * First step of every send-like action, before anything registers a
  * generation or touches the chat: bring the open chat up to date.
  *
- * Returns false when the action must not run. A send with text simply goes
- * out on the refreshed chat. Anything that acts on the message the user was
- * looking at (continue, reroll, resend, resume) would hit a different message
- * if the list changed, so it is dropped with a notice and the user decides
- * again on what is on screen now. A refresh that fails changes nothing and
- * never blocks.
+ * A send with text simply goes out on the refreshed chat. Anything that acts
+ * on the message the user was looking at (continue, reroll, resend, resume)
+ * would hit a different message if the list changed, so it is dropped with a
+ * notice and the user decides again on what is on screen now. A refresh that
+ * fails changes nothing and never blocks.
+ *
+ * The action belongs to the chat it was started on: if the user opened another
+ * chat while the refresh was under way, it does not run there. A fork is not
+ * that: it moves this tab to the new chat, which is the same conversation.
  */
-export async function refreshOpenChatBeforeSend(kind: SendKind): Promise<boolean> {
+export async function refreshOpenChatBeforeSend(kind: SendKind): Promise<SendGate> {
     const open = openChatIds()
-    if (!open) return true
+    if (!open) return { run: true, changed: false, forked: false }
     const result = await refreshChatFromServer(open.chaId, open.chatId)
-    if (kind === 'send' || !result.messagesChanged) return true
-    notifyInfo(language.chatRefreshedRetry)
-    return false
+    const expected = result.status === 'forked' && result.forkId ? result.forkId : open.chatId
+    const now = openChatIds()
+    if (!now || now.chaId !== open.chaId || now.chatId !== expected) return { run: false, changed: false, forked: false }
+    if (kind !== 'send' && result.messagesChanged) {
+        notifyInfo(language.chatRefreshedRetry)
+        return { run: false, changed: true, forked: false }
+    }
+    return { run: true, changed: false, forked: expected !== open.chatId }
 }
 
 let started = false
