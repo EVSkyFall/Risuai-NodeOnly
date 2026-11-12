@@ -278,6 +278,21 @@ export async function loadLoreBookV3Prompt(){
         constant:boolean
     }[] = []
     let activatedIndexes:number[] = []
+    // "Always active in chat" stores a child entry with the parent's id in the
+    // chat's localLore. The parent is pinned on for this chat even on turns its
+    // own key activates it first and the child is skipped (matched as below).
+    const pinnedIndexes = new Set<number>()
+    for(let i=0;i<fullLore.length;i++){
+        if(fullLore[i].mode !== 'child'){
+            continue
+        }
+        for(let j=0;j<i;j++){
+            if(fullLore[j].id === fullLore[i].id){
+                pinnedIndexes.add(j)
+                break
+            }
+        }
+    }
     let disabledUIPrompts:string[] = []
     let matchTimes = 0
     let keepActivateAfterMatch = false
@@ -608,7 +623,7 @@ export async function loadLoreBookV3Prompt(){
                     priority: priority,
                     source: fullLore[i].comment || `lorebook ${i}`,
                     inject: inject ?? null,
-                    constant: !!fullLore[i].alwaysActive,
+                    constant: !!fullLore[i].alwaysActive || pinnedIndexes.has(i),
                 })
                 activatedIndexes.push(i)
 

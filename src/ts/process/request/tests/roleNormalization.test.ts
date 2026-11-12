@@ -606,4 +606,35 @@ describe('beforeRequest meta hand-off', () => {
         expect(asReceived).toEqual([meta(), meta()])
         expect(received[1]).not.toBe(received[0])
     })
+
+    test('entries reach the replacer unescaped exactly as the prompt messages do, on every attempt', async () => {
+        harness.db.requestRetrys = 1
+        harness.provider
+            .mockResolvedValueOnce({ success: false, content: 'transient failure' })
+            .mockResolvedValueOnce({ success: true, content: 'second attempt' })
+        const escaped = 'hp ok'
+        const given = { lorebook: { placed: false, entries: [{ role: 'system', content: escaped, constant: true }] } }
+        const prompt: string[] = []
+        const entries: string[] = []
+        plugins.replacerbeforeRequest.add((input: any, _type: string, m: any) => {
+            prompt.push(input[0].content)
+            entries.push(m.lorebook.entries[0].content)
+            return input
+        })
+        await expect(request(args({ formated: [{ role: 'system', content: escaped }], beforeRequestMeta: given }), 'model'))
+            .resolves.toMatchObject({ type: 'success', result: 'second attempt' })
+        expect(entries).toEqual(['{{hp}} (ok):', '{{hp}} (ok):'])
+        expect(entries).toEqual(prompt)
+        expect(given.lorebook.entries[0].content).toBe(escaped)
+    })
+
+    test('a meta whose entries cannot be prepared gives the replacer undefined and the request is unchanged', async () => {
+        const hook = vi.fn((input: any, ..._rest: any[]) => input)
+        plugins.replacerbeforeRequest.add(hook)
+        const broken = { lorebook: { placed: false, entries: [{ role: 'system', content: 42 as any, constant: true }] } }
+        await expect(request(args({ beforeRequestMeta: broken }), 'model')).resolves.toMatchObject({ type: 'success', result: 'response' })
+        expect(hook).toHaveBeenCalledOnce()
+        expect(hook.mock.calls[0][0]).toEqual([{ role: 'user', content: 'original' }])
+        expect(hook.mock.calls[0][2]).toBeUndefined()
+    })
 })

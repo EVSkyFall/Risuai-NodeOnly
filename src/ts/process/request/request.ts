@@ -188,6 +188,19 @@ function copyBeforeRequestMeta(meta: BeforeRequestMeta | undefined): BeforeReque
     }
 }
 
+// The handed-over lorebook entries stand in for the lorebook slot's messages,
+// so they get the same single unescape the prompt gets in requestChatDataInner.
+function unescapeBeforeRequestMeta(meta: BeforeRequestMeta | undefined): BeforeRequestMeta | undefined {
+    if (!meta?.lorebook) return meta
+    try {
+        const entries = meta.lorebook.entries.map((entry) => ({ ...entry, content: risuUnescape(entry.content) }))
+        return { ...meta, lorebook: { ...meta.lorebook, entries } }
+    } catch (e) {
+        console.warn('[plugin] beforeRequest meta could not be unescaped — passing undefined:', e)
+        return undefined
+    }
+}
+
 export async function requestChatData(arg:requestDataArgument, model:ModelModeExtended, abortSignal:AbortSignal=null):Promise<requestDataResponse> {
     try {
         return await raceAbort(() => requestChatDataInner(arg, model, abortSignal), abortSignal)
@@ -218,6 +231,7 @@ async function requestChatDataInner(arg:requestDataArgument, model:ModelModeExte
             m.content = risuUnescape(m.content)
             return m
         })
+    const beforeRequestMeta = unescapeBeforeRequestMeta(arg.beforeRequestMeta)
 
     for(let fallbackIndex=0;fallbackIndex<fallBackModels.length;fallbackIndex++){
         let trys = 0
@@ -244,7 +258,7 @@ async function requestChatDataInner(arg:requestDataArgument, model:ModelModeExte
                 for(const replacer of pluginV2.replacerbeforeRequest){
                     throwIfAborted(abortSignal)
                     const input = safeStructuredClone(arg.formated)
-                    const meta = copyBeforeRequestMeta(arg.beforeRequestMeta)
+                    const meta = copyBeforeRequestMeta(beforeRequestMeta)
                     try {
                         const next = await raceAbort(() => replacerWithTimeout(() => {
                             throwIfAborted(abortSignal)

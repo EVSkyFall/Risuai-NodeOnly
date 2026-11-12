@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'vitest'
 import { buildBeforeRequestMeta, isLorebookSlotPlaced, isNormalLoreActive } from '../beforeRequestMeta'
+import { stripIllustrationControlNodesFromPrompt } from '../../illustrationJobs/controlNodes'
 
 type Active = { pos: string, inject: unknown, constant: boolean, role: 'system' | 'user' | 'assistant', prompt: string }
 const active = (prompt: string, extras: Partial<Active> = {}): Active => ({
@@ -63,6 +64,39 @@ describe('buildBeforeRequestMeta', () => {
 
     test('no actives gives an empty entry list', () => {
         expect(buildBeforeRequestMeta([], [], true)).toEqual({ lorebook: { placed: true, entries: [] } })
+    })
+})
+
+describe('buildBeforeRequestMeta hands each entry over as the lorebook slot sends it', () => {
+    test('trims the surrounding whitespace', () => {
+        const meta = buildBeforeRequestMeta([active('x')], [{ role: 'system', content: '\n\n  lore text \n' }], false)
+        expect(meta.lorebook!.entries).toEqual([{ role: 'system', content: 'lore text', constant: false }])
+    })
+
+    test('leaves out an entry that is empty once trimmed, and the others keep their own constant flag', () => {
+        const actives = [active('one'), active('blank', { constant: true }), active('three')]
+        const messages = [
+            { role: 'system', content: 'one' },
+            { role: 'system', content: ' \n\t ' },
+            { role: 'system', content: 'three' },
+        ]
+        expect(buildBeforeRequestMeta(actives, messages, false).lorebook!.entries).toEqual([
+            { role: 'system', content: 'one', constant: false },
+            { role: 'system', content: 'three', constant: false },
+        ])
+    })
+
+    test('strips illustration control nodes as the prompt strip does', () => {
+        const content = ' before <risu-illustration-slot data-v="1" data-job="job1" data-token="tok1"></risu-illustration-slot> after<!--risu-illustration-request:v1:n1-->\n'
+        const meta = buildBeforeRequestMeta([active('x')], [{ role: 'system', content }], true)
+        const [slot] = stripIllustrationControlNodesFromPrompt([{ role: 'system', content: content.trim() }])
+        expect(meta.lorebook!.entries[0].content).toBe('before  after')
+        expect(meta.lorebook!.entries[0].content).toBe(slot.content)
+    })
+
+    test('leaves escaped characters to the single unescape in requestChatData', () => {
+        const meta = buildBeforeRequestMeta([active('x')], [{ role: 'system', content: 'hp' }], false)
+        expect(meta.lorebook!.entries[0].content).toBe('hp')
     })
 })
 

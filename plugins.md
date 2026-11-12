@@ -893,20 +893,24 @@ Risuai.addRisuReplacer('afterRequest', async (content, type) => {
 Risuai.removeRisuReplacer('beforeRequest', replacerFunction);
 ```
 
-**Lorebook hand-off (`beforeRequest` third argument):** a `beforeRequest` replacer is called as `(messages, type, meta)`. On the chat turn's main model request (including its retries and fallback models, continue and regenerate) `meta` carries the ordinary lorebook entries RisuAI activated for that turn; on every other request (emotion, translation, memory/summary, sub-model utilities, requests started by plugins or scripts) it is `undefined`. Each replacer gets its own copy, so changing it affects nobody else.
+RisuAI waits up to 10 minutes for a `beforeRequest` replacer and up to 60 seconds for an `afterRequest` replacer. When a replacer throws, takes longer, or returns something other than a message array (`beforeRequest`) or a string (`afterRequest`), RisuAI ignores its return value and the request goes on.
+
+**Lorebook hand-off (`beforeRequest` third argument):** a `beforeRequest` replacer is called as `(messages, type, meta)`. On the chat turn's main model request (including its retries and fallback models, continue and regenerate) `meta` carries the ordinary lorebook entries RisuAI activated for that turn; on every other request (emotion, translation, memory/summary, sub-model utilities, requests started by plugins or scripts) it is `undefined`. An exact-replay regenerate resends the recorded request and calls no `beforeRequest` replacer at all. Each replacer gets its own copy, so changing it affects nobody else.
 
 ```typescript
 type BeforeRequestMeta = {
   lorebook?: {
-    placed: boolean   // the prompt has a lorebook slot (template card `lorebook`, or `lorebook` in the legacy format order)
-    entries: {        // activated entries without a position, depth or inject decorator, rendered, in prompt order
+    placed: boolean   // the prompt has a lorebook slot (template card `lorebook`, `lorebook` in the legacy format order, or a utility-bot character's built-in template)
+    entries: {        // activated entries without a position, depth or inject decorator, in prompt order
       role: string
-      content: string
-      constant: boolean  // true: always-active entry; false: activated another way (key match, @@activate, ...)
+      content: string    // the text the lorebook slot sends: rendered, trimmed, illustration control nodes stripped, unescaped
+      constant: boolean  // true: always-active entry, or one pinned on for this chat ("always active in chat"); false: activated another way (key match, @@activate, ...)
     }[]
   }
 }
 ```
+
+Each entry carries the text RisuAI's lorebook slot would send for it. An entry that renders to nothing but whitespace is left out, as the slot leaves it out. A Lua `editRequest` listener edits the assembled prompt, not these entries, so its edits never show in them. An `@@inject_lore` entry is not an entry of its own: its text appears inside the content of the entry it targets.
 
 When `placed` is `true` RisuAI already placed the entries into the prompt (possibly merged with neighbouring system messages); when it is `false` the prompt has no lorebook slot and the entries appear nowhere in it. A replacer that ignores the third argument behaves exactly as before.
 
@@ -1042,7 +1046,7 @@ Does **not** run for the `webspeech` provider (the browser synthesizes and plays
 
 - **Sequential.** Hooks run in registration order; each receives the previous hook's output.
 - **Error isolation.** If a hook throws, its result is discarded and the next hook runs. TTS playback itself is not interrupted.
-- **No enforced timeout.** Matches the trust model of `addRisuScriptHandler` and `addRisuReplacer`. A hook that hangs will stall TTS playback for that message. Plugins that call slow services (auxiliary LLMs, remote audio processors) should implement their own `AbortController` + timer for cancellation.
+- **No enforced timeout.** Matches the trust model of `addRisuScriptHandler` (unlike `addRisuReplacer`, whose replacers RisuAI stops waiting for after 10 minutes for `beforeRequest` and 60 seconds for `afterRequest`). A hook that hangs will stall TTS playback for that message. Plugins that call slow services (auxiliary LLMs, remote audio processors) should implement their own `AbortController` + timer for cancellation.
 - **Short-circuit.** A hook that returns `{ skip: true }` stops the pipeline and aborts the TTS for that message. Later hooks are not called.
 - **No permission prompt.** These hooks are in the same trust category as `addRisuScriptHandler`. They transform text or audio that the plugin could already transmit via `nativeFetch`.
 - **Auto-cleanup.** Hooks registered by a plugin are removed automatically when the plugin unloads.

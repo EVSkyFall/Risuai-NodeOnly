@@ -271,26 +271,37 @@ type ReplacerType = 'beforeRequest' | 'afterRequest';
 /**
  * Third argument of a `beforeRequest` replacer. Present on the chat turn's
  * main model request (including its retries and fallback models, continue and
- * regenerate); `undefined` on every other request.
+ * regenerate); `undefined` on every other request. An exact-replay regenerate
+ * resends the recorded request and calls no `beforeRequest` replacer at all.
  */
 type BeforeRequestMeta = {
     lorebook?: {
         /**
          * `true` when this turn's prompt has the lorebook slot (a `lorebook`
-         * card in the prompt template, or `lorebook` in the legacy format
-         * order), so `entries` were placed into the prompt (possibly merged
-         * with neighbouring system messages). `false` when the prompt has no
-         * lorebook slot and `entries` appear nowhere in it.
+         * card in the prompt template, `lorebook` in the legacy format order,
+         * or a utility-bot character's built-in template), so `entries` were
+         * placed into the prompt (possibly merged with neighbouring system
+         * messages). `false` when the prompt has no lorebook slot and
+         * `entries` appear nowhere in it.
          */
         placed: boolean;
         /**
          * The ordinary lorebook entries activated for this turn (those without
-         * a position, depth or inject decorator), rendered, in prompt order.
+         * a position, depth or inject decorator), in prompt order. An
+         * `@@inject_lore` entry is not listed; its text appears inside the
+         * entry it targets.
          */
         entries: {
             role: string;
+            /**
+             * The text the lorebook slot sends for this entry: rendered,
+             * trimmed, illustration control nodes stripped, unescaped. An
+             * entry that renders to whitespace only is left out, as the slot
+             * leaves it out. A Lua `editRequest` listener edits the assembled
+             * prompt and is not applied here.
+             */
             content: string;
-            /** `true` for an always-active entry, `false` when it was activated another way (key match, `@@activate`, ...). */
+            /** `true` for an always-active entry or one pinned on for this chat ("always active in chat"), `false` when it was activated another way (key match, `@@activate`, ...). */
             constant: boolean;
         }[];
     };
@@ -2459,10 +2470,10 @@ interface RisuaiPluginAPI {
      * discarded and the next hook runs.
      *
      * No timeout is enforced on hook execution (consistent with
-     * `addRisuScriptHandler` and `addRisuReplacer`), so a hook that hangs will
-     * stall TTS playback for that message. Plugins that call slow services
-     * (auxiliary LLMs, remote analysis) should implement their own
-     * `AbortController` + timer if cancellation is needed.
+     * `addRisuScriptHandler`; `addRisuReplacer` differs, see there), so a hook
+     * that hangs will stall TTS playback for that message. Plugins that call
+     * slow services (auxiliary LLMs, remote analysis) should implement their
+     * own `AbortController` + timer if cancellation is needed.
      *
      * Applies to all providers (including 'webspeech'). No permission prompt.
      * Auto-unregistered when the plugin unloads.
@@ -2550,6 +2561,11 @@ interface RisuaiPluginAPI {
      * Types:
      * - 'beforeRequest': Modify messages before sending to AI
      * - 'afterRequest': Modify response after receiving from AI
+     *
+     * RisuAI waits up to 10 minutes for a 'beforeRequest' replacer and up to
+     * 60 seconds for an 'afterRequest' replacer. When a replacer throws, takes
+     * longer, or returns something other than a message array / string,
+     * RisuAI ignores its return value and the request goes on.
      *
      * A 'beforeRequest' replacer also receives `meta` ({@link BeforeRequestMeta}):
      * the lorebook entries RisuAI activated for the chat turn, on the turn's

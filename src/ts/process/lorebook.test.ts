@@ -60,6 +60,21 @@ describe('loadLoreBookV3Prompt constant flag', () => {
         })
     })
 
+    test('an entry pinned on by "always active in chat" is constant whether or not its own key matches', async () => {
+        const constantsOf = (actives: { source: string, constant: boolean }[], source: string) =>
+            actives.filter((a) => a.source === source).map((a) => a.constant)
+
+        // Key absent: the chat-local child entry activates in the parent's place.
+        const absent = (await loadLoreBookV3Prompt()).actives
+        expect(constantsOf(absent, 'local')).toEqual([true])
+
+        // Key present: the parent activates by its key first and the child is skipped.
+        harness.db.characters[0].chats[0].message = [{ role: 'user', data: 'hello dragon, nothing else' }]
+        const present = (await loadLoreBookV3Prompt()).actives
+        expect(constantsOf(present, 'local')).toEqual([true])
+        expect(constantsOf(present, 'keyed')).toEqual([false])
+    })
+
     test('existing fields of an active are unchanged', async () => {
         const { actives } = await loadLoreBookV3Prompt()
         expect(actives.find((a) => a.source === 'keyed')).toEqual({
