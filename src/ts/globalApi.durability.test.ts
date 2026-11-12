@@ -141,6 +141,21 @@ test.each(['fetchViaProxy2', 'fetchWithProxy'])('cause7f: %s resends the same bo
     expect(fetch).toHaveBeenCalledTimes(1)
 })
 
+test('proxied requests bypass the HTTP cache, on the first send and on the auth retry', async () => {
+    const json = (status, body, expired = false) => new Response(JSON.stringify(body), { status, headers: expired ? { 'x-risu-auth-error': 'token-expired' } : {} })
+    const fetch = vi.fn().mockResolvedValueOnce(json(400, { error: 'Token Expired' }, true)).mockResolvedValue(json(200, { result: 'ok' }))
+    const fetchViaProxy2 = run(`${extract('fetchProxyWithAuthRetry')}\n${extract('fetchViaProxy2')}; return fetchViaProxy2;`, {
+        fetch, forageStorage: { createAuth: vi.fn().mockResolvedValue('auth') }, getEffectiveTurnId: () => undefined, DBState: { db: {} },
+    })
+    expect((await fetchViaProxy2('http://127.0.0.1:1/status', {}, undefined, { method: 'GET' })).status).toBe(200)
+    expect(fetch).toHaveBeenCalledTimes(2)
+    for (const [path, init] of fetch.mock.calls) {
+        expect(path).toBe('/proxy2')
+        expect(init.cache).toBe('no-store')
+        expect(init.method).toBe('GET')
+    }
+})
+
 test.each(['throw', 'retry'])('round2-C-D: main loop joining backoff cannot lose retry (%s)', async kind => {
     const persist = kind === 'throw' ? vi.fn().mockRejectedValue(new Error('offline')) : vi.fn().mockResolvedValue('retry')
     let release: () => void

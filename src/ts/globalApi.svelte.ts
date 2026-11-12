@@ -2066,6 +2066,11 @@ async function fetchWithUSFetch(url: string, arg: GlobalFetchArgs): Promise<Glob
  * @returns {Promise<GlobalFetchResult>} - The result of the fetch request.
  */
 async function fetchProxyWithAuthRetry(init: RequestInit, path = '/proxy2'): Promise<Response> {
+    // Every proxied request shares one URL (the target is a header) and the
+    // proxy drops the upstream Cache-Control, so Chrome's HTTP cache queues the
+    // GETs on one cache entry: behind a long-lived one (an SSE stream) each
+    // other GET waits out the 20 s cache lock before it is sent at all.
+    init = { cache: 'no-store', ...init }
     const response = await fetch(path, init)
     if (response.status !== 400 || response.headers.get('x-risu-auth-error') !== 'token-expired') return response
     const headers = new Headers(init.headers)
