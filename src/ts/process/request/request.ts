@@ -37,6 +37,7 @@ import { TOOL_CAPABLE_ADAPTER_KINDS, VISION_CAPABLE_ADAPTER_KINDS, type AdapterK
 import { resolveWireModelId } from "src/ts/preset/adapter/wireInvariants";
 import { pumpPresetStream } from "./presetStreamPump";
 import { shouldStageMainRequestSnapshot, stageMainRequestSnapshot } from "./requestReplay";
+import type { BeforeRequestMeta } from "./beforeRequestMeta";
 import { formatReasoningParts } from "src/ts/preset/adapter/reasoning";
 import { makeJobFetch, ModelJobBusyError, type JobClaimHandle } from "./jobFetch";
 import { toLogSource, toRequestKind } from "./logSource";
@@ -98,6 +99,9 @@ interface requestDataArgument{
     // it to the ModelPreset bound to that module (db.moduleModelBindings).
     // Absent for character-owned scripts and normal chat sends.
     moduleId?: string
+    /** Third argument of every beforeRequest replacer. Only sendChat's main
+     *  request sets it; all other requests hand the replacers `undefined`. */
+    beforeRequestMeta?: BeforeRequestMeta
 }
 
 export interface RequestDataArgumentExtended extends requestDataArgument{
@@ -174,6 +178,16 @@ function replacerWithTimeout<T>(run: () => T | Promise<T>, ms: number): Promise<
     })
 }
 
+function copyBeforeRequestMeta(meta: BeforeRequestMeta | undefined): BeforeRequestMeta | undefined {
+    if (meta === undefined) return undefined
+    try {
+        return safeStructuredClone(meta)
+    } catch (e) {
+        console.warn('[plugin] beforeRequest meta could not be copied — passing undefined:', e)
+        return undefined
+    }
+}
+
 export async function requestChatData(arg:requestDataArgument, model:ModelModeExtended, abortSignal:AbortSignal=null):Promise<requestDataResponse> {
     try {
         return await raceAbort(() => requestChatDataInner(arg, model, abortSignal), abortSignal)
@@ -230,10 +244,11 @@ async function requestChatDataInner(arg:requestDataArgument, model:ModelModeExte
                 for(const replacer of pluginV2.replacerbeforeRequest){
                     throwIfAborted(abortSignal)
                     const input = safeStructuredClone(arg.formated)
+                    const meta = copyBeforeRequestMeta(arg.beforeRequestMeta)
                     try {
                         const next = await raceAbort(() => replacerWithTimeout(() => {
                             throwIfAborted(abortSignal)
-                            return replacer(input, model)
+                            return replacer(input, model, meta)
                         }, REPLACER_BEFORE_TIMEOUT_MS), abortSignal)
                         arg.formated = safeStructuredClone(input)
                         if (Array.isArray(next)) arg.formated = safeStructuredClone(next)

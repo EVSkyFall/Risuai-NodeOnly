@@ -269,6 +269,34 @@ type ScriptMode = 'display' | 'output' | 'input' | 'process';
 type ReplacerType = 'beforeRequest' | 'afterRequest';
 
 /**
+ * Third argument of a `beforeRequest` replacer. Present on the chat turn's
+ * main model request (including its retries and fallback models, continue and
+ * regenerate); `undefined` on every other request.
+ */
+type BeforeRequestMeta = {
+    lorebook?: {
+        /**
+         * `true` when this turn's prompt has the lorebook slot (a `lorebook`
+         * card in the prompt template, or `lorebook` in the legacy format
+         * order), so `entries` were placed into the prompt (possibly merged
+         * with neighbouring system messages). `false` when the prompt has no
+         * lorebook slot and `entries` appear nowhere in it.
+         */
+        placed: boolean;
+        /**
+         * The ordinary lorebook entries activated for this turn (those without
+         * a position, depth or inject decorator), rendered, in prompt order.
+         */
+        entries: {
+            role: string;
+            content: string;
+            /** `true` for an always-active entry, `false` when it was activated another way (key match, `@@activate`, ...). */
+            constant: boolean;
+        }[];
+    };
+};
+
+/**
  * Argument passed to chat lifecycle listeners
  */
 type ChatOutputListenerArg = {
@@ -2523,6 +2551,11 @@ interface RisuaiPluginAPI {
      * - 'beforeRequest': Modify messages before sending to AI
      * - 'afterRequest': Modify response after receiving from AI
      *
+     * A 'beforeRequest' replacer also receives `meta` ({@link BeforeRequestMeta}):
+     * the lorebook entries RisuAI activated for the chat turn, on the turn's
+     * main request only (`undefined` on every other request). Each replacer
+     * gets its own copy.
+     *
      * @example
      * ```typescript
      * // Modify messages before sending
@@ -2533,6 +2566,15 @@ interface RisuaiPluginAPI {
      *   }));
      * });
      *
+     * // Read the lorebook entries activated for this chat turn
+     * await risuai.addRisuReplacer('beforeRequest', async (messages, type, meta) => {
+     *   if (meta?.lorebook && !meta.lorebook.placed) {
+     *     const lore = meta.lorebook.entries.map(e => e.content).join('\n');
+     *     return [{ role: 'system', content: lore }, ...messages];
+     *   }
+     *   return messages;
+     * });
+     *
      * // Modify response after receiving
      * await risuai.addRisuReplacer('afterRequest', async (content, type) => {
      *   return content.replace(/bad/gi, '***');
@@ -2541,7 +2583,7 @@ interface RisuaiPluginAPI {
      */
     addRisuReplacer(
         type: 'beforeRequest',
-        func: (messages: OpenAIChat[], type: string) => OpenAIChat[] | Promise<OpenAIChat[]>
+        func: (messages: OpenAIChat[], type: string, meta?: BeforeRequestMeta) => OpenAIChat[] | Promise<OpenAIChat[]>
     ): Promise<void>;
     addRisuReplacer(
         type: 'afterRequest',

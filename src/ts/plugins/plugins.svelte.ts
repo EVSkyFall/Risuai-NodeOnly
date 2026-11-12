@@ -7,6 +7,7 @@ import type { OpenAIChat } from "../process/index.svelte";
 import { fetchNative, globalFetch, readImage, requestImmediateSave, saveAsset, toGetter } from "../globalApi.svelte";
 import { DBState, hotReloading, pluginAlertModalStore, selectedCharID } from "../stores.svelte";
 import type { ScriptMode } from "../process/scripts";
+import type { BeforeRequestMeta } from "../process/request/beforeRequestMeta";
 import { checkCodeSafety } from "./pluginSafety";
 import { SafeDocument, SafeIdbFactory, SafeLocalStorage } from "./pluginSafeClass";
 import { loadV3Plugins, reloadV3Plugin } from "./apiV3/v3.svelte";
@@ -567,7 +568,7 @@ export type PluginV2ProviderOptions = {
 }
 
 export type EditFunction = (content: string) => string | null | undefined | Promise<string | null | undefined>
-type ReplacerFunction = (content: OpenAIChat[], type: string) => OpenAIChat[] | Promise<OpenAIChat[]>
+type ReplacerFunction = (content: OpenAIChat[], type: string, meta?: BeforeRequestMeta) => OpenAIChat[] | Promise<OpenAIChat[]>
 type ChatOutputListenerArg = { char: any, chat: any, characterIndex: number, chatIndex: number, messageIndex: number }
 type ChatOutputListener = (arg: ChatOutputListenerArg) => void | Promise<void>
 

@@ -521,3 +521,89 @@ describe('request plugin Stop', () => {
         expect(argument.formated[0].content).toBe('original')
     })
 })
+
+describe('beforeRequest meta hand-off', () => {
+    let plugins: typeof import('src/ts/plugins/plugins.svelte').pluginV2
+    let request: typeof import('../request').requestChatData
+    const meta = () => ({
+        lorebook: {
+            placed: false,
+            entries: [
+                { role: 'system', content: 'always on', constant: true },
+                { role: 'user', content: 'key matched', constant: false },
+            ],
+        },
+    })
+    const args = (extras: Record<string, unknown> = {}) => ({
+        formated: [{ role: 'user' as const, content: 'original' }], bias: {}, tools: [], ...extras,
+    }) as any
+    beforeEach(async () => {
+        plugins = (await import('src/ts/plugins/plugins.svelte')).pluginV2
+        request = (await import('../request')).requestChatData
+        plugins.replacerbeforeRequest.clear()
+        plugins.replacerafterRequest.clear()
+        harness.db.aiModel = 'pluginmodel:::meta-test'
+        harness.models.set(harness.db.aiModel, model(harness.db.aiModel, harness.formats.Plugin, { flags: [FULL] }))
+        harness.providers.set('meta-test', harness.provider)
+        harness.provider.mockResolvedValue({ success: true, content: 'response' })
+    })
+    afterEach(() => {
+        plugins.replacerbeforeRequest.clear()
+        plugins.replacerafterRequest.clear()
+    })
+
+    test('a replacer receives the given meta as its third argument', async () => {
+        const hook = vi.fn((input: any, ..._rest: any[]) => input)
+        plugins.replacerbeforeRequest.add(hook)
+        await expect(request(args({ beforeRequestMeta: meta() }), 'model')).resolves.toMatchObject({ type: 'success' })
+        expect(hook).toHaveBeenCalledOnce()
+        expect(hook.mock.calls[0][1]).toBe('model')
+        expect(hook.mock.calls[0][2]).toEqual(meta())
+    })
+
+    test('each replacer receives its own copy, so one plugin cannot change what the next one or the app sees', async () => {
+        const given = meta()
+        const first = vi.fn((input: any, _type: string, received: any) => {
+            received.lorebook.entries[0].content = 'changed by the first plugin'
+            received.lorebook.entries.push({ role: 'system', content: 'added', constant: false })
+            received.lorebook.placed = true
+            return input
+        })
+        const second = vi.fn((input: any, ..._rest: any[]) => input)
+        plugins.replacerbeforeRequest.add(first)
+        plugins.replacerbeforeRequest.add(second)
+        await request(args({ beforeRequestMeta: given }), 'model')
+        expect(first.mock.calls[0][2]).not.toBe(given)
+        expect(second.mock.calls[0][2]).not.toBe(given)
+        expect(second.mock.calls[0][2]).not.toBe(first.mock.calls[0][2])
+        expect(second.mock.calls[0][2]).toEqual(meta())
+        expect(given).toEqual(meta())
+    })
+
+    test('a request without meta calls the replacer with undefined as its third argument', async () => {
+        const hook = vi.fn((input: any, ..._rest: any[]) => input)
+        plugins.replacerbeforeRequest.add(hook)
+        await request(args(), 'model')
+        expect(hook).toHaveBeenCalledOnce()
+        expect(hook.mock.calls[0][2]).toBeUndefined()
+    })
+
+    test('a retry inside requestChatData hands a fresh copy of the meta to the replacer again', async () => {
+        harness.db.requestRetrys = 1
+        harness.provider
+            .mockResolvedValueOnce({ success: false, content: 'transient failure' })
+            .mockResolvedValueOnce({ success: true, content: 'second attempt' })
+        const received: any[] = []
+        const asReceived: any[] = []
+        plugins.replacerbeforeRequest.add((input: any, _type: string, m: any) => {
+            received.push(m)
+            asReceived.push(structuredClone(m))
+            if (m) m.lorebook.entries.length = 0
+            return input
+        })
+        await expect(request(args({ beforeRequestMeta: meta() }), 'model')).resolves.toMatchObject({ type: 'success', result: 'second attempt' })
+        expect(harness.provider).toHaveBeenCalledTimes(2)
+        expect(asReceived).toEqual([meta(), meta()])
+        expect(received[1]).not.toBe(received[0])
+    })
+})

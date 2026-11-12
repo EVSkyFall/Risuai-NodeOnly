@@ -1056,3 +1056,20 @@ describe('round 2 RPC relay regressions', () => {
         expect((harness.host as any).pendingCallbacks.size).toBe(0);
     });
 });
+
+describe('replacer callback arguments', () => {
+    test('a guest beforeRequest replacer receives the third argument the host passes, meta or undefined', async () => {
+        let registered: ((...args: any[]) => Promise<any>) | undefined;
+        const harness = hostHarness({ ...initialization, addRisuReplacer: async (_name: string, fn: any) => { registered = fn; } });
+        const guest = await harness.guest();
+        const calls: any[][] = [];
+        await guest.api.addRisuReplacer('beforeRequest', (...args: any[]) => { calls.push(args); return args[0]; });
+        const messages = [{ role: 'user', content: 'hello' }];
+        const meta = { lorebook: { placed: true, entries: [{ role: 'system', content: 'lore', constant: true }] } };
+        await expect(registered!(messages, 'model', meta)).resolves.toEqual(messages);
+        await registered!(messages, 'model', undefined);
+        expect(calls[0]).toEqual([messages, 'model', meta]);
+        expect(calls[1]).toHaveLength(3);
+        expect(calls[1][2]).toBeUndefined();
+    });
+});

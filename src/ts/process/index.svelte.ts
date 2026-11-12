@@ -11,6 +11,7 @@ import { loadLoreBookV3Prompt } from "./lorebook.svelte";
 import { findCharacterbyId, getAuthorNoteDefaultText, getPersonaPrompt, getUserName, isLastCharPunctuation, trimUntilPunctuation, parseToggleSyntax, prebuiltAssetCommand } from "../util";
 import { requestChatData } from "./request/request";
 import { commitMainRequestSnapshot, type MainRequestSnapshot } from "./request/requestReplay";
+import { buildBeforeRequestMeta, isLorebookSlotPlaced, isNormalLoreActive, type BeforeRequestMeta } from "./request/beforeRequestMeta";
 import { stableDiff } from "./stableDiff";
 import { armStreamingScriptCircuit, disarmStreamingScriptCircuit, isStreamingScriptTripped, processScript, processScriptFull, risuChatParser, STREAM_SCRIPT_BUDGET_MS, tripStreamingScriptCircuit } from "./scripts";
 import { exampleMessage } from "./exampleMessages";
@@ -413,6 +414,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     let biases:[string,number][] = []
     let inputTokens = 0
     let outputTokens:number
+    let beforeRequestMeta:BeforeRequestMeta|undefined
 
     if(!arg.replayRequest){
     setGenerationStage(genKey, 1)
@@ -590,9 +592,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         return result
     }
 
-    const normalActives = lorepmt.actives.filter(v => {
-        return v.pos === '' && v.inject === null
-    })
+    const normalActives = lorepmt.actives.filter(isNormalLoreActive)
     console.log(normalActives)
 
     for(const lorebook of normalActives){
@@ -601,6 +601,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             content: risuChatParser(resolvePosition(lorebook.prompt), {chara: currentChar})
         })
     }
+    // Copied now: prompt assembly later merges into and trims these objects in place.
+    const pushedLorebook = unformated.lorebook.map((m) => ({ role: m.role, content: m.content }))
 
     const descActives = lorepmt.actives.filter(v => {
         return v.pos === 'after_desc' || v.pos === 'before_desc' || v.pos === 'personality' || v.pos === 'scenario'
@@ -1493,6 +1495,12 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
     }
 
+    try {
+        beforeRequestMeta = buildBeforeRequestMeta(lorepmt.actives, pushedLorebook, isLorebookSlotPlaced(promptTemplate, formatOrder))
+    } catch (e) {
+        console.warn('[plugin] could not build the beforeRequest meta — passing undefined:', e)
+    }
+
 
     formated = formated.map((v) => {
         v.content = v.content.trim()
@@ -1667,6 +1675,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         replayStaticModel: arg.replayRequest?.staticModel,
         replayTools: arg.replayRequest?.tools,
         generationInfo,
+        beforeRequestMeta,
     }, 'model', abortSignal)), abortSignal)
 
     // Commit the staged replay snapshot only for responses that will actually

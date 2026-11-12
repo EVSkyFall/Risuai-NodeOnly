@@ -275,6 +275,7 @@ export async function loadLoreBookV3Prompt(){
             param:string
             lore:boolean
         }|null
+        constant:boolean
     }[] = []
     let activatedIndexes:number[] = []
     let disabledUIPrompts:string[] = []
@@ -606,7 +607,8 @@ export async function loadLoreBookV3Prompt(){
                     tokens: await tokenize(risuChatParser(content, {chara: char})),
                     priority: priority,
                     source: fullLore[i].comment || `lorebook ${i}`,
-                    inject: inject ?? null
+                    inject: inject ?? null,
+                    constant: !!fullLore[i].alwaysActive,
                 })
                 activatedIndexes.push(i)
 

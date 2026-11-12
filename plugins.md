@@ -893,6 +893,23 @@ Risuai.addRisuReplacer('afterRequest', async (content, type) => {
 Risuai.removeRisuReplacer('beforeRequest', replacerFunction);
 ```
 
+**Lorebook hand-off (`beforeRequest` third argument):** a `beforeRequest` replacer is called as `(messages, type, meta)`. On the chat turn's main model request (including its retries and fallback models, continue and regenerate) `meta` carries the ordinary lorebook entries RisuAI activated for that turn; on every other request (emotion, translation, memory/summary, sub-model utilities, requests started by plugins or scripts) it is `undefined`. Each replacer gets its own copy, so changing it affects nobody else.
+
+```typescript
+type BeforeRequestMeta = {
+  lorebook?: {
+    placed: boolean   // the prompt has a lorebook slot (template card `lorebook`, or `lorebook` in the legacy format order)
+    entries: {        // activated entries without a position, depth or inject decorator, rendered, in prompt order
+      role: string
+      content: string
+      constant: boolean  // true: always-active entry; false: activated another way (key match, @@activate, ...)
+    }[]
+  }
+}
+```
+
+When `placed` is `true` RisuAI already placed the entries into the prompt (possibly merged with neighbouring system messages); when it is `false` the prompt has no lorebook slot and the entries appear nowhere in it. A replacer that ignores the third argument behaves exactly as before.
+
 ### Asset Management
 
 ```javascript
