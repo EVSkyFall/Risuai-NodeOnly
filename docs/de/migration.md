@@ -26,7 +26,7 @@ Es gibt vier Möglichkeiten, Daten von einer bestehenden RisuAI-Installation (We
 Der PocketRisu-Server lädt die im Konto von Web-RisuAI (risuai.xyz) gespeicherten Daten direkt von RisuAI herunter. Übertragen werden die Charaktere, Chats, Einstellungen und Bilder des Kontos.
 
 1. **In Web-RisuAI** (falls Sie die Kontosynchronisierung noch nicht nutzen): Melden Sie sich unter Einstellungen > Konto & Daten an und aktivieren Sie "Daten im Konto speichern". Wenn eine Auswahl erscheint, wählen Sie "Aktuelle Daten im Konto speichern" und geben Sie zur Bestätigung `RISUAI` ein. Ihre aktuellen Daten werden dann ins Konto hochgeladen.
-2. **In PocketRisu**: Unter Einstellungen > Datenmigration > "Aus RisuAI-Konto importieren" den Nutzungsbedingungen von RisuAI zustimmen und anmelden.
+2. **In PocketRisu**: Unter Einstellungen > Datenmigration > "Aus RisuAI-Konto importieren" anmelden.
 3. Anzahl der Charaktere, Chats und Bilder sowie die geschätzte Dauer prüfen und auf "Import starten" klicken.
 4. Bis zum Ende zeigt PocketRisu nur den Importbildschirm. Danach werden die Daten ersetzt und die Seite lädt automatisch neu.
 

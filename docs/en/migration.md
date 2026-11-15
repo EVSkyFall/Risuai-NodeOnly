@@ -24,7 +24,7 @@ There are four ways to migrate data from an existing RisuAI installation (Web Ri
 The PocketRisu server downloads the data saved in your web RisuAI (risuai.xyz) account directly from RisuAI. It moves the characters, chats, settings and images in the account.
 
 1. **In web RisuAI** (if you have not been using account sync): log in under Settings > Account & Files and turn on "Save Data in Account". If a choice appears, pick "Save Current Data to Account", then type `RISUAI` in the confirmation box. Your current data is uploaded to the account.
-2. **In PocketRisu**: Settings > Data Migration > "Import from RisuAI account", accept RisuAI's Terms of Service and log in.
+2. **In PocketRisu**: Settings > Data Migration > "Import from RisuAI account" and log in.
 3. Check the number of characters, chats and images and the estimated time, then press "Start import".
 4. Until it ends, PocketRisu shows only the import screen. When it ends, your data is replaced and the page reloads by itself.
 

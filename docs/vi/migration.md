@@ -26,7 +26,7 @@ Có bốn cách để di chuyển dữ liệu từ cài đặt RisuAI hiện có
 Máy chủ PocketRisu tải trực tiếp từ RisuAI dữ liệu được lưu trong tài khoản RisuAI web (risuai.xyz). Nhân vật, cuộc trò chuyện, cài đặt và hình ảnh trong tài khoản sẽ được chuyển sang.
 
 1. **Trên RisuAI web** (nếu chưa dùng đồng bộ tài khoản): đăng nhập ở Cài đặt > Tài khoản & Các tập tin rồi bật "Lưu dữ liệu trong tài khoản". Khi hộp chọn hiện ra, chọn "Lưu dữ liệu hiện tại vào tài khoản" và nhập `RISUAI` vào ô xác nhận. Dữ liệu hiện tại sẽ được tải lên tài khoản.
-2. **Trong PocketRisu**: tại Cài đặt > Di chuyển dữ liệu > "Nhập từ tài khoản RisuAI", đồng ý với điều khoản dịch vụ của RisuAI rồi đăng nhập.
+2. **Trong PocketRisu**: tại Cài đặt > Di chuyển dữ liệu > "Nhập từ tài khoản RisuAI", đăng nhập.
 3. Kiểm tra số nhân vật, cuộc trò chuyện, hình ảnh và thời gian dự kiến, rồi bấm "Bắt đầu nhập".
 4. Cho đến khi xong, PocketRisu chỉ hiển thị màn hình nhập. Khi xong, dữ liệu được thay thế và trang tự tải lại.
 
