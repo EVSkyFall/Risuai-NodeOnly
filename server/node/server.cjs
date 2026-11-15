@@ -36,7 +36,7 @@ const {
     MUTATING_OPS: PLUGIN_ATOMIC_MUTATING_OPS,
     BACKUP_ENTRY_NAME: PLUGIN_ATOMIC_BACKUP_ENTRY_NAME,
 } = require('./pluginAtomicStore.cjs');
-const { preparePluginStorageImport, writePluginStorageRescue } = require('./pluginStorageSafety.cjs');
+const { PLUGIN_STORAGE_PREFIXES, preparePluginStorageImport, writePluginStorageRescue } = require('./pluginStorageSafety.cjs');
 const {
     addLogBatch, queryLogs, clearLogs, countLogs,
     logger, installProcessHandlers, expressErrorMiddleware,
@@ -1591,11 +1591,14 @@ const ACCOUNT_IMPORT_OPEN_ROUTES = new Set([
     '/api/proxy/copilot-chat', '/api/model-preset/google-service-account/token',
 ]);
 function changesDataDuringAccountImport(req) {
-    if (!req.path.startsWith('/api/')) return false;
-    if (req.path === '/api/remove') return true;
+    // Express matches routes case-insensitively and with or without a
+    // trailing slash; compare the same way so no spelling slips past.
+    const route = req.path.toLowerCase().replace(/\/+$/, '');
+    if (!route.startsWith('/api/')) return false;
+    if (route === '/api/remove') return true;
     if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return false;
-    if (req.path.startsWith('/api/risu-account/') || ACCOUNT_IMPORT_OPEN_ROUTES.has(req.path)) return false;
-    return !(req.path.startsWith('/api/mcp/') && /\/(get|list)$/.test(req.path));
+    if (route.startsWith('/api/risu-account/') || ACCOUNT_IMPORT_OPEN_ROUTES.has(route)) return false;
+    return !(route.startsWith('/api/mcp/') && /\/(get|list)$/.test(route));
 }
 app.use((req, res, next) => {
     if (!changesDataDuringAccountImport(req) || !risuAccountImport.isBlocking()) return next();
@@ -3246,6 +3249,14 @@ async function importBackupFromSourceUnlocked(dataSource, { maxBytes = 0, totalB
     const REPLACED_PREFIXES = ['assets/', 'inlay/', 'inlay_thumb/', 'inlay_meta/', 'inlay_info/', 'coldstorage/', 'drafts/', 'remotes/'];
     const importedKeys = new Set();
     const createdKeys = new Set();
+    // Plugin storage is not content-addressed: a backup value under an
+    // existing key really replaces it. Its rows are written as they arrive
+    // (and may commit with a batch), so each overwritten row is copied to
+    // PLUGIN_IMPORT_STASH_PREFIX first and put back if the import fails;
+    // rows the backup does not bring go only in the final transaction.
+    const PLUGIN_IMPORT_STASH_PREFIX = 'import-stash/plugin/';
+    const pluginImportedKeys = new Set();
+    const stashedPluginKeys = new Set();
 
     const stagingDir = path.join(savePath, 'inlays_import_staging');
     const backupInlayDir = path.join(savePath, 'inlays_import_backup');
@@ -3303,8 +3314,11 @@ async function importBackupFromSourceUnlocked(dataSource, { maxBytes = 0, totalB
     // Assets live in the asset file store, outside kv: the ones already
     // there are listed now so a failed import removes only what it added.
     const assetKeysBefore = new Set((await assetFileStore.list()).map((row) => row.key));
+    for (const key of kvList(PLUGIN_IMPORT_STASH_PREFIX)) kvDel(key);
     // Applied in the final transaction, after plugin_atomic is wiped there.
-    let pluginAtomicRows = null;
+    // Kept as { rows } so a present entry is imported (and validated) even
+    // when its payload is null, false or 0.
+    let pluginAtomicEntry = null;
 
     sqliteDb.exec('BEGIN');
 
@@ -3409,15 +3423,25 @@ async function importBackupFromSourceUnlocked(dataSource, { maxBytes = 0, totalB
                     // restore the record revisions are authoritative, so a
                     // replayed operationKey resolves to a CAS conflict rather
                     // than a double apply.
-                    pluginAtomicRows = JSON.parse(data.toString('utf-8'));
+                    pluginAtomicEntry = { rows: JSON.parse(data.toString('utf-8')) };
                 } else {
                     const storageKey = resolveBackupStorageKey(name);
+                    // Takes the rescue dump at the first plugin entry; the
+                    // wipe itself waits for the end of the stream (below).
                     pluginWipeDone = await preparePluginStorageImport({
                         storageKey,
                         pluginWipeDone,
                         dumpPluginStorageRescue,
-                        kvDelPrefix,
+                        kvDelPrefix: () => {},
                     });
+                    if (PLUGIN_STORAGE_PREFIXES.some((prefix) => storageKey.startsWith(prefix))) {
+                        if (kvGetUpdatedAt(storageKey) === null) createdKeys.add(storageKey);
+                        else if (!stashedPluginKeys.has(storageKey)) {
+                            kvCopyValue(storageKey, PLUGIN_IMPORT_STASH_PREFIX + storageKey);
+                            stashedPluginKeys.add(storageKey);
+                        }
+                        pluginImportedKeys.add(storageKey);
+                    }
                     let storageValue = storageKey.startsWith('coldstorage/')
                         ? encodeColdStorageCanonicalBuffer(
                             parseColdStorageJsonBuffer(data, name, { allowPlainJson: true }).coldData
@@ -3480,6 +3504,16 @@ async function importBackupFromSourceUnlocked(dataSource, { maxBytes = 0, totalB
         // left /api/read failing with 500 on every boot — infinite loading
         // with no way back from the UI.
         await assertBackupDatabaseDecodable(pendingDatabase);
+        // The backup carried plugin storage: it becomes what the backup
+        // brought. Before the legacy values below move into kv, so those
+        // are not deleted with the old rows.
+        if (pluginWipeDone) {
+            for (const prefix of PLUGIN_STORAGE_PREFIXES) {
+                for (const key of kvList(prefix)) {
+                    if (!pluginImportedKeys.has(key)) kvDel(key);
+                }
+            }
+        }
         const importedDb = await decodeRisuSave(pendingDatabase, { extractPluginStorage: true });
         const importPluginRestore = restoreColdPluginStorageInDb(importedDb);
         if (importPluginRestore) {
@@ -3545,9 +3579,10 @@ async function importBackupFromSourceUnlocked(dataSource, { maxBytes = 0, totalB
         // instead of silently resuming. better-sqlite3 turns the store's
         // nested db.transaction into a SAVEPOINT of this transaction.
         pluginAtomic.purgeForRestore();
-        if (pluginAtomicRows) pluginAtomic.importRows(pluginAtomicRows);
+        if (pluginAtomicEntry) pluginAtomic.importRows(pluginAtomicEntry.rows);
         comfyOrchestrator.purgeForWorldReplacement();
         clearEntities();
+        for (const key of kvList(PLUGIN_IMPORT_STASH_PREFIX)) kvDel(key);
         sqliteDb.exec('COMMIT');
     } catch (error) {
         try { sqliteDb.exec('ROLLBACK'); } catch (_) {}
@@ -3564,9 +3599,25 @@ async function importBackupFromSourceUnlocked(dataSource, { maxBytes = 0, totalB
                 logger.error(`[Backup Import] Could not remove ${createdKeys.size} row(s) of the failed import:`, cleanupError);
             }
         }
+        // A stash row exists only where its overwrite was committed with an
+        // earlier batch; one rolled back with the last batch left the
+        // original in place.
+        if (stashedPluginKeys.size > 0) {
+            try {
+                sqliteDb.transaction(() => {
+                    for (const key of stashedPluginKeys) {
+                        const stashKey = PLUGIN_IMPORT_STASH_PREFIX + key;
+                        if (kvGetUpdatedAt(stashKey) === null) continue;
+                        kvCopyValue(stashKey, key);
+                        kvDel(stashKey);
+                    }
+                })();
+            } catch (restoreError) {
+                logger.error(`[Backup Import] Could not put back ${stashedPluginKeys.size} plugin storage row(s) of the failed import (the rescue dump in backups/ has them):`, restoreError);
+            }
+        }
         await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => {});
         await fs.rm(backupInlayDir, { recursive: true, force: true }).catch(() => {});
-        if (pluginWipeDone) error.message = `${error.message} Plugin data may have been partially replaced.`;
         throw error;
     } finally {
         sqliteDb.pragma('synchronous = NORMAL');

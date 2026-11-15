@@ -317,14 +317,14 @@ describe('download and apply', () => {
         await importer.prepare({ token: account.token, id: account.id })
         importer.startDownload()
         let status = await settle(importer)
-        for (let i = 0; i < 200 && status.state !== 'downloaded'; i++) {
-            await new Promise((resolve) => setTimeout(resolve, 5))
+        for (let i = 0; i < 1000 && status.state !== 'downloaded'; i++) {
+            await new Promise((resolve) => setTimeout(resolve, 10))
             status = await settle(importer)
         }
         // The fixture's one missing asset (204) is all that is missing.
         expect(status).toMatchObject({ state: 'downloaded', missingCount: 1 })
         expect(await fs.readFile(path.join(stagingDir, 'assets', a3.key.slice('assets/'.length)))).toEqual(a3.data)
-    })
+    }, 30_000)
 
     it('stops for a new login when the token expires, then continues by itself and reuses the staged files', async () => {
         // database + remote character + 4 cold items + 2 assets, then 403

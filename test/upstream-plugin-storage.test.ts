@@ -77,11 +77,19 @@ describe('resolveUpstreamPluginStorage (unit)', () => {
         expect(r.record.failedEntries).toEqual([{ k: 'lost', l: BIG }, { k: 'broken', l: 'unreadable' }])
     })
 
+    // NodeOnly tolerates unknown versions (Build for Abandonment): an index of a
+    // later version is read through the fields this code knows.
+    test('an index of an unknown version is read through the known fields and its version recorded', () => {
+        const r = resolve({ [INDEX_KEY]: IDX }, { [IDX]: { type: INDEX_TYPE, version: 2, entries: [{ k: 'kept', s: '"value"' }], extra: true } })
+        expect(Object.fromEntries(r.values)).toEqual({ kept: 'value' })
+        expect(r.failed).toBe(0)
+        expect(r.record).toMatchObject({ pointer: IDX, indexVersion: 2, trashCount: 0 })
+    })
+
     test('an unusable index is reported without throwing, legacy keys still restore', () => {
         const cases: Array<[unknown, string]> = [
             [undefined, 'index item not found'],
             [{ type: 'something-else', version: 1, entries: [], trash: [] }, 'not a plugin storage index'],
-            [{ type: INDEX_TYPE, version: 2, entries: [], trash: [] }, 'unsupported index version 2'],
             [{ type: INDEX_TYPE, version: 1, entries: {}, trash: [] }, 'malformed index'],
         ]
         for (const [item, error] of cases) {

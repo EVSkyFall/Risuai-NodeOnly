@@ -42,14 +42,14 @@ function hasReservedKeys(storage) {
     return isPlainObject(storage) && RESERVED_KEYS.some((key) => hasOwn(storage, key));
 }
 
-// Throws when the index item is missing or not a layout this code knows, so
-// an unknown future version is reported instead of being half-read.
+// Throws when the index item is missing or its entries do not have the known
+// shape. A version this code does not know is still read through the fields
+// it knows (entries of k + s/l); the caller records the version it saw.
 function readIndexEntries(pointer, readCold) {
     const index = readCold(pointer);
     if (index === undefined) throw new Error('index item not found');
     if (!isPlainObject(index) || index.type !== INDEX_TYPE) throw new Error('not a plugin storage index');
-    if (index.version !== INDEX_VERSION) throw new Error(`unsupported index version ${index.version}`);
-    if (!Array.isArray(index.entries) || !Array.isArray(index.trash)) throw new Error('malformed index');
+    if (!Array.isArray(index.entries)) throw new Error('malformed index');
     const entries = new Map();
     for (const entry of index.entries) {
         if (typeof entry?.k !== 'string') continue;
@@ -58,7 +58,7 @@ function readIndexEntries(pointer, readCold) {
         if (typeof entry.l === 'string') entries.set(entry.k, { large: entry.l });
         else if (typeof entry.s === 'string') entries.set(entry.k, { json: entry.s });
     }
-    return { entries, trashCount: index.trash.length };
+    return { entries, trashCount: Array.isArray(index.trash) ? index.trash.length : 0, version: index.version };
 }
 
 function sample(keys) {
@@ -100,6 +100,7 @@ function resolveUpstreamPluginStorage(storage, { readCold, isPresent, source }) 
                 const read = readIndexEntries(pointer, readCold);
                 indexEntries = read.entries;
                 record.trashCount = read.trashCount;
+                if (read.version !== INDEX_VERSION) record.indexVersion = read.version;
             } catch (err) {
                 record.pointerError = String(err?.message || err);
                 failed++;

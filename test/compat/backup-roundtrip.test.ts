@@ -732,6 +732,58 @@ describe('malformed import safety', () => {
 
     expect(fingerprintAssets(await client.exportBackup())).toEqual(fingerprintAssets(next))
   })
+
+  // Plugin values are not content-addressed: an overwritten key really changes.
+  // Rows written before the first batch commit must be put back on rejection.
+  const pluginRow = (key: string) => `plugin-custom-storage/${Buffer.from(key, 'utf-8').toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')}.json`
+  const pluginEntry = (key: string, value: unknown) => ({ name: pluginRow(key), data: Buffer.from(JSON.stringify(value)) })
+  async function readPlugin(client: Awaited<ReturnType<typeof createClient>>, key: string) {
+    const res = await client.fetch('/api/read', { headers: { 'file-path': Buffer.from(pluginRow(key), 'utf-8').toString('hex') } })
+    const text = res.status === 200 ? await res.text() : ''
+    return text ? JSON.parse(text) : null
+  }
+
+  test('a backup rejected after the first batch keeps the existing plugin storage', async () => {
+    const srv = await spawnServer()
+    servers.push(srv)
+    const client = await createClient(srv.port, srv.password)
+
+    expect((await client.importBackup(Buffer.concat([
+      encodeBackup([pluginEntry('kept', 'original'), pluginEntry('untouched', 'stays')]),
+      createSeedBackup({ characterCount: 1 }),
+    ]))).ok).toBe(true)
+    expect(await readPlugin(client, 'kept')).toBe('original')
+
+    const bulk = Array.from({ length: 5_100 }, (_, i) => ({ name: `bulk-${i}.png`, data: Buffer.from(`bulk-${i}`) }))
+    const rejected = Buffer.concat([
+      encodeBackup([pluginEntry('kept', 'replaced'), pluginEntry('added', 'new'), ...bulk, { name: 'bulk-0.png', data: Buffer.from('again') }]),
+      createSeedBackup({ characterCount: 1 }),
+    ])
+    const result = await importViaNdjson(client, rejected).catch(() => null)
+    expect(result?.done).toBeUndefined()
+
+    expect(await readPlugin(client, 'kept')).toBe('original')
+    expect(await readPlugin(client, 'untouched')).toBe('stays')
+    expect(await readPlugin(client, 'added')).toBeNull()
+  }, 60000)
+
+  test('an accepted backup with plugin storage replaces it wholesale', async () => {
+    const srv = await spawnServer()
+    servers.push(srv)
+    const client = await createClient(srv.port, srv.password)
+
+    await client.importBackup(Buffer.concat([
+      encodeBackup([pluginEntry('kept', 'original'), pluginEntry('dropped', 'old')]),
+      createSeedBackup({ characterCount: 1 }),
+    ]))
+    expect((await client.importBackup(Buffer.concat([
+      encodeBackup([pluginEntry('kept', 'replaced')]),
+      createSeedBackup({ characterCount: 1 }),
+    ]))).ok).toBe(true)
+
+    expect(await readPlugin(client, 'kept')).toBe('replaced')
+    expect(await readPlugin(client, 'dropped')).toBeNull()
+  })
 })
 
 // ─── Unreadable database payloads ───────────────────────────────────────────

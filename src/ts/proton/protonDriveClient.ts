@@ -40,11 +40,14 @@ async function request(
     } else if (req.body) {
         body = new Uint8Array(await new Response(req.body).arrayBuffer())
     }
-    const signals = [signal, req.signal, AbortSignal.timeout(req.timeoutMs)].filter((s): s is AbortSignal => !!s)
+    // req.timeoutMs (30 s for API calls, 10 min per block) is not applied:
+    // a slow request that would finish must not be cut off (fork policy, no
+    // timeouts). A dead link still ends in a network error, which the SDK
+    // retries; the import's own signal cancels.
+    const signals = [signal, req.signal].filter((s): s is AbortSignal => !!s)
     return fetchViaProxy2(req.url, headers, body, {
         method: req.method,
         signal: anySignal(signals),
-        requestTimeoutMs: req.timeoutMs,
     })
 }
 

@@ -331,13 +331,16 @@ function createRisuAccountImport({
             }
             const retryable = failure || badContent || result.status === 429 || result.status >= 500;
             if (!retryable) return result;
+            const retryAfterMs = parseRetryAfter(result?.headers?.get('retry-after'));
             if (attempt >= retryDelaysMs.length) {
                 if (badContent) return { ...result, unreadable: true };
                 const reason = failure ? redact(failure.message || String(failure)) : `HTTP ${result.status}`;
-                throw new AccountImportError(`RisuAI account request failed (${label}): ${reason}`, 'ACCOUNT_REQUEST_FAILED', 424);
+                const failedError = new AccountImportError(`RisuAI account request failed (${label}): ${reason}`, 'ACCOUNT_REQUEST_FAILED', 424);
+                // The paused download waits at least this long before it resumes.
+                if (retryAfterMs !== null) failedError.retryAfterMs = retryAfterMs;
+                throw failedError;
             }
             let delay = retryDelaysMs[attempt];
-            const retryAfterMs = parseRetryAfter(result?.headers?.get('retry-after'));
             if (retryAfterMs !== null) {
                 // Asking earlier than the server said would only add load.
                 if (retryAfterMs > maxRetryAfterMs) {
