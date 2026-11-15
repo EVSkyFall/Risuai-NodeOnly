@@ -49,6 +49,19 @@ const REMOTE_CHARACTER_TYPES = new Set([2, 7]); // CHARACTER_WITH_CHAT, CHARACTE
 const MAX_COLD_ITEM_BYTES = 512 * 1024 * 1024;
 // Free space left for the live database while downloading.
 const DISK_RESERVE_BYTES = 256 * 1024 * 1024;
+// setTimeout fires at once for a delay past this (Node's timer range); a
+// longer wait is slept in parts of at most this long.
+const MAX_TIMER_MS = 2_147_483_647;
+
+function sleepLong(ms) {
+    return new Promise((resolve) => {
+        const step = (left) => {
+            if (left > MAX_TIMER_MS) setTimeout(() => step(left - MAX_TIMER_MS), MAX_TIMER_MS);
+            else setTimeout(resolve, left);
+        };
+        step(ms);
+    });
+}
 
 // Failures caused by the account server use 4xx statuses: the client retries
 // 502-504 on its own, and a proxy in front may replace a 5xx body.
@@ -184,7 +197,7 @@ function createRisuAccountImport({
     retryDelaysMs = [2000, 5000, 15000],
     // Waits before a paused download starts again by itself; the last repeats.
     resumeDelaysMs = [30_000, 60_000, 120_000, 300_000, 600_000],
-    sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    sleep = sleepLong,
     checkDiskSpace = null,
     // async (entries, { totalBytes, onProgress }) => result; without it the
     // import stops at downloaded.
@@ -767,16 +780,25 @@ function createRisuAccountImport({
         clearTimeout(resumeTimer);
         const delay = Math.max(resumeDelaysMs[Math.min(pauseStreak, resumeDelaysMs.length - 1)], waitAtLeastMs);
         pauseStreak += 1;
-        // setTimeout fires at once for a delay past 2^31-1 ms.
+        armResume(pausedJob, delay);
+    }
+
+    // A wait past the timer range runs in parts; each part checks again that
+    // the same job is still paused.
+    function armResume(pausedJob, remaining) {
         resumeTimer = setTimeout(() => {
             resumeTimer = null;
             if (state !== 'paused' || job !== pausedJob) return;
+            if (remaining > MAX_TIMER_MS) {
+                armResume(pausedJob, remaining - MAX_TIMER_MS);
+                return;
+            }
             try {
                 startDownload();
             } catch (error) {
                 logger.warn?.(`[AccountImport] Could not resume by itself: ${errorInfo(error).message}`);
             }
-        }, Math.min(delay, 2_147_483_647));
+        }, Math.min(remaining, MAX_TIMER_MS));
         resumeTimer.unref?.();
     }
 
@@ -972,4 +994,5 @@ module.exports = {
     listPluginIndexColdKeys,
     parseColdItem,
     encodeBackupEntry,
+    sleepLong,
 };

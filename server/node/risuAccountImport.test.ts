@@ -649,3 +649,22 @@ describe('download and apply', () => {
         await expect(fs.access(stagingDir)).rejects.toThrow()
     })
 })
+
+describe('long waits', () => {
+    it('sleeps past the timer range in parts instead of firing at once', async () => {
+        vi.useFakeTimers()
+        try {
+            const max = 2_147_483_647
+            let done = false
+            void accountImport.sleepLong(max * 2 + 5).then(() => { done = true })
+            await vi.advanceTimersByTimeAsync(1)
+            expect(done).toBe(false)
+            await vi.advanceTimersByTimeAsync(max)
+            expect(done).toBe(false)
+            await vi.advanceTimersByTimeAsync(max + 4)
+            expect(done).toBe(true)
+        } finally {
+            vi.useRealTimers()
+        }
+    })
+})
