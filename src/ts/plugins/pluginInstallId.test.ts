@@ -3,6 +3,7 @@ import {
     INSTALL_ID_PATTERN,
     backfillInstallIds,
     commitImportedPlugin,
+    installIdViaPlugin,
     isValidInstallId,
     newInstallId,
     preserveInstallId,
@@ -59,6 +60,21 @@ describe('preserveInstallId', () => {
         const next = mk('p', 'v2', keep)
         preserveInstallId(next, null)
         expect(next.installId).toBe(keep)
+    })
+})
+
+describe('installIdViaPlugin', () => {
+    it('ignores the caller-supplied id and keeps the installed one on a replacement', () => {
+        const installed = mk('Foo', 'old', newInstallId())
+        const forged = newInstallId()
+        expect(installIdViaPlugin(mk('Foo', 'new', forged), installed)).toBe(installed.installId)
+    })
+
+    it('mints a fresh id for a new install, never the caller-supplied one', () => {
+        const forged = newInstallId()
+        const id = installIdViaPlugin(mk('Bar', 'new', forged), undefined)
+        expect(isValidInstallId(id)).toBe(true)
+        expect(id).not.toBe(forged)
     })
 })
 

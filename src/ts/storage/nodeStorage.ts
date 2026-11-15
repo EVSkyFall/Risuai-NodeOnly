@@ -737,6 +737,12 @@ export class NodeStorage{
                 conflictError: typeof data.error === 'string' ? data.error : undefined,
             }
         }
+        if (da.status === 423) {
+            // A started RisuAI account import refuses every write; the full
+            // write it would fall back to (a whole-database encode) is
+            // refused the same way, so fail the save attempt instead.
+            throw await this.storageRequestError('patchItem', da)
+        }
         if (da.status < 200 || da.status >= 300) {
             // Surface the server's error detail — without this the browser
             // console shows nothing while every save silently falls back to

@@ -16,7 +16,7 @@ import * as pluginStorageStore from "./pluginStorageStore";
 import { PLUGIN_CUSTOM_STORAGE_KEY, applyPluginDbKey, installApprovedPlugins, pluginCustomStorageProxy } from "./pluginDbProxy";
 import { hydratePluginCharacterSnapshotSync, restorePluginCharacterManifest, restorePluginDbKey } from './pluginCharacterSnapshot';
 import { pluginBlobKv } from "./pluginKvStorage";
-import { backfillInstallIds, commitImportedPlugin, newInstallId } from "./pluginInstallId";
+import { backfillInstallIds, commitImportedPlugin, installIdViaPlugin } from "./pluginInstallId";
 
 export const customProviderStore = writable([] as string[])
 
@@ -1110,11 +1110,10 @@ export async function handlePluginInstallViaPlugin(plugins: RisuPlugin[]){
             const message = replacing ? language.confirmReplacePluginViaPlugin : language.confirmInstallPluginViaPlugin
             const confirmation = await alertConfirm(message.replace('{plugin}', plugin.name))
             if(confirmation){
-                // The plugin object comes from ANOTHER plugin's sandbox, so any
-                // installId on it is caller-supplied and must never be honoured
-                // — it could name an existing installation's namespace. Mint a
-                // fresh one unconditionally.
-                trimmedPlugins.push({ ...plugin, installId: newInstallId() })
+                // Never the caller-supplied installId; a replacement keeps the
+                // one of the installation it updates (installIdViaPlugin).
+                const installed = DBState.db.plugins.find((p: RisuPlugin) => p.name === plugin.name)
+                trimmedPlugins.push({ ...plugin, installId: installIdViaPlugin(plugin, installed) })
             }
         }
         else{

@@ -551,14 +551,26 @@ describe('download and apply', () => {
         expect(accountImport.parseColdItem(await fs.readFile(path.join(stagingDir, 'cold', coldChatId)))).toBeNull()
     })
 
-    it('pauses instead of asking again early when the server wants a long wait', async () => {
+    // NodeOnly has no cap on Retry-After (no time limits): the import waits as
+    // long as the server asks instead of stopping.
+    it('waits as long as the server asks before asking again, however long', async () => {
         const [a1] = account.expected.assets
         account.faults.push({ key: a1.key, status: 429, times: 1, headers: { 'retry-after': '3600' } })
-        const importer = createImport()
+        const pauses: number[] = []
+        const importer = createImport({ sleep: async (ms: number) => { pauses.push(ms) } })
         await importer.prepare({ token: account.token, id: account.id })
         importer.startDownload()
-        expect(await settle(importer)).toMatchObject({ state: 'paused', error: { code: 'ACCOUNT_RATE_LIMITED' } })
-        expect(account.log.filter((entry) => entry.key === a1.key)).toHaveLength(1)
+        expect((await settle(importer)).state).toBe('downloaded')
+        expect(Math.max(...pauses)).toBeGreaterThanOrEqual(3_600_000)
+        expect(account.log.filter((entry) => entry.key === a1.key)).toHaveLength(2)
+    })
+
+    it('waits for a long Retry-After while checking the account too', async () => {
+        account.faults.push({ key: 'remotes/acc-char-b.local.bin', status: 429, times: 1, headers: { 'retry-after': '90' } })
+        const pauses: number[] = []
+        const { summary } = await createImport({ sleep: async (ms: number) => { pauses.push(ms) } }).prepare({ token: account.token, id: account.id })
+        expect(summary).toMatchObject({ characters: 3, unresolvedRemotes: 0 })
+        expect(Math.max(...pauses)).toBeGreaterThanOrEqual(90_000)
     })
 
     it('waits for a Retry-After given as a date', async () => {

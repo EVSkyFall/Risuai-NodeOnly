@@ -158,7 +158,8 @@ function resolveUpstreamPluginStorage(storage, { readCold, isPresent, source }) 
                     value = undefined;
                 }
                 if (value === undefined) {
-                    legacyFailed[key] = id;
+                    // defineProperty keeps a "__proto__" key an own entry.
+                    Object.defineProperty(legacyFailed, key, { value: id, enumerable: true, writable: true, configurable: true });
                     failed++;
                     continue;
                 }

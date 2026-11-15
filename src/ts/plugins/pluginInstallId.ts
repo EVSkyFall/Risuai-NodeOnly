@@ -48,6 +48,18 @@ export function preserveInstallId<T extends PluginInstallIdentity>(next: T, prev
 }
 
 /**
+ * installId for a plugin that another plugin installs through setDatabase().
+ * The incoming object comes from that plugin's sandbox, so an installId on it
+ * is never honoured: it could name another installation's namespace. Replacing
+ * an installed plugin of the same name is an update of that installation and
+ * keeps the id the host minted for it (as an OTA update or a file import does),
+ * so its durable storage carries over; a new install gets a fresh id.
+ */
+export function installIdViaPlugin(incoming: PluginInstallIdentity, installed?: PluginInstallIdentity | null): string {
+    return preserveInstallId({ name: incoming.name, installId: undefined }, installed).installId!
+}
+
+/**
  * One-time backfill for installations that predate this field. Idempotent, and
  * never reorders or otherwise disturbs the list. Returns how many ids were
  * assigned so callers can skip persisting when there was nothing to do.

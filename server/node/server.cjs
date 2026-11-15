@@ -6854,6 +6854,9 @@ async function applyRisuAccountEntries(entries, { totalBytes, onProgress }) {
         throw new AccountImportError('Another import is already in progress', 'ACCOUNT_IMPORT_BUSY', 409);
     }
     importInProgress = true;
+    // Like the other imports: the background asset migration must not run
+    // inside the import's open transactions.
+    const resumeAssetMigration = assetFileStore.pauseMigration();
     try {
         // Writes accepted before the import started may still wait in the
         // storage queue; they run before the swap, not after it. New ones are
@@ -6866,6 +6869,7 @@ async function applyRisuAccountEntries(entries, { totalBytes, onProgress }) {
         return await importBackupFromSource(entries, { totalBytes, onProgress });
     } finally {
         importInProgress = false;
+        resumeAssetMigration();
     }
 }
 
@@ -7759,12 +7763,15 @@ function clearImportedPluginStorage() {
 
 function finishImportedPluginStorage(database) {
     // Explicit KV payload wins if a legacy blob also contains stale copies.
-    restoreColdPluginStorageInDb(database);
+    const restored = restoreColdPluginStorageInDb(database);
+    if (restored) logPluginStorageRestore('Restored', restored);
     pluginStorage.migrateFromDb(database, { kvWinsOnRemigration: true });
     kvSet('_meta/plugin-storage-migrated', Buffer.from('1'));
     kvSet('_meta/plugin-blob-migrated', Buffer.from('1'));
-    if (database?.pluginCustomStorage && Object.keys(database.pluginCustomStorage).length > 0
-        && !hasRemoteBlocks(kvGet(DB_BLOB_KEY))) {
+    // Also when every value failed: the reserved keys are gone from the
+    // database and the recovery record must reach disk.
+    const hasPluginValues = !!database?.pluginCustomStorage && Object.keys(database.pluginCustomStorage).length > 0;
+    if ((hasPluginValues || restored) && !hasRemoteBlocks(kvGet(DB_BLOB_KEY))) {
         database.pluginCustomStorage = {};
         kvSet(DB_BLOB_KEY, Buffer.from(encodeRisuSaveLegacy(database)));
     }

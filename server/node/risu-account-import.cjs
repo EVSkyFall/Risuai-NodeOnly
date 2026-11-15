@@ -182,7 +182,6 @@ function createRisuAccountImport({
     fetchImpl = (...args) => fetch(...args),
     requestGapMs = 1000,
     retryDelaysMs = [2000, 5000, 15000],
-    maxRetryAfterMs = 60_000,
     // Waits before a paused download starts again by itself; the last repeats.
     resumeDelaysMs = [30_000, 60_000, 120_000, 300_000, 600_000],
     sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
@@ -341,15 +340,10 @@ function createRisuAccountImport({
                 throw failedError;
             }
             let delay = retryDelaysMs[attempt];
-            if (retryAfterMs !== null) {
-                // Asking earlier than the server said would only add load.
-                if (retryAfterMs > maxRetryAfterMs) {
-                    const limited = new AccountImportError(`RisuAI asked to wait ${Math.ceil(retryAfterMs / 60000)} min before more requests`, 'ACCOUNT_RATE_LIMITED', 424);
-                    limited.retryAfterMs = retryAfterMs;
-                    throw limited;
-                }
-                delay = Math.max(delay, retryAfterMs);
-            }
+            // Asking earlier than the server said would only add load; waiting
+            // as long as it asks, however long, keeps the check or download
+            // going (a cancel ends the wait).
+            if (retryAfterMs !== null) delay = Math.max(delay, retryAfterMs);
             logger.warn?.(`[AccountImport] ${label}: ${failure ? 'request error' : badContent ? 'unreadable content' : `HTTP ${result.status}`}, retrying in ${delay}ms`);
             await pauseFor(delay, signal);
         }
