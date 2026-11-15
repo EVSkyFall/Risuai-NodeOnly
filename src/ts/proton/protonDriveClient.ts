@@ -47,7 +47,9 @@ async function request(
     const signals = [signal, req.signal].filter((s): s is AbortSignal => !!s)
     return fetchViaProxy2(req.url, headers, body, {
         method: req.method,
-        signal: anySignal(signals),
+        // One signal needs no combining (and, without AbortSignal.any, no
+        // listener left on the long-lived session signal).
+        signal: signals.length === 1 ? signals[0] : anySignal(signals),
     })
 }
 

@@ -53,8 +53,9 @@ export function anySignal(signals: AbortSignal[]): AbortSignal {
         controller.abort(aborted.reason)
         return controller.signal
     }
-    // Detach from every input once one fires, so a long-lived session signal
-    // doesn't collect a listener per request (each request also has a timeout).
+    // Detach from every input once one fires. Requests carry no timeout, so
+    // until then a long-lived session signal keeps one small listener per
+    // request (only without AbortSignal.any, Safari < 17.4); they go with it.
     const onAbort = (event: Event) => {
         controller.abort((event.target as AbortSignal).reason)
         for (const signal of signals) signal.removeEventListener('abort', onAbort)

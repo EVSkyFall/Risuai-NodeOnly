@@ -53,11 +53,15 @@ const DISK_RESERVE_BYTES = 256 * 1024 * 1024;
 // longer wait is slept in parts of at most this long.
 const MAX_TIMER_MS = 2_147_483_647;
 
+// Unref'd: a wait the import abandoned (a cancel) must not keep the process
+// alive; the server's own listeners do that while it runs.
 function sleepLong(ms) {
     return new Promise((resolve) => {
         const step = (left) => {
-            if (left > MAX_TIMER_MS) setTimeout(() => step(left - MAX_TIMER_MS), MAX_TIMER_MS);
-            else setTimeout(resolve, left);
+            const timer = left > MAX_TIMER_MS
+                ? setTimeout(() => step(left - MAX_TIMER_MS), MAX_TIMER_MS)
+                : setTimeout(resolve, left);
+            timer.unref?.();
         };
         step(ms);
     });
