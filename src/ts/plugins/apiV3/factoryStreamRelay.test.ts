@@ -37,6 +37,8 @@ function captureChannels() {
 function hostHarness(api: any, failPost?: (message: any) => void, Host = SandboxHost) {
     const handlers = new Set<(event: any) => void | Promise<void>>();
     let guestHandler: (event: any) => void;
+    // The guest accepts only messages whose source is its parent window.
+    let guestParent: any = null;
     const guestEvents = new Map<string, () => void>();
     const answers: any[] = [];
     const hostPosts: { message: any, transfer: Transferable[] }[] = [];
@@ -58,7 +60,7 @@ function hostHarness(api: any, failPost?: (message: any) => void, Host = Sandbox
                 failPost?.(message);
                 const received = structuredClone(message, { transfer });
                 answers.push(received);
-                if (guestHandler) queueMicrotask(() => guestHandler({ data: received }));
+                if (guestHandler) queueMicrotask(() => guestHandler({ data: received, source: guestParent }));
             }
         };
     }
@@ -101,6 +103,7 @@ function hostHarness(api: any, failPost?: (message: any) => void, Host = Sandbox
                     }
                 }
             };
+            guestParent = guestWindow.parent;
             const instrumented = script
                 .replace(/function mapValue[^\n]*\{/, '$& window.walkCalls++;')
                 .replace('const abortControllers = new Map();', 'const abortControllers = new Map(); window.controllers = abortControllers;')

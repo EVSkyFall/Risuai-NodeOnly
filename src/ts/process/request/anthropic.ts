@@ -398,14 +398,9 @@ export async function requestClaude(arg:RequestDataArgumentExtended):Promise<req
         delete body.top_k
         delete body.top_p
     }
-
-    // Effort is independent from thinking — applies to all output tokens.
-    // Send whenever model supports adaptive (and thus effort) and value is non-default.
-    if(adaptiveCapable && db.adaptiveThinkingEffort && db.adaptiveThinkingEffort !== 'high'){
-        body.output_config = { ...(body.output_config || {}), effort: db.adaptiveThinkingEffort }
-    } else if(!adaptiveCapable){
-        delete body.output_config
-    }
+    // Budget thinking. This chain used to hang off the effort check below, so
+    // it ran only for adaptive-capable models left at the default effort:
+    // every other model sent `thinking` without a type.
     else if(body?.thinking?.budget_tokens === 0){
         delete body.thinking
     }
@@ -414,6 +409,14 @@ export async function requestClaude(arg:RequestDataArgumentExtended):Promise<req
     }
     else if(body?.thinking?.budget_tokens === null){
         delete body.thinking
+    }
+
+    // Effort is independent from thinking — applies to all output tokens.
+    // Send whenever model supports adaptive (and thus effort) and value is non-default.
+    if(adaptiveCapable && db.adaptiveThinkingEffort && db.adaptiveThinkingEffort !== 'high'){
+        body.output_config = { ...(body.output_config || {}), effort: db.adaptiveThinkingEffort }
+    } else if(!adaptiveCapable){
+        delete body.output_config
     }
 
     if(systemPrompt.trim() === ''){

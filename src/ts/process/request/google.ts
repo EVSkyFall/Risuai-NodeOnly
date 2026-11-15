@@ -38,7 +38,7 @@ interface GeminiPart{
 }
 
 interface GeminiChat {
-    role: "user"|"model"|"function"
+    role?: "user"|"model"
     parts:|GeminiPart[]
 }
 
@@ -238,7 +238,6 @@ export async function requestGoogleCloudVertex(arg:RequestDataArgumentExtended):
 
                             // Insert functionResponse
                             reformatedChat.splice(insertIndex, 0, {
-                                role: 'function',
                                 parts: [{
                                     functionResponse: {
                                         name: segment.call.call.name,
@@ -982,7 +981,6 @@ async function requestGoogle(url:string, body:any, headers:{[key:string]:string}
         
         // Add the user response part to the request content (function responses)
         chat.push({
-            role: 'function',
             parts: functionParts
         })
 
@@ -1298,7 +1296,6 @@ function wrapToolStream(
                         }
                         // Add the user response part to the request content (function responses)
                         chat.push({
-                            role: 'function',
                             parts: parts
                         })
 

@@ -325,7 +325,7 @@ describe('v3 permission wiring', () => {
         const providerStart = source.indexOf('const provider = async')
         const providerEnd = source.indexOf('pluginV2.providerOptions.set(name', providerStart)
         const providerBlock = source.slice(providerStart, providerEnd)
-        expect(providerBlock).toContain("const conf = await getPluginPermission(plugin.name, 'provider', 'periodically')")
+        expect(providerBlock).toContain("const conf = await getPermission('provider', 'periodically')")
         expect(providerBlock).toContain('if(!conf)')
         expect(providerBlock).toContain('return { success: false, content: language.permissionDenied }')
         expect(providerBlock.indexOf('if(!conf)')).toBeLessThan(providerBlock.indexOf('return await func'))

@@ -687,6 +687,7 @@ export function populateDatabaseDefaults(data:Database):Database{
     data.showDeprecatedTriggerV2 ??= false
     data.returnCSSError ??= true
     data.realmDirectOpen ??= false
+    data.blockedRealmCreators ??= []
     data.checkCorruption ??= false
     data.toggleConfirmRecommendedPreset ??= false
     data.useExperimentalGoogleTranslator ??= false
@@ -1144,6 +1145,11 @@ export interface RisuPersona {
     embeddedModule?:RisuModule
 }
 
+export type BlockedRealmCreator = {
+    id: string
+    name: string
+}
+
 /** User-defined group for organizing list items (personas, presets, ...). */
 export interface PromptPresetFolder {
     id: string
@@ -1348,12 +1354,12 @@ export interface Database{
     personas:RisuPersona[]
     /** User-defined groups for organizing personas. */
     personaFolders?:PromptPresetFolder[]
-    personaNote:boolean
     assetWidth:number
     animationSpeed:number
     botSettingAtStart:false
     NAIsettings:NAISettings
     hideRealm:boolean
+    blockedRealmCreators:BlockedRealmCreator[]
     colorScheme:ColorScheme
     colorSchemeName:string
     promptTemplate?:PromptItem[]
@@ -1980,6 +1986,7 @@ export interface character{
         ext: string
     }>
     defaultVariables?:string
+    onboarding?:CharacterOnboarding
     lowLevelAccess?:boolean
     hideChatIcon?:boolean
     lastInteraction?:number
@@ -2022,10 +2029,9 @@ export function purgeUnsupportedGroupChats(db: Database): number {
                 }
                 continue
             }
-            const data = entry.data.filter((id) => validIds.has(id))
-            if (data.length > 0) {
-                nextOrder.push({ ...entry, data })
-            }
+            // Empty folders are kept, as in checkCharOrder: the character
+            // manager creates a folder first and fills it afterwards.
+            nextOrder.push({ ...entry, data: entry.data.filter((id) => validIds.has(id)) })
         }
         db.characterOrder = nextOrder
     }
@@ -2420,6 +2426,38 @@ export type { ChatStub } from './chatStub'
 export { isChatStub } from './chatStub'
 
 export type ChatOrStub = Chat | import('./chatStub').ChatStub
+
+export interface OnboardingOption{
+    label:string
+    value:string
+}
+
+export interface OnboardingQuestion{
+    id:string
+    title:string
+    description?:string
+    type:'single'|'multiple'|'text'
+    varName:string
+    required?:boolean
+    options:OnboardingOption[]
+    placeholder?:string
+}
+
+/**
+ * A creator-defined set of choices shown before a chat starts (upstream card
+ * spec, `extensions.risuai.onboarding`). PocketRisu keeps the data through
+ * card import/export but does not show it yet.
+ */
+export interface CharacterOnboarding{
+    enabled:boolean
+    mode:'form'|'html'
+    title?:string
+    description?:string
+    questions:OnboardingQuestion[]
+    html?:string
+    /** Also shows a floating button on the chat screen that opens the onboarding. */
+    floatingButton?:boolean
+}
 
 export interface ChatFolder{
     id:string

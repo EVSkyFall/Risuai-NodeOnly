@@ -15,6 +15,7 @@ interface RpcMessage {
     type: MsgType;
     reqId?: string;
     id?: string;
+    ids?: string[];
     method?: string;
     args?: any[];
     result?: any;
@@ -385,7 +386,22 @@ await (async function() {
     const pendingRequests = new Map();
     const callbackRegistry = new Map();
     const callbackIdByFunction = new WeakMap();
-    const proxyRefRegistry = new Map();
+    const proxyRefRegistry = new WeakMap();
+    const releaseBuffer = [];
+    const flushReleases = () => {
+        if (releaseBuffer.length === 0) return;
+        const ids = releaseBuffer.splice(0);
+        try {
+            send({ type: 'RELEASE_INSTANCE', ids: ids });
+        } catch (_) {
+            // Frame is tearing down; host clears its registry anyway
+        }
+    };
+    const releaseRegistry = new FinalizationRegistry((id) => {
+        // Schedule one flush per burst: first push arms the microtask.
+        if (releaseBuffer.length === 0) queueMicrotask(flushReleases);
+        releaseBuffer.push(id);
+    });
     const abortControllers = new Map();
     // Keep the guest endpoint alive for the entire document lifetime.
     let livenessPort;
@@ -448,15 +464,25 @@ await (async function() {
                     if (prop === 'release') {
                         return () => send({ type: 'RELEASE_INSTANCE', id: val.id });
                     }
-                    return (...args) => sendRequest('CALL_INSTANCE', {
-                        id: val.id,
-                        method: prop,
-                        args: args
-                    });
+                    return (...args) => {
+                        // Extracted methods must pin their owning proxy:
+                        // without this reference the proxy could be
+                        // collected (and auto-released) while this
+                        // function is still callable.
+                        void proxy;
+                        return sendRequest('CALL_INSTANCE', {
+                            id: val.id,
+                            method: prop,
+                            args: args
+                        });
+                    };
                 }
             });
             // Store the mapping so we can serialize it back
             proxyRefRegistry.set(proxy, val.id);
+            // Held value must be the id string, never the proxy itself:
+            // the registry holds it strongly until cleanup fires.
+            releaseRegistry.register(proxy, val.id);
             return proxy;
         }
         if (val && typeof val === 'object' && val.__type === 'CALLBACK_STREAMS') {
@@ -517,6 +543,8 @@ await (async function() {
     
     
     window.addEventListener('message', async (event) => {
+        if (event.source !== window.parent) return;
+
         const data = event.data;
         if (!data) return;
 
@@ -572,7 +600,7 @@ await (async function() {
                         if (a.aborted) { controller.abort(); }
                         return controller.signal;
                     }
-                    return a;
+                    return deserializeResult(a);
                 });
                 const result = await fn(...deserializedArgs);
                 response.result = result;
@@ -685,6 +713,14 @@ await (async function() {
 })();
 `;
 
+// A callback called after terminate() fails at once instead of waiting
+// forever, marked handled like the ones terminate() rejects.
+function quietSandboxTerminated(error: Error = new Error('Sandbox terminated')): Promise<never> {
+    const failed = Promise.reject(error);
+    failed.catch(() => {});
+    return failed;
+}
+
 export class SandboxHost {
     private iframe: HTMLIFrameElement;
     private apiFactory: any;
@@ -695,11 +731,12 @@ export class SandboxHost {
 
     private streamBridge = createStreamRelayBridge();
     private instanceRegistry = new Map<string, any>();
+    private refIdCounter = 0;
     private abortControllers = new Map<string, AbortController>();
     private messageHandlerRef: ((event: MessageEvent) => void) | null = null;
     private callbackWrapperCache = new Map<string, Function>();
 
-    private pendingCallbacks = new Map<string, { resolve: Function, reject: Function }>();
+    private pendingCallbacks = new Map<string, { resolve: Function, reject: Function, call?: Promise<unknown> }>();
     private pendingExecutions = new Set<(error: Error) => void>();
     private pendingOperations = new Set<(error: Error) => void>();
     private stopped: Error | undefined;
@@ -784,7 +821,7 @@ export class SandboxHost {
             if (Array.isArray(val)) return val;
 
 
-            const id = 'ref_' + Math.random().toString(36).substring(2);
+            const id = 'ref_' + (++this.refIdCounter);
             this.instanceRegistry.set(id, val);
             return { __type: 'REMOTE_REF', id } as RemoteRef;
         }
@@ -825,9 +862,10 @@ export class SandboxHost {
                 const cached = this.callbackWrapperCache.get(cbRef.id);
                 if (cached) return cached;
 
-                const wrapper = async (...innerArgs: any[]) => {
-                    if (this.stopped) throw this.stopped;
-                    return new Promise((resolve, reject) => {
+                const wrapper = (...innerArgs: any[]) => {
+                    if (this.stopped) return quietSandboxTerminated(this.stopped);
+                    const reqId = 'cb_req_' + Math.random().toString(36).substring(2);
+                    const call = new Promise((resolve, reject) => {
                         // Stale-stub guard (D2): after a plugin reload the old factory's
                         // iframe is gone — its stubs may still sit in host Sets (e.g.
                         // pluginV2.replacer*). postMessage via `contentWindow?.` was a
@@ -837,7 +875,6 @@ export class SandboxHost {
                             reject(new Error('plugin iframe is gone (stale callback stub)'));
                             return;
                         }
-                        const reqId = 'cb_req_' + Math.random().toString(36).substring(2);
                         this.pendingCallbacks.set(reqId, { resolve, reject });
 
                         // AbortSignal cannot be structured-cloned for postMessage.
@@ -864,7 +901,7 @@ export class SandboxHost {
                                 }
                                 return ref;
                             }
-                            return arg;
+                            return this.serialize(arg);
                         });
 
                         const message = {
@@ -894,6 +931,9 @@ export class SandboxHost {
                             reject(e);
                         }
                     });
+                    const pending = this.pendingCallbacks.get(reqId);
+                    if (pending) pending.call = call;
+                    return call;
                 };
                 this.callbackWrapperCache.set(cbRef.id, wrapper);
                 return wrapper;
@@ -904,6 +944,7 @@ export class SandboxHost {
                 if (instance) {
                     return instance;
                 }
+                throw new Error("Instance not found or released");
             }
             if (arg && typeof arg === 'object' && arg.constructor === Object) {
                 let out: any = null;
@@ -1006,7 +1047,8 @@ export class SandboxHost {
 
 
             if (data.type === 'RELEASE_INSTANCE') {
-                this.instanceRegistry.delete(data.id!);
+                if (data.id) this.instanceRegistry.delete(data.id!);
+                if (Array.isArray(data.ids)) for (const id of data.ids) this.instanceRegistry.delete(id);
                 return;
             }
 
@@ -1128,7 +1170,10 @@ export class SandboxHost {
     // abandons in-flight callback awaits — whatever request was awaiting that
     // replacer freezes forever. Reject them so guarded callers fail open.
     private rejectPendingCallbacks(error: Error) {
-        for (const { reject } of this.pendingCallbacks.values()) {
+        // Callers that never await (DOM listeners, observers) must not get an
+        // unhandled rejection alert for it, so each call is marked handled first.
+        for (const { reject, call } of this.pendingCallbacks.values()) {
+            call?.catch(() => {});
             try { reject(error); } catch (_) { /* already settled */ }
         }
         this.pendingCallbacks.clear();

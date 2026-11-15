@@ -1,5 +1,5 @@
 import { writable, type Writable } from "svelte/store"
-import { alertCardExport, alertConfirm, alertError, alertInput, alertStore, alertWait, notifySuccess, notifyError } from "./alert"
+import { alertCardExport, alertConfirm, alertError, alertInput, alertNormal, alertStore, alertWait, notifySuccess, notifyError } from "./alert"
 import { defaultSdDataFunc, type character, setDatabase, type customscript, type loreSettings, type loreBook, type triggerscript, importPreset, getDatabase, setDatabaseLite, appVer, newChatModelDefaults } from "./storage/database.svelte"
 import { checkNullish, decryptBuffer, isKnownUri, selectFileByDom, sleep } from "./util"
 import { language } from "src/lang"
@@ -7,7 +7,7 @@ import { v4 as uuidv4, v4 } from 'uuid';
 import { characterFormatUpdate } from "./characters"
 import { AppendableBuffer, BlankWriter, checkCharOrder, downloadFile, forageStorage, loadAsset, loadAssetManifestItems, LocalWriter, readImage, saveAsset, VirtualWriter } from "./globalApi.svelte"
 import { compressImage, getImageType } from "./media"
-import { selectedCharID } from "./stores.svelte"
+import { DBState, selectedCharID } from "./stores.svelte"
 import { openSettings, SettingsRoute } from "./routing"
 import { hasher } from "./parser/parser.svelte"
 import { type CharacterCardV3, type LorebookEntry } from '@risuai/ccardlib'
@@ -16,6 +16,8 @@ import { PngChunk } from "./pngChunk"
 import type { OnnxModelFiles } from "./process/transformers"
 import { CharXImporter, CharXSkippableChecker, CharXWriter } from "./process/processzip"
 import { exportModuleLegacy, readModule, type RisuModule } from "./process/modules"
+import { filterBlockedRealmCards, isRealmCreatorBlocked } from "./realmBlocking"
+import { normalizeOnboarding } from "./onboarding"
 
 
 const EXTERNAL_HUB_URL = 'https://sv.risuai.xyz';
@@ -338,20 +340,79 @@ export async function importCharacterProcess<T extends boolean = false>(f:{
     
 }
 
+async function fetchRealmInfo(realmPath: string): Promise<hubType> {
+    const res = await fetch(`${hubURL}/hub/info/${realmPath}`)
+    if(res.status !== 200){
+        throw new Error(await res.text())
+    }
+
+    return await res.json()
+}
+
+function canAccessRealmCreator(creator?: string): boolean {
+    if(isRealmCreatorBlocked(DBState.db.blockedRealmCreators ?? [], creator)){
+        alertNormal(language.realmCreatorBlocked)
+        return false
+    }
+
+    return true
+}
+
 export const getRealmInfo = async (realmPath:string) => {
     const url = new URL(location.href);
     url.searchParams.delete('realm');
     window.history.pushState(null, '', url.toString());
 
-    const res = await fetch(`${hubURL}/hub/info/${realmPath}`)
-    if(res.status !== 200){
-        notifyError(await res.text())
-        return
+    try {
+        const realmInfo = await fetchRealmInfo(realmPath)
+        if(!canAccessRealmCreator(realmInfo.creator)){
+            return
+        }
+        showRealmInfoStore.set(realmInfo)
+    } catch (error) {
+        notifyError(error)
     }
-    showRealmInfoStore.set(await res.json())
 }
 
 export const showRealmInfoStore:Writable<null|hubType> = writable(null)
+
+// Returns false when the file type is not importable or the import failed.
+export async function importFileByName(name:string, data:Uint8Array):Promise<boolean> {
+    if(name.endsWith('.charx') || name.endsWith('.jpg') || name.endsWith('.jpeg') || name.endsWith('.png')){
+        // importCharacterProcess returns the last index even when the user
+        // declines the card, so count the characters instead.
+        const before = getDatabase().characters.length
+        await importCharacterProcess({
+            name: name,
+            data: data
+        })
+        return getDatabase().characters.length > before
+    }
+    if(name.endsWith('.risupreset') || name.endsWith('.risup')){
+        await importPreset({
+            name: name,
+            data: data
+        })
+        openSettings(SettingsRoute.ChatBot)
+        notifySuccess(language.successImport)
+        return true
+    }
+    if(name.endsWith('risum')){
+        // View, not copy: asset modules can be hundreds of MB.
+        const md = await readModule(Buffer.from(data.buffer, data.byteOffset, data.byteLength))
+        // readModule has already told the user why.
+        if(!md){
+            return false
+        }
+        md.id = v4()
+        const db = getDatabase()
+        db.modules.push(md)
+        notifySuccess(language.successImport)
+        openSettings(SettingsRoute.Module)
+        return true
+    }
+    return false
+}
 
 export async function characterURLImport() {
     const realmPath = (new URLSearchParams(location.search)).get('realm')
@@ -402,7 +463,7 @@ export async function characterURLImport() {
                 method: 'GET',
             })
             const data = new Uint8Array(await res.arrayBuffer())
-            await importFile(getFileName(res), data)
+            await importFileByName(getFileName(res), data)
             checkCharOrder()
         } catch (error) {
             notifyError(language.errors.noData)
@@ -413,6 +474,7 @@ export async function characterURLImport() {
         const data = hash.replace('#import_module=', '')
         const importData = JSON.parse(Buffer.from(decodeURIComponent(data), 'base64').toString('utf-8'))
         importData.id = v4()
+        delete importData.mcp
 
         const db = getDatabase()
         if(importData.lowLevelAccess){
@@ -477,7 +539,7 @@ export async function characterURLImport() {
             for(const f of files){
                 const file = await f.getFile()
                 const data = new Uint8Array(await file.arrayBuffer())
-                await importFile(f.name, data);
+                await importFileByName(f.name, data);
             }
         }
         //@ts-expect-error launchQueue is File Handling API for PWA, not yet in TypeScript's Window interface
@@ -487,34 +549,6 @@ export async function characterURLImport() {
                 handleFiles(files)
             }
         });
-    }
-
-    async function importFile(name:string, data:Uint8Array) {
-        if(name.endsWith('.charx') || name.endsWith('.jpg') || name.endsWith('.jpeg') || name.endsWith('.png')){
-            await importCharacterProcess({
-                name: name,
-                data: data
-            })
-            return
-        }
-        if(name.endsWith('.risupreset') || name.endsWith('.risup')){
-            await importPreset({
-                name: name,
-                data: data
-            })
-            openSettings(SettingsRoute.ChatBot)
-            notifySuccess(language.successImport)
-            return
-        }
-        if(name.endsWith('risum')){
-            const md = await readModule(Buffer.from(data))
-            md.id = v4()
-            const db = getDatabase()
-            db.modules.push(md)
-            notifySuccess(language.successImport)
-            openSettings(SettingsRoute.Module)
-            return
-        }
     }
 
     function getFileName(res : Response) : string {
@@ -631,6 +665,29 @@ export async function exportChar(charaID:number):Promise<string> {
         return option.type
     }
     return ''
+}
+
+async function readCardExportImage(image?: string) {
+    if(image){
+        try{
+            const img = await readImage(image)
+            if(img?.length){
+                return img
+            }
+        } catch (e) {
+            console.warn('readCardExportImage: failed to read character image, falling back to none.webp', e)
+        }
+    }
+
+    const res = await fetch('/none.webp')
+    if(!res.ok){
+        throw new Error(`Failed to load fallback character image: ${res.status} ${res.statusText}`)
+    }
+    const fallbackImage = new Uint8Array(await res.arrayBuffer())
+    if(!fallbackImage.length){
+        throw new Error('Failed to load fallback character image: empty response')
+    }
+    return fallbackImage
 }
 
 
@@ -934,6 +991,7 @@ async function importCharacterCardSpec<T extends boolean = false>(card:Character
         customModuleToggle: data?.extensions?.risuai?.toggles ?? '',
         moduleNamespace: data?.extensions?.risuai?.moduleNamespace,
         hideChatIcon: data?.extensions?.risuai?.hideChatIcon ?? false,
+        onboarding: normalizeOnboarding(data?.extensions?.risuai?.onboarding),
     }
 
     if(card.spec === 'chara_card_v3'){
@@ -1178,7 +1236,7 @@ export async function exportCharacterCard(char:character, type:'png'|'json'|'cha
     onProgress?:(msg:string, pct:number) => void
 } = {}) {
     char = await hydrateCharacterAssets(safeStructuredClone(char))
-    let img = await readImage(char.image)
+    let img = await readCardExportImage(char.image)
     const spec:'v2'|'v3' = arg.spec ?? 'v2' //backward compatibility
     const onProgress = arg.onProgress ?? ((msg:string, pct:number) => {
         if (pct >= 100) {
@@ -1568,7 +1626,8 @@ export function createBaseV3(char:character){
                     prebuiltAssetStyle: char.prebuiltAssetStyle ?? '',
                     toggles: char.customModuleToggle ?? '',
                     moduleNamespace: char.moduleNamespace,
-                    hideChatIcon: char.hideChatIcon ?? false
+                    hideChatIcon: char.hideChatIcon ?? false,
+                    onboarding: char.onboarding
                 },
                 depth_prompt: char.depth_prompt
             },
@@ -1634,11 +1693,11 @@ export async function getRisuHub(arg:{
             return []
         }
         const jso = await da.json()
-        if(Array.isArray(jso)){
-            return jso
+        const cards:hubType[] = Array.isArray(jso) ? jso : jso.cards
+        if(!Array.isArray(jso)){
+            hubAdditionalHTML = jso.additionalHTML || hubAdditionalHTML
         }
-        hubAdditionalHTML = jso.additionalHTML || hubAdditionalHTML
-        return jso.cards
+        return filterBlockedRealmCards(cards, DBState.db.blockedRealmCreators ?? [])
     } catch (error) {
         return[]
     }
@@ -1646,8 +1705,23 @@ export async function getRisuHub(arg:{
 
 export async function downloadRisuHub(id:string, arg:{
     forceRedirect?: boolean
+    creator?: string
 } = {}) {
     try {
+        let creator = arg.creator
+        if(!creator){
+            try {
+                const realmInfo = await fetchRealmInfo(id)
+                creator = realmInfo.creator
+            } catch (error) {
+                alertError(error)
+                return
+            }
+        }
+        if(!canAccessRealmCreator(creator)){
+            return
+        }
+
         if(!arg.forceRedirect){
             alertStore.set({
                 type: "wait",

@@ -1,6 +1,5 @@
 import { migrateLegacyTrash } from "./characterArchive";
 import { changeFullscreen, checkNullish } from "./util"
-import { installDynamicViewportHeight } from "./viewportHeight"
 import { v4 as uuidv4 } from 'uuid';
 import { get } from "svelte/store";
 import { setDatabase, defaultSdDataFunc, getDatabase, changeToThemePreset, initUnitSnapshotsAtBoot } from "./storage/database.svelte";
@@ -8,7 +7,7 @@ import { captureRawUnitPresence } from "./storage/presetPersonaUnits";
 import { chatDraftKey, sweepOrphanDrafts } from "./storage/chatDraft";
 import { checkRisuUpdate } from "./update";
 import { fetchPublicStats } from "./publicStats";
-import { MobileGUI, botMakerMode, selectedCharID, loadedStore, DBState, LoadingStatusState, bootBackupPromptStore } from "./stores.svelte";
+import { MobileGUI, botMakerMode, selectedCharID, loadedStore, DBState, LoadingStatusState, bootBackupPromptStore, accountImportBlocking } from "./stores.svelte";
 import { recordDbTransferSize } from "./transferSize";
 import { loadPlugins } from "./plugins/plugins.svelte";
 import { pluginBlobKv } from "./plugins/pluginKvStorage";
@@ -45,6 +44,17 @@ export async function loadData() {
     if (!loaded) {
         try {
             applyEarlyLanguage()
+            // A started RisuAI account import will replace all data, so the
+            // app shows only its screen until it ends. When the status cannot
+            // be read the boot goes on; the server still refuses every write.
+            try {
+                if ((await forageStorage.getRisuAccountImportStatus()).blocking) {
+                    accountImportBlocking.set(true)
+                    return
+                }
+            } catch (error) {
+                console.warn('[bootstrap] account import status failed:', error)
+            }
             let createdFreshDatabase = false
             let rawUnitPresence: Record<string, boolean | null> | null = null
             {
@@ -169,11 +179,6 @@ export async function loadData() {
             updateTextThemeAndCSS()
             updateAnimationSpeed()
             updateHeightMode()
-            // Only when no explicit heightMode override is active — an explicit
-            // vh/dvh/svh/... choice must keep sizing exactly as configured.
-            if (!db.heightMode || db.heightMode === 'normal') {
-                installDynamicViewportHeight()
-            }
             updateErrorHandling()
             updateGuisize()
             if (!db.didFirstSetup) {

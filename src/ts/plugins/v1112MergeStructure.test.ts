@@ -43,7 +43,9 @@ describe('v1.11.2 policy structure', () => {
     test('inlay extends the existing permission preset manager', () => {
         expect(pluginPermissionDescList).toEqual(['fetchLogs', 'db', 'mainDom', 'replacer', 'provider', 'sendChat', 'inlay'])
         const v3 = source('src/ts/plugins/apiV3/v3.svelte.ts')
-        expect(v3).toContain("getPluginPermission(plugin.name, 'inlay', 'periodically')")
+        expect(v3).toContain("getPermission('inlay', 'periodically')")
+        // The per-instance getPermission delegates to the name-keyed preset manager.
+        expect(v3).toContain('getPluginPermission(plugin.name, permissionDesc, reconfirm)')
         expect(v3).toContain('pluginPermissionManager.getPermission(')
         expect(v3).not.toContain('const permissionDeniedPlugins: Set<string>')
     })

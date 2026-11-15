@@ -76,7 +76,7 @@ describe('round 2 asset regressions', () => {
         const comfy = vi.fn(() => { throw new Error('must not interrupt Comfy') })
         const handler = route("app.post('/api/assets/bulk-write',", {
             checkAuth: async () => true, queueStorageOperation: queue, assetFileStore: store,
-            withComfyWorldReplacementGate: comfy, BULK_BATCH: 100, kvSet() {},
+            withComfyWorldReplacementGate: comfy, BULK_BATCH: 100, kvSet() {}, DB_BLOB_KEY: 'database/database.bin',
         })
         const migrating = store.migrateOne('assets/a')
         await reached.promise

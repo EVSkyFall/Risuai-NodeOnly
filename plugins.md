@@ -400,19 +400,25 @@ const rects = await element.getClientRects();
 
 #### Event Listeners
 
-Event listeners have security restrictions and return unique IDs:
+Event listeners have security restrictions and return unique IDs. Listeners receive events that reach the element via normal DOM propagation, while non-bubbling events such as scroll fire only on the element itself:
 
 ```javascript
 // Add event listener - returns ID for later removal
 const listenerId = await element.addEventListener('click', async (event) => {
   console.log('Element clicked!');
-
-  // Do something with the event
-  const target = event.target;
 }, { capture: false });
 
 // Remove event listener using the ID
 await element.removeEventListener('click', listenerId);
+```
+
+To listen document-wide, use the `SafeDocument` from `getRootDocument()`:
+
+```javascript
+const rootDoc = await Risuai.getRootDocument();
+const id = await rootDoc.addEventListener('keydown', async (event) => {
+  console.log('Key pressed anywhere!');
+});
 ```
 
 **Allowed Events (Unlimited):**
@@ -493,6 +499,12 @@ const observer = await Risuai.createMutationObserver(async (mutations) => {
     for (const node of addedNodes) {
       console.log(`Node added: ${await node.nodeName()}`);
     }
+
+    // getRemovedNodes() returns SafeClassArray<SafeElement>
+    const removedNodes = await Risuai.unwarpSafeArray(await mutation.getRemovedNodes());
+    for (const node of removedNodes) {
+      console.log(`Node removed: ${await node.nodeName()}`);
+    }
   }
 });
 
@@ -505,6 +517,8 @@ await observer.observe(body, {
   attributes: true
 });
 ```
+
+Note: `getAddedNodes()`/`getRemovedNodes()` contain HTML element nodes only; text nodes and SVG elements are excluded.
 
 ### SafeClassArray
 
@@ -1461,10 +1475,10 @@ Add clear comments and metadata:
 
 (async () => {
   try {
-    const rootDoc = Risuai.getRootDocument();
+    const rootDoc = await Risuai.getRootDocument();
 
     // Add a status indicator
-    const indicator = rootDoc.createElement('div');
+    const indicator = await rootDoc.createElement('div');
     await indicator.setStyle('position', 'fixed');
     await indicator.setStyle('bottom', '10px');
     await indicator.setStyle('right', '10px');
@@ -1474,20 +1488,32 @@ Add clear comments and metadata:
     await indicator.setStyle('borderRadius', '5px');
     await indicator.setTextContent('Plugin Active');
 
-    const body = rootDoc.querySelector('body');
+    const body = await rootDoc.querySelector('body');
     if (body) {
       await body.appendChild(indicator);
     }
 
     // Monitor DOM changes
+    // Mark the indicator so the callback can skip its own updates
+    await indicator.setAttribute('x-dom-monitor', 'indicator');
+
     let changeCount = 0;
-    const observer = Risuai.createMutationObserver(async (mutations) => {
-      changeCount += mutations.length;
+    const observer = await Risuai.createMutationObserver(async (mutations) => {
+      let counted = 0;
+      for (const mutation of await Risuai.unwarpSafeArray(mutations)) {
+        const target = await mutation.getTarget();
+        // Updating the indicator below is itself a mutation inside body;
+        // counting it would retrigger this callback forever
+        if (await target.getAttribute('x-dom-monitor') === 'indicator') continue;
+        counted++;
+      }
+      if (counted === 0) return;
+      changeCount += counted;
       await indicator.setTextContent(`Changes: ${changeCount}`);
     });
 
     if (body) {
-      observer.observe(body, {
+      await observer.observe(body, {
         childList: true,
         subtree: true,
         attributes: false

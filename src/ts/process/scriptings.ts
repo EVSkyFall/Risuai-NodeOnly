@@ -1,6 +1,6 @@
 import { raceAbort, throwIfAborted } from "./abort";
 import { asBuffer } from 'src/ts/util';
-import { getChatVar, getGlobalChatVar, setChatVar } from "../parser/chatVar.svelte";
+import { getChatVar, getChatVarOf, getGlobalChatVar, setChatVar, setChatVarOf } from "../parser/chatVar.svelte";
 import { hasher, type simpleCharacterArgument, risuChatParser } from "../parser/parser.svelte";
 import { LuaEngine, LuaFactory } from "wasmoon";
 import { getCurrentCharacter, getCurrentChat, getDatabase, setDatabase, type Chat, type character, type triggerscript } from "../storage/database.svelte";
@@ -8,7 +8,7 @@ import { get } from "svelte/store";
 import { ReloadChatPointer, ReloadGUIPointer, selectedCharID } from "../stores.svelte";
 import { alertSelect, alertError, alertInput, alertNormal, alertConfirm } from "../alert";
 import { HypaProcesser } from "./memory/hypamemory";
-import { generateAIImage } from "./stableDiff";
+import { generateAIImage, type ImageGenerationOptions } from "./stableDiff";
 import { InlayImageWriteError, writeInlayImage, getInlayAsset } from "./files/inlays";
 import type { OpenAIChat, MultiModal } from "./index.svelte";
 import { requestChatData, type StreamResponseChunk } from "./request/request";
@@ -219,7 +219,7 @@ async function runScriptedInner(code:string, arg: Parameters<typeof runScripted>
                 // code is stamped only after doString succeeds (like the py path):
                 // stamping early would leave a poisoned persistent state on init
                 // failure — later calls would skip re-init and run a dead engine.
-                ScriptingEngineState.engine = await luaFactory.createEngine({injectObjects: true})
+                ScriptingEngineState.engine = await luaFactory.createEngine({injectObjects: true, enableProxy: false})
                 const luaEngine = ScriptingEngineState.engine
                 const editListeners = new Set<string>()
                 ScriptingEngineState.editListeners = editListeners
@@ -588,14 +588,18 @@ async function runScriptedInner(code:string, arg: Parameters<typeof runScripted>
                 }
             })
 
-            declareAPI('generateImage', async (id:string, value:string, negValue:string = '') => {
+            declareAPI('generateImage', async (id:string, value:string, negValue:string = '', options?:ImageGenerationOptions) => {
                 const signal = ScriptingEngineState.signal
                 if (signal?.aborted) return
                 if(!ScriptingLowLevelIds.has(id)){
                     return
                 }
+                const orientation = options?.orientation
+                if(orientation !== undefined && orientation !== 'landscape' && orientation !== 'portrait'){
+                    return 'Error: Image orientation must be landscape or portrait, received ' + orientation
+                }
                 try {
-                    const gen = await raceAbort(() => (generateAIImage(value, (ScriptingEngineState.char ?? char) as character, negValue, 'inlay', 'interactive', signal)), signal)
+                    const gen = await raceAbort(() => (generateAIImage(value, (ScriptingEngineState.char ?? char) as character, negValue, 'inlay', 'interactive', signal, { orientation })), signal)
                     if(!gen){
                         return 'Error: Image generation failed'
                     }
@@ -1194,7 +1198,15 @@ async function runScriptedInner(code:string, arg: Parameters<typeof runScripted>
                         }
                     }
 
-                    const options = parseLuaOptions(optionsStr) as { streaming?: boolean }
+                    const options = parseLuaOptions(optionsStr) as { mode?: string, streaming?: boolean }
+                    const modes = new Set(['emotion', 'memory', 'otherAx', 'submodel', 'translate'])
+                    const mode = options.mode ?? 'otherAx'
+                    if (!modes.has(mode)) {
+                        return JSON.stringify({
+                            result: 'Error: Invalid axLLM mode: ' + mode,
+                            success: false
+                        })
+                    }
                     const result = await raceAbort(() => (requestChatData({
                         formated: promptbody,
                         bias: {},
@@ -1202,7 +1214,7 @@ async function runScriptedInner(code:string, arg: Parameters<typeof runScripted>
                         forceStreaming: options.streaming === true,
                         noMultiGen: true,
                         moduleId: ScriptingEngineState.moduleId,
-                    }, 'otherAx', signal)), signal)
+                    }, mode as 'emotion' | 'memory' | 'otherAx' | 'submodel' | 'translate', signal)), signal)
 
                     if(result.type === 'fail'){
                         // Surface silent aux failures (see v2RunLLM warn) — Lua callers
@@ -1426,6 +1438,13 @@ end
                         warnIfLuaHandlerOverwritten(ScriptingEngineState, 'onButtonClick')
                         if(func){
                             res = await func(accessKey, data)
+                        }
+                        break
+                    }
+                    case 'onFormSubmit':{
+                        const func = luaEngine.global.get('onFormSubmit')
+                        if(func){
+                            res = await func(accessKey, data, JSON.stringify(meta))
                         }
                         break
                     }
@@ -1838,7 +1857,14 @@ export async function runLuaEditTrigger<T extends string|OpenAIChat[]>(char:char
     }
 }
 
-export async function runLuaButtonTrigger(char:character|simpleCharacterArgument, data:string):Promise<any>{
+export async function runLuaInteractionTrigger(type: 'button'|'form', char: character|simpleCharacterArgument, triggerKey: string, meta?: object, chat: Chat = getCurrentChat()): Promise<any> {
+    const mode = type === 'button' ? 'onButtonClick' : 'onFormSubmit'
+    // The caller awaits this while the user can open another chat, so every
+    // script here works on, and keeps its variables in, the chat it started on.
+    const defaultVariables = char.type !== 'simple' ? char.defaultVariables : undefined
+    const getVar = (key:string) => getChatVarOf(chat, key, defaultVariables)
+    const setVar = (key:string, value:string) => setChatVarOf(chat, key, value)
+
     let runResult
     try {
         const triggers = char.triggerscript.map<triggerscript>((v) => ({
@@ -1849,10 +1875,14 @@ export async function runLuaButtonTrigger(char:character|simpleCharacterArgument
         for(let trigger of triggers){
             if(trigger?.effect?.[0]?.type === 'triggerlua'){
                 runResult = await runScripted(trigger.effect[0].code, {
-                    char: char,
+                    char,
+                    chat,
+                    data: triggerKey,
+                    getVar,
+                    setVar,
                     lowLevelAccess: trigger.lowLevelAccess,
-                    mode: 'onButtonClick',
-                    data: data,
+                    meta,
+                    mode,
                     moduleId: trigger.moduleId,
                 })
             }

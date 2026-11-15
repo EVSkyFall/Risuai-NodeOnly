@@ -7,7 +7,7 @@
     import ShDropdownMenuTrigger from 'src/lib/UI/GUI/ShDropdownMenuTrigger.svelte';
     import ShDropdownMenuContent from 'src/lib/UI/GUI/ShDropdownMenuContent.svelte';
     import ShDropdownMenuItem from 'src/lib/UI/GUI/ShDropdownMenuItem.svelte';
-    import { selectedCharID, PlaygroundStore, createSimpleCharacter, hypaV3ModalOpen, ScrollToMessageStore, additionalChatMenu, additionalFloatingActionButtons, chatDeselected, chatPanelStore } from "../../ts/stores.svelte";
+    import { selectedCharID, PlaygroundStore, createSimpleCharacter, hypaV3ModalOpen, ScrollToMessageStore, additionalChatMenu, additionalFloatingActionButtons, chatDeselected, chatPanelStore, holdChatEditorOverlay } from "../../ts/stores.svelte";
     import { tick, untrack } from 'svelte';
     import Chat from "./Chat.svelte";
     import { getAdditionalChatLoadPages, getInitialChatLoadPages } from 'src/ts/chatLoadPages';
@@ -478,6 +478,10 @@ import { isMobile } from 'src/ts/platform'
     // editor. Enter inserts a newline (no send); sending is via the Send button.
     let composerFullscreen = $state(false)
     let fullscreenEle:HTMLTextAreaElement = $state()
+    // Lift the chat layer above the docked sidebar while the editor is open (see ChatScreen).
+    $effect(() => {
+        if (composerFullscreen) return holdChatEditorOverlay()
+    })
     $effect(() => {
         if (composerFullscreen && fullscreenEle) {
             const el = fullscreenEle
@@ -873,7 +877,9 @@ import { isMobile } from 'src/ts/platform'
     });
 
     async function updateInputTransateMessage(reverse: boolean) {
-        if(!DBState.db.useAutoTranslateInput){
+        // The menu toggle is hidden while Translator Language is Disabled (''),
+        // so a stale useAutoTranslateInput must not keep translating.
+        if(!DBState.db.useAutoTranslateInput || DBState.db.translator === ''){
             return
         }
         if(isExpTranslator()){
@@ -1294,7 +1300,7 @@ import { isMobile } from 'src/ts/platform'
                 </div>
               </div>
             </div>
-            {#if DBState.db.useAutoTranslateInput && DBState.db.characters[$selectedCharID]?.chaId !== '§playground'}
+            {#if DBState.db.useAutoTranslateInput && DBState.db.translator !== '' && DBState.db.characters[$selectedCharID]?.chaId !== '§playground'}
                 <div class="flex items-center mt-2 mb-2">
                     <label for='messageInputTranslate' class="text-textcolor ml-4">
                         <LanguagesIcon />

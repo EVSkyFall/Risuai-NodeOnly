@@ -21,7 +21,7 @@ test.each(['model', 'memory'])('a transient job connection loss remains retryabl
         wireModel: 'wire-model', preset: { name: 'Preset' },
     })
     const dispatch = vi.fn().mockResolvedValueOnce(failed).mockResolvedValueOnce({ type: 'success', result: 'reattached response', model: 'wire-model' })
-    const request = evaluate(`${fn('requestChatDataInner').getText(ast)}; return requestChatDataInner;`, {
+    const request = evaluate(`${fn('unescapeBeforeRequestMeta').getText(ast)}; ${fn('requestChatDataInner').getText(ast)}; return requestChatDataInner;`, {
         getDatabase: () => ({ requestRetrys: 1 }), safeStructuredClone: structuredClone,
         getTools: async () => [], risuUnescape: (x: string) => x,
         pluginV2: { replacerbeforeRequest: new Set(), replacerafterRequest: new Set() },

@@ -27,8 +27,12 @@ export type ImageGenerationAttempt = {
     notifyErrorValue?: unknown
 }
 
+export type ImageOrientation = 'landscape' | 'portrait'
+
 export type ImageGenerationOptions = {
     preservePromptText?: boolean
+    /** NovelAI: put the longer configured edge on the width (landscape) or the height (portrait). */
+    orientation?: ImageOrientation
     illustrationPrompt?: IllustrationPromptV1
     seed?: number
     signal?: AbortSignal
@@ -670,8 +674,9 @@ export async function generateAIImage(
     returnSdData:string,
     priorityClass:ImageGenerationPriority = 'interactive',
     signal?: AbortSignal,
+    options: Omit<ImageGenerationOptions, 'signal'> = {},
 ):Promise<string|false>{
-    const attempt = await raceAbort(() => (generateAIImageTyped(genPrompt, currentChar, neg, returnSdData, priorityClass, { signal })), signal)
+    const attempt = await raceAbort(() => (generateAIImageTyped(genPrompt, currentChar, neg, returnSdData, priorityClass, { ...options, signal })), signal)
     if (!attempt.result.ok && attempt.shouldNotify) {
         notifyError(attempt.notifyErrorValue)
     }
@@ -818,6 +823,8 @@ async function generateAIImageInternal(
                 compatibilityValue: returnSdData === 'inlay' ? '' : false,
             }
         }
+        const dimensions = applyImageOrientation(db.NAIImgConfig.width, db.NAIImgConfig.height, options.orientation)
+
         if(options.preservePromptText !== true){
             genPrompt = genPrompt
                 .replaceAll('\\(', "♧")
@@ -887,8 +894,8 @@ async function generateAIImageInternal(
                     "controlnet_strength": 1,
                     "dynamic_thresholding": db.NAIImgModel.includes('nai-diffusion-3') || db.NAIImgModel.includes('nai-diffusion-furry-3') || db.NAIImgModel.includes('nai-diffusion-2') ? db.NAIImgConfig.decrisp : false,
                     "n_samples": 1,
-                    "width": db.NAIImgConfig.width,
-                    "height": db.NAIImgConfig.height,
+                    "width": dimensions.width,
+                    "height": dimensions.height,
                     "sampler": db.NAIImgConfig.sampler,
                     "steps": db.NAIImgConfig.steps,
                     "scale": db.NAIImgConfig.scale,
@@ -2042,4 +2049,28 @@ async function generateAIImageInternal(
         }
     }
     return ''
+}
+
+/**
+ * Places the longer edge on the width for landscape and on the height for portrait.
+ */
+export function applyImageOrientation(width: number, height: number, orientation?: ImageOrientation) {
+    if (!orientation) {
+        return { height, width }
+    }
+
+    const longerEdge = Math.max(height, width)
+    const shorterEdge = Math.min(height, width)
+
+    if (orientation === 'landscape') {
+        return {
+            height: shorterEdge,
+            width: longerEdge,
+        }
+    }
+
+    return {
+        height: longerEdge,
+        width: shorterEdge,
+    }
 }

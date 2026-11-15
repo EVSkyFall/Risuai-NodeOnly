@@ -13,7 +13,7 @@ import { SafeDocument, SafeIdbFactory, SafeLocalStorage } from "./pluginSafeClas
 import { loadV3Plugins, reloadV3Plugin } from "./apiV3/v3.svelte";
 import { pluginCodeTranspiler } from "./apiV3/transpiler";
 import * as pluginStorageStore from "./pluginStorageStore";
-import { PLUGIN_CUSTOM_STORAGE_KEY, applyPluginDbKey, pluginCustomStorageProxy } from "./pluginDbProxy";
+import { PLUGIN_CUSTOM_STORAGE_KEY, applyPluginDbKey, installApprovedPlugins, pluginCustomStorageProxy } from "./pluginDbProxy";
 import { hydratePluginCharacterSnapshotSync, restorePluginCharacterManifest, restorePluginDbKey } from './pluginCharacterSnapshot';
 import { pluginBlobKv } from "./pluginKvStorage";
 import { backfillInstallIds, commitImportedPlugin, newInstallId } from "./pluginInstallId";
@@ -480,7 +480,8 @@ export async function importPlugin(code:string|null = null, argu:{
         else{
             loadPlugins()
         }
-        
+        return true
+
     } catch (error) {
         console.error(error)
         alertError(language.errors.noData)
@@ -907,15 +908,11 @@ export const getV2PluginAPIs = () => {
                 }
                 if (key === 'plugins') {
                     console.warn('[WARN] Plugin attempted to access plugin directly. this would be blocked in future versions. Instead, use the provided APIs to manage plugins. Attempting to handle plugin installation via plugin for new plugins in the provided database object.')
-                    // handlePluginInstallViaPlugin returns ONLY the newly
-                    // confirmed installs, so assigning it wholesale DELETED
-                    // every already-installed plugin. A plugin doing the
-                    // natural read-modify-write (hand back the db it just read)
-                    // confirms nothing new, so the list was replaced by an
-                    // empty array. Keep what is installed, append what the user
-                    // approved.
-                    const confirmedInstalls = await handlePluginInstallViaPlugin(newDb.plugins)
-                    newDb[key] = [...db.plugins, ...confirmedInstalls]
+                    await installApprovedPlugins(newDb.plugins, handlePluginInstallViaPlugin, {
+                        get: () => db.plugins ?? [],
+                        set: (plugins) => { db.plugins = plugins },
+                    })
+                    continue
                 }
 
                 if (applyPluginDbKey(key, newDb[key])) {
@@ -1109,7 +1106,9 @@ export async function handlePluginInstallViaPlugin(plugins: RisuPlugin[]){
                 console.warn(`Plugin "${plugin.name}" has version "${plugin.version}", which is not supported for installation via plugin. Only API version 3.0 plugins can be installed via plugin. Skipping installation of this plugin.`)
                 continue
             }
-            const confirmation = await alertConfirm(language.confirmInstallPluginViaPlugin.replace('{plugin}', plugin.name))
+            const replacing = DBState.db.plugins.some((p: RisuPlugin) => p.name === plugin.name)
+            const message = replacing ? language.confirmReplacePluginViaPlugin : language.confirmInstallPluginViaPlugin
+            const confirmation = await alertConfirm(message.replace('{plugin}', plugin.name))
             if(confirmation){
                 // The plugin object comes from ANOTHER plugin's sandbox, so any
                 // installId on it is caller-supplied and must never be honoured

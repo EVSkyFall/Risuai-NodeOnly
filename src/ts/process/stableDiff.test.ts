@@ -52,6 +52,7 @@ vi.mock('lodash/random', () => ({
 const {
     generateAIImage,
     generateAIImageTyped,
+    applyImageOrientation,
     __resetComfyPollersForTest: resetComfyPollersForTest,
 } = await import('./stableDiff')
 
@@ -2977,4 +2978,34 @@ describe('NAI director reference fields', () => {
         expect(parameters.director_reference_strength_values).toEqual([1])
         expect(parameters.director_reference_descriptions).toHaveLength(1)
     })
+
+describe('applyImageOrientation', () => {
+    it('keeps configured dimensions without an orientation', () => {
+        expect(applyImageOrientation(1024, 640)).toEqual({ height: 640, width: 1024 })
+    })
+
+    it('places the longer edge on the width for landscape', () => {
+        expect(applyImageOrientation(640, 1024, 'landscape')).toEqual({ height: 640, width: 1024 })
+    })
+
+    it('places the longer edge on the height for portrait', () => {
+        expect(applyImageOrientation(1024, 640, 'portrait')).toEqual({ height: 1024, width: 640 })
+    })
+})
+
+describe('generateAIImage NAI orientation', () => {
+    it('sends the oriented canvas to NovelAI and leaves the setting alone', async () => {
+        mocks.db.NAIImgConfig.width = 1216
+        mocks.db.NAIImgConfig.height = 832
+        mocks.globalFetch.mockResolvedValue(fetchResult({}))
+
+        await generateAIImage('prompt', currentChar, 'negative', 'inlay', 'interactive', undefined, { orientation: 'portrait' })
+        const [, request] = mocks.globalFetch.mock.calls[0] as [string, { body: any }]
+
+        expect(request.body.parameters.width).toBe(832)
+        expect(request.body.parameters.height).toBe(1216)
+        expect(mocks.db.NAIImgConfig.width).toBe(1216)
+        expect(mocks.db.NAIImgConfig.height).toBe(832)
+    })
+})
 })

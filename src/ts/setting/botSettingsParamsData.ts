@@ -6,7 +6,7 @@
  */
 
 import type { SettingItem } from './types';
-import { LLMFlags, LLMFormat } from '../model/types';
+import { LLMFlags, LLMFormat, resolveClaudeThinkingType } from '../model/types';
 
 /**
  * Basic parameter settings that are always visible
@@ -161,7 +161,7 @@ export const modelSpecificParameterItems: SettingItem[] = [
         bindKey: 'thinkingTokens',
         condition: (ctx) =>
             ctx.modelInfo.parameters.includes('thinking_tokens') &&
-            ctx.db.thinkingType === 'budget' &&
+            resolveClaudeThinkingType(ctx.modelInfo.flags, ctx.db.thinkingType) === 'budget' &&
             !ctx.modelInfo.flags.includes(LLMFlags.geminiThinking),
         options: {
             min: -1,

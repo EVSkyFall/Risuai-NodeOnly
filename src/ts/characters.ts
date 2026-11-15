@@ -17,6 +17,7 @@ import { translateHTML } from "./translator/translator";
 import { doingChat } from "./process/index.svelte";
 import { importCharacter } from "./characterCards";
 import { importCharacterPackage } from "./characterPackage";
+import { protonImportDialogOpen } from "./proton/protonImport";
 import { PngChunk } from "./pngChunk";
 
 export function createNewCharacter() {
@@ -764,6 +765,11 @@ export async function addCharacter(arg:{
         deselectCharacter()
         OpenRealmStore.set(true)
         MobileGUIStack.set(0)
+        return
+    }
+    if(r === 'importProton'){
+        protonImportDialogOpen.set(true)
+        MobileGUIStack.set(1)
         return
     }
     reseter();

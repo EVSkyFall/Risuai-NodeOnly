@@ -444,6 +444,7 @@ let requestImmediateSaveImpl: ((options?: {
 }) => Promise<void> | void) = () => {}
 let flushSavesImpl: (signal?: AbortSignal) => Promise<boolean> = async () => false
 let trackCharacterForSaveImpl: (chaId: string) => void = () => {}
+let trackChatForSaveImpl: (chaId: string, chatId: string) => void = () => {}
 let patchSyncBaseline: Database | null = null
 let activeSavePatcher: RisuSavePatcher | null = null
 
@@ -631,6 +632,15 @@ export function flushSaves(signal?: AbortSignal): Promise<boolean> {
 /** Include this character in the next save even if nothing tracked it. */
 export function trackCharacterForSave(chaId: string) {
     trackCharacterForSaveImpl(chaId)
+}
+
+/**
+ * Include this chat's body in the next save. Only the chat on screen is
+ * tracked automatically, so a write to any other chat needs this; a failed
+ * save keeps it queued like any other change.
+ */
+export function trackChatForSave(chaId: string, chatId: string) {
+    trackChatForSaveImpl(chaId, chatId)
 }
 
 export function setPatchSyncBaseline(data: Database | null) {
@@ -1713,6 +1723,12 @@ export async function saveDb() {
         await triggerSave({
             forceFullWrite: options?.forceFullWrite,
         })
+    }
+
+    trackChatForSaveImpl = (chaId, chatId) => {
+        if (!chaId || !chatId) return
+        if (changeTracker.chat.some(([c, id]) => c === chaId && id === chatId)) return
+        changeTracker.chat.push([chaId, chatId])
     }
 
     while (true) {
@@ -2971,7 +2987,8 @@ export async function fetchViaProxy2(
         body: realBody as any,
         headers: proxyHeaders,
         method: arg.method,
-        signal: arg.signal
+        signal: arg.signal,
+        cache: 'no-store',
     })
 
     return new Response(r.body, {

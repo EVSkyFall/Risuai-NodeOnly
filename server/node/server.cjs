@@ -45,6 +45,7 @@ const { createRequestLogs } = require('./request-logs.cjs');
 const { applyPatch } = require('fast-json-patch');
 const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, normalizeForwardHeaders, hasRemoteBlocks } = require('./utils.cjs');
 const pluginStorage = require('./plugin-storage-store.cjs');
+const upstreamPluginStorage = require('./upstream-plugin-storage.cjs');
 const { createAssetManifestStore } = require('./assetManifestStore.cjs');
 const {
     stripAssetManifests,
@@ -730,12 +731,28 @@ async function decodeDatabaseWithPersistentChatIds(raw, options = {}) {
         onMintId: () => { hadMintedEntryIds = true; },
     }));
     let needsPersist = hadMintedEntryIds;
+    // Upstream's cold-storage-backed plugin storage, in either layout, is
+    // folded back into plain keys before the kv split so the values move
+    // with it.
     const coldPluginResult = restoreColdPluginStorageInDb(dbObj);
-    if (coldPluginResult.failed) logger.warn(`[ColdStorage] ${coldPluginResult.failed} plugin value(s) remain recoverable in _coldplugin`);
+    if (coldPluginResult) {
+        needsPersist = true;
+        logPluginStorageRestore('Restored', coldPluginResult);
+    }
     const pluginMigration = pluginStorage.migrateFromDb(dbObj, { kvWinsOnRemigration: true });
     if (pluginMigration.migrated) needsPersist = true;
     dbObj.pluginCustomStorage = {};
     kvSet('_meta/plugin-storage-migrated', Buffer.from('1'));
+    let leakedPluginResult = null;
+    try {
+        leakedPluginResult = recoverLeakedPluginStorageKeys(dbObj);
+    } catch (e) {
+        logger.error('[PluginStorage] Recovering upstream plugin storage keys from kv failed; they stay as they are', e);
+    }
+    if (leakedPluginResult) {
+        needsPersist = true;
+        logPluginStorageRestore('Recovered', leakedPluginResult);
+    }
 
     const hadMissingIds = assignMissingChatIds(dbObj);
     if (hadMissingIds) needsPersist = true;
@@ -785,6 +802,7 @@ async function decodeDatabaseWithPersistentChatIds(raw, options = {}) {
     }
     if (migrationResult) {
         migrationResult.coldStorageFailed = coldRestoreResult.failed;
+        migrationResult.pluginStorageColdFailed = (coldPluginResult?.failed || 0) + (leakedPluginResult?.failed || 0);
     }
     return dbObj;
 }
@@ -1562,6 +1580,27 @@ app.use('/assets', express.static(path.join(process.cwd(), 'dist/assets'), {
 }));
 app.use(express.static(path.join(process.cwd(), 'dist'), {index: false, maxAge: 0}));
 app.use(express.json({ limit: '100mb' }));
+
+// A started RisuAI account import will replace all data: nothing may write
+// until it ends (risu-account-import.cjs). Open meanwhile: the import's own
+// routes, sign-in, and requests that read or leave the data alone.
+const ACCOUNT_IMPORT_OPEN_ROUTES = new Set([
+    '/api/login', '/api/token/refresh', '/api/session', '/api/crypto', '/api/set_password',
+    '/api/logs', '/api/termux-notify', '/api/tunnel/start', '/api/tunnel/stop',
+    '/api/assets/bulk-read', '/api/asset-manifests/resolve', '/api/mcp/llm/call',
+    '/api/proxy/copilot-chat', '/api/model-preset/google-service-account/token',
+]);
+function changesDataDuringAccountImport(req) {
+    if (!req.path.startsWith('/api/')) return false;
+    if (req.path === '/api/remove') return true;
+    if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return false;
+    if (req.path.startsWith('/api/risu-account/') || ACCOUNT_IMPORT_OPEN_ROUTES.has(req.path)) return false;
+    return !(req.path.startsWith('/api/mcp/') && /\/(get|list)$/.test(req.path));
+}
+app.use((req, res, next) => {
+    if (!changesDataDuringAccountImport(req) || !risuAccountImport.isBlocking()) return next();
+    res.status(423).json({ error: 'A RisuAI account import is in progress', code: 'ACCOUNT_IMPORT_ACTIVE' });
+});
 
 // PocketRisu -> Termux native Android notification
 app.post('/api/termux-notify', async (req, res) => {
@@ -3133,8 +3172,8 @@ function backupImportError(message, code) {
 // its local backups since v2026.6.102 (kwaroran/RisuAI d0548267). The key is
 // fetched from sv.risuai.xyz per backup and is not obtainable from here.
 const BACKUP_ENCRYPTED_MESSAGE =
-    'This backup was exported from RisuAI while logged in to a web account (sync), so its database is encrypted and cannot be imported. ' +
-    'In RisuAI, log out of the account (your data is moved to the device) or use Partial Backup, then export again. Your existing database was not replaced.';
+    'This backup was exported from the RisuAI web version (risuai.xyz), so its database is encrypted and can only be opened on risuai.xyz. ' +
+    'Turn on "Save Data in Account" in RisuAI, then use "Import from RisuAI account" in Data Migration. Your existing database was not replaced.';
 
 // decodeRisuSave has lenient fallbacks that can turn random bytes into a
 // msgpack primitive instead of throwing, so the result must also be an object.
@@ -3186,11 +3225,27 @@ async function importBackupFromSourceUnlocked(dataSource, { maxBytes = 0, totalB
     let batchCount = 0;
     // Backups may omit plugin data, so only an actual plugin entry authorizes replacement.
     let pluginWipeDone = false;
+    // Plugin values the backup's database names in cold storage but that
+    // could not be read; reported with the result.
+    let importPluginColdFailed = 0;
     const seenEntryNames = new Set();
     const importedInlayIds = new Set();
     const importedSidecarIds = new Set();
     const explicitSidecarMap = new Map();
     const legacyInlayInfoMap = new Map();
+    // Rows a backup replaces wholesale. They are deleted in the final
+    // transaction, and only those the backup did not bring: entries are
+    // committed in BATCH_SIZE batches, so a delete in the first batch survived
+    // a rejection later in the stream (duplicate entry, the encryption marker
+    // upstream writes after every asset, a truncated upload, an undecodable
+    // database) and left the old database without its images and cold items.
+    // Rows the import creates are removed again when it fails (createdKeys).
+    // Incoming rows overwrite same-named old rows on the way in and stay;
+    // asset names are content hashes and cold ids are UUIDs, so those carry
+    // the same data.
+    const REPLACED_PREFIXES = ['assets/', 'inlay/', 'inlay_thumb/', 'inlay_meta/', 'inlay_info/', 'coldstorage/', 'drafts/', 'remotes/'];
+    const importedKeys = new Set();
+    const createdKeys = new Set();
 
     const stagingDir = path.join(savePath, 'inlays_import_staging');
     const backupInlayDir = path.join(savePath, 'inlays_import_backup');
@@ -3198,11 +3253,21 @@ async function importBackupFromSourceUnlocked(dataSource, { maxBytes = 0, totalB
     await fs.rm(backupInlayDir, { recursive: true, force: true });
     await fs.mkdir(stagingDir, { recursive: true });
 
+    // Entry ids become file names here. Ids are validated before use, and
+    // this check keeps a crafted name from writing outside the staging dir
+    // even if a parser misses one (e.g. "\" separators on Windows).
+    const resolvedStagingDir = path.resolve(stagingDir) + path.sep;
+    function assertInsideStagingDir(filePath) {
+        if (!path.resolve(filePath).startsWith(resolvedStagingDir)) {
+            throw new Error(`Path escapes inlay import staging directory: ${filePath}`);
+        }
+        return filePath;
+    }
     function stagingInlayFilePath(id, ext) {
-        return path.join(stagingDir, `${id}.${normalizeInlayExt(ext)}`);
+        return assertInsideStagingDir(path.join(stagingDir, `${id}.${normalizeInlayExt(ext)}`));
     }
     function stagingSidecarPath(id) {
-        return path.join(stagingDir, `${id}.meta.json`);
+        return assertInsideStagingDir(path.join(stagingDir, `${id}.meta.json`));
     }
     function writeStagingInlayFileSync(id, ext, buffer, info) {
         const normalizedExt = normalizeInlayExt(ext);
@@ -3235,40 +3300,13 @@ async function importBackupFromSourceUnlocked(dataSource, { maxBytes = 0, totalB
 
     sqliteDb.pragma('synchronous = OFF');
 
+    // Assets live in the asset file store, outside kv: the ones already
+    // there are listed now so a failed import removes only what it added.
+    const assetKeysBefore = new Set((await assetFileStore.list()).map((row) => row.key));
+    // Applied in the final transaction, after plugin_atomic is wiped there.
+    let pluginAtomicRows = null;
+
     sqliteDb.exec('BEGIN');
-    await assetFileStore.legacyBatch(writer => writer.clear());
-    kvDelPrefix('inlay/');
-    kvDelPrefix('inlay_thumb/');
-    kvDelPrefix('inlay_meta/');
-    kvDelPrefix('inlay_info/');
-    kvDelPrefix('coldstorage/');
-    // Plugin namespaces are replaced only after an actual payload triggers rescue.
-    // Composer drafts are session/device-local and not carried in the backup;
-    // wipe stale ones so an old snapshot's chats don't resurrect later drafts.
-    kvDelPrefix('drafts/');
-    // Same reasoning as clearExistingData (save-folder import path): wipe stale
-    // remote payloads from the prior user before this backup's contents land.
-    // .bin backups never carry REMOTE blocks today, so the migration won't
-    // resolveRemote on them — but keeping the two import paths consistent
-    // avoids a contamination regression if that ever changes (upstream sync,
-    // plugin-generated buffers, etc.).
-    kvDelPrefix('remotes/');
-    // Allow remote-block migration to re-evaluate against the new database.bin.
-    // (.bin backups themselves never carry REMOTE blocks — legacy msgpack
-    // format only — but a fresh import is a clear "data changed" signal.)
-    kvDel(REMOTE_MIGRATION_MARKER_KEY);
-    kvDel(REMOTE_CHAT_RECOVERY_MARKER);
-    // plugin_atomic is not in kv, so no kvDelPrefix above reaches it. Wipe it
-    // unconditionally (not only when the archive carries an entry): an import
-    // replaces the whole world, and leaving forward-moving CAS revisions paired
-    // with a rewound chat blob is exactly the failure this closes. The epoch
-    // bump inside purgeForRestore invalidates every outstanding change cursor,
-    // so a plugin gets a typed cursor_expired instead of silently resuming.
-    // Runs inside the explicit BEGIN above — better-sqlite3 turns the store's
-    // nested db.transaction into a SAVEPOINT, so it rolls back with the import.
-    pluginAtomic.purgeForRestore();
-    comfyOrchestrator.purgeForWorldReplacement();
-    clearEntities();
 
     try {
         for await (const chunk of dataSource) {
@@ -3299,6 +3337,11 @@ async function importBackupFromSourceUnlocked(dataSource, { maxBytes = 0, totalB
                 const inlaySidecar = parseInlaySidecarBackupName(name);
 
                 if (inlayRaw) {
+                    // parseInlayBackupName only rejects "/"; an id with "\"
+                    // or ".." would escape the staging dir on Windows.
+                    if (!isSafeInlayId(inlayRaw.id)) {
+                        throw new Error(`Invalid inlay backup entry name: ${name}`);
+                    }
                     importedInlayIds.add(inlayRaw.id);
                     if (inlayRaw.ext) {
                         writeStagingInlayFileSync(inlayRaw.id, inlayRaw.ext, data, legacyInlayInfoMap.get(inlayRaw.id) || { ext: inlayRaw.ext, name: inlayRaw.id, type: 'image' });
@@ -3361,12 +3404,12 @@ async function importBackupFromSourceUnlocked(dataSource, { maxBytes = 0, totalB
                     if (meta?.type === 'account') encryptedMarker = true;
                 } else if (name === PLUGIN_ATOMIC_BACKUP_ENTRY_NAME) {
                     // Restores the rows the export carried, with revisions and
-                    // tombstones intact, on top of the wipe performed above.
-                    // Receipts are deliberately NOT carried: after a restore the
-                    // record revisions are authoritative, so a replayed
-                    // operationKey resolves to a CAS conflict rather than a
-                    // double apply.
-                    pluginAtomic.importRows(JSON.parse(data.toString('utf-8')));
+                    // tombstones intact, on top of the wipe in the final
+                    // transaction. Receipts are deliberately NOT carried: after a
+                    // restore the record revisions are authoritative, so a
+                    // replayed operationKey resolves to a CAS conflict rather
+                    // than a double apply.
+                    pluginAtomicRows = JSON.parse(data.toString('utf-8'));
                 } else {
                     const storageKey = resolveBackupStorageKey(name);
                     pluginWipeDone = await preparePluginStorageImport({
@@ -3382,7 +3425,13 @@ async function importBackupFromSourceUnlocked(dataSource, { maxBytes = 0, totalB
                         : data;
                     if (storageKey === DB_BLOB_KEY) pendingDatabase = storageValue;
                     else {
-                        if (storageKey.startsWith('assets/')) await assetFileStore.legacyBatch(writer => writer.put(storageKey, storageValue));
+                        const isAsset = storageKey.startsWith('assets/');
+                        if (REPLACED_PREFIXES.some((prefix) => storageKey.startsWith(prefix))) {
+                            const existed = isAsset ? assetKeysBefore.has(storageKey) : kvGetUpdatedAt(storageKey) !== null;
+                            if (!existed) createdKeys.add(storageKey);
+                            importedKeys.add(storageKey);
+                        }
+                        if (isAsset) await assetFileStore.legacyBatch(writer => writer.put(storageKey, storageValue));
                         else kvSet(storageKey, storageValue);
                         assetsRestored += 1;
                     }
@@ -3432,14 +3481,23 @@ async function importBackupFromSourceUnlocked(dataSource, { maxBytes = 0, totalB
         // with no way back from the UI.
         await assertBackupDatabaseDecodable(pendingDatabase);
         const importedDb = await decodeRisuSave(pendingDatabase, { extractPluginStorage: true });
-        restoreColdPluginStorageInDb(importedDb);
-        if (importedDb?.pluginCustomStorage && Object.keys(importedDb.pluginCustomStorage).length) {
+        const importPluginRestore = restoreColdPluginStorageInDb(importedDb);
+        if (importPluginRestore) {
+            importPluginColdFailed = importPluginRestore.failed;
+            logPluginStorageRestore('Restored', importPluginRestore);
+        }
+        const hasPluginValues = !!importedDb?.pluginCustomStorage && Object.keys(importedDb.pluginCustomStorage).length > 0;
+        if (hasPluginValues) {
             pluginWipeDone = await preparePluginStorageImport({
                 storageKey: `${pluginStorage.PREFIX}legacy.json`, pluginWipeDone,
                 dumpPluginStorageRescue, kvDelPrefix,
             });
             pluginStorage.migrateFromDb(importedDb, { kvWinsOnRemigration: true });
             importedDb.pluginCustomStorage = {};
+        }
+        // Also when every value failed: the reserved keys are gone and the
+        // recovery record must reach disk.
+        if (hasPluginValues || importPluginRestore) {
             pendingDatabase = Buffer.from(encodeRisuSaveLegacy(importedDb));
         }
         kvSet('database/database.bin', pendingDatabase);
@@ -3456,16 +3514,68 @@ async function importBackupFromSourceUnlocked(dataSource, { maxBytes = 0, totalB
             kvSet('_meta/plugin-storage-migrated', Buffer.from('1'));
             kvSet('_meta/plugin-blob-migrated', Buffer.from('1'));
         }
+        // See REPLACED_PREFIXES. archive/ and archive-meta/ rows are
+        // deliberately NOT wiped: the imported database is inlined and
+        // references none of them, and the pre-import snapshot may still.
+        // They become orphan rows for the dashboard purge. Composer drafts
+        // are session/device-local and not carried in the backup, so stale
+        // ones go and an old snapshot's chats don't resurrect later drafts.
+        // Stale remote payloads go for the same reason as in
+        // clearExistingData (save-folder import).
+        const staleAssetKeys = [...assetKeysBefore].filter((key) => !importedKeys.has(key));
+        await assetFileStore.legacyBatch((writer) => {
+            for (const key of staleAssetKeys) writer.remove(key);
+        });
+        for (const prefix of REPLACED_PREFIXES) {
+            if (prefix === 'assets/') continue;
+            for (const key of kvList(prefix)) {
+                if (!importedKeys.has(key)) kvDel(key);
+            }
+        }
+        // Allow remote-block migration to re-evaluate against the new
+        // database.bin — a fresh import is a clear "data changed" signal.
+        kvDel(REMOTE_MIGRATION_MARKER_KEY);
+        kvDel(REMOTE_CHAT_RECOVERY_MARKER);
+        // plugin_atomic is not in kv, so the prefixes above do not reach it.
+        // Wiped unconditionally (not only when the archive carries an entry):
+        // an import replaces the whole world, and leaving forward-moving CAS
+        // revisions paired with a rewound chat blob is exactly the failure
+        // this closes. The epoch bump inside purgeForRestore invalidates every
+        // outstanding change cursor, so a plugin gets a typed cursor_expired
+        // instead of silently resuming. better-sqlite3 turns the store's
+        // nested db.transaction into a SAVEPOINT of this transaction.
+        pluginAtomic.purgeForRestore();
+        if (pluginAtomicRows) pluginAtomic.importRows(pluginAtomicRows);
+        comfyOrchestrator.purgeForWorldReplacement();
+        clearEntities();
         sqliteDb.exec('COMMIT');
     } catch (error) {
         try { sqliteDb.exec('ROLLBACK'); } catch (_) {}
+        // Earlier batches are committed already: take back the rows they added.
+        if (createdKeys.size > 0) {
+            try {
+                sqliteDb.transaction(() => {
+                    for (const key of createdKeys) if (!key.startsWith('assets/')) kvDel(key);
+                })();
+                await assetFileStore.legacyBatch((writer) => {
+                    for (const key of createdKeys) if (key.startsWith('assets/')) writer.remove(key);
+                });
+            } catch (cleanupError) {
+                logger.error(`[Backup Import] Could not remove ${createdKeys.size} row(s) of the failed import:`, cleanupError);
+            }
+        }
         await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => {});
         await fs.rm(backupInlayDir, { recursive: true, force: true }).catch(() => {});
-        error.message = `${error.message} Assets, cold chats, remotes and plugin data may have been partially replaced.`;
+        if (pluginWipeDone) error.message = `${error.message} Plugin data may have been partially replaced.`;
         throw error;
     } finally {
         sqliteDb.pragma('synchronous = NORMAL');
     }
+
+    // The new database is committed: drop the cache and chat store of the
+    // old one now, so a failure in the inlay swap below cannot leave them
+    // to be flushed over the import.
+    invalidateDbCache();
 
     await ensureInlayDir();
     try {
@@ -3484,11 +3594,10 @@ async function importBackupFromSourceUnlocked(dataSource, { maxBytes = 0, totalB
         throw swapError;
     }
 
-    invalidateDbCache();
-
     // Trigger cold storage migration now so import result includes failure count.
     const dbRaw = kvGet('database/database.bin');
     let coldStorageFailed = 0;
+    let pluginStorageColdFailed = 0;
     if (dbRaw) {
         const migration = {};
         const dbObj = await decodeDatabaseWithPersistentChatIds(dbRaw, {
@@ -3496,6 +3605,7 @@ async function importBackupFromSourceUnlocked(dataSource, { maxBytes = 0, totalB
             migrationResult: migration,
         });
         coldStorageFailed = migration.coldStorageFailed || 0;
+        pluginStorageColdFailed = migration.pluginStorageColdFailed || 0;
         await initChatStoreFromDisk(dbObj);
     }
 
@@ -3509,7 +3619,10 @@ async function importBackupFromSourceUnlocked(dataSource, { maxBytes = 0, totalB
     if (coldStorageFailed > 0) {
         logger.error(`[Backup Import] ${coldStorageFailed} cold storage character(s) could not be restored`);
     }
-    return { assetsRestored, bytesReceived, coldStorageFailed };
+    if (pluginStorageColdFailed > 0) {
+        logger.error(`[Backup Import] ${pluginStorageColdFailed} plugin storage item(s) could not be restored from cold storage`);
+    }
+    return { assetsRestored, bytesReceived, coldStorageFailed, pluginStorageColdFailed: pluginStorageColdFailed + importPluginColdFailed };
 }
 
 app.get('/', async (req, res, next) => {
@@ -4236,7 +4349,16 @@ const reverseProxyFunc = async (req, res, next) => {
         head.delete('content-security-policy');
         head.delete('content-security-policy-report-only');
         head.delete('clear-site-data');
-        head.delete('Cache-Control');
+        // Targets picked by the risu-url header all share the /proxy(2) URL, so
+        // no cache (browser or CDN) may store a relay response for reuse, and
+        // upstream cache headers (Expires, CDN-only ones) must not override that.
+        head.set('Cache-Control', 'private, no-store');
+        head.delete('Expires');
+        head.delete('CDN-Cache-Control');
+        head.delete('Cloudflare-CDN-Cache-Control');
+        head.delete('Surrogate-Control');
+        head.delete('Edge-Control');
+        head.delete('X-Accel-Expires');
         head.delete('Content-Encoding');
         // Node's fetch already decompressed the body, so the upstream
         // (compressed) Content-Length no longer matches and would truncate the
@@ -4333,7 +4455,16 @@ const reverseProxyFunc_get = async (req, res, next) => {
         head.delete('content-security-policy');
         head.delete('content-security-policy-report-only');
         head.delete('clear-site-data');
-        head.delete('Cache-Control');
+        // Targets picked by the risu-url header all share the /proxy(2) URL, so
+        // no cache (browser or CDN) may store a relay response for reuse, and
+        // upstream cache headers (Expires, CDN-only ones) must not override that.
+        head.set('Cache-Control', 'private, no-store');
+        head.delete('Expires');
+        head.delete('CDN-Cache-Control');
+        head.delete('Cloudflare-CDN-Cache-Control');
+        head.delete('Surrogate-Control');
+        head.delete('Edge-Control');
+        head.delete('X-Accel-Expires');
         head.delete('Content-Encoding');
         // Node's fetch already decompressed the body, so the upstream
         // (compressed) Content-Length no longer matches and would truncate the
@@ -4442,24 +4573,22 @@ async function hubProxyFunc(req, res) {
     ];
 
     try {
-        let externalURL = '';
-
-        const pathHeader = req.headers['x-risu-node-path'];
-        if (pathHeader) {
-            const decodedPath = decodeURIComponent(pathHeader);
-            externalURL = decodedPath;
-        } else {
-            const pathAndQuery = req.originalUrl.replace(/^\/hub-proxy/, '');
-            externalURL = hubURL + pathAndQuery;
+        const hubOrigin = new URL(hubURL).origin;
+        const pathAndQuery = req.originalUrl.replace(/^\/hub-proxy/, '');
+        const externalURL = new URL(hubURL + pathAndQuery);
+        if (externalURL.origin !== hubOrigin) {
+            res.status(400).send({ error: 'Invalid hub path' });
+            return;
         }
-        
+
         const headersToSend = { ...req.headers };
         delete headersToSend.host;
         delete headersToSend.connection;
         delete headersToSend['content-length'];
         delete headersToSend['x-risu-node-path'];
+        delete headersToSend['risu-auth'];
+        delete headersToSend.cookie;
 
-        const hubOrigin = new URL(hubURL).origin;
         headersToSend.origin = hubOrigin;
 
         //if Authorization header is "Server-Auth, set the token to be Server-Auth
@@ -4492,7 +4621,12 @@ async function hubProxyFunc(req, res) {
         res.status(response.status);
 
         if (response.status >= 300 && response.status < 400 && response.headers.get('location')) {
-            const redirectUrl = response.headers.get('location');
+            const redirectUrl = new URL(response.headers.get('location'), externalURL);
+            if (redirectUrl.origin !== hubOrigin) {
+                res.removeHeader('location');
+                res.status(502).send({ error: 'Hub redirected to a different origin' });
+                return;
+            }
             const newHeaders = { ...headersToSend };
             const redirectResponse = await fetch(redirectUrl, {
                 method: req.method,
@@ -6173,6 +6307,13 @@ app.post('/api/assets/bulk-write', async (req, res, next) => {
             res.status(400).send({ error: 'Body must be a JSON array of {key, value}' });
             return;
         }
+        // database.bin goes through /api/write. Written here it would skip
+        // every guard and leave dbCache and the chat store describing the
+        // old one, which the next flush writes back over it.
+        if(entries.some((entry) => entry?.key === DB_BLOB_KEY)){
+            res.status(400).send({ error: 'database/database.bin cannot be written through bulk-write' });
+            return;
+        }
         await queueStorageOperation(() => assetFileStore.withMigrationPaused(async () => {
             for(let i = 0; i < entries.length; i += BULK_BATCH){
                 const batch = entries.slice(i, i + BULK_BATCH);
@@ -6545,11 +6686,15 @@ app.post('/api/backup/import', async (req, res, next) => {
     importInProgress = true;
     const resumeAssetMigration = assetFileStore.pauseMigration();
 
-    // Disable timeouts for large backup uploads
-    const prevRequestTimeout = req.socket.server?.requestTimeout;
+    // Disable timeouts for large backup uploads. Keep the server reference:
+    // when the upload is cut off (client abort, rejection mid-stream) the
+    // finally block runs after req.socket was detached, and reading
+    // req.socket.server there threw and took the whole process down.
+    const httpServer = req.socket.server;
+    const prevRequestTimeout = httpServer?.requestTimeout;
     req.socket.setTimeout(0);
     req.socket.setKeepAlive(true);
-    if (req.socket.server) req.socket.server.requestTimeout = 0;
+    if (httpServer) httpServer.requestTimeout = 0;
 
     // NDJSON streaming keeps the response socket alive during long
     // post-upload work (WAL checkpoint, cold-storage migration). Without it
@@ -6601,6 +6746,7 @@ app.post('/api/backup/import', async (req, res, next) => {
                 ok: true,
                 assetsRestored: result.assetsRestored,
                 coldStorageFailed: result.coldStorageFailed,
+                pluginStorageColdFailed: result.pluginStorageColdFailed,
             }) + '\n');
             res.end();
         } else {
@@ -6609,6 +6755,7 @@ app.post('/api/backup/import', async (req, res, next) => {
                 ok: true,
                 assetsRestored: result.assetsRestored,
                 coldStorageFailed: result.coldStorageFailed,
+                pluginStorageColdFailed: result.pluginStorageColdFailed,
             });
         }
     } catch (error) {
@@ -6624,9 +6771,116 @@ app.post('/api/backup/import', async (req, res, next) => {
         if (heartbeatTimer) clearInterval(heartbeatTimer);
         importInProgress = false;
         resumeAssetMigration();
-        if (req.socket.server && prevRequestTimeout !== undefined) {
-            req.socket.server.requestTimeout = prevRequestTimeout;
+        if (httpServer && prevRequestTimeout !== undefined) {
+            httpServer.requestTimeout = prevRequestTimeout;
         }
+    }
+});
+
+// ── RisuAI account import ───────────────────────────────────────────────────
+// Downloads a risuai.xyz account (database, assets, cold storage) to a staging
+// folder, then applies it through importBackupFromSource. Logic lives in
+// risu-account-import.cjs; while an import is started, the write gate above
+// (changesDataDuringAccountImport) refuses every data write.
+// POCKETRISU_RISU_ACCOUNT_URL points tests at a fake
+// account server and POCKETRISU_RISU_ACCOUNT_GAP_MS shortens the pause between
+// account requests there.
+const { createRisuAccountImport, AccountImportError } = require('./risu-account-import.cjs');
+const accountRequestGapMs = Number(process.env.POCKETRISU_RISU_ACCOUNT_GAP_MS);
+const risuAccountImport = createRisuAccountImport({
+    baseUrl: process.env.POCKETRISU_RISU_ACCOUNT_URL || undefined,
+    requestGapMs: process.env.POCKETRISU_RISU_ACCOUNT_GAP_MS && Number.isFinite(accountRequestGapMs) && accountRequestGapMs >= 0 ? accountRequestGapMs : undefined,
+    stagingDir: path.join(savePath, 'account_import_staging'),
+    logger,
+    decodeRisuSave,
+    encodeRisuSaveLegacy,
+    checkDiskSpace,
+    applyEntries: applyRisuAccountEntries,
+});
+
+async function applyRisuAccountEntries(entries, { totalBytes, onProgress }) {
+    if (importInProgress) {
+        throw new AccountImportError('Another import is already in progress', 'ACCOUNT_IMPORT_BUSY', 409);
+    }
+    importInProgress = true;
+    try {
+        // Writes accepted before the import started may still wait in the
+        // storage queue; they run before the swap, not after it. New ones are
+        // refused while the import blocks.
+        await queueStorageOperation(async () => {});
+        const disk = await checkDiskSpace(totalBytes * BACKUP_DISK_HEADROOM);
+        if (!disk.ok) {
+            throw new AccountImportError('Not enough free disk space to apply the import', 'ACCOUNT_DISK_FULL', 507);
+        }
+        return await importBackupFromSource(entries, { totalBytes, onProgress });
+    } finally {
+        importInProgress = false;
+    }
+}
+
+function sendAccountImportError(res, error, next) {
+    if (error?.code && typeof error.status === 'number') {
+        res.status(error.status).json({ error: error.message, code: error.code });
+        return;
+    }
+    next(error);
+}
+
+app.get('/api/risu-account/config', async (req, res) => {
+    if (!await checkAuth(req, res)) { return; }
+    res.json(risuAccountImport.config());
+});
+
+app.get('/api/risu-account/status', async (req, res, next) => {
+    if (!await checkAuth(req, res)) { return; }
+    try {
+        res.json(await risuAccountImport.status());
+    } catch (error) {
+        next(error);
+    }
+});
+
+app.post('/api/risu-account/prepare', async (req, res, next) => {
+    if (!await checkAuth(req, res)) { return; }
+    try {
+        // Reads the account database in the background; the client polls
+        // status for the summary (or the error).
+        risuAccountImport.prepare({ token: req.body?.token, id: req.body?.id });
+        res.json({ ok: true });
+    } catch (error) {
+        sendAccountImportError(res, error, next);
+    }
+});
+
+// The first call starts the import: from then on PocketRisu is blocked until
+// it is applied or cancelled.
+app.post('/api/risu-account/download', async (req, res, next) => {
+    if (!await checkAuth(req, res)) { return; }
+    try {
+        res.json(risuAccountImport.startDownload());
+    } catch (error) {
+        sendAccountImportError(res, error, next);
+    }
+});
+
+app.post('/api/risu-account/cancel', async (req, res, next) => {
+    if (!await checkAuth(req, res)) { return; }
+    try {
+        await risuAccountImport.cancel();
+        res.json({ ok: true });
+    } catch (error) {
+        sendAccountImportError(res, error, next);
+    }
+});
+
+// Applies a download with missing items once the user accepts them (one
+// without missing items applies by itself). Runs in the background.
+app.post('/api/risu-account/apply', async (req, res, next) => {
+    if (!await checkAuth(req, res)) { return; }
+    try {
+        res.json(risuAccountImport.startApply());
+    } catch (error) {
+        sendAccountImportError(res, error, next);
     }
 });
 
@@ -6845,6 +7099,7 @@ app.post('/api/backup/server/restore', async (req, res, next) => {
             ok: true,
             assetsRestored: result.assetsRestored,
             coldStorageFailed: result.coldStorageFailed,
+            pluginStorageColdFailed: result.pluginStorageColdFailed,
         }) + '\n');
         res.end();
     } catch (error) {
@@ -7001,50 +7256,87 @@ function restoreColdStorageCharactersInDb(dbObj) {
     return result;
 }
 
-// Upstream (cad8595a) keeps v3 pluginStorage values in cold storage and leaves
-// only a key -> cold id map in pluginCustomStorage._coldplugin. Fold the
-// values back inline so pluginStorage.migrateFromDb moves them into kv.
-// Keys whose entry is missing or unreadable stay in _coldplugin as recovery
-// breadcrumbs; their cold storage KV entries are never deleted.
-const COLD_PLUGIN_STORAGE_KEY = '_coldplugin';
+// Upstream keeps v3 pluginStorage values in cold storage: cad8595a leaves a
+// key -> cold id map in pluginCustomStorage._coldplugin, and 68b5d032c
+// (v2026.10.210+) a _coldpluginIndex pointer to one index item. Fold both back
+// into plain keys so pluginStorage.migrateFromDb moves them into kv (see
+// upstream-plugin-storage.cjs). Cold storage KV entries are never deleted.
+// What cannot be restored is recorded in nodeOnlyPluginStorageRecovery,
+// outside the plugin key space, so a reserved key never reaches a plugin or
+// an export to upstream, where it would be read as a live pointer.
+const PLUGIN_STORAGE_RECOVERY_KEY = 'nodeOnlyPluginStorageRecovery';
+
+function readColdPluginItem(coldId) {
+    try {
+        const entry = readColdStorageJsonEntry(coldId, { migrateLegacy: true });
+        return entry ? entry.coldData : undefined;
+    } catch (err) {
+        logger.error(`[ColdStorage] plugin storage item ${coldId} could not be read:`, err.message);
+        throw err;
+    }
+}
+
+function appendPluginStorageRecovery(dbObj, record) {
+    const existing = Array.isArray(dbObj[PLUGIN_STORAGE_RECOVERY_KEY]) ? dbObj[PLUGIN_STORAGE_RECOVERY_KEY] : [];
+    dbObj[PLUGIN_STORAGE_RECOVERY_KEY] = [...existing, record];
+}
+
+function logPluginStorageRestore(action, result) {
+    if (result.restored > 0) {
+        logger.info(`[ColdStorage] ${action} ${result.restored} plugin storage key(s) from cold storage`);
+    }
+    if (result.failed > 0) {
+        logger.error(`[ColdStorage] ${result.failed} plugin storage item(s) could not be restored; details are kept in ${PLUGIN_STORAGE_RECOVERY_KEY}. Cold storage KV data is preserved.`);
+    }
+}
 
 function restoreColdPluginStorageInDb(dbObj) {
-    const result = { restored: 0, failed: 0, failedKeys: [] };
     const storage = dbObj?.pluginCustomStorage;
-    if (!storage || typeof storage !== 'object' || Array.isArray(storage)) return result;
-    if (!Object.prototype.hasOwnProperty.call(storage, COLD_PLUGIN_STORAGE_KEY)) return result;
-    const map = storage[COLD_PLUGIN_STORAGE_KEY];
-    if (!map || typeof map !== 'object' || Array.isArray(map)) return result;
+    if (!upstreamPluginStorage.hasReservedKeys(storage)) return null;
+    const resolved = upstreamPluginStorage.resolveUpstreamPluginStorage(storage, {
+        readCold: readColdPluginItem,
+        isPresent: (key) => Object.prototype.hasOwnProperty.call(storage, key),
+        source: 'database',
+    });
+    for (const key of upstreamPluginStorage.RESERVED_KEYS) delete storage[key];
+    for (const [key, value] of resolved.assign) {
+        // defineProperty keeps a "__proto__" key an own property.
+        Object.defineProperty(storage, key, { value, enumerable: true, writable: true, configurable: true });
+    }
+    if (resolved.record) appendPluginStorageRecovery(dbObj, resolved.record);
+    return resolved;
+}
 
-    const remaining = Object.create(null);
-    for (const key of Object.keys(map)) {
-        const coldId = map[key];
-        let entry = null;
+// Builds that did not know the index layout moved upstream's reserved keys
+// into kv as ordinary plugin keys (the pointer string, and _coldplugin
+// breadcrumbs). Resolve them the same way, once: the values already in kv are
+// live and win over the cold copies.
+function recoverLeakedPluginStorageKeys(dbObj) {
+    const leaked = {};
+    for (const key of upstreamPluginStorage.RESERVED_KEYS) {
+        let value = null;
         try {
-            entry = typeof coldId === 'string' && coldId
-                ? readColdStorageJsonEntry(coldId, { migrateLegacy: true })
-                : null;
+            value = pluginStorage.get(key);
         } catch (err) {
-            logger.error(`[ColdStorage] plugin storage key "${key}" (${coldId}) could not be read:`, err.message);
+            logger.error(`[PluginStorage] Reserved key "${key}" in kv could not be read:`, err.message);
         }
-        if (!entry) {
-            remaining[key] = coldId;
-            result.failed++;
-            result.failedKeys.push(key);
-            continue;
-        }
-        // The cold copy is upstream's live value; an inline key of the same
-        // name is a stale pre-migration leftover.
-        Object.defineProperty(storage, key, { value: entry.coldData, enumerable: true, configurable: true, writable: true });
-        result.restored++;
+        if (value !== null && value !== undefined) leaked[key] = value;
     }
+    if (Object.keys(leaked).length === 0) return null;
 
-    if (Object.keys(remaining).length > 0) {
-        storage[COLD_PLUGIN_STORAGE_KEY] = remaining;
-    } else {
-        delete storage[COLD_PLUGIN_STORAGE_KEY];
-    }
-    return result;
+    createBackupAndRotate({ force: true });
+    const present = new Set(pluginStorage.list().map((entry) => entry.key));
+    const resolved = upstreamPluginStorage.resolveUpstreamPluginStorage(leaked, {
+        readCold: readColdPluginItem,
+        isPresent: (key) => present.has(key),
+        source: 'leaked-kv',
+    });
+    sqliteDb.transaction(() => {
+        for (const [key, value] of resolved.assign) pluginStorage.set(key, value);
+        for (const key of Object.keys(leaked)) pluginStorage.remove(key);
+    })();
+    if (resolved.record) appendPluginStorageRecovery(dbObj, resolved.record);
+    return resolved;
 }
 
 function isColdStorageChat(chat) {
@@ -7560,8 +7852,10 @@ app.post('/api/migrate/save-folder/upload', async (req, res, next) => {
 
     req.socket.setTimeout(0);
     req.socket.setKeepAlive(true);
-    const prevRequestTimeout = req.socket.server?.requestTimeout;
-    if (req.socket.server) req.socket.server.requestTimeout = 0;
+    // Same as /api/backup/import: req.socket can be detached by the finally block.
+    const httpServer = req.socket.server;
+    const prevRequestTimeout = httpServer?.requestTimeout;
+    if (httpServer) httpServer.requestTimeout = 0;
 
     try {
         const chunks = [];
@@ -7610,8 +7904,8 @@ app.post('/api/migrate/save-folder/upload', async (req, res, next) => {
     } finally {
         importInProgress = false;
         resumeAssetMigration();
-        if (req.socket.server && prevRequestTimeout !== undefined) {
-            req.socket.server.requestTimeout = prevRequestTimeout;
+        if (httpServer && prevRequestTimeout !== undefined) {
+            httpServer.requestTimeout = prevRequestTimeout;
         }
     }
 });
@@ -10189,7 +10483,10 @@ app.post('/api/tunnel/stop', async (req, res) => {
 app.use(expressErrorMiddleware);
 app.use((err, req, res, next) => {
     if (res.headersSent) return next(err);
-    res.status(500).json({ error: err?.message || 'internal server error' });
+    // Body parsers reject an oversized body with type 'entity.too.large'; keep
+    // its 413 so the client can show the size message instead of a generic one.
+    const status = err?.type === 'entity.too.large' ? 413 : 500;
+    res.status(status).json({ error: err?.message || 'internal server error' });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
