@@ -499,9 +499,10 @@ await (async function() {
     }
 
     function collectTransferables(obj, transferables = []) {
-        // ReadableStream check must precede the first "return transferables" —
-        // guest-source sniffers (e.g. CPM) lazily match up to that point to
-        // decide whether transferable-stream bridging is supported.
+        // Keep this ReadableStream check before the first return of this
+        // function: guest-source sniffers (e.g. CPM) lazily match from the
+        // function name to its first return and look for "ReadableStream"
+        // in between to decide whether streams can cross the bridge.
         if (obj instanceof ReadableStream) return transferables;
         for (const value of getTransferables(obj)) transferables.push(value);
         return transferables;
@@ -712,6 +713,44 @@ await (async function() {
     Object.freeze(window.postMessage);
 })();
 `;
+
+// The bridge is the first <script> of the document, in <head>: guest-source
+// sniffers (CPM's stream check) read document.querySelector('script'), and
+// plugins append their own scripts to <head> (CPM runs its sub-plugins that
+// way before its check), which would come first if this one sat in <body>.
+// Plugin code waits for the parser, so it still finds document.body.
+export const AWAIT_PARSED_DOCUMENT = `if (document.readyState === 'loading') {
+                    await new Promise((resolve) => document.addEventListener('DOMContentLoaded', resolve, { once: true }));
+                }`;
+
+export function guestDocument(csp: string, nonce: string, userCode: string) {
+    return `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <meta http-equiv="Content-Security-Policy" content="${csp}" id="csp-meta">
+        <script nonce="${nonce}">
+            document.querySelector('meta#csp-meta')?.remove();
+            (async () => {
+                ${GUEST_BRIDGE_SCRIPT}
+                ${AWAIT_PARSED_DOCUMENT}
+                (async () => {
+                    ${userCode}
+                })()
+            })();
+        </script>
+      </head>
+      <body>
+        <style>
+            body {
+                background-color: transparent;
+            }
+        </style>
+      </body>
+      </html>
+    `;
+}
 
 // A callback called after terminate() fails at once instead of waiting
 // forever, marked handled like the ones terminate() rejects.
@@ -1132,34 +1171,7 @@ export class SandboxHost {
         window.addEventListener('message', this.messageHandlerRef);
 
 
-        const html = `
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <meta charset="UTF-8">
-        <meta http-equiv="Content-Security-Policy" content="${this.csp}" id="csp-meta">
-      </head>
-      <body>
-        <style>
-            body {
-                background-color: transparent;
-            }
-        </style>
-        <script nonce="${this.nonce}">
-            document.querySelector('meta#csp-meta')?.remove();
-            (async () => {
-                ${GUEST_BRIDGE_SCRIPT}
-                    
-                (async () => {
-                    ${userCode}
-                })()
-            })();
-        </script>
-      </body>
-      </html>
-    `;
-
-        this.iframe.srcdoc = html;
+        this.iframe.srcdoc = guestDocument(this.csp, this.nonce, userCode);
 
         return () => {
             this.terminate();

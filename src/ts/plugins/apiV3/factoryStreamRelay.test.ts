@@ -677,6 +677,13 @@ describe('SandboxHost RESPONSE lifecycle', () => {
         const harness = hostHarness({ _getPropertiesForInitialization: () => ({ list: [] }), _getAliases: () => ({}), fetch: () => new Response(bytes([6, 7])) }, undefined, built.SandboxHost);
         const { api: guest } = await harness.guest(built.GUEST_BRIDGE_SCRIPT);
         expect(new Uint8Array(await (await guest.fetch()).arrayBuffer())).toEqual(new Uint8Array([6, 7]));
+        // run() loads the guest document, whose first script after the
+        // minifier still passes CPM's source check (bridge in <head>).
+        const srcdoc = harness.frame.srcdoc;
+        expect(srcdoc).toBe(built.guestDocument((harness.host as any).csp, (harness.host as any).nonce, ''));
+        expect(srcdoc.indexOf('<script')).toBeLessThan(srcdoc.indexOf('<body>'));
+        const match = srcdoc.match(/function\s+collectTransferables\b[\s\S]{0,3000}?return\s+transferables/);
+        expect(match?.[0]).toContain('ReadableStream');
     });
 });
 
