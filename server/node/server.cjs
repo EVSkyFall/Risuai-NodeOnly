@@ -5457,7 +5457,12 @@ app.post('/api/write', async (req, res, next) => {
             } else if (key.startsWith('inlay_info/')) {
                 const id = key.slice('inlay_info/'.length)
                 const parsed = JSON.parse(Buffer.from(fileContent).toString('utf-8'));
-                await writeInlaySidecar(id, parsed);
+                // Metadata only: while the sidecar points at a file that is there, its
+                // ext stays. A client whose own read failed sends what it had cached,
+                // and that may name the format the image had before it was converted.
+                const current = await readInlaySidecar(id);
+                const stored = current && await fs.access(getInlayFilePath(id, current.ext)).then(() => true, () => false);
+                await writeInlaySidecar(id, stored ? { ...parsed, ext: current.ext } : parsed);
                 kvDel(key);
             } else if (key === 'database/database.bin') {
                 // Client sends stubs-only DB — merge full chats from server before persisting
