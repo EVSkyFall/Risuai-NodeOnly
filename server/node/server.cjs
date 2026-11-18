@@ -11875,8 +11875,10 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
         console.log(`[Server] Received ${sig}, flushing pending data...`);
         stopTunnel();
         try { await comfyOrchestrator.stop(); } catch (e) { logger.error('[Server] Comfy stop error:', e); }
-        try { await mediaTranscode.stop(); } catch (e) { logger.error('[Media transcode] shutdown:', e); }
+        // Told to stop at once (it starts nothing afterwards), but the flush below does not wait for it.
+        const transcodeStopped = mediaTranscode.stop().catch((e) => { logger.error('[Media transcode] shutdown:', e); });
         try { await flushPendingDb(); } catch (e) { logger.error('[Server] Flush error:', e); }
+        await transcodeStopped;
         try { await assetFileStore.close(); } catch (e) { logger.error('[Asset files] shutdown:', e); }
         try { checkpointWal('TRUNCATE'); } catch { /* non-fatal */ }
         process.exit(0);

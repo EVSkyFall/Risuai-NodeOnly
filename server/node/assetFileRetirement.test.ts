@@ -82,6 +82,20 @@ describe('asset generation retirement times', () => {
         expect(retiredAt('old-retired')).toBeGreaterThan(Date.now() - 60_000)
         expect(retiredAt('old-live')).toBeUndefined()
         expect(db.prepare('SELECT count(*) n FROM asset_file_retirements').get().n).toBe(1)
+        expect(db.prepare('SELECT was_live FROM asset_file_retirements').get().was_live).toBe(0)
+    })
+
+    it('stamps old rows only when the table first appears, not on every start', async () => {
+        const { dir, db, retiredAt } = await fixture()
+        // As if a row had lost its stamp while the server was down.
+        db.prepare('INSERT INTO asset_file_generations VALUES (?, ?, 1, ?, 5, 0)').run('late', 'assets/y.png', 'h')
+        db.prepare('UPDATE asset_file_generations SET retired = 1 WHERE generationId = ?').run('late')
+        db.prepare('DELETE FROM asset_file_retirements').run()
+        const again = createAssetFileStore(db, { saveDir: dir, logger: { warn: () => {} } })
+        cleanup.push(async () => { await again.close() })
+        expect(retiredAt('late')).toBeUndefined()
+        // Without a stamp it is simply never deleted.
+        expect(again.deleteRetired('late', Date.now() + 86_400_000)).toBe(false)
     })
 })
 
@@ -101,7 +115,7 @@ describe('publishIfCurrent', () => {
     })
 
     it('publishes nothing when the key moved on, and leaves the newer bytes live', async () => {
-        const { store, liveId, retiredAt } = await fixture()
+        const { store, db, liveId, file } = await fixture()
         await store.put('assets/a.png', 'png bytes')
         const source = liveId('assets/a.png')
         const entry = await store.writeDetached('assets/a.png', 'stale webp')
@@ -110,8 +124,14 @@ describe('publishIfCurrent', () => {
         expect(store.publishIfCurrent('assets/a.png', source, entry)).toBe(false)
         expect(liveId('assets/a.png')).toBe(newer)
         expect((await store.get('assets/a.png')).toString()).toBe('newer png')
-        // The unused generation is tracked as retired, so it can be cleaned up like any other.
-        expect(retiredAt(entry.generationId)).toBeGreaterThan(0)
+        // Nothing was registered for the unused file; the caller removes it.
+        expect(db.prepare('SELECT count(*) n FROM asset_file_generations WHERE generationId = ?').get(entry.generationId).n).toBe(0)
+        expect(existsSync(file(entry.generationId))).toBe(true)
+        expect(store.discardDetached(entry.generationId)).toBe(true)
+        expect(existsSync(file(entry.generationId))).toBe(false)
+        // A generation the catalog knows is never discarded this way.
+        expect(store.discardDetached(newer)).toBe(false)
+        expect(existsSync(file(newer))).toBe(true)
     })
 
     it('publishes nothing for a key that was removed', async () => {
@@ -151,6 +171,13 @@ describe('deleteRetired', () => {
         expect(store.deleteRetired(second, Date.now() + 86_400_000)).toBe(false)
         expect(existsSync(file(second))).toBe(true)
         expect(store.deleteRetired('f'.repeat(64), Date.now() + 86_400_000)).toBe(false)
+    })
+
+    it('never calls a retirement without a recorded time old enough', async () => {
+        const { store, db, first, file } = await retiredFixture()
+        db.prepare('DELETE FROM asset_file_retirements WHERE generationId = ?').run(first)
+        expect(store.deleteRetired(first, Date.now() + 86_400_000)).toBe(false)
+        expect(existsSync(file(first))).toBe(true)
     })
 
     it('clears the row of a generation whose file is already gone', async () => {

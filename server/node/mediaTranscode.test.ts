@@ -136,7 +136,7 @@ describe('media transcode: converting assets', () => {
     })
 
     it('publishes nothing when the key was written again while its image was being encoded', async () => {
-        const { store, settle, put, liveId, logRow, hooks } = await fixture()
+        const { store, settle, put, liveId, logRow, hooks, db, dir } = await fixture()
         const original = await put('assets/a.png', await markedPicture())
         const newer = await markedPicture(7)
         hooks.beforeQueue = async () => { await store.put('assets/a.png', newer) }
@@ -144,6 +144,10 @@ describe('media transcode: converting assets', () => {
         expect((await store.get('assets/a.png')).equals(newer)).toBe(true)
         expect(logRow(original)).toBeUndefined()
         expect(liveId('assets/a.png')).not.toBe(original)
+        // The WebP made from the old bytes left neither a row nor a file.
+        expect(db.prepare('SELECT count(*) n FROM asset_file_generations').get().n).toBe(2)
+        expect(readdirSync(path.join(dir, 'assets'), { recursive: true }).filter(name => String(name).endsWith('.blob'))).toHaveLength(2)
+        expect(db.prepare('SELECT count(*) n FROM media_originals').get().n).toBe(0)
     })
 
     it('records a failed read as an error and tries again only after the backoff', async () => {
@@ -226,10 +230,13 @@ describe('media transcode: the encoder', () => {
     })
 
     it('stops promptly while it rests between images', async () => {
-        const { transcode, put } = await fixture({ enabled: true, paceMs: 3_600_000 })
-        await put('assets/a.png', await markedPicture())
+        const { transcode, put, logRow } = await fixture({ enabled: true, paceMs: 3_600_000 })
+        const id = await put('assets/a.png', await markedPicture())
         const running = transcode.pass()
-        await new Promise(resolve => setTimeout(resolve, 1500))
+        // The conversion is recorded before the rest begins, so from here on it is resting.
+        for (let i = 0; i < 300 && logRow(id)?.outcome !== 'converted'; i++) await new Promise(resolve => setTimeout(resolve, 100))
+        expect(logRow(id)).toMatchObject({ outcome: 'converted' })
+        await new Promise(resolve => setTimeout(resolve, 200))
         const started = Date.now()
         await transcode.stop()
         await running
@@ -462,6 +469,134 @@ describe('media transcode: stopping and long waits', () => {
         expect(fired).toBe(1)
         cancelLong()
         cancelShort()
+    })
+})
+
+describe('media transcode: decisions follow the configuration', () => {
+    it('takes a "not marked" decision again when the markers change', async () => {
+        const { settle, setConfig, put, logRow } = await fixture({ enabled: true, paceMs: 0, markers: ['nothing-has-this'] })
+        const id = await put('assets/a.png', await markedPicture())
+        await settle()
+        expect(logRow(id)).toMatchObject({ outcome: 'not-marked', basis: '["nothing-has-this"]' })
+        setConfig({ enabled: true, paceMs: 0 })
+        await settle()
+        expect(logRow(id)).toMatchObject({ outcome: 'converted' })
+    })
+
+    it('uses the default markers when the list has no usable entry', async () => {
+        expect(normalizeConfig({ markers: [] }).markers).toEqual(['AssetMaid'])
+        expect(normalizeConfig({ markers: ['', 3, null] }).markers).toEqual(['AssetMaid'])
+        const { settle, put, logRow } = await fixture({ enabled: true, paceMs: 0, markers: [] })
+        const id = await put('assets/a.png', await markedPicture())
+        await settle()
+        expect(logRow(id)).toMatchObject({ outcome: 'converted' })
+    })
+
+    it('takes a rejected encode again when the encode settings change', async () => {
+        const { settle, setConfig, put, logRow } = await fixture({ enabled: true, paceMs: 0, maxDiff: 0, quality: 1 })
+        const id = await put('assets/a.png', await markedPicture())
+        await settle()
+        expect(logRow(id)).toMatchObject({ outcome: 'failed-check', basis: '1/0/40' })
+        const at = logRow(id).at
+        await settle()
+        expect(logRow(id).at).toBe(at)
+        setConfig({ enabled: true, paceMs: 0 })
+        await settle()
+        expect(logRow(id)).toMatchObject({ outcome: 'converted' })
+    })
+
+    it('adds an hour to the wait with every further failure', async () => {
+        const { settle, put, logRow, file, db } = await fixture()
+        const id = await put('assets/a.png', await markedPicture())
+        unlinkSync(file(id))
+        await settle()
+        const first = logRow(id)
+        expect(first.next_at - first.at).toBe(3_600_000)
+        db.prepare('UPDATE media_transcode_log SET next_at = ? WHERE id = ?').run(Date.now() - 1, id)
+        await settle()
+        const second = logRow(id)
+        expect(second).toMatchObject({ outcome: 'error', attempts: 2 })
+        expect(second.next_at - second.at).toBe(7_200_000)
+    })
+})
+
+describe('media transcode: staying out of the way', () => {
+    it('does nothing while an import has paused the asset store', async () => {
+        const context = await fixture()
+        const { store, transcode, settle, put, logRow, rel } = context
+        const done = await put('assets/done.png', await markedPicture())
+        await settle()
+        const waiting = await put('assets/waiting.png', await markedPicture(5))
+        writeFileSync(path.join(transcode.paths.originalsDir, 'pin-1.covered'), `${rel(done)}\n`)
+        context.retireAge(done, 4)
+        const resume = store.pauseMigration()
+        expect(await transcode.pass()).toBe(60_000)
+        await transcode.housekeeping(transcode.readConfig())
+        expect(logRow(waiting)).toBeUndefined()
+        expect(existsSync(path.join(transcode.paths.originalsDir, 'pin-1.covered'))).toBe(true)
+        expect(existsSync(context.file(done))).toBe(true)
+        resume()
+        await settle()
+        expect(logRow(waiting)).toMatchObject({ outcome: 'converted' })
+        expect(existsSync(context.file(done))).toBe(false)
+    })
+
+    it('finds a candidate behind any number of decided images, one slice of the catalog at a time', async () => {
+        const { transcode, put, logRow } = await fixture({ enabled: true, paceMs: 0 }, { sliceSize: 3 })
+        const plain = await picture()
+        // Ten old images that end up decided, then one to convert, older ones first.
+        const decided: string[] = []
+        for (let i = 0; i < 10; i++) decided.push(await put(`assets/plain-${i}.png`, plain, 200 - i))
+        const target = await put('assets/target.png', await markedPicture(), 60)
+        let passes = 0
+        for (; passes < 60; passes++) if (await transcode.pass() !== 0) break
+        expect(logRow(target)).toMatchObject({ outcome: 'converted' })
+        for (const id of decided) expect(logRow(id)).toMatchObject({ outcome: 'not-marked' })
+        // Everything is decided now: the next search walks the slices without examining anything.
+        const at = logRow(target).at
+        let quiet = 0
+        for (; quiet < 60; quiet++) if (await transcode.pass() !== 0) break
+        expect(quiet).toBeGreaterThanOrEqual(3)
+        expect(quiet).toBeLessThan(60)
+        expect(logRow(target).at).toBe(at)
+    })
+
+    it('closes the record of an original that is gone from the catalog and the disk', async () => {
+        const context = await fixture()
+        const { transcode, settle, put, db, rel, file } = context
+        const original = await put('assets/a.png', await markedPicture())
+        await settle()
+        // As if the file and its row had been removed by hand.
+        unlinkSync(file(original))
+        db.prepare('DELETE FROM asset_file_generations WHERE generationId = ?').run(original)
+        await transcode.housekeeping(transcode.readConfig())
+        const row = db.prepare('SELECT * FROM media_originals WHERE path = ?').get(rel(original))
+        expect(row.deleted_at).toBeGreaterThan(0)
+        expect(row.listed_at).toBeGreaterThan(0)
+        expect(readFileSync(transcode.paths.wantPath, 'utf-8')).toBe('')
+    })
+})
+
+describe('media transcode: the encoder, continued', () => {
+    it('gives the image after a timed-out one a fresh worker', async () => {
+        const marker = path.join(tmpdir(), `media-transcode-once-${process.pid}-${Math.random().toString(16).slice(2)}`)
+        const workerPath = `${marker}.cjs`
+        // Silent for the first worker ever started, answering in every later one.
+        writeFileSync(workerPath, [
+            "const fs = require('node:fs');",
+            "const { parentPort } = require('node:worker_threads');",
+            `const first = !fs.existsSync(${JSON.stringify(marker)});`,
+            `if (first) fs.writeFileSync(${JSON.stringify(marker)}, '');`,
+            "parentPort.on('message', () => { if (!first) parentPort.postMessage({ notSmaller: true }); });",
+        ].join('\n'))
+        cleanup.push(async () => { await rm(workerPath, { force: true }); await rm(marker, { force: true }) })
+        const { settle, put, logRow } = await fixture({ enabled: true, paceMs: 0, itemTimeoutMinutes: 0.01 }, { workerPath })
+        const first = await put('assets/a.png', await markedPicture(), 90)
+        const second = await put('assets/b.png', await markedPicture(5), 60)
+        await settle()
+        expect(logRow(first)).toMatchObject({ outcome: 'error' })
+        expect(logRow(first).detail).toMatch(/no answer/)
+        expect(logRow(second)).toMatchObject({ outcome: 'not-smaller' })
     })
 })
 

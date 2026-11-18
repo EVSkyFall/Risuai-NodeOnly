@@ -101,7 +101,7 @@ describe('media transcode through the server', () => {
 
         // The backup side confirms the pin; three days later (moved up here) the original goes.
         await writeFile(path.join(saveDir, 'media-originals', 'pin-test.covered'), `${relative}\n`)
-        await until('the covered list to be ingested', () => sql(db => db.prepare('SELECT count(*) n FROM media_originals').get().n === 1))
+        await until('the covered list to be ingested', () => sql(db => db.prepare('SELECT count(*) n FROM media_originals WHERE covered_at IS NOT NULL').get().n === 1))
         expect(existsSync(originalFile)).toBe(true)
         sql(db => db.prepare('UPDATE asset_file_retirements SET retired_at = ? WHERE generationId = ?').run(Date.now() - 4 * DAY, original))
         await until('the original to be deleted', () => !existsSync(originalFile))

@@ -19,11 +19,16 @@
 // because a backup import holds a transaction open on the shared connection for as long as it
 // runs. (The tables are created at startup, before any request; a covered list is removed after
 // its rows are committed.)
+//
+// Nothing here looks at the whole catalog in one go: the search walks it in slices and the
+// originals are tracked in a table of their own, so the work per step stays the same however
+// large the catalog and its history grow.
 
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { performance } = require('node:perf_hooks');
 const { Worker } = require('node:worker_threads');
 const { generationPath } = require('./assetFileIO.cjs');
 const { CHECKS, isPng, pngFacts, hasMarker } = require('./mediaTranscodeCore.cjs');
@@ -53,14 +58,15 @@ function numberIn(value, low, high, fallback) {
 // Unknown fields are ignored and unusable values fall back, so an old or hand-edited file never stops the server.
 function normalizeConfig(raw) {
     const source = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
-    const markers = Array.isArray(source.markers) ? source.markers.filter(marker => typeof marker === 'string' && marker) : null;
+    const markers = Array.isArray(source.markers) ? source.markers.filter(marker => typeof marker === 'string' && marker) : [];
     return {
         enabled: source.enabled === true || source.enabled === 'report' ? source.enabled : false,
         ageDays: numberIn(source.ageDays, 0, 36500, DEFAULTS.ageDays),
         quality: numberIn(source.quality, 1, 100, DEFAULTS.quality),
         maxDiff: numberIn(source.maxDiff, 0, 255, DEFAULTS.maxDiff),
         maxBlockDiff: numberIn(source.maxBlockDiff, 0, 255, DEFAULTS.maxBlockDiff),
-        markers: markers || [...DEFAULTS.markers],
+        // A list without a usable marker would mark nothing; that is a mistake, not a wish.
+        markers: markers.length ? markers : [...DEFAULTS.markers],
         paceMs: numberIn(source.paceMs, 0, 3_600_000, DEFAULTS.paceMs),
         sweepMinutes: numberIn(source.sweepMinutes, 0.01, 525_600, DEFAULTS.sweepMinutes),
         retentionDays: numberIn(source.retentionDays, 0, 36500, DEFAULTS.retentionDays),
@@ -70,14 +76,15 @@ function normalizeConfig(raw) {
 }
 
 // setTimeout fires after 1 ms when asked for more than about 24.8 days, so a long wait is a
-// chain of short ones. Returns a function that cancels it.
+// chain of short ones, measured on the monotonic clock so that a corrected wall clock neither
+// shortens nor stretches it. Returns a function that cancels it.
 function after(ms, action) {
-    const end = Date.now() + ms;
+    const end = performance.now() + ms;
     let timer = null;
     let cancelled = false;
     const step = () => {
         if (cancelled) return;
-        const left = end - Date.now();
+        const left = end - performance.now();
         if (left <= 0) return void action();
         timer = setTimeout(step, Math.min(left, DAY_MS));
         timer.unref?.();
@@ -90,57 +97,88 @@ function after(ms, action) {
 class EncoderUnavailable extends Error {}
 
 function createMediaTranscode({ db, saveDir, store, queue, logger = console, now = Date.now,
-    workerPath = path.join(__dirname, 'mediaTranscodeWorker.cjs') }) {
+    workerPath = path.join(__dirname, 'mediaTranscodeWorker.cjs'), sliceSize = 2000 }) {
     const originalsDir = path.join(saveDir, 'media-originals');
     const collectedDir = path.join(originalsDir, 'collected');
     const wantPath = path.join(originalsDir, 'want.list');
     const configPath = path.join(saveDir, 'media-transcode.json');
 
     db.exec(`
+        -- One row per examined generation. basis is what the decision rested on (the markers
+        -- for "not-marked", the encode settings for a rejected encode), so it is taken again
+        -- when the configuration changes.
         CREATE TABLE IF NOT EXISTS media_transcode_log (
             id TEXT PRIMARY KEY, kind TEXT NOT NULL, key TEXT NOT NULL, outcome TEXT NOT NULL,
-            result TEXT, detail TEXT, checks INTEGER NOT NULL,
+            result TEXT, detail TEXT, basis TEXT, checks INTEGER NOT NULL,
             attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER, at INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS media_transcode_log_result ON media_transcode_log(result) WHERE result IS NOT NULL;
-        -- One row per original that a pinned snapshot holds. Rows stay after the file is deleted:
-        -- they are the record of which pin has which original.
+        -- One row per original this module wants to delete, from the moment it wants to. Rows
+        -- stay after the deletion: they are the record of which pin has which original.
         CREATE TABLE IF NOT EXISTS media_originals (
-            path TEXT PRIMARY KEY, covered_at INTEGER NOT NULL, manifest TEXT,
-            deleted_at INTEGER, listed_at INTEGER
+            path TEXT PRIMARY KEY, generationId TEXT NOT NULL, wanted_at INTEGER NOT NULL,
+            covered_at INTEGER, manifest TEXT, deleted_at INTEGER, listed_at INTEGER
         );
+        CREATE INDEX IF NOT EXISTS media_originals_open ON media_originals(path) WHERE deleted_at IS NULL;
+        CREATE INDEX IF NOT EXISTS media_originals_unlisted ON media_originals(path)
+            WHERE deleted_at IS NOT NULL AND listed_at IS NULL;
     `);
-    const generationRelPath = "'assets/' || substr(g.generationId, 1, 2) || '/' || g.generationId || '.blob'";
-    const candidates = db.prepare(`
+    // Where the slice that starts after the cursor ends: its last row, or nothing when fewer
+    // rows than a slice are left.
+    const sliceEnd = db.prepare(`
+        SELECT updated_at AS time, generationId AS id FROM asset_file_generations
+        WHERE retired = 0 AND updated_at <= @cutoff AND (updated_at, generationId) > (@afterTime, @afterId)
+        ORDER BY updated_at, generationId LIMIT 1 OFFSET ${Math.max(1, Math.floor(sliceSize)) - 1}`);
+    // The upper bound is a plain term so that it ends the index range: inside a slice its end
+    // (which the cutoff already limited), in the last, short slice the cutoff itself.
+    const candidatesUpTo = (bound) => db.prepare(`
         SELECT g.generationId, g.key, g.size, g.updated_at FROM asset_file_generations g
         LEFT JOIN media_transcode_log l ON l.id = g.generationId
-        WHERE g.retired = 0 AND g.updated_at <= @cutoff
+        WHERE g.retired = 0
             AND (g.updated_at, g.generationId) > (@afterTime, @afterId)
+            AND ${bound}
             AND NOT EXISTS (SELECT 1 FROM media_transcode_log made WHERE made.result = g.generationId)
             AND (l.id IS NULL OR l.checks < @checks
                 OR (l.outcome = 'error' AND l.next_at <= @now)
-                OR (l.outcome = 'would-convert' AND @live = 1))
+                OR (l.outcome = 'would-convert' AND @live = 1)
+                OR (l.outcome = 'not-marked' AND l.basis IS NOT @markersBasis)
+                OR (l.outcome IN ('failed-check', 'not-smaller', 'would-convert') AND l.basis IS NOT @encodeBasis))
         ORDER BY g.updated_at, g.generationId LIMIT 50`);
+    const candidatesInSlice = candidatesUpTo('(g.updated_at, g.generationId) <= (@endTime, @endId)');
+    const candidatesToCutoff = candidatesUpTo('g.updated_at <= @cutoff');
     const record = db.prepare(`
-        INSERT INTO media_transcode_log (id, kind, key, outcome, result, detail, checks, attempts, next_at, at)
-        VALUES (@id, @kind, @key, @outcome, @result, @detail, @checks, @attempts, @next_at, @at)
+        INSERT INTO media_transcode_log (id, kind, key, outcome, result, detail, basis, checks, attempts, next_at, at)
+        VALUES (@id, @kind, @key, @outcome, @result, @detail, @basis, @checks, @attempts, @next_at, @at)
         ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, key = excluded.key, outcome = excluded.outcome,
-            result = excluded.result, detail = excluded.detail, checks = excluded.checks,
+            result = excluded.result, detail = excluded.detail, basis = excluded.basis, checks = excluded.checks,
             attempts = excluded.attempts, next_at = excluded.next_at, at = excluded.at`);
     const attemptsOf = db.prepare('SELECT attempts FROM media_transcode_log WHERE id = ?');
-    // Retired generations that may be deleted one day, with whether a covered list names them.
-    // "transcoded": the PNG generations this module replaced. "all": every generation that was
-    // live once. A generation that was never live may still be waiting for its publication
-    // (an import, a migration), however long that takes, so it is never in scope.
-    const retiredInScope = db.prepare(`
-        SELECT g.generationId, ${generationRelPath} AS path, r.retired_at, o.path AS covered
-        FROM asset_file_generations g
-        JOIN asset_file_retirements r ON r.generationId = g.generationId
-        LEFT JOIN media_originals o ON o.path = ${generationRelPath}
-        WHERE g.retired = 1 AND (
-            EXISTS (SELECT 1 FROM media_transcode_log l WHERE l.id = g.generationId AND l.outcome = 'converted')
-            OR (@all = 1 AND r.was_live = 1))`);
-    const markDeleted = db.prepare('UPDATE media_originals SET deleted_at = ? WHERE path = ?');
+    const wantOriginal = db.prepare('INSERT OR IGNORE INTO media_originals (path, generationId, wanted_at) VALUES (?, ?, ?)');
+    // "all": every retired generation that was live once is wanted, whoever retired it. A
+    // generation that was never live may still be waiting for its publication (an import, a
+    // migration), however long that takes, so it is never wanted.
+    const adoptRetired = db.prepare(`
+        INSERT OR IGNORE INTO media_originals (path, generationId, wanted_at)
+        SELECT 'assets/' || substr(r.generationId, 1, 2) || '/' || r.generationId || '.blob', r.generationId, @at
+        FROM asset_file_retirements r WHERE r.was_live = 1`);
+    const coverOriginal = db.prepare(`
+        INSERT INTO media_originals (path, generationId, wanted_at, covered_at, manifest)
+        VALUES (@path, @generationId, @at, @at, @manifest)
+        ON CONFLICT(path) DO UPDATE SET covered_at = excluded.covered_at, manifest = excluded.manifest
+            WHERE media_originals.covered_at IS NULL`);
+    // The originals not deleted yet, a page at a time, with what the catalog says about each.
+    const openOriginals = db.prepare(`
+        SELECT o.path, o.generationId, o.covered_at, g.retired, r.retired_at, r.was_live,
+            EXISTS (SELECT 1 FROM media_transcode_log l WHERE l.id = o.generationId AND l.outcome = 'converted') AS transcoded
+        FROM media_originals o
+        LEFT JOIN asset_file_generations g ON g.generationId = o.generationId
+        LEFT JOIN asset_file_retirements r ON r.generationId = o.generationId
+        WHERE o.deleted_at IS NULL AND o.path > @after
+        ORDER BY o.path LIMIT 1000`);
+    const markDeleted = db.prepare('UPDATE media_originals SET deleted_at = ? WHERE path = ? AND deleted_at IS NULL');
+    const unlisted = db.prepare(`SELECT path FROM media_originals
+        WHERE deleted_at IS NOT NULL AND listed_at IS NULL ORDER BY path LIMIT 5000`);
+    const markListed = db.prepare('UPDATE media_originals SET listed_at = ? WHERE path = ? AND listed_at IS NULL');
 
     let running = false;
     let stopping = false;
@@ -162,6 +200,8 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
         wake = () => { cancel(); resolve(); };
     }).finally(() => { wake = null; });
     const nextTurn = () => new Promise((resolve) => setImmediate(resolve));
+    // An import is running or waiting for the queue: everything here waits for it to finish.
+    const idle = () => stopping || store.isPaused();
 
     function readConfig() {
         try { return normalizeConfig(JSON.parse(fs.readFileSync(configPath, 'utf-8'))); }
@@ -170,6 +210,8 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
             return normalizeConfig(null);
         }
     }
+    const markersBasis = (config) => JSON.stringify([...config.markers].sort());
+    const encodeBasis = (config) => `${config.quality}/${config.maxDiff}/${config.maxBlockDiff}`;
 
     function encode(bytes, config) {
         return new Promise((resolve, reject) => {
@@ -199,16 +241,22 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
                 worker = current;
             }
             const active = worker;
-            // A stuck encode must not stop every later image: ending the worker fails this item
-            // (it is tried again later with backoff) and the next item gets a fresh worker.
-            const cancelWatchdog = after(config.itemTimeoutMinutes * 60_000, () => { void active.terminate(); });
-            pending = { resolve, reject, cancelWatchdog };
+            const request = { resolve, reject, cancelWatchdog: null };
+            // A stuck encode must not stop every later image: this item fails (it is tried again
+            // later with backoff) and the next one gets a fresh worker. The worker is let go of
+            // before it is ended, so an answer that still arrives is not taken for the next image's.
+            request.cancelWatchdog = after(config.itemTimeoutMinutes * 60_000, () => {
+                if (worker === active) worker = null;
+                if (pending === request) { pending = null; request.reject(new Error(`no answer from the encoder in ${config.itemTimeoutMinutes} minutes`)); }
+                void active.terminate();
+            });
+            pending = request;
             active.postMessage({ bytes: new Uint8Array(bytes), options: { quality: config.quality, maxDiff: config.maxDiff, maxBlockDiff: config.maxBlockDiff } });
         });
     }
 
     function decision(item, outcome, extra = {}) {
-        return { id: item.generationId, kind: 'asset', key: item.key, outcome, result: null, detail: null, ...extra };
+        return { id: item.generationId, kind: 'asset', key: item.key, outcome, result: null, detail: null, basis: null, ...extra };
     }
 
     // Runs inside the storage queue. An error is tried again with linear backoff and no attempt limit.
@@ -244,7 +292,7 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
         }
         const facts = pngFacts(bytes);
         if (facts.reason) { cheap.push(decision(item, 'not-plain-png', { detail: facts.reason })); return false; }
-        if (!hasMarker(facts.keywords, config.markers)) { cheap.push(decision(item, 'not-marked')); return false; }
+        if (!hasMarker(facts.keywords, config.markers)) { cheap.push(decision(item, 'not-marked', { basis: markersBasis(config) })); return false; }
         if (stopping) return false;
 
         let encoded;
@@ -256,14 +304,16 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
             cheap.push(decision(item, 'error', { detail: `encode: ${error.message}` }));
             return true;
         }
-        if (encoded.notSmaller) { cheap.push(decision(item, 'not-smaller')); return true; }
-        if (encoded.skip) { cheap.push(decision(item, 'failed-check', { detail: encoded.skip })); return true; }
+        const basis = encodeBasis(config);
+        if (encoded.notSmaller) { cheap.push(decision(item, 'not-smaller', { basis })); return true; }
+        if (encoded.skip) { cheap.push(decision(item, 'failed-check', { detail: encoded.skip, basis })); return true; }
         const detail = JSON.stringify({ from: bytes.length, to: encoded.webp.length,
             diff: Number(Number(encoded.diff).toFixed(3)), blockDiff: Number(Number(encoded.blockDiff).toFixed(1)) });
         if (config.enabled !== true) {
-            cheap.push(decision(item, 'would-convert', { detail }));
+            cheap.push(decision(item, 'would-convert', { detail, basis }));
             return true;
         }
+        if (stopping) return false;
 
         // The slow file write stays outside the queue; registering and publishing it does not.
         let entry;
@@ -276,32 +326,48 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
             });
             return true;
         }
+        let published = false;
         try {
-            // One transaction: the replaced original is only ever found again through its
-            // "converted" row, so a publication without that row must not exist.
-            await queue(() => db.transaction(() => {
-                // When the key has moved on, its new generation is examined once it is old enough;
-                // the generation written here stays registered, retired and unused.
-                if (!store.publishIfCurrent(item.key, item.generationId, entry)) return;
-                writeDecisions([decision(item, 'converted', { result: entry.generationId, detail })]);
-            }).immediate());
-        } catch (error) {
-            // Nothing was committed, so the file written above belongs to no row.
-            try { await queue(() => store.discardDetached(entry.generationId)); } catch {}
-            throw error;
+            await queue(() => {
+                if (stopping) return;
+                // One transaction: the publication, its decision and the wish to delete the
+                // original it replaced. None of the three may exist without the others.
+                published = db.transaction(() => {
+                    if (!store.publishIfCurrent(item.key, item.generationId, entry)) return false;
+                    writeDecisions([decision(item, 'converted', { result: entry.generationId, detail })]);
+                    wantOriginal.run(`assets/${item.generationId.slice(0, 2)}/${item.generationId}.blob`, item.generationId, now());
+                    return true;
+                }).immediate();
+            });
+        } finally {
+            // Not published (the key moved on, the server is stopping, or the transaction
+            // failed): the file written above belongs to no row. The key's current generation
+            // is examined by a later search once it is old enough.
+            if (!published) { try { await queue(() => store.discardDetached(entry.generationId)); } catch {} }
         }
         return true;
     }
 
-    // One batch from the cursor on. Returns false when the catalog has nothing left.
+    // One step of the search from the cursor on: at most one slice of the catalog is looked at,
+    // and at most 50 images of it are examined. Returns false when the catalog has nothing left.
     async function sweepAssets(config) {
-        const batch = candidates.all({ cutoff: now() - config.ageDays * DAY_MS, afterTime: cursor.time, afterId: cursor.id,
-            checks: CHECKS, now: now(), live: config.enabled === true ? 1 : 0 });
-        if (!batch.length) return false;
+        const from = { afterTime: cursor.time, afterId: cursor.id };
+        const cutoff = now() - config.ageDays * DAY_MS;
+        const end = sliceEnd.get({ ...from, cutoff });
+        const terms = { ...from, checks: CHECKS, now: now(), live: config.enabled === true ? 1 : 0,
+            markersBasis: markersBasis(config), encodeBasis: encodeBasis(config) };
+        const batch = end
+            ? candidatesInSlice.all({ ...terms, endTime: end.time, endId: end.id })
+            : candidatesToCutoff.all({ ...terms, cutoff });
+        if (!batch.length) {
+            // Nothing to examine in this slice: on to the next one, or done.
+            if (end) cursor = end;
+            return !!end;
+        }
         const cheap = [];
         try {
             for (const item of batch) {
-                if (stopping || store.isPaused()) break;
+                if (idle()) break;
                 let encoded = false;
                 try { encoded = await examineAsset(item, config, cheap); }
                 catch (error) {
@@ -312,7 +378,7 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
                 if (stopping) break;
                 cursor = { time: item.updated_at, id: item.generationId };
                 if (config.enabled === true && now() - lastHousekeeping >= HOUSEKEEPING_MS) {
-                    // Decisions first: the housekeeping below reads them.
+                    // Decisions first: the housekeeping reads them.
                     if (cheap.length) await queue(() => writeDecisions(cheap.splice(0)));
                     await housekeeping(config);
                 }
@@ -330,7 +396,7 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
         try { names = (await fsp.readdir(originalsDir)).filter(name => name.endsWith('.covered')).sort(); }
         catch (error) { if (error.code !== 'ENOENT') warn(`cannot list ${originalsDir}: ${error.message}`); return; }
         for (const name of names) {
-            if (stopping) return;
+            if (idle()) return;
             const file = path.join(originalsDir, name);
             let lines;
             try { lines = (await fsp.readFile(file, 'utf-8')).split('\n').map(line => line.replace(/\r$/, '')); }
@@ -338,8 +404,9 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
             const paths = lines.filter(line => GENERATION_PATH.test(line));
             await queue(() => {
                 const at = now();
-                const insert = db.prepare('INSERT OR IGNORE INTO media_originals (path, covered_at, manifest) VALUES (?, ?, ?)');
-                db.transaction(() => { for (const entry of paths) insert.run(entry, at, name); })();
+                db.transaction(() => {
+                    for (const entry of paths) coverOriginal.run({ path: entry, generationId: entry.slice(10, 74), at, manifest: name });
+                })();
             });
             await fsp.unlink(file).catch((error) => { if (error.code !== 'ENOENT') warn(`cannot remove ${file}: ${error.message}`); });
             info(`${name}: ${paths.length} originals are pinned`);
@@ -355,33 +422,46 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
         await fsp.rename(temp, file);
     }
 
-    // Files this module wants pinned: retired, in scope, not in a covered list yet, and present
-    // on disk. Compared with the file itself, so a list someone else replaced is put right.
-    async function writeWantList(config) {
-        const rows = retiredInScope.all({ all: config.collect === 'all' ? 1 : 0 }).filter(row => !row.covered);
-        const present = [];
-        for (const row of rows) {
-            try { if ((await fsp.stat(generationPath(store.root, row.generationId))).isFile()) present.push(row.path); }
-            catch (error) { if (error.code !== 'ENOENT') warn(`cannot stat ${row.path}: ${error.message}`); }
+    // Sorts the originals not deleted yet into: still to be pinned, ready to be deleted, and
+    // already gone (no row and no file). Out of scope or not retired: left alone.
+    async function survey(config) {
+        const all = config.collect === 'all';
+        const before = now() - config.retentionDays * DAY_MS;
+        const want = [], due = [], gone = [];
+        // Whether the file is there. Anything but "no such file" counts as there: an original is
+        // never written off because it could not be looked at.
+        const isPresent = async (row) => {
+            try { return (await fsp.stat(generationPath(store.root, row.generationId))).isFile(); }
+            catch (error) {
+                if (error.code === 'ENOENT') return false;
+                warn(`cannot stat ${row.path}: ${error.message}`);
+                return true;
+            }
+        };
+        for (let after = ''; !stopping;) {
+            const rows = openOriginals.all({ after });
+            for (const row of rows) {
+                if (stopping) break;
+                if (row.retired === null) { if (!await isPresent(row)) gone.push(row); continue; }
+                if (row.retired !== 1 || !(row.transcoded === 1 || (all && row.was_live === 1))) continue;
+                if (row.covered_at === null) { if (await isPresent(row)) want.push(row); }
+                else if (typeof row.retired_at === 'number' && row.retired_at <= before) due.push(row);
+            }
+            if (rows.length < 1000) break;
+            after = rows[rows.length - 1].path;
+            await nextTurn();
         }
-        const text = present.sort().map(entry => `${entry}\n`).join('');
-        try {
-            const current = await fsp.readFile(wantPath, 'utf-8').catch((error) => { if (error.code === 'ENOENT') return null; throw error; });
-            if (current !== text) await writeAtomic(wantPath, text);
-        } catch (error) { warn(`cannot write ${wantPath}: ${error.message}`); }
+        return { want, due, gone, before, complete: !stopping };
     }
 
-    async function collect(config) {
-        const before = now() - config.retentionDays * DAY_MS;
-        const due = retiredInScope.all({ all: config.collect === 'all' ? 1 : 0 })
-            .filter(row => row.covered && row.retired_at <= before);
+    async function collect({ due, gone, before }) {
         let deleted = 0;
-        for (let start = 0; start < due.length && !stopping; start += 200) {
-            if (holds > 0 || store.isPaused()) break;
+        for (let start = 0; start < due.length; start += 200) {
+            if (idle() || holds > 0) break;
             const chunk = due.slice(start, start + 200);
             await queue(() => {
-                if (holds > 0) return;
                 for (const row of chunk) {
+                    if (stopping || holds > 0) return;
                     try {
                         // The deletion and its record commit together. If the record cannot be
                         // written the row comes back (its file may already be gone, which the next
@@ -397,39 +477,54 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
             });
             await nextTurn();
         }
+        if (gone.length && !idle()) await queue(() => db.transaction(() => { for (const row of gone) markDeleted.run(now(), row.path); })());
         if (deleted) info(`deleted ${deleted} pinned originals`);
     }
 
     // Tells the mirror which files are gone. Only completed deletions are listed, and a row is
     // marked listed after its list file is in place, so a crash in between lists it again.
     async function listCollected() {
-        while (!stopping) {
-            const rows = db.prepare(`SELECT path FROM media_originals
-                WHERE deleted_at IS NOT NULL AND listed_at IS NULL ORDER BY path LIMIT 5000`).all();
+        while (!idle()) {
+            const rows = unlisted.all();
             if (!rows.length) return;
             const file = path.join(collectedDir, `${new Date(now()).toISOString().replace(/[-:.]/g, '')}-${crypto.randomBytes(4).toString('hex')}.list`);
             try { await writeAtomic(file, rows.map(row => `${row.path}\n`).join('')); }
             catch (error) { warn(`cannot write ${file}: ${error.message}`); return; }
-            await queue(() => {
-                const mark = db.prepare('UPDATE media_originals SET listed_at = ? WHERE path = ? AND listed_at IS NULL');
-                db.transaction(() => { for (const row of rows) mark.run(now(), row.path); })();
-            });
+            await queue(() => db.transaction(() => { for (const row of rows) markListed.run(now(), row.path); })());
         }
+    }
+
+    // What this module wants pinned. Compared with the file itself, so a list someone else
+    // replaced is put right.
+    async function writeWantList({ want }) {
+        const text = want.map(row => row.path).sort().map(entry => `${entry}\n`).join('');
+        try {
+            const current = await fsp.readFile(wantPath, 'utf-8').catch((error) => { if (error.code === 'ENOENT') return null; throw error; });
+            if (current !== text) await writeAtomic(wantPath, text);
+        } catch (error) { warn(`cannot write ${wantPath}: ${error.message}`); }
     }
 
     async function housekeeping(config) {
         lastHousekeeping = now();
+        if (idle()) return;
         await ingestCovered();
-        await collect(config);
+        if (idle()) return;
+        if (config.collect === 'all') await queue(() => { adoptRetired.run({ at: now() }); });
+        const found = await survey(config);
+        // A survey cut short knows only part of what is wanted; a list written from it would be short.
+        if (idle() || !found.complete) return;
+        await collect(found);
         await listCollected();
-        if (!stopping) await writeWantList(config);
+        // Deleting changes nothing about what is still wanted, so the survey above still holds.
+        if (!idle()) await writeWantList(found);
     }
 
     // Returns how long to rest before the next pass.
     async function pass() {
         const config = readConfig();
-        if (!config.enabled || store.isPaused()) return 60_000;
+        if (!config.enabled || idle()) return 60_000;
         const live = config.enabled === true;
+        // Also before the first search, so pins and deletions move even while the encoder cannot start.
         if (live && now() - lastHousekeeping >= HOUSEKEEPING_MS) await housekeeping(config);
         let more;
         try { more = await sweepAssets(config); }
@@ -441,8 +536,9 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
         }
         encoderWarned = false;
         if (more) return 0;
+        if (idle()) return 60_000;
         cursor = { time: -1, id: '' };
-        if (live && !stopping) await housekeeping(config);
+        if (live) await housekeeping(config);
         return config.sweepMinutes * 60_000;
     }
 
@@ -461,13 +557,15 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
         cancelTick = after(0, tick);
     }
 
+    // From its first line on nothing new is started: no encode, no publication, no deletion,
+    // no list. What is already inside the storage queue finishes (a few statements).
     async function stop() {
         running = false;
         stopping = true;
         cancelTick?.();
         wake?.();
         // Ends an encode in progress: nothing is recorded against its image, which is taken
-        // up again after the next start. From here on encode() starts no worker.
+        // up again after the next start.
         const request = pending;
         const current = worker;
         pending = null;

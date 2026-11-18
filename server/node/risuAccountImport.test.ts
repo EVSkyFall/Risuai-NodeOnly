@@ -21,7 +21,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
     vi.restoreAllMocks()
-    await fs.rm(path.dirname(stagingDir), { recursive: true, force: true })
+    await fs.rm(path.dirname(stagingDir), { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
 })
 
 function createImport(overrides: Record<string, unknown> = {}) {

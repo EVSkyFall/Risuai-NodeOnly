@@ -60,9 +60,11 @@ function createAssetFileStore(db, options) {
     // else records either: retiring only flips the flag, updated_at stays the publication time,
     // and a generation that is prepared but not published yet is a retired row as well.
     // Triggers see every statement that retires or revives a row, including the kv triggers
-    // above and other processes.
+    // above and other processes. Rows retired before the table existed are stamped once, when
+    // it is created (same transaction), as never live: nothing is known about them.
     const nowMs = "CAST(strftime('%s', 'now') AS INTEGER) * 1000";
-    db.exec(`
+    const retirementsAreNew = !db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'asset_file_retirements'").get();
+    db.transaction(() => db.exec(`
         CREATE TABLE IF NOT EXISTS asset_file_retirements (
             generationId TEXT PRIMARY KEY, retired_at INTEGER NOT NULL, was_live INTEGER NOT NULL DEFAULT 0
         );
@@ -81,11 +83,13 @@ function createAssetFileStore(db, options) {
         CREATE TRIGGER IF NOT EXISTS asset_file_generation_deleted AFTER DELETE ON asset_file_generations BEGIN
             DELETE FROM asset_file_retirements WHERE generationId = OLD.generationId;
         END;
-        INSERT OR IGNORE INTO asset_file_retirements
-            SELECT generationId, ${nowMs}, 0 FROM asset_file_generations WHERE retired = 1;
+        CREATE INDEX IF NOT EXISTS asset_file_retirements_live
+            ON asset_file_retirements(generationId) WHERE was_live = 1;
         CREATE INDEX IF NOT EXISTS asset_file_live_time
             ON asset_file_generations(updated_at, generationId) WHERE retired = 0;
-    `);
+        ${retirementsAreNew ? `INSERT OR IGNORE INTO asset_file_retirements
+            SELECT generationId, ${nowMs}, 0 FROM asset_file_generations WHERE retired = 1;` : ''}
+    `))();
     const live = db.prepare('SELECT * FROM asset_file_generations WHERE key = ? AND retired = 0');
     // kv.updated_at sits after the BLOB, so reading it walks the whole overflow chain; the
     // trigger-maintained timestamp avoids that, and length() is answered from the record header.
@@ -189,15 +193,16 @@ function createAssetFileStore(db, options) {
     // Unlike put, nothing here ever moves an asset into kv.
     function publishIfCurrent(key, expectedGenerationId, entry) {
         return db.transaction(() => {
-            registerRetired(entry);
+            // Nothing is registered for a key that has moved on: the caller discards the file.
             if (live.get(key)?.generationId !== expectedGenerationId) return false;
+            registerRetired(entry);
             publish(key, { ...entry, key });
             return true;
         }).immediate();
     }
 
 
-    // Removes a detached generation file that no row refers to, for a publication that did not commit.
+    // Removes a detached generation file that no row refers to, for a publication that did not happen.
     function discardDetached(generationId) {
         return db.transaction(() => {
             if (db.prepare('SELECT 1 FROM asset_file_generations WHERE generationId = ?').get(generationId)) return false;
@@ -216,7 +221,8 @@ function createAssetFileStore(db, options) {
         return db.transaction(() => {
             const row = db.prepare(`SELECT g.retired, r.retired_at FROM asset_file_generations g
                 LEFT JOIN asset_file_retirements r ON r.generationId = g.generationId WHERE g.generationId = ?`).get(generationId);
-            if (!row || row.retired !== 1 || !(row.retired_at <= retiredBefore)) return false;
+            // A retirement without a recorded time is never old enough (null <= n is true in JS).
+            if (!row || row.retired !== 1 || typeof row.retired_at !== 'number' || row.retired_at > retiredBefore) return false;
             try { fs.unlinkSync(generationPath(root, generationId)); }
             catch (error) { if (error.code !== 'ENOENT') throw error; }
             db.prepare('DELETE FROM asset_file_generations WHERE generationId = ?').run(generationId);
