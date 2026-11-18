@@ -112,7 +112,7 @@ describe('media transcode through the server', () => {
         expect(after.status).toBe(200)
         expect(isWebp(Buffer.from(await after.arrayBuffer()))).toBe(true)
 
-        // The server still shuts down cleanly with the scheduler running.
+        // The process ends with the scheduler running (what stop() does is covered in mediaTranscode.test.ts).
         await server.stop('SIGTERM')
     }, 120_000)
 

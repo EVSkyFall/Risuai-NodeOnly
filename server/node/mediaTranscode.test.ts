@@ -363,6 +363,108 @@ describe('media transcode: pinning and deleting originals', () => {
     })
 })
 
+describe('media transcode: what a crash or a failed write leaves behind', () => {
+    const assetFiles = (dir: string) => readdirSync(path.join(dir, 'assets'), { recursive: true }).filter(name => String(name).endsWith('.blob'))
+
+    it('publishes nothing when the decision cannot be recorded, and converts once it can', async () => {
+        const { store, settle, put, liveId, logRow, db, dir, logs } = await fixture()
+        const png = await markedPicture()
+        const original = await put('assets/a.png', png)
+        db.exec(`CREATE TRIGGER fail_converted BEFORE INSERT ON media_transcode_log WHEN NEW.outcome = 'converted'
+            BEGIN SELECT RAISE(ABORT, 'log unavailable'); END`)
+        await settle()
+        // Still the PNG, no row for a WebP, and the WebP file that was written is gone again.
+        expect(liveId('assets/a.png')).toBe(original)
+        expect((await store.get('assets/a.png')).equals(png)).toBe(true)
+        expect(db.prepare('SELECT count(*) n FROM asset_file_generations').get().n).toBe(1)
+        expect(assetFiles(dir)).toHaveLength(1)
+        expect(logRow(original)).toBeUndefined()
+        expect(logs.some(line => line.includes('log unavailable'))).toBe(true)
+        db.exec('DROP TRIGGER fail_converted')
+        await settle()
+        expect(logRow(original)).toMatchObject({ outcome: 'converted' })
+        expect(isWebp(await store.get('assets/a.png'))).toBe(true)
+    })
+
+    it('keeps the row of a deleted original until the deletion is recorded, so the mirror always hears of it', async () => {
+        const context = await fixture()
+        const { transcode, store, settle, put, db, rel, file } = context
+        const original = await put('assets/a.png', await markedPicture())
+        await settle()
+        mkdirSync(transcode.paths.originalsDir, { recursive: true })
+        writeFileSync(path.join(transcode.paths.originalsDir, 'pin-1.covered'), `${rel(original)}\n`)
+        context.retireAge(original, 4)
+        db.exec(`CREATE TRIGGER fail_deleted BEFORE UPDATE OF deleted_at ON media_originals
+            BEGIN SELECT RAISE(ABORT, 'record unavailable'); END`)
+        await transcode.housekeeping(transcode.readConfig())
+        // The file went first; the catalog row and the missing record came back with the rollback.
+        expect(existsSync(file(original))).toBe(false)
+        expect(db.prepare('SELECT retired FROM asset_file_generations WHERE generationId = ?').get(original)).toEqual({ retired: 1 })
+        expect(db.prepare('SELECT deleted_at FROM media_originals WHERE path = ?').get(rel(original)).deleted_at).toBeNull()
+        expect(existsSync(transcode.paths.collectedDir)).toBe(false)
+        db.exec('DROP TRIGGER fail_deleted')
+        await transcode.housekeeping(transcode.readConfig())
+        expect(db.prepare('SELECT count(*) n FROM asset_file_generations WHERE generationId = ?').get(original).n).toBe(0)
+        const listed = readdirSync(transcode.paths.collectedDir).flatMap(name => readFileSync(path.join(transcode.paths.collectedDir, name), 'utf-8').split('\n').filter(Boolean))
+        expect(listed).toEqual([rel(original)])
+        expect(isWebp(await store.get('assets/a.png'))).toBe(true)
+    })
+
+    it('puts the want list right when something else replaced it', async () => {
+        const context = await fixture()
+        const { transcode, settle, put, rel } = context
+        const original = await put('assets/a.png', await markedPicture())
+        await settle()
+        expect(readFileSync(transcode.paths.wantPath, 'utf-8')).toBe(`${rel(original)}\n`)
+        writeFileSync(transcode.paths.wantPath, '')
+        await transcode.housekeeping(transcode.readConfig())
+        expect(readFileSync(transcode.paths.wantPath, 'utf-8')).toBe(`${rel(original)}\n`)
+        unlinkSync(transcode.paths.wantPath)
+        await transcode.housekeeping(transcode.readConfig())
+        expect(readFileSync(transcode.paths.wantPath, 'utf-8')).toBe(`${rel(original)}\n`)
+    })
+})
+
+describe('media transcode: stopping and long waits', () => {
+    it('ends an encode in progress at once, without the rest that follows an encode and without blaming the image', async () => {
+        const workerPath = path.join(tmpdir(), `media-transcode-silent-${process.pid}-${Math.random().toString(16).slice(2)}.cjs`)
+        writeFileSync(workerPath, `require('node:worker_threads').parentPort.on('message', () => {})\n`)
+        cleanup.push(async () => { await rm(workerPath, { force: true }) })
+        const { transcode, put, logRow } = await fixture({ enabled: true, paceMs: 3_600_000 }, { workerPath })
+        const id = await put('assets/a.png', await markedPicture())
+        const running = transcode.pass()
+        await new Promise(resolve => setTimeout(resolve, 1500))
+        const started = Date.now()
+        await transcode.stop()
+        await running
+        expect(Date.now() - started).toBeLessThan(5000)
+        expect(logRow(id)).toBeUndefined()
+    })
+
+    it('starts no work once it has been stopped', async () => {
+        const { transcode, put, logRow } = await fixture({ enabled: true, paceMs: 3_600_000 })
+        const id = await put('assets/a.png', await markedPicture())
+        await transcode.stop()
+        const started = Date.now()
+        await transcode.pass()
+        expect(Date.now() - started).toBeLessThan(3000)
+        expect(logRow(id)).toBeUndefined()
+    })
+
+    it('waits out a delay longer than a timer can hold instead of firing at once', async () => {
+        const { after } = transcodeModule
+        let fired = 0
+        const cancelLong = after(2 ** 31 + 60_000, () => { fired += 100 })
+        const cancelShort = after(30, () => { fired += 1 })
+        const cancelled = after(30, () => { fired += 10 })
+        cancelled()
+        await new Promise(resolve => setTimeout(resolve, 300))
+        expect(fired).toBe(1)
+        cancelLong()
+        cancelShort()
+    })
+})
+
 describe('media transcode: configuration', () => {
     it('falls back per field and ignores what it does not know', () => {
         expect(normalizeConfig(null).enabled).toBe(false)

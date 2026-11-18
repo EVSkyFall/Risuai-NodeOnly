@@ -15,8 +15,10 @@
 // A generation file is write-once and its name is never reused, so a path in a covered list is
 // proof for the file on disk. Without the backup script nothing is ever deleted.
 //
-// Every database write and every deletion runs inside the server's storage queue, because a
-// backup import holds a transaction open on the shared connection for as long as it runs.
+// Every database write and every deletion after startup runs inside the server's storage queue,
+// because a backup import holds a transaction open on the shared connection for as long as it
+// runs. (The tables are created at startup, before any request; a covered list is removed after
+// its rows are committed.)
 
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
@@ -65,6 +67,24 @@ function normalizeConfig(raw) {
         collect: source.collect === 'all' ? 'all' : 'transcoded',
         itemTimeoutMinutes: numberIn(source.itemTimeoutMinutes, 0.01, 525_600, DEFAULTS.itemTimeoutMinutes),
     };
+}
+
+// setTimeout fires after 1 ms when asked for more than about 24.8 days, so a long wait is a
+// chain of short ones. Returns a function that cancels it.
+function after(ms, action) {
+    const end = Date.now() + ms;
+    let timer = null;
+    let cancelled = false;
+    const step = () => {
+        if (cancelled) return;
+        const left = end - Date.now();
+        if (left <= 0) return void action();
+        timer = setTimeout(step, Math.min(left, DAY_MS));
+        timer.unref?.();
+    };
+    timer = setTimeout(step, Math.min(Math.max(ms, 0), DAY_MS));
+    timer.unref?.();
+    return () => { cancelled = true; clearTimeout(timer); };
 }
 
 class EncoderUnavailable extends Error {}
@@ -120,27 +140,26 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
         WHERE g.retired = 1 AND (
             EXISTS (SELECT 1 FROM media_transcode_log l WHERE l.id = g.generationId AND l.outcome = 'converted')
             OR (@all = 1 AND r.was_live = 1))`);
+    const markDeleted = db.prepare('UPDATE media_originals SET deleted_at = ? WHERE path = ?');
 
     let running = false;
     let stopping = false;
-    let tickTimer = null;
+    let cancelTick = null;
     let wake = null;
     let passPromise = null;
     let holds = 0;
     let worker = null;
     let pending = null;
     let cursor = { time: -1, id: '' };
-    let lastWant = null;
     let lastHousekeeping = -Infinity;
     let encoderWarned = false;
 
     const info = (message) => (logger.info || logger.log || (() => {})).call(logger, `[Media transcode] ${message}`);
     const warn = (message) => logger.warn(`[Media transcode] ${message}`);
-    // stop() ends a rest at once.
-    const rest = (ms) => new Promise((resolve) => {
-        const timer = setTimeout(resolve, ms);
-        timer.unref?.();
-        wake = () => { clearTimeout(timer); resolve(); };
+    // stop() ends a rest at once, and nothing rests once it has been called.
+    const rest = (ms) => stopping ? Promise.resolve() : new Promise((resolve) => {
+        const cancel = after(ms, resolve);
+        wake = () => { cancel(); resolve(); };
     }).finally(() => { wake = null; });
     const nextTurn = () => new Promise((resolve) => setImmediate(resolve));
 
@@ -154,6 +173,7 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
 
     function encode(bytes, config) {
         return new Promise((resolve, reject) => {
+            if (stopping) return reject(new Error('the server is stopping'));
             if (!worker) {
                 const current = new Worker(workerPath);
                 const failed = (error) => {
@@ -161,14 +181,14 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
                     worker = null;
                     const request = pending;
                     pending = null;
-                    if (request) { clearTimeout(request.watchdog); request.reject(error); }
+                    if (request) { request.cancelWatchdog(); request.reject(error); }
                 };
                 current.on('message', (message) => {
                     if (worker !== current) return;
                     const request = pending;
                     pending = null;
                     if (!request) return;
-                    clearTimeout(request.watchdog);
+                    request.cancelWatchdog();
                     if (message.unavailable) request.reject(new EncoderUnavailable(message.unavailable));
                     else if (message.error) request.reject(new Error(message.error));
                     else request.resolve(message.webp ? { ...message, webp: Buffer.from(message.webp) } : message);
@@ -181,9 +201,8 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
             const active = worker;
             // A stuck encode must not stop every later image: ending the worker fails this item
             // (it is tried again later with backoff) and the next item gets a fresh worker.
-            const watchdog = setTimeout(() => { void active.terminate(); }, config.itemTimeoutMinutes * 60_000);
-            watchdog.unref?.();
-            pending = { resolve, reject, watchdog };
+            const cancelWatchdog = after(config.itemTimeoutMinutes * 60_000, () => { void active.terminate(); });
+            pending = { resolve, reject, cancelWatchdog };
             active.postMessage({ bytes: new Uint8Array(bytes), options: { quality: config.quality, maxDiff: config.maxDiff, maxBlockDiff: config.maxBlockDiff } });
         });
     }
@@ -205,8 +224,8 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
         })();
     }
 
-    // Decisions that need no encode are collected in `cheap` and written in one go.
-    // Returns true when an encode ran.
+    // Decisions that need no publication are collected in `cheap` and written in one go.
+    // Returns true when an encode ran to its end.
     async function examineAsset(item, config, cheap) {
         const file = generationPath(store.root, item.generationId);
         let bytes;
@@ -226,14 +245,15 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
         const facts = pngFacts(bytes);
         if (facts.reason) { cheap.push(decision(item, 'not-plain-png', { detail: facts.reason })); return false; }
         if (!hasMarker(facts.keywords, config.markers)) { cheap.push(decision(item, 'not-marked')); return false; }
+        if (stopping) return false;
 
         let encoded;
         try { encoded = await encode(bytes, config); }
         catch (error) {
             if (error instanceof EncoderUnavailable) throw error;
             // An encode cut short by a shutdown says nothing about the image.
-            if (stopping) return true;
-            await queue(() => writeDecisions([decision(item, 'error', { detail: `encode: ${error.message}` })]));
+            if (stopping) return false;
+            cheap.push(decision(item, 'error', { detail: `encode: ${error.message}` }));
             return true;
         }
         if (encoded.notSmaller) { cheap.push(decision(item, 'not-smaller')); return true; }
@@ -256,12 +276,20 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
             });
             return true;
         }
-        await queue(() => {
-            // When the key has moved on, its new generation is examined once it is old enough;
-            // the generation written here stays registered, retired and unused.
-            if (!store.publishIfCurrent(item.key, item.generationId, entry)) return;
-            writeDecisions([decision(item, 'converted', { result: entry.generationId, detail })]);
-        });
+        try {
+            // One transaction: the replaced original is only ever found again through its
+            // "converted" row, so a publication without that row must not exist.
+            await queue(() => db.transaction(() => {
+                // When the key has moved on, its new generation is examined once it is old enough;
+                // the generation written here stays registered, retired and unused.
+                if (!store.publishIfCurrent(item.key, item.generationId, entry)) return;
+                writeDecisions([decision(item, 'converted', { result: entry.generationId, detail })]);
+            }).immediate());
+        } catch (error) {
+            // Nothing was committed, so the file written above belongs to no row.
+            try { await queue(() => store.discardDetached(entry.generationId)); } catch {}
+            throw error;
+        }
         return true;
     }
 
@@ -274,8 +302,20 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
         try {
             for (const item of batch) {
                 if (stopping || store.isPaused()) break;
-                const encoded = await examineAsset(item, config, cheap);
+                let encoded = false;
+                try { encoded = await examineAsset(item, config, cheap); }
+                catch (error) {
+                    if (error instanceof EncoderUnavailable) throw error;
+                    // Left without a decision, so the next search takes it up again.
+                    warn(`${item.key}: ${error?.message || error}`);
+                }
+                if (stopping) break;
                 cursor = { time: item.updated_at, id: item.generationId };
+                if (config.enabled === true && now() - lastHousekeeping >= HOUSEKEEPING_MS) {
+                    // Decisions first: the housekeeping below reads them.
+                    if (cheap.length) await queue(() => writeDecisions(cheap.splice(0)));
+                    await housekeeping(config);
+                }
                 if (encoded && config.paceMs > 0) await rest(config.paceMs);
                 else await nextTurn();
             }
@@ -290,6 +330,7 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
         try { names = (await fsp.readdir(originalsDir)).filter(name => name.endsWith('.covered')).sort(); }
         catch (error) { if (error.code !== 'ENOENT') warn(`cannot list ${originalsDir}: ${error.message}`); return; }
         for (const name of names) {
+            if (stopping) return;
             const file = path.join(originalsDir, name);
             let lines;
             try { lines = (await fsp.readFile(file, 'utf-8')).split('\n').map(line => line.replace(/\r$/, '')); }
@@ -315,7 +356,7 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
     }
 
     // Files this module wants pinned: retired, in scope, not in a covered list yet, and present
-    // on disk.
+    // on disk. Compared with the file itself, so a list someone else replaced is put right.
     async function writeWantList(config) {
         const rows = retiredInScope.all({ all: config.collect === 'all' ? 1 : 0 }).filter(row => !row.covered);
         const present = [];
@@ -324,9 +365,10 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
             catch (error) { if (error.code !== 'ENOENT') warn(`cannot stat ${row.path}: ${error.message}`); }
         }
         const text = present.sort().map(entry => `${entry}\n`).join('');
-        if (text === lastWant && fs.existsSync(wantPath)) return;
-        try { await writeAtomic(wantPath, text); lastWant = text; }
-        catch (error) { warn(`cannot write ${wantPath}: ${error.message}`); }
+        try {
+            const current = await fsp.readFile(wantPath, 'utf-8').catch((error) => { if (error.code === 'ENOENT') return null; throw error; });
+            if (current !== text) await writeAtomic(wantPath, text);
+        } catch (error) { warn(`cannot write ${wantPath}: ${error.message}`); }
     }
 
     async function collect(config) {
@@ -339,10 +381,18 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
             const chunk = due.slice(start, start + 200);
             await queue(() => {
                 if (holds > 0) return;
-                const mark = db.prepare('UPDATE media_originals SET deleted_at = ? WHERE path = ?');
                 for (const row of chunk) {
-                    try { if (store.deleteRetired(row.generationId, before)) { mark.run(now(), row.path); deleted++; } }
-                    catch (error) { warn(`cannot delete ${row.path}: ${error.message}`); }
+                    try {
+                        // The deletion and its record commit together. If the record cannot be
+                        // written the row comes back (its file may already be gone, which the next
+                        // attempt tolerates), so a deletion is never left unannounced.
+                        const done = db.transaction(() => {
+                            if (!store.deleteRetired(row.generationId, before)) return false;
+                            markDeleted.run(now(), row.path);
+                            return true;
+                        }).immediate();
+                        if (done) deleted++;
+                    } catch (error) { warn(`cannot delete ${row.path}: ${error.message}`); }
                 }
             });
             await nextTurn();
@@ -353,7 +403,7 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
     // Tells the mirror which files are gone. Only completed deletions are listed, and a row is
     // marked listed after its list file is in place, so a crash in between lists it again.
     async function listCollected() {
-        for (;;) {
+        while (!stopping) {
             const rows = db.prepare(`SELECT path FROM media_originals
                 WHERE deleted_at IS NOT NULL AND listed_at IS NULL ORDER BY path LIMIT 5000`).all();
             if (!rows.length) return;
@@ -372,7 +422,7 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
         await ingestCovered();
         await collect(config);
         await listCollected();
-        await writeWantList(config);
+        if (!stopping) await writeWantList(config);
     }
 
     // Returns how long to rest before the next pass.
@@ -392,7 +442,7 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
         encoderWarned = false;
         if (more) return 0;
         cursor = { time: -1, id: '' };
-        if (live) await housekeeping(config);
+        if (live && !stopping) await housekeeping(config);
         return config.sweepMinutes * 60_000;
     }
 
@@ -406,29 +456,25 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
             try { passPromise = pass(); wait = await passPromise; }
             catch (error) { warn(`pass failed: ${error?.stack || error}`); }
             finally { passPromise = null; }
-            if (running) { tickTimer = setTimeout(tick, wait); tickTimer.unref?.(); }
+            if (running) cancelTick = after(wait, tick);
         };
-        tickTimer = setTimeout(tick, 0);
-        tickTimer.unref?.();
+        cancelTick = after(0, tick);
     }
 
     async function stop() {
         running = false;
         stopping = true;
-        clearTimeout(tickTimer);
+        cancelTick?.();
         wake?.();
+        // Ends an encode in progress: nothing is recorded against its image, which is taken
+        // up again after the next start. From here on encode() starts no worker.
+        const request = pending;
         const current = worker;
-        if (pending) {
-            // Ends the encode in progress; its item is recorded as an error and tried again later.
-            worker = null;
-            const request = pending;
-            pending = null;
-            clearTimeout(request.watchdog);
-            request.reject(new Error('the server is stopping'));
-        }
-        if (passPromise) await passPromise.catch(() => {});
+        pending = null;
         worker = null;
+        if (request) { request.cancelWatchdog(); request.reject(new Error('the server is stopping')); }
         if (current) await current.terminate();
+        if (passPromise) await passPromise.catch(() => {});
     }
 
     // While held, nothing is deleted. A reader that listed files takes a hold until it has them.
@@ -441,4 +487,4 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
     return { start, stop, hold, pass, housekeeping, readConfig, paths: { originalsDir, collectedDir, wantPath, configPath } };
 }
 
-module.exports = { createMediaTranscode, normalizeConfig, DEFAULTS };
+module.exports = { createMediaTranscode, normalizeConfig, DEFAULTS, after };

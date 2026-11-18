@@ -29,7 +29,8 @@ export function getImageType(arr: Uint8Array): ImageType {
             arr[8] === 0x61 &&
             arr[9] === 0x76 &&
             arr[10] === 0x69 &&
-            arr[11] === 0x66:
+            // 'avif' for a still picture, 'avis' for an image sequence
+            (arr[11] === 0x66 || arr[11] === 0x73):
             return 'AVIF'
         case arr[0] === 0x52 &&
             arr[1] === 0x49 &&

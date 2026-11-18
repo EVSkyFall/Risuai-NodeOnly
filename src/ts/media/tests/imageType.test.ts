@@ -84,6 +84,16 @@ const webpBytes = new Uint8Array([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45
 const jpegBytes = new Uint8Array([0xff, 0xd8, 0x00, 0x00, 0xff, 0xd9])
 const otherBytes = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
 
+test('should detect an AVIF image sequence', () => {
+    const avis = new Uint8Array([0, 0, 0, 0x1c, 0x66, 0x74, 0x79, 0x70, 0x61, 0x76, 0x69, 0x73])
+    expect(getImageType(avis)).toBe('AVIF')
+    expect(getImageMime(avis)).toBe('image/avif')
+    expect(getImageExt(avis, 'png')).toBe('avif')
+    // Another ISO-BMFF brand is not an image.
+    const mp4 = new Uint8Array([0, 0, 0, 0x1c, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d])
+    expect(getImageType(mp4)).toBe('Unknown')
+})
+
 test('getImageMime labels bytes by what they are, whatever they were stored as', () => {
     expect(getImageMime(pngBytes)).toBe('image/png')
     expect(getImageMime(webpBytes)).toBe('image/webp')

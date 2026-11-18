@@ -490,6 +490,27 @@ describe('download and apply', () => {
         expect((await fs.readFile(path.join(stagingDir, 'assets', a1.key.slice('assets/'.length)))).equals(webp)).toBe(true)
     })
 
+    it('keeps a staged complete WebP under a hashed name instead of downloading it again', async () => {
+        const [a1] = account.expected.assets
+        const assetName = a1.key.slice('assets/'.length)
+        const payload = Buffer.from('VP8 payload bytes!')
+        const header = Buffer.alloc(12)
+        header.write('RIFF', 0, 'latin1')
+        header.writeUInt32LE(4 + payload.length, 4)
+        header.write('WEBP', 8, 'latin1')
+        const webp = Buffer.concat([header, payload])
+        const importer = createImport()
+        await importer.prepare({ token: account.token, id: account.id })
+        await fs.writeFile(path.join(stagingDir, 'assets', assetName), webp)
+        // A second download would get this and end up unreadable.
+        account.faults.push({ key: a1.key, status: 200, times: 9, body: Buffer.from('wrong bytes') })
+        importer.startDownload()
+        const status = await settle(importer)
+        expect(status.state).toBe('downloaded')
+        expect(status.missing.some((item: any) => item.key === a1.key)).toBe(false)
+        expect((await fs.readFile(path.join(stagingDir, 'assets', assetName))).equals(webp)).toBe(true)
+    })
+
     it('leaves out a staged file that fails its check when the account copy is unreadable too', async () => {
         const [a1] = account.expected.assets
         const assetName = a1.key.slice('assets/'.length)

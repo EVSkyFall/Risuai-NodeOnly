@@ -185,7 +185,8 @@ function createAssetFileStore(db, options) {
 
     // Makes a detached generation the live one only while the generation it was derived from
     // still is. One write transaction, so the comparison holds against every other writer of
-    // this database. Unlike put, nothing here ever moves an asset into kv.
+    // this database (called inside another transaction it becomes part of that one).
+    // Unlike put, nothing here ever moves an asset into kv.
     function publishIfCurrent(key, expectedGenerationId, entry) {
         return db.transaction(() => {
             registerRetired(entry);
@@ -195,6 +196,16 @@ function createAssetFileStore(db, options) {
         }).immediate();
     }
 
+
+    // Removes a detached generation file that no row refers to, for a publication that did not commit.
+    function discardDetached(generationId) {
+        return db.transaction(() => {
+            if (db.prepare('SELECT 1 FROM asset_file_generations WHERE generationId = ?').get(generationId)) return false;
+            try { fs.unlinkSync(generationPath(root, generationId)); }
+            catch (error) { if (error.code !== 'ENOENT') throw error; }
+            return true;
+        }).immediate();
+    }
 
     // Deletes the file and the row of a generation that is still retired and was retired at or
     // before retiredBefore. The write lock is held across the unlink, so no writer in any process
@@ -524,7 +535,7 @@ function createAssetFileStore(db, options) {
 
     return { root, put, prepare, publishBatch, legacyBatch, legacyBatchSync, remove, list, capture, captureEntries, stat, open, get,
         stats, cleanupImportStaging, pauseMigration, withMigrationPaused, migrateOne, start, close,
-        writeDetached, publishIfCurrent, registerRetired, deleteRetired, isPaused: paused };
+        writeDetached, publishIfCurrent, discardDetached, registerRetired, deleteRetired, isPaused: paused };
 }
 
 module.exports = { createAssetFileStore };
