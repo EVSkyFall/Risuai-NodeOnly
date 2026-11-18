@@ -31,6 +31,7 @@ const { kvGet, kvSet, kvDel, kvList,
         gcChunks, reclaimableChunkBytes, isDbBlobChunked, snapshotFootprint, illustrationAtomic,
         pluginAtomic, comfyStore, assetFileStore, storageReady,
         db: sqliteDb } = require('./db.cjs');
+const { createMediaTranscode } = require('./mediaTranscode.cjs');
 const { MUTATING_OPS: ILLUSTRATION_ATOMIC_MUTATING_OPS } = require('./illustrationAtomicStore.cjs');
 const {
     MUTATING_OPS: PLUGIN_ATOMIC_MUTATING_OPS,
@@ -1834,6 +1835,11 @@ const comfyOrchestrator = createComfyOrchestrator({
 const comfyWorldReplacementGate = createComfyWorldReplacementGate({
     orchestrator: comfyOrchestrator,
 })
+// Old PNG assets become WebP in the background. It does nothing unless
+// save/media-transcode.json switches it on; see mediaTranscode.cjs.
+const mediaTranscode = createMediaTranscode({
+    db: sqliteDb, saveDir: savePath, store: assetFileStore, queue: queueStorageOperation, logger,
+})
 const inlayMigrationMarker = path.join(inlayDir, '.migrated_to_fs')
 const hexRegex = /^[0-9a-fA-F]+$/;
 const BACKUP_IMPORT_MAX_BYTES = Number(process.env.RISU_BACKUP_IMPORT_MAX_BYTES ?? '0');
@@ -2446,6 +2452,19 @@ function detectMime(buf) {
     if (buf[0] === 0x1a && buf[1] === 0x45) return 'video/webm'
     if (buf.length >= 8 && buf[4] === 0x66 && buf[5] === 0x74 && buf[6] === 0x79 && buf[7] === 0x70) return 'video/mp4'
     return 'application/octet-stream'
+}
+// What an image's own first bytes say it is, or null. A stored image keeps its key
+// when its bytes change format (media transcoding, client-side compression), so the
+// extension in the key cannot be trusted for images.
+function sniffImageMime(buf) {
+    if (!buf || buf.length < 12) return null
+    if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'image/png'
+    if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg'
+    if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38) return 'image/gif'
+    if (buf.toString('latin1', 0, 4) === 'RIFF' && buf.toString('latin1', 8, 12) === 'WEBP') return 'image/webp'
+    // ISO-BMFF: only the AVIF brands are images; the same box opens every mp4.
+    if (buf.toString('latin1', 4, 8) === 'ftyp' && ['avif', 'avis'].includes(buf.toString('latin1', 8, 12))) return 'image/avif'
+    return null
 }
 const ASSET_EXT_MIME = {
     png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
@@ -4909,7 +4928,10 @@ function resolveAssetPayload(key, rawValue) {
 
     // assets/* and others: raw binary
     const ext = key.split('.').pop()?.toLowerCase()
-    const contentType = ASSET_EXT_MIME[ext] || detectMime(rawValue)
+    const named = ASSET_EXT_MIME[ext]
+    // For a key that claims an image (or nothing) the bytes decide; a video or audio key is left alone.
+    const sniffed = !named || named.startsWith('image/') ? sniffImageMime(rawValue) : null
+    const contentType = sniffed || named || detectMime(rawValue)
     return { binary: rawValue, contentType }
 }
 
@@ -11825,6 +11847,7 @@ async function startServer() {
             setupLLMWorkerWebSocket(server);
             server.listen(port, () => {
                 assetFileStore.start();
+                mediaTranscode.start();
                 console.log("[Server] HTTPS server is running.");
                 console.log(`[Server] https://localhost:${port}/`);
             });
@@ -11835,6 +11858,7 @@ async function startServer() {
             setupLLMWorkerWebSocket(server);
             server.listen(port, () => {
                 assetFileStore.start();
+                mediaTranscode.start();
                 console.log("[Server] HTTP server is running.");
                 console.log(`[Server] http://localhost:${port}/`);
             });
@@ -11851,6 +11875,7 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
         console.log(`[Server] Received ${sig}, flushing pending data...`);
         stopTunnel();
         try { await comfyOrchestrator.stop(); } catch (e) { logger.error('[Server] Comfy stop error:', e); }
+        try { await mediaTranscode.stop(); } catch (e) { logger.error('[Media transcode] shutdown:', e); }
         try { await flushPendingDb(); } catch (e) { logger.error('[Server] Flush error:', e); }
         try { await assetFileStore.close(); } catch (e) { logger.error('[Asset files] shutdown:', e); }
         try { checkpointWal('TRUNCATE'); } catch { /* non-fatal */ }

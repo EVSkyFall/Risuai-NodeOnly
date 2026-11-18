@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest'
-import { getImageType } from '../imageType'
+import { getImageExt, getImageMime, getImageType } from '../imageType'
 
 test('should detect JPEG', () => {
     // JPEG starts with FF D8, ends with FF D9
@@ -77,4 +77,27 @@ test('should return Unknown for unrecognized format', () => {
 test('should return Unknown for empty array', () => {
     const empty = new Uint8Array([])
     expect(getImageType(empty)).toBe('Unknown')
+})
+
+const pngBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+const webpBytes = new Uint8Array([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50])
+const jpegBytes = new Uint8Array([0xff, 0xd8, 0x00, 0x00, 0xff, 0xd9])
+const otherBytes = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
+
+test('getImageMime labels bytes by what they are, whatever they were stored as', () => {
+    expect(getImageMime(pngBytes)).toBe('image/png')
+    expect(getImageMime(webpBytes)).toBe('image/webp')
+    expect(getImageMime(jpegBytes)).toBe('image/jpeg')
+    expect(getImageMime(otherBytes)).toBe('image/png')
+    expect(getImageMime(otherBytes, 'application/octet-stream')).toBe('application/octet-stream')
+})
+
+test('getImageExt follows the bytes only when the recorded image extension is wrong', () => {
+    expect(getImageExt(webpBytes, 'png')).toBe('webp')
+    expect(getImageExt(pngBytes, 'png')).toBe('png')
+    expect(getImageExt(jpegBytes, 'jpg')).toBe('jpg')
+    expect(getImageExt(jpegBytes, 'JPEG')).toBe('JPEG')
+    expect(getImageExt(jpegBytes, 'png')).toBe('jpg')
+    expect(getImageExt(otherBytes, 'png')).toBe('png')
+    expect(getImageExt(webpBytes, 'mp3')).toBe('mp3')
 })

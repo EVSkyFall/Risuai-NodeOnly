@@ -469,6 +469,27 @@ describe('download and apply', () => {
         await fs.access(path.join(stagingDir, 'assets', a1.key.slice('assets/'.length)))
     })
 
+    it('accepts a complete WebP under a hashed name, and still rejects a cut one', async () => {
+        const [a1, a2] = account.expected.assets
+        // What a server-side media transcode leaves behind: the hashed .png name, WebP bytes.
+        const payload = Buffer.from('VP8 payload bytes!')
+        const header = Buffer.alloc(12)
+        header.write('RIFF', 0, 'latin1')
+        header.writeUInt32LE(4 + payload.length, 4)
+        header.write('WEBP', 8, 'latin1')
+        const webp = Buffer.concat([header, payload])
+        account.faults.push({ key: a1.key, status: 200, times: 9, body: webp })
+        account.faults.push({ key: a2.key, status: 200, times: 9, body: webp.subarray(0, webp.length - 5) })
+        const importer = createImport()
+        await importer.prepare({ token: account.token, id: account.id })
+        importer.startDownload()
+        const status = await settle(importer)
+        expect(status.state).toBe('downloaded')
+        expect(status.missing).toEqual(expect.arrayContaining([{ kind: 'asset', key: a2.key, status: 200, reason: 'unreadable' }]))
+        expect(status.missing.some((item: any) => item.key === a1.key)).toBe(false)
+        expect((await fs.readFile(path.join(stagingDir, 'assets', a1.key.slice('assets/'.length)))).equals(webp)).toBe(true)
+    })
+
     it('leaves out a staged file that fails its check when the account copy is unreadable too', async () => {
         const [a1] = account.expected.assets
         const assetName = a1.key.slice('assets/'.length)

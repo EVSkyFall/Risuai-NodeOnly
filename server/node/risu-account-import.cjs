@@ -190,6 +190,18 @@ function sha256(buffer) {
     return createHash('sha256').update(buffer).digest('hex');
 }
 
+// A server-side media transcode keeps an asset's hashed name while its bytes become WebP,
+// so such a body can never match the name. The hash check exists to catch a body that did
+// not arrive whole; a WebP whose container length equals the body length did.
+function isCompleteWebp(body) {
+    return body.length >= 12 && body.toString('latin1', 0, 4) === 'RIFF' && body.toString('latin1', 8, 12) === 'WEBP'
+        && body.readUInt32LE(4) + 8 === body.length;
+}
+
+function assetBodyMatches(hash, body) {
+    return sha256(body) === hash || isCompleteWebp(body);
+}
+
 function createRisuAccountImport({
     baseUrl = DEFAULT_ACCOUNT_URL,
     stagingDir,
@@ -395,7 +407,7 @@ function createRisuAccountImport({
         const hash = HASHED_ASSET.exec(name)?.[1];
         if (!hash) return false;
         try {
-            return sha256(await fs.readFile(path.join(assetsDir, name))) === hash;
+            return assetBodyMatches(hash, await fs.readFile(path.join(assetsDir, name)));
         } catch {
             return false;
         }
@@ -757,7 +769,7 @@ function createRisuAccountImport({
             await fs.rm(path.join(assetsDir, name), { force: true });
             const hash = HASHED_ASSET.exec(name)?.[1];
             const response = await withRetry(`asset ${name}`, () => readKey(key, signal), signal,
-                (result) => !hash || sha256(result.body) === hash);
+                (result) => !hash || assetBodyMatches(hash, result.body));
             if (response.status === 403) throw loginExpired();
             if (response.status === 204) {
                 job.missing.push({ kind: 'asset', key, status: 204, reason: 'not-found' });

@@ -30,6 +30,7 @@ import { resolveChatModelBinding, resolveClassicModelId, resolvePresetMaxOutputT
 import { hypaMemoryV3 } from "./memory/hypav3";
 import { getModuleAssets, getModuleLorebooks, getModules, getModuleToggles, getModuleTriggers } from "./modules";
 import { forageStorage, getCurrentTurnId, readImage, resolvePrioritizedAssetManifestNames, setCurrentTurnId } from "../globalApi.svelte";
+import { getImageMime } from "../media/imageType";
 import { stripIllustrationControlNodes, stripIllustrationControlNodesFromPrompt } from "./illustrationJobs/controlNodes";
 import { finalizeIllustrationRootTurn } from "./illustrationJobs/terminalCapture";
 import { getActiveHypaV3Preset } from "./memory/memoryPresets"
@@ -1073,7 +1074,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     const assetDataBuf = await raceAbort(() => (readImage(asset[1])), abortSignal)
                     multimodal.push({
                         type: "image",
-                        base64: `data:image/png;base64,${Buffer.from(assetDataBuf).toString('base64')}`
+                        base64: `data:${getImageMime(assetDataBuf)};base64,${Buffer.from(assetDataBuf).toString('base64')}`
                     })
                 })())
             }
@@ -1097,7 +1098,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                         const assetDataBuf = await raceAbort(() => (readImage(source)), abortSignal)
                         multimodal.push({
                             type: "image",
-                            base64: `data:image/png;base64,${Buffer.from(assetDataBuf).toString('base64')}`
+                            base64: `data:${getImageMime(assetDataBuf)};base64,${Buffer.from(assetDataBuf).toString('base64')}`
                         })
                     })())
                 }

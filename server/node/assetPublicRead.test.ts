@@ -12,7 +12,7 @@ import transport from './assetFileTransport.cjs'
 const source = fs.readFileSync(new URL('./server.cjs', import.meta.url), 'utf8')
 const ast = ts.createSourceFile('server.cjs', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS)
 const routes = ['/api/asset/:hexKey', '/api/db/flush', '/api/inlays/compress']
-const functions = ['parseSessionCookie', 'hasValidSession', 'sessionAuthMiddleware', 'checkAuth', 'detectMime', 'resolveAssetPayload']
+const functions = ['parseSessionCookie', 'hasValidSession', 'sessionAuthMiddleware', 'checkAuth', 'detectMime', 'sniffImageMime', 'resolveAssetPayload']
 const extracted = ast.statements.filter(node => {
     if (ts.isFunctionDeclaration(node)) return functions.includes(node.name?.text ?? '')
     if (!ts.isExpressionStatement(node) || !ts.isCallExpression(node.expression)) return false

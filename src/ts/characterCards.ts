@@ -6,7 +6,7 @@ import { language } from "src/lang"
 import { v4 as uuidv4, v4 } from 'uuid';
 import { characterFormatUpdate } from "./characters"
 import { AppendableBuffer, BlankWriter, checkCharOrder, downloadFile, forageStorage, loadAsset, loadAssetManifestItems, LocalWriter, readImage, saveAsset, VirtualWriter } from "./globalApi.svelte"
-import { compressImage, getImageType } from "./media"
+import { compressImage, getImageExt, getImageType } from "./media"
 import { DBState, selectedCharID } from "./stores.svelte"
 import { openSettings, SettingsRoute } from "./routing"
 import { hasher } from "./parser/parser.svelte"
@@ -1408,7 +1408,13 @@ export async function exportCharacterCard(char:character, type:'png'|'json'|'cha
                         if(name.length > 100){
                             name = name.substring(0,100)
                         }
-                        const ext = card.data.assets[i].ext === 'unknown' ? 'png' : card.data.assets[i].ext
+                        // A stored image keeps its name when its bytes change format, so the archive
+                        // entry and the card's ext follow the bytes that are actually written.
+                        const written = Buffer.from(await compressImage(rData))
+                        if(card.data.assets[i].ext !== 'unknown'){
+                            card.data.assets[i].ext = getImageExt(written, card.data.assets[i].ext)
+                        }
+                        const ext = card.data.assets[i].ext === 'unknown' ? getImageExt(written, 'png') : card.data.assets[i].ext
                         const baseDir = card.data.assets[i].ext === 'unknown'
                             ? `assets/${type}/image`
                             : `assets/${type}/${itype}`
@@ -1449,7 +1455,7 @@ export async function exportCharacterCard(char:character, type:'png'|'json'|'cha
                                 'type': imageType
                             }), 'utf-8'), 6)
                         }
-                        await writer.write(path, Buffer.from(await compressImage(rData)))
+                        await writer.write(path, written)
                     }
                 }
             }

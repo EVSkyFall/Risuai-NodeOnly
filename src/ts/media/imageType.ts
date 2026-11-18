@@ -44,3 +44,31 @@ export function getImageType(arr: Uint8Array): ImageType {
 
     return 'Unknown'
 }
+
+const IMAGE_FORMATS: Record<Exclude<ImageType, 'Unknown'>, { mime: string, exts: string[] }> = {
+    JPEG: { mime: 'image/jpeg', exts: ['jpg', 'jpeg'] },
+    PNG: { mime: 'image/png', exts: ['png'] },
+    GIF: { mime: 'image/gif', exts: ['gif'] },
+    BMP: { mime: 'image/bmp', exts: ['bmp'] },
+    AVIF: { mime: 'image/avif', exts: ['avif'] },
+    WEBP: { mime: 'image/webp', exts: ['webp'] },
+}
+const IMAGE_EXTS = new Set(Object.values(IMAGE_FORMATS).flatMap((format) => format.exts))
+
+// A stored image keeps its name when its bytes change format (server-side
+// transcoding, lossy compression), so a label has to come from the bytes.
+export function getImageMime(arr: Uint8Array, fallback = 'image/png'): string {
+    const type = getImageType(arr)
+    return type === 'Unknown' ? fallback : IMAGE_FORMATS[type].mime
+}
+
+// The extension a file holding these bytes should carry. `recorded` is kept when it
+// already names the bytes' format, when the bytes are not a known image, or when it
+// is not an image extension at all.
+export function getImageExt(arr: Uint8Array, recorded: string): string {
+    const type = getImageType(arr)
+    if (type === 'Unknown') return recorded
+    const lower = recorded.toLowerCase()
+    if (!IMAGE_EXTS.has(lower) || IMAGE_FORMATS[type].exts.includes(lower)) return recorded
+    return IMAGE_FORMATS[type].exts[0]
+}

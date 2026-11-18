@@ -1,2 +1,2 @@
 export { compressImage } from './compressImage'
-export { getImageType } from './imageType'
+export { getImageType, getImageMime, getImageExt } from './imageType'

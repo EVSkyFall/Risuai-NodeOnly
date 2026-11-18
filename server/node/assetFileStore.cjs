@@ -56,6 +56,36 @@ function createAssetFileStore(db, options) {
                     ON CONFLICT(key) DO UPDATE SET updated_at = max(updated_at, excluded.updated_at);
             END;`);
     }
+    // When a generation stopped being reachable, and whether it ever was (was_live). Nothing
+    // else records either: retiring only flips the flag, updated_at stays the publication time,
+    // and a generation that is prepared but not published yet is a retired row as well.
+    // Triggers see every statement that retires or revives a row, including the kv triggers
+    // above and other processes.
+    const nowMs = "CAST(strftime('%s', 'now') AS INTEGER) * 1000";
+    db.exec(`
+        CREATE TABLE IF NOT EXISTS asset_file_retirements (
+            generationId TEXT PRIMARY KEY, retired_at INTEGER NOT NULL, was_live INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TRIGGER IF NOT EXISTS asset_file_retired_insert AFTER INSERT ON asset_file_generations
+            WHEN NEW.retired = 1 BEGIN
+                INSERT OR REPLACE INTO asset_file_retirements VALUES (NEW.generationId, ${nowMs}, 0);
+            END;
+        CREATE TRIGGER IF NOT EXISTS asset_file_retired_update AFTER UPDATE OF retired ON asset_file_generations
+            WHEN NEW.retired = 1 AND OLD.retired = 0 BEGIN
+                INSERT OR REPLACE INTO asset_file_retirements VALUES (NEW.generationId, ${nowMs}, 1);
+            END;
+        CREATE TRIGGER IF NOT EXISTS asset_file_revived AFTER UPDATE OF retired ON asset_file_generations
+            WHEN NEW.retired = 0 BEGIN
+                DELETE FROM asset_file_retirements WHERE generationId = NEW.generationId;
+            END;
+        CREATE TRIGGER IF NOT EXISTS asset_file_generation_deleted AFTER DELETE ON asset_file_generations BEGIN
+            DELETE FROM asset_file_retirements WHERE generationId = OLD.generationId;
+        END;
+        INSERT OR IGNORE INTO asset_file_retirements
+            SELECT generationId, ${nowMs}, 0 FROM asset_file_generations WHERE retired = 1;
+        CREATE INDEX IF NOT EXISTS asset_file_live_time
+            ON asset_file_generations(updated_at, generationId) WHERE retired = 0;
+    `);
     const live = db.prepare('SELECT * FROM asset_file_generations WHERE key = ? AND retired = 0');
     // kv.updated_at sits after the BLOB, so reading it walks the whole overflow chain; the
     // trigger-maintained timestamp avoids that, and length() is answered from the record header.
@@ -145,6 +175,42 @@ function createAssetFileStore(db, options) {
         const prepared = await prepare(key, value);
         await checkpoint('pre-publish', prepared);
         db.transaction(() => publish(key, prepared))();
+    }
+
+    // Writes a generation file and registers nothing. The caller registers it through
+    // publishIfCurrent, so the slow write can stay outside whatever serializes its database work.
+    async function writeDetached(key, value) {
+        return { key, ...await writeGeneration(root, Buffer.from(value), options) };
+    }
+
+    // Makes a detached generation the live one only while the generation it was derived from
+    // still is. One write transaction, so the comparison holds against every other writer of
+    // this database. Unlike put, nothing here ever moves an asset into kv.
+    function publishIfCurrent(key, expectedGenerationId, entry) {
+        return db.transaction(() => {
+            registerRetired(entry);
+            if (live.get(key)?.generationId !== expectedGenerationId) return false;
+            publish(key, { ...entry, key });
+            return true;
+        }).immediate();
+    }
+
+
+    // Deletes the file and the row of a generation that is still retired and was retired at or
+    // before retiredBefore. The write lock is held across the unlink, so no writer in any process
+    // can revive the row in between; a crash after the unlink leaves a retired row whose file is
+    // gone, which the next call clears.
+    function deleteRetired(generationId, retiredBefore) {
+        if (captures.size > 0 || paused()) return false;
+        return db.transaction(() => {
+            const row = db.prepare(`SELECT g.retired, r.retired_at FROM asset_file_generations g
+                LEFT JOIN asset_file_retirements r ON r.generationId = g.generationId WHERE g.generationId = ?`).get(generationId);
+            if (!row || row.retired !== 1 || !(row.retired_at <= retiredBefore)) return false;
+            try { fs.unlinkSync(generationPath(root, generationId)); }
+            catch (error) { if (error.code !== 'ENOENT') throw error; }
+            db.prepare('DELETE FROM asset_file_generations WHERE generationId = ?').run(generationId);
+            return true;
+        }).immediate();
     }
 
     async function publishBatch(prepared, otherWrites = () => {}, beforeWrites = () => {}) {
@@ -457,7 +523,8 @@ function createAssetFileStore(db, options) {
     }
 
     return { root, put, prepare, publishBatch, legacyBatch, legacyBatchSync, remove, list, capture, captureEntries, stat, open, get,
-        stats, cleanupImportStaging, pauseMigration, withMigrationPaused, migrateOne, start, close };
+        stats, cleanupImportStaging, pauseMigration, withMigrationPaused, migrateOne, start, close,
+        writeDetached, publishIfCurrent, registerRetired, deleteRetired, isPaused: paused };
 }
 
 module.exports = { createAssetFileStore };
