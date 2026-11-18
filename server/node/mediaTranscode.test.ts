@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import Database from 'better-sqlite3'
 import { existsSync, readFileSync, readdirSync, writeFileSync, mkdirSync, unlinkSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
+import { randomBytes } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import storeModule from './assetFileStore.cjs'
@@ -496,13 +497,26 @@ describe('media transcode: decisions follow the configuration', () => {
         const { settle, setConfig, put, logRow } = await fixture({ enabled: true, paceMs: 0, maxDiff: 0, quality: 1 })
         const id = await put('assets/a.png', await markedPicture())
         await settle()
-        expect(logRow(id)).toMatchObject({ outcome: 'failed-check', basis: '1/0/40' })
+        expect(logRow(id)).toMatchObject({ outcome: 'failed-check', basis: '1/0/40 ["AssetMaid"]' })
         const at = logRow(id).at
         await settle()
         expect(logRow(id).at).toBe(at)
         setConfig({ enabled: true, paceMs: 0 })
         await settle()
         expect(logRow(id)).toMatchObject({ outcome: 'converted' })
+    })
+
+    it('in report mode takes "would convert" again when the markers are narrowed', async () => {
+        const { settle, setConfig, put, logRow } = await fixture({ enabled: 'report', paceMs: 0, markers: ['AssetMaid', 'parameters'] })
+        const maid = await put('assets/maid.png', await markedPicture())
+        const foreign = await put('assets/foreign.png', await markedPicture(5, 'parameters'))
+        await settle()
+        expect(logRow(maid)).toMatchObject({ outcome: 'would-convert' })
+        expect(logRow(foreign)).toMatchObject({ outcome: 'would-convert' })
+        setConfig({ enabled: 'report', paceMs: 0 })
+        await settle()
+        expect(logRow(maid)).toMatchObject({ outcome: 'would-convert' })
+        expect(logRow(foreign)).toMatchObject({ outcome: 'not-marked' })
     })
 
     it('adds an hour to the wait with every further failure', async () => {
@@ -561,19 +575,52 @@ describe('media transcode: staying out of the way', () => {
         expect(logRow(target).at).toBe(at)
     })
 
-    it('closes the record of an original that is gone from the catalog and the disk', async () => {
+    it('forgets an original that is in neither the catalog nor on disk, and tells the mirror nothing', async () => {
         const context = await fixture()
         const { transcode, settle, put, db, rel, file } = context
         const original = await put('assets/a.png', await markedPicture())
         await settle()
-        // As if the file and its row had been removed by hand.
+        // As after restoring an older database and its files: this module deleted nothing.
         unlinkSync(file(original))
         db.prepare('DELETE FROM asset_file_generations WHERE generationId = ?').run(original)
+        writeFileSync(path.join(transcode.paths.originalsDir, 'pin-late.covered'), `${rel(original)}\n`)
         await transcode.housekeeping(transcode.readConfig())
-        const row = db.prepare('SELECT * FROM media_originals WHERE path = ?').get(rel(original))
-        expect(row.deleted_at).toBeGreaterThan(0)
-        expect(row.listed_at).toBeGreaterThan(0)
+        expect(db.prepare('SELECT count(*) n FROM media_originals').get().n).toBe(0)
+        expect(existsSync(transcode.paths.collectedDir)).toBe(false)
         expect(readFileSync(transcode.paths.wantPath, 'utf-8')).toBe('')
+    })
+
+    it('accepts a covered line only for the one path a generation has', async () => {
+        const context = await fixture()
+        const { transcode, settle, put, db, rel, file } = context
+        const original = await put('assets/a.png', await markedPicture())
+        await settle()
+        context.retireAge(original, 400)
+        // The right file name in another directory proves nothing about this file.
+        const other = original.slice(0, 2) === 'aa' ? 'bb' : 'aa'
+        writeFileSync(path.join(transcode.paths.originalsDir, 'pin-odd.covered'), `assets/${other}/${original}.blob\n`)
+        await transcode.housekeeping(transcode.readConfig())
+        expect(db.prepare('SELECT covered_at FROM media_originals WHERE path = ?').get(rel(original)).covered_at).toBeNull()
+        expect(db.prepare('SELECT count(*) n FROM media_originals').get().n).toBe(1)
+        expect(existsSync(file(original))).toBe(true)
+    })
+
+    it('with "all" takes up a large number of retired generations a page at a time', async () => {
+        const { transcode, db } = await fixture({ enabled: true, paceMs: 0, collect: 'all' })
+        const insert = db.prepare('INSERT INTO asset_file_generations (generationId, key, size, sha256, updated_at, retired) VALUES (?, ?, 1, ?, 5, 0)')
+        const ids: string[] = []
+        db.transaction(() => {
+            for (let i = 0; i < 2500; i++) {
+                const id = randomBytes(32).toString('hex')
+                ids.push(id)
+                insert.run(id, `assets/key-${i}.png`, 'h')
+            }
+            db.prepare('UPDATE asset_file_generations SET retired = 1').run()
+        })()
+        await transcode.housekeeping(transcode.readConfig())
+        expect(db.prepare('SELECT count(*) n FROM media_originals').get().n).toBe(2500)
+        const sample = ids[1234]
+        expect(db.prepare('SELECT path FROM media_originals WHERE generationId = ?').get(sample)).toEqual({ path: `assets/${sample.slice(0, 2)}/${sample}.blob` })
     })
 })
 

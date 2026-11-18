@@ -34,7 +34,8 @@ const { generationPath } = require('./assetFileIO.cjs');
 const { CHECKS, isPng, pngFacts, hasMarker } = require('./mediaTranscodeCore.cjs');
 
 const DAY_MS = 86_400_000;
-const GENERATION_PATH = /^assets\/[0-9a-f]{2}\/[0-9a-f]{64}\.blob$/;
+// The one path a generation has: its directory is the first two characters of its id.
+const GENERATION_PATH = /^assets\/([0-9a-f]{2})\/\1[0-9a-f]{62}\.blob$/;
 // Lists, pins and deletions are looked at this often while images are still being converted.
 const HOUSEKEEPING_MS = 300_000;
 const DEFAULTS = Object.freeze({
@@ -105,8 +106,8 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
 
     db.exec(`
         -- One row per examined generation. basis is what the decision rested on (the markers
-        -- for "not-marked", the encode settings for a rejected encode), so it is taken again
-        -- when the configuration changes.
+        -- for "not-marked"; the encode settings and the markers for the outcome of an encode),
+        -- so it is taken again when the configuration changes.
         CREATE TABLE IF NOT EXISTS media_transcode_log (
             id TEXT PRIMARY KEY, kind TEXT NOT NULL, key TEXT NOT NULL, outcome TEXT NOT NULL,
             result TEXT, detail TEXT, basis TEXT, checks INTEGER NOT NULL,
@@ -154,13 +155,11 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
             attempts = excluded.attempts, next_at = excluded.next_at, at = excluded.at`);
     const attemptsOf = db.prepare('SELECT attempts FROM media_transcode_log WHERE id = ?');
     const wantOriginal = db.prepare('INSERT OR IGNORE INTO media_originals (path, generationId, wanted_at) VALUES (?, ?, ?)');
-    // "all": every retired generation that was live once is wanted, whoever retired it. A
-    // generation that was never live may still be waiting for its publication (an import, a
-    // migration), however long that takes, so it is never wanted.
-    const adoptRetired = db.prepare(`
-        INSERT OR IGNORE INTO media_originals (path, generationId, wanted_at)
-        SELECT 'assets/' || substr(r.generationId, 1, 2) || '/' || r.generationId || '.blob', r.generationId, @at
-        FROM asset_file_retirements r WHERE r.was_live = 1`);
+    // For "all": the retired generations that were live once. A generation that was never live
+    // may still be waiting for its publication (an import, a migration), however long that
+    // takes, so it is never wanted.
+    const retiredPage = db.prepare(`SELECT generationId FROM asset_file_retirements
+        WHERE was_live = 1 AND generationId > @after ORDER BY generationId LIMIT 1000`);
     const coverOriginal = db.prepare(`
         INSERT INTO media_originals (path, generationId, wanted_at, covered_at, manifest)
         VALUES (@path, @generationId, @at, @at, @manifest)
@@ -176,6 +175,7 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
         WHERE o.deleted_at IS NULL AND o.path > @after
         ORDER BY o.path LIMIT 1000`);
     const markDeleted = db.prepare('UPDATE media_originals SET deleted_at = ? WHERE path = ? AND deleted_at IS NULL');
+    const forgetOriginal = db.prepare('DELETE FROM media_originals WHERE path = ? AND deleted_at IS NULL');
     const unlisted = db.prepare(`SELECT path FROM media_originals
         WHERE deleted_at IS NOT NULL AND listed_at IS NULL ORDER BY path LIMIT 5000`);
     const markListed = db.prepare('UPDATE media_originals SET listed_at = ? WHERE path = ? AND listed_at IS NULL');
@@ -189,6 +189,7 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
     let worker = null;
     let pending = null;
     let cursor = { time: -1, id: '' };
+    let adoptCursor = '';
     let lastHousekeeping = -Infinity;
     let encoderWarned = false;
 
@@ -211,7 +212,8 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
         }
     }
     const markersBasis = (config) => JSON.stringify([...config.markers].sort());
-    const encodeBasis = (config) => `${config.quality}/${config.maxDiff}/${config.maxBlockDiff}`;
+    // An encode is only reached by a marked image, so its outcome rests on the markers as well.
+    const encodeBasis = (config) => `${config.quality}/${config.maxDiff}/${config.maxBlockDiff} ${markersBasis(config)}`;
 
     function encode(bytes, config) {
         return new Promise((resolve, reject) => {
@@ -293,7 +295,7 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
         const facts = pngFacts(bytes);
         if (facts.reason) { cheap.push(decision(item, 'not-plain-png', { detail: facts.reason })); return false; }
         if (!hasMarker(facts.keywords, config.markers)) { cheap.push(decision(item, 'not-marked', { basis: markersBasis(config) })); return false; }
-        if (stopping) return false;
+        if (idle()) return false;
 
         let encoded;
         try { encoded = await encode(bytes, config); }
@@ -313,7 +315,8 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
             cheap.push(decision(item, 'would-convert', { detail, basis }));
             return true;
         }
-        if (stopping) return false;
+        // Nothing was decided about the image: it is encoded again when the server is free.
+        if (idle()) return false;
 
         // The slow file write stays outside the queue; registering and publishing it does not.
         let entry;
@@ -329,7 +332,7 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
         let published = false;
         try {
             await queue(() => {
-                if (stopping) return;
+                if (idle()) return;
                 // One transaction: the publication, its decision and the wish to delete the
                 // original it replaced. None of the three may exist without the others.
                 published = db.transaction(() => {
@@ -340,9 +343,9 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
                 }).immediate();
             });
         } finally {
-            // Not published (the key moved on, the server is stopping, or the transaction
-            // failed): the file written above belongs to no row. The key's current generation
-            // is examined by a later search once it is old enough.
+            // Not published (the key moved on, the server is stopping or an import has come
+            // in, or the transaction failed): the file written above belongs to no row. The
+            // key's generation is examined again by a later search.
             if (!published) { try { await queue(() => store.discardDetached(entry.generationId)); } catch {} }
         }
         return true;
@@ -375,7 +378,9 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
                     // Left without a decision, so the next search takes it up again.
                     warn(`${item.key}: ${error?.message || error}`);
                 }
-                if (stopping) break;
+                // Interrupted (stopping, or an import came in): the cursor stays, so this image is
+                // looked at again when the search goes on.
+                if (idle()) break;
                 cursor = { time: item.updated_at, id: item.generationId };
                 if (config.enabled === true && now() - lastHousekeeping >= HOUSEKEEPING_MS) {
                     // Decisions first: the housekeeping reads them.
@@ -402,6 +407,7 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
             try { lines = (await fsp.readFile(file, 'utf-8')).split('\n').map(line => line.replace(/\r$/, '')); }
             catch (error) { if (error.code !== 'ENOENT') warn(`cannot read ${file}: ${error.message}`); continue; }
             const paths = lines.filter(line => GENERATION_PATH.test(line));
+            if (idle()) return;
             await queue(() => {
                 const at = now();
                 db.transaction(() => {
@@ -423,7 +429,7 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
     }
 
     // Sorts the originals not deleted yet into: still to be pinned, ready to be deleted, and
-    // already gone (no row and no file). Out of scope or not retired: left alone.
+    // unknown (neither a catalog row nor a file). Out of scope or not retired: left alone.
     async function survey(config) {
         const all = config.collect === 'all';
         const before = now() - config.retentionDays * DAY_MS;
@@ -438,10 +444,10 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
                 return true;
             }
         };
-        for (let after = ''; !stopping;) {
+        for (let after = ''; !idle();) {
             const rows = openOriginals.all({ after });
             for (const row of rows) {
-                if (stopping) break;
+                if (idle()) break;
                 if (row.retired === null) { if (!await isPresent(row)) gone.push(row); continue; }
                 if (row.retired !== 1 || !(row.transcoded === 1 || (all && row.was_live === 1))) continue;
                 if (row.covered_at === null) { if (await isPresent(row)) want.push(row); }
@@ -451,7 +457,7 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
             after = rows[rows.length - 1].path;
             await nextTurn();
         }
-        return { want, due, gone, before, complete: !stopping };
+        return { want, due, gone, before, complete: !idle() };
     }
 
     async function collect({ due, gone, before }) {
@@ -477,8 +483,30 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
             });
             await nextTurn();
         }
-        if (gone.length && !idle()) await queue(() => db.transaction(() => { for (const row of gone) markDeleted.run(now(), row.path); })());
+        // Nothing here deleted these, so nothing is announced: a mirror must not follow a file
+        // that merely is not there (after a restore its copy may be the only one at hand).
+        if (gone.length && !idle()) await queue(() => db.transaction(() => { for (const row of gone) forgetOriginal.run(row.path); })());
         if (deleted) info(`deleted ${deleted} pinned originals`);
+    }
+
+    // "all": wants every retired generation that was live once. A thousand at a time, and at
+    // most twenty thousand per round, continuing where the last round ended, so a large
+    // backlog (an import, pins that do not arrive) is neither scanned in one go nor over and over.
+    async function adoptRetired() {
+        for (let pages = 0; pages < 20 && !idle(); pages++) {
+            const rows = retiredPage.all({ after: adoptCursor });
+            if (rows.length) {
+                await queue(() => {
+                    const at = now();
+                    db.transaction(() => {
+                        for (const row of rows) wantOriginal.run(`assets/${row.generationId.slice(0, 2)}/${row.generationId}.blob`, row.generationId, at);
+                    })();
+                });
+            }
+            if (rows.length < 1000) { adoptCursor = ''; return; }
+            adoptCursor = rows[rows.length - 1].generationId;
+            await nextTurn();
+        }
     }
 
     // Tells the mirror which files are gone. Only completed deletions are listed, and a row is
@@ -500,7 +528,7 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
         const text = want.map(row => row.path).sort().map(entry => `${entry}\n`).join('');
         try {
             const current = await fsp.readFile(wantPath, 'utf-8').catch((error) => { if (error.code === 'ENOENT') return null; throw error; });
-            if (current !== text) await writeAtomic(wantPath, text);
+            if (current !== text && !idle()) await writeAtomic(wantPath, text);
         } catch (error) { warn(`cannot write ${wantPath}: ${error.message}`); }
     }
 
@@ -509,7 +537,7 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
         if (idle()) return;
         await ingestCovered();
         if (idle()) return;
-        if (config.collect === 'all') await queue(() => { adoptRetired.run({ at: now() }); });
+        if (config.collect === 'all') await adoptRetired();
         const found = await survey(config);
         // A survey cut short knows only part of what is wanted; a list written from it would be short.
         if (idle() || !found.complete) return;
