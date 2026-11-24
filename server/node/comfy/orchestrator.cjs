@@ -379,9 +379,10 @@ function createComfyOrchestrator(options) {
         const ids = new Set(submittingInputs.keys());
         for (const job of store.listNonterminalJobs()) {
             ids.add(`comfy-${job.jobId}`);
-            if (typeof job.inputAssetId === 'string') ids.add(job.inputAssetId);
+            // A job without an input stores an empty id.
+            if (typeof job.inputAssetId === 'string' && job.inputAssetId) ids.add(job.inputAssetId);
             for (const entry of Object.values(job.inputAssets ?? {})) {
-                if (typeof entry?.assetId === 'string') ids.add(entry.assetId);
+                if (typeof entry?.assetId === 'string' && entry.assetId) ids.add(entry.assetId);
             }
         }
         return ids;

@@ -52,7 +52,10 @@ const HOUSEKEEPING_MS = 300_000;
 const SETTLED = new Set(['not-plain-png', 'failed-check', 'not-smaller']);
 const DEFAULTS = Object.freeze({
     enabled: false,          // false | true | "report" (examine and log, change nothing)
-    inlays: true,            // inlays follow `enabled`; false leaves them alone, "report" only examines them
+    // Inlays follow `enabled`; false leaves them alone, "report" only examines them. Originals
+    // that are already in quarantine go on to be pinned and deleted either way, as long as
+    // `enabled` is true: they are no longer inlays.
+    inlays: true,
     ageDays: 30,
     quality: 90,
     maxDiff: 4,
@@ -140,11 +143,13 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
     const wantPath = path.join(originalsDir, 'want.list');
     const configPath = path.join(saveDir, 'media-transcode.json');
     const quarantineDir = path.join(originalsDir, 'inlays');
-    // Temporary files of this module. A quarantine copy is completed here and renamed into
-    // place. The new payload and sidecar of an inlay wait inside the inlay directory's own
-    // subfolder, so that moving them in is a rename within one directory tree whatever the
-    // inlay directory is mounted on (inlay listings look at files only, never at subfolders).
-    const quarantineStagingDir = path.join(originalsDir, 'staging');
+    // Where this module completes its files before they are renamed into place: a quarantine
+    // copy, and the new payload and sidecar of an inlay. Nothing is ever prepared inside the
+    // inlay directory itself, because an import replaces that directory as a whole.
+    const stagingDir = path.join(originalsDir, 'staging');
+    // Used only inside the storage queue, and only when the inlay directory turns out to lie
+    // on another file system than the staging directory (see moveIn). Inlay listings look at
+    // files only, never at subfolders.
     const inlayStagingDir = inlays ? path.join(inlays.dir, '.staging') : null;
 
     db.exec(`
@@ -225,14 +230,16 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
     const inlayLog = db.prepare('SELECT outcome, basis, checks, next_at FROM media_transcode_log WHERE id = ?');
     // A conversion wants the quarantined original from now on, so the retention starts again
     // even when an earlier conversion of the same bytes already wanted it. A pin counts only
-    // for the file it saw: after the file was written anew, or the row had been closed by a
-    // deletion, it has to be pinned again.
+    // for the file it saw: a row that had been closed by a deletion has to be pinned again
+    // (and so has a file that is written anew: see quarantine).
     const wantQuarantined = db.prepare(`
         INSERT INTO media_originals (path, generationId, wanted_at) VALUES (@path, @sha, @at)
         ON CONFLICT(path) DO UPDATE SET wanted_at = excluded.wanted_at,
-            covered_at = CASE WHEN @fresh = 0 AND media_originals.deleted_at IS NULL THEN media_originals.covered_at END,
-            manifest = CASE WHEN @fresh = 0 AND media_originals.deleted_at IS NULL THEN media_originals.manifest END,
+            covered_at = CASE WHEN media_originals.deleted_at IS NULL THEN media_originals.covered_at END,
+            manifest = CASE WHEN media_originals.deleted_at IS NULL THEN media_originals.manifest END,
             deleted_at = NULL, listed_at = NULL`);
+    const knownOriginal = db.prepare('SELECT 1 FROM media_originals WHERE path = ?');
+    const forgetPin = db.prepare('UPDATE media_originals SET covered_at = NULL, manifest = NULL WHERE path = ?');
     // For a file found in quarantine without an open row: an open row is left as it is.
     const adoptQuarantined = db.prepare(`
         INSERT INTO media_originals (path, generationId, wanted_at) VALUES (@path, @sha, @at)
@@ -487,14 +494,23 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
     }
 
     // Puts the original's bytes into quarantine under the hash of its content. A file already
-    // there is kept only if it really has that content. Returns whether the file was written now.
+    // there is kept only if it really has that content. Returns false when that could not be
+    // done for now (an import or a shutdown came in between).
     async function quarantine(bytes, hash) {
         const target = path.join(quarantineDir, `${hash}.png`);
         const current = await fsp.readFile(target).catch((error) => { if (error.code === 'ENOENT') return null; throw error; });
-        if (current && sha256(current) === hash) return false;
+        if (current && sha256(current) === hash) return true;
+        // The file is written anew. A pin that saw whatever was there before (or nothing) says
+        // nothing about these bytes, so a row for this path loses its pin first. In that order:
+        // were the file replaced first, a crash in between would leave it covered by the old pin.
+        if (knownOriginal.get(quarantinePath(hash))) {
+            let cleared = false;
+            await queue(() => { if (idle()) return; forgetPin.run(quarantinePath(hash)); cleared = true; });
+            if (!cleared) return false;
+        }
         await fsp.mkdir(quarantineDir, { recursive: true });
-        await fsp.mkdir(quarantineStagingDir, { recursive: true });
-        const temp = path.join(quarantineStagingDir, `${hash}.${crypto.randomBytes(6).toString('hex')}.tmp`);
+        await fsp.mkdir(stagingDir, { recursive: true });
+        const temp = path.join(stagingDir, `${hash}.${crypto.randomBytes(6).toString('hex')}.tmp`);
         try {
             await writeSynced(temp, bytes);
             await fsp.rename(temp, target);
@@ -521,22 +537,44 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
         try { inlays.forgetThumbnail?.(id, stat); } catch { /* a thumbnail left behind is only a small file */ }
     }
 
+    // Inside the storage queue: puts a staged file under its name in the inlay directory.
+    // Normally that is one rename. If the inlay directory lies on another file system, the
+    // file is first copied into that directory's own subfolder and renamed from there, so what
+    // appears under the name is a complete file either way.
+    function moveIn(staged, target) {
+        try { fs.renameSync(staged, target); return; }
+        catch (error) { if (error.code !== 'EXDEV') throw error; }
+        fs.mkdirSync(inlayStagingDir, { recursive: true });
+        const near = path.join(inlayStagingDir, path.basename(staged));
+        fs.copyFileSync(staged, near);
+        const descriptor = fs.openSync(near, 'r+');
+        try { fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
+        fs.renameSync(near, target);
+    }
+
     // The PNG is not the payload its sidecar names, and that payload exists: a switch was cut
     // short after the sidecar went in. Readers already get the other file, so the PNG only
     // has to leave, through quarantine like any original.
     async function finishSwitch(id, seen, sidecarText, payload) {
-        try { if (!(await fsp.stat(payload)).isFile()) return; } catch { return; }
+        try {
+            const other = await fsp.stat(payload, { bigint: true });
+            // The same file under another spelling of its name is not another payload.
+            if (!other.isFile() || (other.dev === seen.dev && other.ino === seen.ino)) return;
+        } catch { return; }
         if (inlays.inUse(id)) return;
         const bytes = await readInlayPng(path.join(inlays.dir, `${id}.png`), seen);
         if (!bytes || idle()) return;
         const hash = sha256(bytes);
-        const fresh = await quarantine(bytes, hash);
+        if (!await quarantine(bytes, hash)) return;
         let done = false;
         await queue(() => {
             const stat = stillAsRead(id, seen, sidecarText);
             if (!stat) return;
-            try { if (!fs.statSync(payload).isFile()) return; } catch { return; }
-            wantQuarantined.run({ path: quarantinePath(hash), sha: hash, at: now(), fresh: fresh ? 1 : 0 });
+            try {
+                const other = fs.statSync(payload, { bigint: true });
+                if (!other.isFile() || (other.dev === seen.dev && other.ino === seen.ino)) return;
+            } catch { return; }
+            wantQuarantined.run({ path: quarantinePath(hash), sha: hash, at: now() });
             fs.unlinkSync(path.join(inlays.dir, `${id}.png`));
             forgetThumbnail(id, stat);
             done = true;
@@ -569,7 +607,6 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
             if (live && ext !== 'meta.json') await finishSwitch(id, seen, sidecarText, path.join(inlays.dir, `${id}.${ext}`));
             return false;
         }
-        if (inlays.inUse(id)) return false;
 
         // A decision holds for this very file under these settings, and no longer.
         const basis = `${seen.mtimeNs}-${seen.size} ${config.quality}/${config.maxDiff}/${config.maxBlockDiff}`;
@@ -579,6 +616,7 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
                 // A "converted" row never holds a PNG back: if the PNG is still the payload, the switch did not happen.
                 : SETTLED.has(prior.outcome) || (prior.outcome === 'would-convert' && !live)) return false;
         }
+        if (inlays.inUse(id)) return false;
 
         let bytes;
         try { bytes = await readInlayPng(file, seen); }
@@ -607,23 +645,24 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
         if (!live) { cheap.push(inlayDecision(id, 'would-convert', { detail, basis })); return true; }
         if (idle()) return false;
 
-        // Everything slow happens here, outside the queue, and nothing of it is visible to a
-        // reader of the inlay directory.
+        // Everything slow happens here, outside the queue and outside the inlay directory.
         const token = crypto.randomBytes(8).toString('hex');
-        const stagedWebp = path.join(inlayStagingDir, `${token}.webp`);
-        const stagedSidecar = path.join(inlayStagingDir, `${token}.json`);
+        const stagedWebp = path.join(stagingDir, `${token}.webp`);
+        const stagedSidecar = path.join(stagingDir, `${token}.json`);
         try {
-            let fresh;
             try {
-                fresh = await quarantine(bytes, hash);
-                await fsp.mkdir(inlayStagingDir, { recursive: true });
+                if (!await quarantine(bytes, hash)) return false;
+                await fsp.mkdir(stagingDir, { recursive: true });
                 await writeSynced(stagedWebp, encoded.webp);
                 // Every field the sidecar has is kept; only the extension changes.
                 await writeSynced(stagedSidecar, JSON.stringify({ ...sidecar, ext: 'webp' }));
             } catch (error) {
+                // Interrupted by a shutdown or an import: nothing is held against the image.
+                if (idle()) return false;
                 cheap.push(inlayDecision(id, 'error', { detail: `stage: ${error.message}`, basis }));
                 return true;
             }
+            if (idle()) return false;
             await queue(() => {
                 const stat = stillAsRead(id, seen, sidecarText);
                 if (!stat || !fs.existsSync(stagedWebp) || !fs.existsSync(stagedSidecar)) return;
@@ -632,10 +671,10 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
                 // switch without them would leave an original nobody asks to have pinned.
                 db.transaction(() => {
                     writeDecisions([inlayDecision(id, 'converted', { detail, basis })]);
-                    wantQuarantined.run({ path: quarantinePath(hash), sha: hash, at: now(), fresh: fresh ? 1 : 0 });
+                    wantQuarantined.run({ path: quarantinePath(hash), sha: hash, at: now() });
                 }).immediate();
-                fs.renameSync(stagedWebp, path.join(inlays.dir, `${id}.webp`));
-                fs.renameSync(stagedSidecar, path.join(inlays.dir, `${id}.meta.json`));
+                moveIn(stagedWebp, path.join(inlays.dir, `${id}.webp`));
+                moveIn(stagedSidecar, path.join(inlays.dir, `${id}.meta.json`));
                 fs.unlinkSync(file);
                 forgetThumbnail(id, stat);
             });
@@ -658,6 +697,9 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
         catch (error) { if (error.code !== 'ENOENT') warn(`cannot read ${inlays.dir}: ${error.message}`); return ids; }
         try {
             for await (const entry of dir) {
+                // An import is about to replace this directory: let go of it at once. What was
+                // not seen is seen by the next walk.
+                if (idle()) break;
                 if (!entry.isFile() || !entry.name.endsWith('.png')) continue;
                 const id = entry.name.slice(0, -4);
                 // Plugin inlays are verified byte for byte by the plugin layer and stay as they are.
@@ -669,7 +711,7 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
 
     // Temporary files a crash left behind. A day is far longer than any step here takes.
     async function sweepStaging() {
-        for (const dir of [quarantineStagingDir, inlayStagingDir]) {
+        for (const dir of [stagingDir, inlayStagingDir]) {
             let names;
             try { names = await fsp.readdir(dir); } catch { continue; }
             for (const name of names) {
@@ -683,7 +725,7 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
     // at most 50 encodes. Returns true while ids of the current walk are left.
     async function sweepInlays(config, live) {
         if (!inlayIds) {
-            await sweepStaging();
+            if (live) await sweepStaging();
             inlayIds = await listPngInlays();
             inlayIndex = 0;
         }
@@ -729,7 +771,11 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
             const match = name.endsWith('.png') && INLAY_ORIGINAL_PATH.exec(entry);
             if (!match || hasOpenOriginal.get(entry)) continue;
             let bytes;
-            try { bytes = await fsp.readFile(path.join(quarantineDir, name)); } catch { continue; }
+            try {
+                // A regular file only: the backup side does not pin anything else.
+                if (!(await fsp.lstat(path.join(quarantineDir, name))).isFile()) continue;
+                bytes = await fsp.readFile(path.join(quarantineDir, name));
+            } catch { continue; }
             if (sha256(bytes) !== match[1]) {
                 // Not an original this module wrote. It is neither pinned under a name it does not deserve nor deleted.
                 if (!oddQuarantine.has(name)) { oddQuarantine.add(name); warn(`${entry} does not have the content its name says; left alone`); }
@@ -986,7 +1032,7 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
     }
 
     return { start, stop, hold, pass, housekeeping, readConfig,
-        paths: { originalsDir, collectedDir, wantPath, configPath, quarantineDir, quarantineStagingDir, inlayStagingDir } };
+        paths: { originalsDir, collectedDir, wantPath, configPath, quarantineDir, stagingDir, inlayStagingDir } };
 }
 
 module.exports = { createMediaTranscode, normalizeConfig, DEFAULTS, after };

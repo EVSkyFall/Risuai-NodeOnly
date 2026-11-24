@@ -237,6 +237,11 @@ describe('inlays through the server', () => {
         expect(names.filter(name => name.startsWith('inlay/')).sort()).toEqual(['inlay/first.png', 'inlay/second.webp', 'inlay/third.png'])
         expect(names.filter(name => name.startsWith('inlay_sidecar/')).sort()).toEqual(['inlay_sidecar/first', 'inlay_sidecar/second', 'inlay_sidecar/third'])
 
+        // An extension with a dot in it is reported whole.
+        await put(client, 'inlay/voice', Buffer.from(JSON.stringify(
+            { ext: 'vnd.wave', name: 'voice', type: 'audio', data: `data:audio/vnd.wave;base64,${Buffer.from('RIFF....WAVE').toString('base64')}` })))
+        expect(JSON.parse(Buffer.from(await (await read(client, 'inlay/voice')).arrayBuffer()).toString())).toMatchObject({ ext: 'vnd.wave', type: 'audio' })
+
         // Removing an inlay takes both files; so does writing it anew.
         expect((await remove(client, 'inlay/first')).status).toBe(200)
         expect((await remove(client, 'inlay/second')).status).toBe(200)

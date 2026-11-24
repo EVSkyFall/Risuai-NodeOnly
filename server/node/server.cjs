@@ -2114,7 +2114,7 @@ async function resolveInlayFilePath(id) {
     // against a fresh read of the sidecar before the directory is searched.
     for (let attempt = 0; attempt < 2; attempt++) {
         const sidecar = await readInlaySidecar(id);
-        if (!sidecar) break;
+        if (!sidecar) continue;
         const candidate = getInlayFilePath(id, sidecar.ext);
         try { await fs.access(candidate); return candidate; } catch {}
     }
@@ -2238,6 +2238,7 @@ function writeInlayFileSync(id, ext, buffer, info = null) {
 // can leave the PNG and the WebP of one id side by side until it is finished, so whoever
 // removes or replaces an inlay takes both along with the payload the sidecar names.
 function inlayPayloadPaths(id, resolved) {
+    if (!isSafeInlayId(id)) return resolved ? [resolved] : [];
     return [...new Set([resolved, getInlayFilePath(id, 'png'), getInlayFilePath(id, 'webp')].filter(Boolean))];
 }
 
@@ -2297,17 +2298,18 @@ async function listInlayFiles() {
     // The PNG and the WebP of one id can lie side by side until an interrupted conversion (the
     // media transcoder, on a crash) is finished. The one the sidecar names is the inlay; listing
     // both would put the id into an archive twice, and such an archive does not restore.
-    const twins = new Map();
+    const pngIds = new Set();
+    const webpIds = new Set();
     for (const file of files) {
-        if (file.ext === 'png' || file.ext === 'webp') twins.set(file.id, [...(twins.get(file.id) || []), file]);
+        if (file.ext === 'png') pngIds.add(file.id);
+        else if (file.ext === 'webp') webpIds.add(file.id);
     }
-    const dropped = new Set();
-    for (const [id, pair] of twins) {
-        if (pair.length !== 2) continue;
-        const keep = (await readInlaySidecar(id))?.ext === 'webp' ? 'webp' : 'png';
-        dropped.add(pair.find((file) => file.ext !== keep));
+    // id → the extension of the file that is not the inlay.
+    const unlisted = new Map();
+    for (const id of pngIds) {
+        if (webpIds.has(id)) unlisted.set(id, (await readInlaySidecar(id))?.ext === 'webp' ? 'png' : 'webp');
     }
-    return dropped.size ? files.filter((file) => !dropped.has(file)) : files;
+    return unlisted.size ? files.filter((file) => unlisted.get(file.id) !== file.ext) : files;
 }
 
 async function readInlayLegacyInfo(id) {
@@ -5372,7 +5374,11 @@ app.get('/api/remove', async (req, res, next) => {
             return res.send({ success: true });
         }
         if (key.startsWith('inlay_info/')) {
-            await queueStorageOperation(() => fs.unlink(getInlaySidecarPath(key.slice('inlay_info/'.length))).catch(() => {}));
+            await queueStorageOperation(async () => {
+                await fs.unlink(getInlaySidecarPath(key.slice('inlay_info/'.length))).catch(() => {});
+                kvDel(key);
+            });
+            return res.send({ success: true });
         }
         // A DB snapshot owns a plugin-storage map row + blobs; a raw kvDel
         // would orphan them (never GC'd, never counted).

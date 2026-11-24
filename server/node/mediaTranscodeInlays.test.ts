@@ -1,6 +1,6 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import Database from 'better-sqlite3'
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs'
+import nodeFs, { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
@@ -84,7 +84,7 @@ async function fixture(config: Record<string, any> | null = { enabled: true, pac
         writeFileSync(path.join(transcode.paths.originalsDir, name), lines.map(line => `${line}\n`).join(''))
     }
     const housekeeping = () => transcode.housekeeping(transcode.readConfig())
-    const staged = () => existsSync(transcode.paths.inlayStagingDir) ? readdirSync(transcode.paths.inlayStagingDir) : []
+    const staged = () => existsSync(transcode.paths.stagingDir) ? readdirSync(transcode.paths.stagingDir) : []
     // Runs passes until the scheduler says there is nothing left for now.
     const settle = async () => { for (let i = 0; i < 50; i++) if (await transcode.pass() !== 0) return; throw new Error('never settled') }
     return { dir, db, store, transcode, setConfig, inlayDir, busy, forgotten, png, webp, sidecarFile, sidecar, setAge, putInlay, payloads,
@@ -98,14 +98,14 @@ describe('media transcode: converting inlays', () => {
         f.putInlay('a', bytes, 60, { custom: 'kept' })
         const thumbnail = f.thumbName('a')
         await f.settle()
-        expect(readdirSync(f.inlayDir).sort()).toEqual(['.staging', 'a.meta.json', 'a.webp'])
+        // Nothing but the inlay itself is ever in the inlay directory, and nothing is left in staging.
+        expect(readdirSync(f.inlayDir).sort()).toEqual(['a.meta.json', 'a.webp'])
         expect(f.staged()).toEqual([])
         const converted = readFileSync(f.webp('a'))
         expect(isWebp(converted)).toBe(true)
         expect(converted.length).toBeLessThan(bytes.length)
         expect(f.sidecar('a')).toEqual({ ext: 'webp', name: 'a picture', type: 'image', height: 480, width: 640, custom: 'kept' })
         expect(readFileSync(f.originalFile(bytes)).equals(bytes)).toBe(true)
-        expect(readdirSync(f.transcode.paths.quarantineStagingDir)).toEqual([])
         expect(f.wantList()).toEqual([f.original(bytes)])
         const row = f.logRow('a')
         expect(row).toMatchObject({ kind: 'inlay', key: 'a', outcome: 'converted', result: null })
@@ -199,6 +199,32 @@ describe('media transcode: converting inlays', () => {
         f.putInlay('profiled', bytes, 45)
         await f.settle()
         expect(f.logRow('profiled')).toMatchObject({ outcome: 'converted' })
+    })
+
+    it('tries an image that failed again later, and at once when the file is another one', async () => {
+        const workerPath = path.join(tmpdir(), `media-transcode-failing-${process.pid}-${Math.random().toString(16).slice(2)}.cjs`)
+        writeFileSync(workerPath, "require('node:worker_threads').parentPort.on('message', function () { this.postMessage({ error: 'boom' }); });")
+        cleanup.push(() => rm(workerPath, { force: true }))
+        const f = await fixture({ enabled: true, paceMs: 0 }, { workerPath })
+        const bytes = await picture()
+        f.putInlay('a', bytes)
+        await f.settle()
+        const first = f.logRow('a')
+        expect(first).toMatchObject({ outcome: 'error', attempts: 1, detail: 'encode: boom' })
+        expect(first.next_at).toBeGreaterThan(Date.now() + 3_000_000)
+        expect(f.payloads('a')).toEqual(['a.png'])
+        // Not before its time.
+        await f.settle()
+        expect(f.logRow('a')).toMatchObject({ attempts: 1, at: first.at })
+        // Its time has come: tried again, and the wait grows.
+        f.db.prepare("UPDATE media_transcode_log SET next_at = ? WHERE id = 'inlay/a'").run(Date.now() - 1)
+        await f.settle()
+        expect(f.logRow('a')).toMatchObject({ outcome: 'error', attempts: 2 })
+        // Another file under the id is not made to wait for the old one's time.
+        f.putInlay('a', bytes, 45)
+        await f.settle()
+        expect(f.logRow('a')).toMatchObject({ outcome: 'error', attempts: 3 })
+        expect(f.logRow('a').basis).not.toBe(first.basis)
     })
 
     it('remembers that an image would not get smaller', async () => {
@@ -355,6 +381,27 @@ describe('media transcode: inlay originals', () => {
         expect(f.originalRow(bytes).deleted_at).not.toBeNull()
     })
 
+    it('takes an original that is already in quarantine to its pin and deletion after inlays were switched off or to "report"', async () => {
+        for (const inlays of [false, 'report']) {
+            const f = await fixture()
+            const bytes = await picture()
+            f.putInlay('a', bytes)
+            await f.settle()
+            f.setConfig({ enabled: true, paceMs: 0, inlays })
+            f.putInlay('later', await picture(640, 480, 3))
+            f.cover('pin-1.covered', [f.original(bytes)])
+            await f.settle()
+            expect(f.originalRow(bytes).covered_at, String(inlays)).not.toBeNull()
+            f.ageWant(bytes, 4)
+            await f.settle()
+            expect(existsSync(f.originalFile(bytes)), String(inlays)).toBe(false)
+            expect(f.originalRow(bytes).deleted_at, String(inlays)).not.toBeNull()
+            // No inlay is changed any more.
+            expect(f.payloads('a')).toEqual(['a.webp'])
+            expect(f.payloads('later')).toEqual(['later.png'])
+        }
+    })
+
     it('wants whatever lies in quarantine under its true name, and leaves alone what does not', async () => {
         const f = await fixture()
         const stray = await picture(640, 480, 3), wrong = await picture(640, 480, 5)
@@ -501,6 +548,82 @@ describe('media transcode: what an interrupted switch leaves behind', () => {
         f.busy.delete('a')
         await f.settle()
         expect(f.payloads('a')).toEqual(['a.webp'])
+    })
+})
+
+describe('media transcode: inlays, the ground under it', () => {
+    it('switches an inlay in when the inlay directory is on another file system', async () => {
+        const f = await fixture()
+        const bytes = await picture()
+        f.putInlay('a', bytes)
+        const rename = nodeFs.renameSync
+        // A rename from the staging directory into the inlay directory is refused, as across mounts.
+        const spy = vi.spyOn(nodeFs, 'renameSync').mockImplementation((from: any, to: any) => {
+            if (path.dirname(String(to)) === f.inlayDir && path.dirname(String(from)) === f.transcode.paths.stagingDir) {
+                throw Object.assign(new Error('EXDEV: cross-device link not permitted'), { code: 'EXDEV' })
+            }
+            return rename(from, to)
+        })
+        cleanup.push(async () => spy.mockRestore())
+        await f.settle()
+        spy.mockRestore()
+        expect(readdirSync(f.inlayDir).sort()).toEqual(['.staging', 'a.meta.json', 'a.webp'])
+        expect(readdirSync(f.transcode.paths.inlayStagingDir)).toEqual([])
+        expect(f.staged()).toEqual([])
+        expect(isWebp(readFileSync(f.webp('a')))).toBe(true)
+        expect(f.sidecar('a')).toMatchObject({ ext: 'webp', name: 'a picture' })
+        expect(readFileSync(f.originalFile(bytes)).equals(bytes)).toBe(true)
+        expect(f.logs.filter(line => line.startsWith('warn'))).toEqual([])
+    })
+
+    it('clears out temporary files a crash left behind, but only when it may change things', async () => {
+        const report = await fixture({ enabled: 'report', paceMs: 0 })
+        const live = await fixture()
+        for (const f of [report, live]) {
+            for (const dir of [f.transcode.paths.stagingDir, f.transcode.paths.inlayStagingDir]) {
+                mkdirSync(dir, { recursive: true })
+                writeFileSync(path.join(dir, 'old.tmp'), 'left behind'); f.setAge(path.join(dir, 'old.tmp'), 2)
+                writeFileSync(path.join(dir, 'young.tmp'), 'in use')
+            }
+            f.putInlay('a', await picture())
+            await f.settle()
+        }
+        for (const dir of [report.transcode.paths.stagingDir, report.transcode.paths.inlayStagingDir]) {
+            expect(readdirSync(dir).sort()).toEqual(['old.tmp', 'young.tmp'])
+        }
+        for (const dir of [live.transcode.paths.stagingDir, live.transcode.paths.inlayStagingDir]) {
+            expect(readdirSync(dir)).toEqual(['young.tmp'])
+        }
+    })
+
+    it('replaces a quarantine file that does not have the content its name says, and asks for a new pin', async () => {
+        const f = await fixture()
+        const bytes = await picture()
+        // Something else sits under the original's name and was pinned as that.
+        mkdirSync(f.transcode.paths.quarantineDir, { recursive: true })
+        writeFileSync(f.originalFile(bytes), 'not the picture')
+        f.db.prepare('INSERT INTO media_originals (path, generationId, wanted_at, covered_at, manifest) VALUES (?, ?, ?, ?, ?)')
+            .run(f.original(bytes), sha(bytes), Date.now() - 10 * DAY, Date.now() - 9 * DAY, 'pin-old.covered')
+        f.putInlay('a', bytes)
+        // Only the conversion, without the housekeeping that would delete what the old receipt covers.
+        const release = f.transcode.hold()
+        await f.settle()
+        release()
+        expect(f.payloads('a')).toEqual(['a.png'])
+        await f.transcode.pass()
+        expect(f.payloads('a')).toEqual(['a.webp'])
+        expect(readFileSync(f.originalFile(bytes)).equals(bytes)).toBe(true)
+        expect(f.originalRow(bytes)).toMatchObject({ covered_at: null, manifest: null, deleted_at: null })
+        await f.housekeeping()
+        expect(existsSync(f.originalFile(bytes))).toBe(true)
+        expect(f.wantList()).toEqual([f.original(bytes)])
+    })
+
+    it('is content with no inlay directory at all', async () => {
+        const f = await fixture()
+        nodeFs.rmdirSync(f.inlayDir)
+        await f.settle()
+        expect(f.logs.filter(line => line.startsWith('warn'))).toEqual([])
     })
 })
 
