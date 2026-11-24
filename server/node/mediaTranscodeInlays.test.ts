@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import Database from 'better-sqlite3'
-import nodeFs, { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs'
+import nodeFs, { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
@@ -156,6 +156,7 @@ describe('media transcode: converting inlays', () => {
             // Nothing was staged or quarantined. (With assets live, media-originals itself exists for their want list.)
             expect(existsSync(f.transcode.paths.originalsDir)).toBe(config.enabled === true)
             expect(existsSync(f.transcode.paths.quarantineDir)).toBe(false)
+            expect(existsSync(f.transcode.paths.stagingDir)).toBe(false)
             expect(existsSync(f.transcode.paths.inlayStagingDir)).toBe(false)
             const at = f.logRow('a').at
             await f.settle()
@@ -220,6 +221,7 @@ describe('media transcode: converting inlays', () => {
         f.db.prepare("UPDATE media_transcode_log SET next_at = ? WHERE id = 'inlay/a'").run(Date.now() - 1)
         await f.settle()
         expect(f.logRow('a')).toMatchObject({ outcome: 'error', attempts: 2 })
+        expect(f.logRow('a').next_at).toBeGreaterThan(Date.now() + 6_000_000)
         // Another file under the id is not made to wait for the old one's time.
         f.putInlay('a', bytes, 45)
         await f.settle()
@@ -447,6 +449,37 @@ describe('media transcode: inlay originals', () => {
         expect(f.wantList()).toEqual([f.original(bytes)])
     })
 
+    it('keeps the record of the earlier pin while the same bytes cannot be put into quarantine again', async () => {
+        const f = await fixture()
+        const bytes = await picture()
+        f.putInlay('a', bytes)
+        await f.settle()
+        f.cover('pin-1.covered', [f.original(bytes)])
+        await f.housekeeping()
+        f.ageWant(bytes, 4)
+        await f.housekeeping()
+        expect(existsSync(f.originalFile(bytes))).toBe(false)
+        // The staging directory cannot be made: a file is in its place.
+        rmSync(f.transcode.paths.stagingDir, { recursive: true, force: true })
+        writeFileSync(f.transcode.paths.stagingDir, 'in the way')
+        f.putInlay('b', bytes)
+        await f.settle()
+        expect(f.logRow('b')).toMatchObject({ outcome: 'error' })
+        expect(f.logRow('b').detail).toMatch(/^stage: /)
+        expect(f.payloads('b')).toEqual(['b.png'])
+        const closed = f.originalRow(bytes)
+        expect(closed).toMatchObject({ manifest: 'pin-1.covered' })
+        expect(closed.covered_at).not.toBeNull()
+        expect(closed.deleted_at).not.toBeNull()
+        // Once it can, the row is open again and waits for a pin of its own.
+        unlinkSync(f.transcode.paths.stagingDir)
+        f.db.prepare("UPDATE media_transcode_log SET next_at = ? WHERE id = 'inlay/b'").run(Date.now() - 1)
+        await f.settle()
+        expect(f.payloads('b')).toEqual(['b.webp'])
+        expect(f.originalRow(bytes)).toMatchObject({ covered_at: null, manifest: null, deleted_at: null })
+        expect(f.wantList()).toEqual([f.original(bytes)])
+    })
+
     it('starts the retention again when the same bytes are converted while their original is still there', async () => {
         const f = await fixture()
         const bytes = await picture()
@@ -524,6 +557,22 @@ describe('media transcode: what an interrupted switch leaves behind', () => {
         expect(readFileSync(f.originalFile(bytes)).equals(bytes)).toBe(true)
         expect(f.wantList()).toEqual([f.original(bytes)])
         expect(f.forgotten).toEqual([thumbnail])
+    })
+
+    it('does not take another spelling of the PNG or of the sidecar for another payload', async () => {
+        const f = await fixture()
+        const bytes = await picture()
+        // Windows drops a trailing dot from a name, so there these lead to the PNG and to the
+        // sidecar themselves; elsewhere they lead to nothing.
+        f.putInlay('dot', bytes, 60, { ext: 'png.' })
+        f.putInlay('side', bytes, 60, { ext: 'meta.json.' })
+        await f.settle()
+        for (const id of ['dot', 'side']) {
+            expect(f.payloads(id), id).toEqual([`${id}.png`])
+            expect(readFileSync(f.png(id)).equals(bytes), id).toBe(true)
+            expect(f.logRow(id), id).toBeUndefined()
+        }
+        expect(existsSync(f.transcode.paths.quarantineDir)).toBe(false)
     })
 
     it('leaves that PNG where it is in report mode, under a hold, and while the inlay is in use', async () => {

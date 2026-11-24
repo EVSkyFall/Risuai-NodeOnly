@@ -238,8 +238,9 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
             covered_at = CASE WHEN media_originals.deleted_at IS NULL THEN media_originals.covered_at END,
             manifest = CASE WHEN media_originals.deleted_at IS NULL THEN media_originals.manifest END,
             deleted_at = NULL, listed_at = NULL`);
-    const knownOriginal = db.prepare('SELECT 1 FROM media_originals WHERE path = ?');
-    const forgetPin = db.prepare('UPDATE media_originals SET covered_at = NULL, manifest = NULL WHERE path = ?');
+    // Open rows only: a closed row keeps the record of the pin that held what was deleted, and
+    // loses it when it is reopened.
+    const forgetPin = db.prepare('UPDATE media_originals SET covered_at = NULL, manifest = NULL WHERE path = ? AND deleted_at IS NULL');
     // For a file found in quarantine without an open row: an open row is left as it is.
     const adoptQuarantined = db.prepare(`
         INSERT INTO media_originals (path, generationId, wanted_at) VALUES (@path, @sha, @at)
@@ -501,9 +502,9 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
         const current = await fsp.readFile(target).catch((error) => { if (error.code === 'ENOENT') return null; throw error; });
         if (current && sha256(current) === hash) return true;
         // The file is written anew. A pin that saw whatever was there before (or nothing) says
-        // nothing about these bytes, so a row for this path loses its pin first. In that order:
+        // nothing about these bytes, so an open row for this path loses its pin first. In that order:
         // were the file replaced first, a crash in between would leave it covered by the old pin.
-        if (knownOriginal.get(quarantinePath(hash))) {
+        if (hasOpenOriginal.get(quarantinePath(hash))) {
             let cleared = false;
             await queue(() => { if (idle()) return; forgetPin.run(quarantinePath(hash)); cleared = true; });
             if (!cleared) return false;
@@ -546,10 +547,15 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
         catch (error) { if (error.code !== 'EXDEV') throw error; }
         fs.mkdirSync(inlayStagingDir, { recursive: true });
         const near = path.join(inlayStagingDir, path.basename(staged));
-        fs.copyFileSync(staged, near);
-        const descriptor = fs.openSync(near, 'r+');
-        try { fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
-        fs.renameSync(near, target);
+        try {
+            fs.copyFileSync(staged, near);
+            const descriptor = fs.openSync(near, 'r+');
+            try { fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
+            fs.renameSync(near, target);
+        } catch (error) {
+            try { fs.unlinkSync(near); } catch { /* not there, or cleared out later with the other leftovers */ }
+            throw error;
+        }
     }
 
     // The PNG is not the payload its sidecar names, and that payload exists: a switch was cut
@@ -557,9 +563,11 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
     // has to leave, through quarantine like any original.
     async function finishSwitch(id, seen, sidecarText, payload) {
         try {
-            const other = await fsp.stat(payload, { bigint: true });
-            // The same file under another spelling of its name is not another payload.
-            if (!other.isFile() || (other.dev === seen.dev && other.ino === seen.ino)) return;
+            if (!(await fsp.stat(payload)).isFile()) return;
+            // The directory has to hold an entry of exactly that name. A name the file system
+            // only folds onto another one (a trailing dot on Windows, say) leads to the PNG or to
+            // the sidecar itself, and neither is another payload.
+            if (!(await fsp.readdir(inlays.dir)).includes(path.basename(payload))) return;
         } catch { return; }
         if (inlays.inUse(id)) return;
         const bytes = await readInlayPng(path.join(inlays.dir, `${id}.png`), seen);
@@ -570,10 +578,7 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
         await queue(() => {
             const stat = stillAsRead(id, seen, sidecarText);
             if (!stat) return;
-            try {
-                const other = fs.statSync(payload, { bigint: true });
-                if (!other.isFile() || (other.dev === seen.dev && other.ino === seen.ino)) return;
-            } catch { return; }
+            try { if (!fs.statSync(payload).isFile()) return; } catch { return; }
             wantQuarantined.run({ path: quarantinePath(hash), sha: hash, at: now() });
             fs.unlinkSync(path.join(inlays.dir, `${id}.png`));
             forgetThumbnail(id, stat);
