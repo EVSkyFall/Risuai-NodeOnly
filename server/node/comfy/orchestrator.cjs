@@ -368,7 +368,49 @@ function createComfyOrchestrator(options) {
         return result;
     }
 
+    // Input assets whose bytes a submission has started to read while its job row does not
+    // exist yet.
+    const submittingInputs = new Map();
+
+    // The inlays nothing else may replace while a job can still touch them: its inputs
+    // (dispatch fails a job whose input no longer hashes to what the submission saw) and
+    // its own output (a resumed materialization expects the file it published).
+    function assetsInUse() {
+        const ids = new Set(submittingInputs.keys());
+        for (const job of store.listNonterminalJobs()) {
+            ids.add(`comfy-${job.jobId}`);
+            if (typeof job.inputAssetId === 'string') ids.add(job.inputAssetId);
+            for (const entry of Object.values(job.inputAssets ?? {})) {
+                if (typeof entry?.assetId === 'string') ids.add(entry.assetId);
+            }
+        }
+        return ids;
+    }
+
     async function submit(input) {
+        const reading = [];
+        // Called before the first await for an asset, so no conversion can slip in between
+        // this submission's reads of it.
+        const readInput = (assetId, ...rest) => {
+            if (typeof assetId === 'string') {
+                submittingInputs.set(assetId, (submittingInputs.get(assetId) ?? 0) + 1);
+                reading.push(assetId);
+            }
+            return assets.readInputAsset(assetId, ...rest);
+        };
+        try {
+            return await submitReading(input, readInput);
+        } finally {
+            // By now the job row exists (and names its inputs) or the submission has failed.
+            for (const assetId of reading) {
+                const left = submittingInputs.get(assetId) - 1;
+                if (left > 0) submittingInputs.set(assetId, left);
+                else submittingInputs.delete(assetId);
+            }
+        }
+    }
+
+    async function submitReading(input, readInput) {
         assertAvailable();
         if (
             !isObject(input)
@@ -407,14 +449,14 @@ function createComfyOrchestrator(options) {
         const inputAssets = {};
         for (const imageSlot of template.templateSlots.inputImages ?? []) {
             const assetId = resolvedSlots[imageSlot.name];
-            const inputAsset = await assets.readInputAsset(assetId);
+            const inputAsset = await readInput(assetId);
             inputAssets[imageSlot.name] = { assetId, hash: inputAsset.hash };
         }
         if (template.templateSlots.timeline) {
             for (const { assetId, type, slot } of collectTimelineAssets(resolvedSlots.timeline)) {
                 let inputAsset;
                 try {
-                    inputAsset = await assets.readInputAsset(assetId, type);
+                    inputAsset = await readInput(assetId, type);
                 } catch (error) {
                     throw attributeTimelineError(error, { type, slot, assetId });
                 }
@@ -1965,6 +2007,7 @@ function createComfyOrchestrator(options) {
 
     return {
         submit,
+        assetsInUse,
         poll,
         findByOperationKey,
         cancel,

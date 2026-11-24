@@ -1835,10 +1835,16 @@ const comfyOrchestrator = createComfyOrchestrator({
 const comfyWorldReplacementGate = createComfyWorldReplacementGate({
     orchestrator: comfyOrchestrator,
 })
-// Old PNG assets become WebP in the background. It does nothing unless
+// Old PNG assets and inlays become WebP in the background. It does nothing unless
 // save/media-transcode.json switches it on; see mediaTranscode.cjs.
 const mediaTranscode = createMediaTranscode({
     db: sqliteDb, saveDir: savePath, store: assetFileStore, queue: queueStorageOperation, logger,
+    inlays: {
+        dir: inlayDir,
+        // A Comfy job reads its inputs by hash and expects the output it published.
+        inUse: (id) => comfyOrchestrator.assetsInUse().has(id),
+        forgetThumbnail: (id, stat) => unlinkSync(getInlayThumbPath(id, inlaySourceVersion(stat))),
+    },
 })
 const inlayMigrationMarker = path.join(inlayDir, '.migrated_to_fs')
 const hexRegex = /^[0-9a-fA-F]+$/;
@@ -2103,8 +2109,12 @@ async function readInlaySidecar(id) {
 
 async function resolveInlayFilePath(id) {
     if (!isSafeInlayId(id)) return null;
-    const sidecar = await readInlaySidecar(id);
-    if (sidecar) {
+    // The sidecar names the payload. Both can be replaced between reading the one and looking
+    // for the other (the media transcoder swaps them in one step), so a miss is checked
+    // against a fresh read of the sidecar before the directory is searched.
+    for (let attempt = 0; attempt < 2; attempt++) {
+        const sidecar = await readInlaySidecar(id);
+        if (!sidecar) break;
         const candidate = getInlayFilePath(id, sidecar.ext);
         try { await fs.access(candidate); return candidate; } catch {}
     }
@@ -2114,7 +2124,7 @@ async function resolveInlayFilePath(id) {
         const match = entries.find((entry) => (
             entry.isFile() &&
             entry.name.startsWith(`${id}.`) &&
-            entry.name !== `${id}.meta.json`
+            !entry.name.endsWith('.meta.json')
         ));
         return match ? path.join(inlayDir, match.name) : null;
     } catch {
@@ -2137,7 +2147,7 @@ function resolveInlayFilePathSync(id) {
         const match = entries.find((entry) => (
             entry.isFile() &&
             entry.name.startsWith(`${id}.`) &&
-            entry.name !== `${id}.meta.json`
+            !entry.name.endsWith('.meta.json')
         ));
         return match ? path.join(inlayDir, match.name) : null;
     } catch {
@@ -2146,18 +2156,36 @@ function resolveInlayFilePathSync(id) {
 }
 
 async function readInlayFile(id) {
-    const filePath = await resolveInlayFilePath(id);
-    if (!filePath) return null;
-    const ext = normalizeInlayExt(path.extname(filePath).slice(1));
-    const buffer = await fs.readFile(filePath);
-    const stat = await fs.stat(filePath);
-    return {
-        buffer,
-        ext,
-        filePath,
-        mtimeMs: stat.mtimeMs,
-        mime: getMimeFromExt(ext, buffer),
-    };
+    // A payload can be replaced between finding its path and opening it (the media
+    // transcoder swaps a PNG for a WebP), so a file that has just gone is looked up again.
+    for (let attempt = 0; ; attempt++) {
+        const filePath = await resolveInlayFilePath(id);
+        if (!filePath) return null;
+        try {
+            const ext = normalizeInlayExt(path.extname(filePath).slice(1));
+            // Bytes and modification time come from one open file, so they belong together.
+            const handle = await fs.open(filePath, 'r');
+            let buffer, stat;
+            try {
+                buffer = await handle.readFile();
+                stat = await handle.stat();
+            } finally {
+                await handle.close();
+            }
+            return {
+                buffer,
+                ext,
+                // Everything after "<id>.", which is what a sidecar calls the extension
+                // (an extension may itself contain a dot).
+                storedExt: normalizeInlayExt(path.basename(filePath).slice(id.length + 1)),
+                filePath,
+                mtimeMs: stat.mtimeMs,
+                mime: getMimeFromExt(ext, buffer),
+            };
+        } catch (error) {
+            if (error?.code !== 'ENOENT' || attempt >= 2) throw error;
+        }
+    }
 }
 
 async function writeInlaySidecar(id, info) {
@@ -2206,26 +2234,34 @@ function writeInlayFileSync(id, ext, buffer, info = null) {
     });
 }
 
+// An inlay has one payload. A conversion that was cut short (the media transcoder, on a crash)
+// can leave the PNG and the WebP of one id side by side until it is finished, so whoever
+// removes or replaces an inlay takes both along with the payload the sidecar names.
+function inlayPayloadPaths(id, resolved) {
+    return [...new Set([resolved, getInlayFilePath(id, 'png'), getInlayFilePath(id, 'webp')].filter(Boolean))];
+}
+
 async function deleteInlayRawFile(id) {
-    const filePath = await resolveInlayFilePath(id);
-    if (!filePath) return;
-    const stat = await fs.stat(filePath).catch(() => null);
-    if (stat) await fs.unlink(getInlayThumbPath(id, inlaySourceVersion(stat))).catch(() => {});
-    await fs.unlink(filePath).catch(() => {});
+    for (const filePath of inlayPayloadPaths(id, await resolveInlayFilePath(id))) {
+        const stat = await fs.stat(filePath).catch(() => null);
+        if (!stat) continue;
+        await fs.unlink(getInlayThumbPath(id, inlaySourceVersion(stat))).catch(() => {});
+        await fs.unlink(filePath).catch(() => {});
+    }
 }
 
 function deleteInlayRawFileSync(id) {
-    const filePath = resolveInlayFilePathSync(id);
-    if (!filePath) return;
-    try {
-        unlinkSync(getInlayThumbPath(id, inlaySourceVersion(statSync(filePath))));
-    } catch {
-        // ignore
-    }
-    try {
-        unlinkSync(filePath);
-    } catch {
-        // ignore
+    for (const filePath of inlayPayloadPaths(id, resolveInlayFilePathSync(id))) {
+        try {
+            unlinkSync(getInlayThumbPath(id, inlaySourceVersion(statSync(filePath))));
+        } catch {
+            // ignore
+        }
+        try {
+            unlinkSync(filePath);
+        } catch {
+            // ignore
+        }
     }
 }
 
@@ -2246,7 +2282,7 @@ function deleteInlayFileSync(id) {
 async function listInlayFiles() {
     await ensureInlayDir();
     const entries = await fs.readdir(inlayDir, { withFileTypes: true });
-    return entries
+    const files = entries
         .filter((entry) => (
             entry.isFile() &&
             entry.name !== '.migrated_to_fs' &&
@@ -2258,6 +2294,20 @@ async function listInlayFiles() {
             return { id, ext, filePath: path.join(inlayDir, entry.name) };
         })
         .filter((entry) => isSafeInlayId(entry.id));
+    // The PNG and the WebP of one id can lie side by side until an interrupted conversion (the
+    // media transcoder, on a crash) is finished. The one the sidecar names is the inlay; listing
+    // both would put the id into an archive twice, and such an archive does not restore.
+    const twins = new Map();
+    for (const file of files) {
+        if (file.ext === 'png' || file.ext === 'webp') twins.set(file.id, [...(twins.get(file.id) || []), file]);
+    }
+    const dropped = new Set();
+    for (const [id, pair] of twins) {
+        if (pair.length !== 2) continue;
+        const keep = (await readInlaySidecar(id))?.ext === 'webp' ? 'webp' : 'png';
+        dropped.add(pair.find((file) => file.ext !== keep));
+    }
+    return dropped.size ? files.filter((file) => !dropped.has(file)) : files;
 }
 
 async function readInlayLegacyInfo(id) {
@@ -2290,7 +2340,8 @@ async function readInlayAssetPayload(id) {
     if (!file) return null;
     const sidecar = (await readInlaySidecar(id)) || (await readInlayLegacyInfo(id));
     const info = {
-        ext: sidecar?.ext || file.ext,
+        // The extension of the bytes that were read: the sidecar may have changed since.
+        ext: file.storedExt,
         name: sidecar?.name || id,
         type: sidecar?.type || 'image',
         height: sidecar?.height,
@@ -5009,20 +5060,27 @@ app.get('/api/asset/:hexKey', async (req, res) => {
             if (!sidecar || sidecar.type !== 'image' || !THUMB_IMAGE_EXTS.has(sidecar.ext)) {
                 return res.status(404).end()
             }
-            const filePath = await resolveInlayFilePath(id)
-            if (!filePath) return res.status(404).set('Cache-Control', 'no-store').end()
-            const stat = await fs.stat(filePath)
-            const etag = `"thumb-${Math.floor(stat.mtimeMs)}"`
-            if (req.headers['if-none-match'] === etag) {
-                return res.status(304).set('Cache-Control', 'public, max-age=31536000, immutable').end()
+            for (let attempt = 0; ; attempt++) {
+                const filePath = await resolveInlayFilePath(id)
+                if (!filePath) return res.status(404).set('Cache-Control', 'no-store').end()
+                try {
+                    const stat = await fs.stat(filePath)
+                    const etag = `"thumb-${Math.floor(stat.mtimeMs)}"`
+                    if (req.headers['if-none-match'] === etag) {
+                        return res.status(304).set('Cache-Control', 'public, max-age=31536000, immutable').end()
+                    }
+                    const thumb = await getInlayThumbnail(id, filePath, inlaySourceVersion(stat))
+                    res.set({
+                        'Content-Type': 'image/webp',
+                        'Cache-Control': 'public, max-age=31536000, immutable',
+                        'ETag': etag,
+                    })
+                    return res.send(thumb)
+                } catch (error) {
+                    // The payload was replaced while this was looking at it: look again.
+                    if (error?.code !== 'ENOENT' || attempt >= 2) throw error
+                }
             }
-            const thumb = await getInlayThumbnail(id, filePath, inlaySourceVersion(stat))
-            res.set({
-                'Content-Type': 'image/webp',
-                'Cache-Control': 'public, max-age=31536000, immutable',
-                'ETag': etag,
-            })
-            return res.send(thumb)
         }
 
         if (key.startsWith('assets/')) {
@@ -5303,14 +5361,18 @@ app.get('/api/remove', async (req, res, next) => {
         }
         if (key.startsWith('inlay/')) {
             const id = key.slice('inlay/'.length)
-            await deleteInlayFile(id)
-            kvDel(key);
-            kvDel(`inlay_thumb/${id}`);
-            kvDel(`inlay_info/${id}`);
+            // In the queue, like every other inlay write: a removal that overlapped the media
+            // transcoder's swap would otherwise leave the new payload of a deleted inlay behind.
+            await queueStorageOperation(async () => {
+                await deleteInlayFile(id)
+                kvDel(key);
+                kvDel(`inlay_thumb/${id}`);
+                kvDel(`inlay_info/${id}`);
+            });
             return res.send({ success: true });
         }
         if (key.startsWith('inlay_info/')) {
-            await fs.unlink(getInlaySidecarPath(key.slice('inlay_info/'.length))).catch(() => {});
+            await queueStorageOperation(() => fs.unlink(getInlaySidecarPath(key.slice('inlay_info/'.length))).catch(() => {}));
         }
         // A DB snapshot owns a plugin-storage map row + blobs; a raw kvDel
         // would orphan them (never GC'd, never counted).
@@ -6538,7 +6600,7 @@ app.get('/api/backup/export/settings-estimate', async (req, res, next) => {
 
 app.get('/api/backup/export', async (req, res, next) => {
     if(!await checkBackupDownloadAuth(req, res)){ return; }
-    let capturedAssets, capturedEntries;
+    let capturedAssets, capturedEntries, releaseInlays;
     try {
         // ?target=upstream excludes NodeOnly-only inlay namespaces (inlay/,
         // inlay_sidecar/, inlay_meta/). Their entry names contain a slash,
@@ -6578,6 +6640,9 @@ app.get('/api/backup/export', async (req, res, next) => {
         // Inlay images only ever attach to chat messages, so a settings-only
         // export skips those namespaces for the same reason upstream does.
         const skipInlay = settingsOnly || target === 'upstream';
+        // The paths and sizes listed here are streamed later: until then the media transcoder
+        // neither switches an inlay nor deletes anything.
+        releaseInlays = mediaTranscode.hold();
         const inlayFiles = skipInlay ? [] : await listInlayFiles();
         const inlayEntries = await Promise.all(inlayFiles.map(async (entry) => {
             const stat = await fs.stat(entry.filePath);
@@ -6718,6 +6783,7 @@ app.get('/api/backup/export', async (req, res, next) => {
     } catch (error) {
         if (!res.destroyed) next(error);
     } finally {
+        releaseInlays?.();
         await capturedEntries?.dispose();
         await capturedAssets?.dispose();
     }
@@ -6973,6 +7039,8 @@ app.post('/api/backup/server/save', async (req, res, next) => {
     if (!await checkAuth(req, res)) { return; }
     let capturedAssets, capturedEntries;
     const warnings = [];
+    // Inlay paths and sizes are listed below and copied later: see /api/backup/export.
+    const releaseInlays = mediaTranscode.hold();
     try {
         await flushPendingDb();
 
@@ -7092,6 +7160,7 @@ app.post('/api/backup/server/save', async (req, res, next) => {
             res.end();
         }
     } finally {
+        releaseInlays();
         await capturedEntries?.dispose();
         await capturedAssets?.dispose();
     }
@@ -9937,6 +10006,9 @@ app.post('/api/inlays/compress', async (req, res) => {
         res.write(`data: ${JSON.stringify(data)}\n\n`);
     };
 
+    // This rewrites inlays outside the storage queue, so the media transcoder keeps its hands
+    // off them for as long as it runs.
+    const releaseInlays = mediaTranscode.hold();
     try {
         const files = await listInlayFiles();
         const imageFiles = [];
@@ -9990,6 +10062,8 @@ app.post('/api/inlays/compress', async (req, res) => {
         send({ type: 'done', total, compressed, skipped, totalSaved });
     } catch (err) {
         send({ type: 'error', message: err?.message || 'Unknown error' });
+    } finally {
+        releaseInlays();
     }
 
     res.end();

@@ -333,8 +333,10 @@ describe('round 2 asset regressions', () => {
 
     it('11: export disconnect exits quietly and disposes captured sources', async () => {
         const dispose = vi.fn(async () => {})
+        const releaseInlays = vi.fn()
         const assets: any = [{ kind: 'buffer', buffer: Buffer.from('a'), key: 'assets/a', size: 1 }]; assets.dispose = dispose
         const handler = route("app.get('/api/backup/export',", {
+            mediaTranscode: { hold: () => releaseInlays },
             checkAuth: async () => true, flushPendingDb: async () => {}, buildFullExportDbValue: async () => null,
             listInlayFiles: async () => [], kvListWithSizes: () => [], kvGet: () => null, listColdStorageBackupEntries: () => [],
             pluginAtomic: { exportRows: () => [] }, path, assetFileStore: { capture: async () => assets, captureEntries: async (e: any) => Object.assign(e, { dispose }) },
@@ -343,6 +345,8 @@ describe('round 2 asset regressions', () => {
         const next = vi.fn(), res = response()
         await handler({ query: {} }, res, next)
         expect(next).not.toHaveBeenCalled(); expect(dispose).toHaveBeenCalled()
+        // The hold on the media transcoder ends with the export, however the export ends.
+        expect(releaseInlays).toHaveBeenCalledOnce()
     })
 
     it('12: missing revision rows are recreated and the legacy asset migrates', async () => {

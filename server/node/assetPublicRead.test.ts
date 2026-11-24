@@ -44,6 +44,9 @@ async function fixture() {
     const listInlayFiles = vi.fn(async () => [{ id: 'image', ext: 'png', filePath: 'synthetic-image' }])
     const writeInlayFile = vi.fn(async () => {})
     const kvDel = vi.fn()
+    // Compression holds the media transcoder off the inlays while it rewrites them.
+    const releaseInlays = vi.fn()
+    const mediaTranscode = { hold: vi.fn(() => releaseInlays) }
     const jwtSecret = nodeCrypto.randomBytes(32)
     const cookie = 'risu-session=synthetic-session'
     const ctx = vm.createContext({
@@ -53,7 +56,7 @@ async function fixture() {
         assetFileStore, sendAsset: transport.sendAsset, ASSET_EXT_MIME: { png: 'image/png' },
         queueStorageOperation: async (work: () => Promise<void>) => work(),
         flushPendingDb, dbEtag: 'synthetic-etag',
-        COMPRESS_IMAGE_EXTS: new Set(['png']), listInlayFiles, writeInlayFile, kvDel,
+        COMPRESS_IMAGE_EXTS: new Set(['png']), listInlayFiles, writeInlayFile, kvDel, mediaTranscode,
         readInlaySidecar: async () => ({ type: 'image', ext: 'png', name: 'image' }),
         fs: { readFile: async () => Buffer.alloc(100) },
         getVips: async () => ({ Image: { newFromBuffer: () => ({
@@ -75,7 +78,7 @@ async function fixture() {
         request: (url: string, init?: RequestInit) => fetch(base + url, init),
         assetUrl: `/api/asset/${Buffer.from(key).toString('hex')}`,
         token: `${header}.${payload}.${signature}`, cookie, bytes,
-        assetFileStore, flushPendingDb, listInlayFiles, writeInlayFile, kvDel,
+        assetFileStore, flushPendingDb, listInlayFiles, writeInlayFile, kvDel, mediaTranscode, releaseInlays,
     }
 }
 
@@ -134,6 +137,8 @@ async function expectCompression(response: Response, f: Awaited<ReturnType<typeo
     ])
     expect(f.writeInlayFile).toHaveBeenCalledWith('image', 'webp', Buffer.alloc(10), { type: 'image', ext: 'webp', name: 'image' })
     expect(f.kvDel).toHaveBeenCalledWith('inlay_thumb/image')
+    expect(f.mediaTranscode.hold).toHaveBeenCalledOnce()
+    expect(f.releaseInlays).toHaveBeenCalledOnce()
 }
 
 test('compress proceeds with a valid JWT and no cookie', async () => {

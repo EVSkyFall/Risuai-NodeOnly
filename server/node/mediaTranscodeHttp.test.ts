@@ -1,12 +1,13 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { existsSync, readFileSync, readdirSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, utimesSync, writeFileSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 import path from 'node:path'
 import Database from 'better-sqlite3'
 import { spawnServer, type ServerHandle } from '../../test/compat/helpers/spawnServer.js'
 import { createClient, type RisuClient } from '../../test/compat/helpers/client.js'
 import io from './assetFileIO.cjs'
-import { isWebp, markedPicture } from './mediaTranscodeTestKit'
+import { isWebp, markedPicture, picture } from './mediaTranscodeTestKit'
 
 const servers: ServerHandle[] = []
 afterEach(async () => { for (const server of servers.splice(0)) await server.cleanup() })
@@ -125,5 +126,123 @@ describe('media transcode through the server', () => {
         await until('the report row', () => sql(db => db.prepare("SELECT 1 FROM media_transcode_log WHERE id = ? AND outcome = 'would-convert'").get(original)))
         expect((await asset(key)).headers.get('content-type')).toContain('image/png')
         expect(existsSync(path.join(saveDir, 'media-originals'))).toBe(false)
+    }, 60_000)
+})
+
+// The names of a backup archive's entries, in order and with repeats.
+function archiveNames(data: Buffer) {
+    const names: string[] = []
+    for (let offset = 0; offset < data.length;) {
+        const nameLength = data.readUInt32LE(offset); offset += 4
+        names.push(data.subarray(offset, offset + nameLength).toString()); offset += nameLength
+        offset += 4 + data.readUInt32LE(offset)
+    }
+    return names
+}
+
+describe('inlays through the server', () => {
+    const read = (client: RisuClient, key: string) => client.fetch('/api/read', { headers: { 'file-path': hex(key) } })
+    const remove = (client: RisuClient, key: string) => client.fetch('/api/remove', { headers: { 'file-path': hex(key) } })
+    const listed = async (client: RisuClient) => (await (await client.fetch('/api/list', { headers: { 'key-prefix': 'inlay/' } })).json()).content as string[]
+    const putInlay = (client: RisuClient, id: string, png: Buffer, ext = 'png') => put(client, `inlay/${id}`, Buffer.from(JSON.stringify(
+        { ext, name: `${id} picture`, type: 'image', width: 640, height: 480, data: `data:image/${ext};base64,${png.toString('base64')}` })))
+    const exported = async (client: RisuClient) => {
+        const response = await client.fetch('/api/backup/export')
+        expect(response.status).toBe(200)
+        return archiveNames(Buffer.from(await response.arrayBuffer()))
+    }
+
+    it('converts an old PNG inlay and everything that shows it keeps working', async () => {
+        // Inlays are held back until the scene is set, then switched on in the running server.
+        const { server, client, saveDir, asset } = await boot({ enabled: true, inlays: false, paceMs: 0, sweepMinutes: 0.01 })
+        const id = 'picture-one'
+        const png = await picture()
+        const inlayDir = path.join(saveDir, 'inlays')
+        await putInlay(client, id, png)
+        const meta = Buffer.from(JSON.stringify({ createdAt: 1700000000000, updatedAt: 1700000001000, charId: 'char-1', chatId: 'chat-1' }))
+        await put(client, `inlay_meta/${id}`, meta)
+        const when = (Date.now() - 60 * DAY) / 1000
+        utimesSync(path.join(inlayDir, `${id}.png`), when, when)
+        expect((await asset(`inlay_thumb/${id}`)).status).toBe(200)
+        const oldThumbs = readdirSync(path.join(inlayDir, '.thumbs'))
+        expect(oldThumbs).toHaveLength(1)
+        expect((await asset(`inlay/${id}`)).headers.get('content-type')).toContain('image/png')
+
+        writeFileSync(path.join(saveDir, 'media-transcode.json'), JSON.stringify({ enabled: true, paceMs: 0, sweepMinutes: 0.01 }))
+        const converted = await until('the WebP to be served', async () => {
+            const response = await asset(`inlay/${id}`)
+            return response.headers.get('content-type')?.includes('image/webp') ? response : null
+        })
+        const body = Buffer.from(await converted.arrayBuffer())
+        expect(isWebp(body)).toBe(true)
+        expect(body.length).toBeLessThan(png.length)
+        expect(readdirSync(inlayDir).filter(name => name.startsWith(id)).sort()).toEqual([`${id}.meta.json`, `${id}.webp`])
+
+        // What the inlay screens read: the payload, its record, the list, the thumbnail.
+        const payload = JSON.parse(Buffer.from(await (await read(client, `inlay/${id}`)).arrayBuffer()).toString())
+        expect(payload).toMatchObject({ ext: 'webp', name: `${id} picture`, type: 'image', width: 640, height: 480 })
+        expect(payload.data.startsWith('data:image/webp;base64,')).toBe(true)
+        expect(JSON.parse(Buffer.from(await (await read(client, `inlay_info/${id}`)).arrayBuffer()).toString()))
+            .toEqual({ ext: 'webp', name: `${id} picture`, type: 'image', width: 640, height: 480 })
+        expect(Buffer.from(await (await read(client, `inlay_meta/${id}`)).arrayBuffer()).equals(meta)).toBe(true)
+        expect((await listed(client)).filter(key => key === `inlay/${id}`)).toHaveLength(1)
+        const thumb = await asset(`inlay_thumb/${id}`)
+        expect(thumb.status).toBe(200)
+        expect(thumb.headers.get('content-type')).toContain('image/webp')
+        const thumbs = readdirSync(path.join(inlayDir, '.thumbs'))
+        expect(thumbs).toHaveLength(1)
+        expect(thumbs).not.toEqual(oldThumbs)
+
+        // A stale client sends back the record it had: the extension stays what the file is.
+        await put(client, `inlay_info/${id}`, Buffer.from(JSON.stringify({ ext: 'png', name: 'renamed', type: 'image', width: 640, height: 480 })))
+        expect(JSON.parse(Buffer.from(await (await read(client, `inlay_info/${id}`)).arrayBuffer()).toString())).toMatchObject({ ext: 'webp', name: 'renamed' })
+
+        // The original waits in quarantine and is asked to be pinned.
+        const relative = `media-originals/inlays/${createHash('sha256').update(png).digest('hex')}.png`
+        expect(readFileSync(path.join(saveDir, relative)).equals(png)).toBe(true)
+        const wantPath = path.join(saveDir, 'media-originals', 'want.list')
+        await until('the want list', () => existsSync(wantPath) && readFileSync(wantPath, 'utf-8').includes(relative))
+
+        // An archive carries the inlay once, as what it is now.
+        const names = await exported(client)
+        expect(names.filter(name => name.startsWith('inlay/'))).toEqual([`inlay/${id}.webp`])
+        expect(names.filter(name => name === `inlay_sidecar/${id}`)).toHaveLength(1)
+        expect(names).toContain(`inlay_meta/${id}`)
+
+        // Removing it removes it; the original stays for the pin.
+        expect((await remove(client, `inlay/${id}`)).status).toBe(200)
+        expect((await remove(client, `inlay_info/${id}`)).status).toBe(200)
+        expect(readdirSync(inlayDir).filter(name => name.startsWith(id))).toEqual([])
+        expect(await listed(client)).not.toContain(`inlay/${id}`)
+        expect(existsSync(path.join(saveDir, relative))).toBe(true)
+        await server.stop('SIGTERM')
+    }, 120_000)
+
+    it('treats two payloads of one id, as an interrupted conversion leaves them, as one inlay', async () => {
+        const { client, saveDir } = await boot(null)
+        const inlayDir = path.join(saveDir, 'inlays')
+        const png = await picture()
+        // The sidecar still names the PNG; a WebP lies next to it.
+        await putInlay(client, 'first', png)
+        writeFileSync(path.join(inlayDir, 'first.webp'), 'stray')
+        // The sidecar already names the WebP; the PNG lies next to it.
+        await putInlay(client, 'second', png)
+        writeFileSync(path.join(inlayDir, 'second.webp'), Buffer.concat([Buffer.from('RIFF'), Buffer.from([4, 0, 0, 0]), Buffer.from('WEBP')]))
+        writeFileSync(path.join(inlayDir, 'second.meta.json'), JSON.stringify({ ext: 'webp', name: 'second picture', type: 'image', width: 640, height: 480 }))
+        await putInlay(client, 'third', png)
+        writeFileSync(path.join(inlayDir, 'third.webp'), 'stray')
+
+        expect((await listed(client)).filter(key => /^inlay\/(first|second|third)$/.test(key)).sort()).toEqual(['inlay/first', 'inlay/second', 'inlay/third'])
+        const names = await exported(client)
+        expect(names.filter(name => name.startsWith('inlay/')).sort()).toEqual(['inlay/first.png', 'inlay/second.webp', 'inlay/third.png'])
+        expect(names.filter(name => name.startsWith('inlay_sidecar/')).sort()).toEqual(['inlay_sidecar/first', 'inlay_sidecar/second', 'inlay_sidecar/third'])
+
+        // Removing an inlay takes both files; so does writing it anew.
+        expect((await remove(client, 'inlay/first')).status).toBe(200)
+        expect((await remove(client, 'inlay/second')).status).toBe(200)
+        await putInlay(client, 'third', png, 'jpg')
+        expect(readdirSync(inlayDir).filter(name => /^(first|second|third)\./.test(name)).sort()).toEqual(['third.jpg', 'third.meta.json'])
+        expect(await listed(client)).not.toContain('inlay/first')
+        expect(await listed(client)).not.toContain('inlay/second')
     }, 60_000)
 })

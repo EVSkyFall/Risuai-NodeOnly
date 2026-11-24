@@ -188,6 +188,90 @@ describe('Comfy orchestrator', () => {
     expect(promptBodies[0].prompt['335'].inputs.seed).toBe(123)
   })
 
+  it('reports the inlays a job depends on, from the first read of a submission until the job is over', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'comfy-orchestrator-'))
+    dirs.push(root)
+    const inlayDir = path.join(root, 'inlays')
+    await mkdir(inlayDir, { recursive: true })
+    await writeFile(path.join(inlayDir, 'source.png'), Buffer.from('89504E470D0A1A0A0000000D49484452', 'hex'))
+    await writeFile(path.join(inlayDir, 'source.meta.json'), JSON.stringify({ ext: 'png', name: 'source.png', type: 'image' }))
+    const mp4 = Buffer.from('000000186674797069736F6D0000000069736F6D', 'hex')
+    let clientId = ''
+    const fetchImpl = (async (urlValue: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(urlValue))
+      if (url.pathname === '/system_stats') return Response.json({ system: { comfyui_version: 'test' } })
+      if (url.pathname === '/upload/image') return Response.json({ name: 'uploaded.png', subfolder: 'risu-comfy', type: 'input' })
+      if (url.pathname === '/queue') return Response.json({ queue_running: [], queue_pending: [] })
+      if (url.pathname === '/history' && url.searchParams.get('max_items') === '1') return Response.json({})
+      if (url.pathname === '/prompt') {
+        clientId = JSON.parse(String(init?.body)).client_id
+        return Response.json({ prompt_id: 'prompt-1', number: 1 })
+      }
+      if (url.pathname === '/history/prompt-1') {
+        return Response.json({
+          'prompt-1': {
+            prompt: [1, 'prompt-1', {}, { client_id: clientId }, ['63']],
+            outputs: { '63': { gifs: [{ filename: 'result.mp4', subfolder: 'video', type: 'output' }] } },
+            status: { status_str: 'success', completed: true, messages: [] },
+          },
+        })
+      }
+      if (url.pathname === '/view') {
+        return new Response(mp4, { headers: { 'content-type': 'video/mp4', 'content-length': String(mp4.length) } })
+      }
+      throw new Error(`Unexpected mock Comfy request: ${url.pathname}`)
+    }) as typeof fetch
+
+    const db = new Database(':memory:')
+    dbs.push(db)
+    const store = createComfyStore(db, { defaultTemplateDir: templateDir })
+    const realAssets = createComfyAssetStore({ inlayDir, stagingDir: path.join(root, 'staging'), fetchImpl })
+    // What is in use at the moment a submission reads an input, before any job row exists.
+    const duringRead: string[][] = []
+    let orchestrator: any
+    const assets = {
+      ...realAssets,
+      readInputAsset: async (...args: any[]) => {
+        duringRead.push([...orchestrator.assetsInUse()])
+        return realAssets.readInputAsset(...args)
+      },
+    }
+    orchestrator = createComfyOrchestrator({
+      store,
+      registry: createTemplateRegistry({ templateDir }),
+      assets,
+      fetchImpl,
+      now: () => 10_000,
+    })
+    await orchestrator.updateEndpoint('http://127.0.0.1:8188')
+    expect([...orchestrator.assetsInUse()]).toEqual([])
+
+    // A submission that fails lets go of what it had started to read.
+    await expect(orchestrator.submit({
+      operationKey: 'plugin-a:message-0',
+      template: 'wan-i2v',
+      slots: { positive: 'walking forward', input_image: 'absent', seed: 123 },
+    })).rejects.toMatchObject({ code: 'COMFY_INPUT_NOT_FOUND' })
+    expect(duringRead).toEqual([['absent']])
+    expect([...orchestrator.assetsInUse()]).toEqual([])
+
+    const submitted = await orchestrator.submit({
+      operationKey: 'plugin-a:message-1',
+      template: 'wan-i2v',
+      slots: { positive: 'walking forward', input_image: 'source', seed: 123 },
+    })
+    expect(duringRead[1]).toEqual(['source'])
+    // Queued: its input, and the output it will publish.
+    const inUse = [`comfy-${submitted.jobId}`, 'source'].sort()
+    expect([...orchestrator.assetsInUse()].sort()).toEqual(inUse)
+    await orchestrator.runOnce()
+    expect(await orchestrator.poll(submitted.jobId)).toMatchObject({ state: 'remote_queued' })
+    expect([...orchestrator.assetsInUse()].sort()).toEqual(inUse)
+    await orchestrator.runOnce()
+    expect(await orchestrator.poll(submitted.jobId)).toMatchObject({ state: 'succeeded' })
+    expect([...orchestrator.assetsInUse()]).toEqual([])
+  })
+
   it('keeps an upload connection failure queued until a later due sweep succeeds', async () => {
     let clock = 15_000
     let uploadCalls = 0

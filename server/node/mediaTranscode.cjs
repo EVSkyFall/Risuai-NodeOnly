@@ -23,6 +23,14 @@
 // Nothing here looks at the whole catalog in one go: the search walks it in slices and the
 // originals are tracked in a table of their own, so the work per step stays the same however
 // large the catalog and its history grow.
+//
+// Inlays (save/inlays/<id>.png with a sidecar <id>.meta.json) are converted the same way, with
+// one difference: an inlay has no generations, so its PNG is first copied to
+// save/media-originals/inlays/<sha256 of its bytes>.png. That copy is what the want list
+// names and what is deleted once pinned. Its name is its content, so here too a path in a
+// covered list is proof for the bytes on disk. The live files are then switched in one
+// synchronous step inside the storage queue; whatever a crash leaves of that step is a state
+// the next search finishes (see examineInlay).
 
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
@@ -36,10 +44,15 @@ const { CHECKS, isPng, pngFacts, hasMarker } = require('./mediaTranscodeCore.cjs
 const DAY_MS = 86_400_000;
 // The one path a generation has: its directory is the first two characters of its id.
 const GENERATION_PATH = /^assets\/([0-9a-f]{2})\/\1[0-9a-f]{62}\.blob$/;
+// The one path a quarantined inlay original has: it is named after the hash of its bytes.
+const INLAY_ORIGINAL_PATH = /^media-originals\/inlays\/([0-9a-f]{64})\.png$/;
 // Lists, pins and deletions are looked at this often while images are still being converted.
 const HOUSEKEEPING_MS = 300_000;
+// Decisions about an inlay's bytes that hold until the file or the encode settings change.
+const SETTLED = new Set(['not-plain-png', 'failed-check', 'not-smaller']);
 const DEFAULTS = Object.freeze({
     enabled: false,          // false | true | "report" (examine and log, change nothing)
+    inlays: true,            // inlays follow `enabled`; false leaves them alone, "report" only examines them
     ageDays: 30,
     quality: 90,
     maxDiff: 4,
@@ -62,6 +75,7 @@ function normalizeConfig(raw) {
     const markers = Array.isArray(source.markers) ? source.markers.filter(marker => typeof marker === 'string' && marker) : [];
     return {
         enabled: source.enabled === true || source.enabled === 'report' ? source.enabled : false,
+        inlays: source.inlays === false || source.inlays === 'report' ? source.inlays : true,
         ageDays: numberIn(source.ageDays, 0, 36500, DEFAULTS.ageDays),
         quality: numberIn(source.quality, 1, 100, DEFAULTS.quality),
         maxDiff: numberIn(source.maxDiff, 0, 255, DEFAULTS.maxDiff),
@@ -97,12 +111,41 @@ function after(ms, action) {
 
 class EncoderUnavailable extends Error {}
 
+const sha256 = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex');
+// The extension a sidecar names, read the way the server reads it.
+const sidecarExt = (value) => (typeof value === 'string' ? value.trim().toLowerCase().replace(/^\.+/, '').replace(/[\/\\\0]/g, '') : '') || 'bin';
+const sameFile = (a, b) => a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeNs === b.mtimeNs;
+
+async function writeSynced(file, data) {
+    const handle = await fsp.open(file, 'wx');
+    try { await handle.writeFile(data); await handle.sync(); }
+    finally { await handle.close(); }
+}
+
+// Makes a rename in this directory durable where the platform allows a directory to be synced.
+async function syncDirectory(dir) {
+    try {
+        const handle = await fsp.open(dir, 'r');
+        try { await handle.sync(); } finally { await handle.close(); }
+    } catch { /* not supported here */ }
+}
+
+// `inlays` is { dir, inUse(id), forgetThumbnail(id, stat) }: the inlay directory, whether
+// something else (a Comfy job) depends on the inlay's bytes right now, and a way to drop the
+// thumbnail of the payload that was replaced. Without it inlays are not looked at.
 function createMediaTranscode({ db, saveDir, store, queue, logger = console, now = Date.now,
-    workerPath = path.join(__dirname, 'mediaTranscodeWorker.cjs'), sliceSize = 2000 }) {
+    workerPath = path.join(__dirname, 'mediaTranscodeWorker.cjs'), sliceSize = 2000, inlays = null }) {
     const originalsDir = path.join(saveDir, 'media-originals');
     const collectedDir = path.join(originalsDir, 'collected');
     const wantPath = path.join(originalsDir, 'want.list');
     const configPath = path.join(saveDir, 'media-transcode.json');
+    const quarantineDir = path.join(originalsDir, 'inlays');
+    // Temporary files of this module. A quarantine copy is completed here and renamed into
+    // place. The new payload and sidecar of an inlay wait inside the inlay directory's own
+    // subfolder, so that moving them in is a rename within one directory tree whatever the
+    // inlay directory is mounted on (inlay listings look at files only, never at subfolders).
+    const quarantineStagingDir = path.join(originalsDir, 'staging');
+    const inlayStagingDir = inlays ? path.join(inlays.dir, '.staging') : null;
 
     db.exec(`
         -- One row per examined generation. basis is what the decision rested on (the markers
@@ -167,7 +210,7 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
             WHERE media_originals.covered_at IS NULL`);
     // The originals not deleted yet, a page at a time, with what the catalog says about each.
     const openOriginals = db.prepare(`
-        SELECT o.path, o.generationId, o.covered_at, g.retired, r.retired_at, r.was_live,
+        SELECT o.path, o.generationId, o.wanted_at, o.covered_at, g.retired, r.retired_at, r.was_live,
             EXISTS (SELECT 1 FROM media_transcode_log l WHERE l.id = o.generationId AND l.outcome = 'converted') AS transcoded
         FROM media_originals o
         LEFT JOIN asset_file_generations g ON g.generationId = o.generationId
@@ -179,6 +222,28 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
     const unlisted = db.prepare(`SELECT path FROM media_originals
         WHERE deleted_at IS NOT NULL AND listed_at IS NULL ORDER BY path LIMIT 5000`);
     const markListed = db.prepare('UPDATE media_originals SET listed_at = ? WHERE path = ? AND listed_at IS NULL');
+    const inlayLog = db.prepare('SELECT outcome, basis, checks, next_at FROM media_transcode_log WHERE id = ?');
+    // A conversion wants the quarantined original from now on, so the retention starts again
+    // even when an earlier conversion of the same bytes already wanted it. A pin counts only
+    // for the file it saw: after the file was written anew, or the row had been closed by a
+    // deletion, it has to be pinned again.
+    const wantQuarantined = db.prepare(`
+        INSERT INTO media_originals (path, generationId, wanted_at) VALUES (@path, @sha, @at)
+        ON CONFLICT(path) DO UPDATE SET wanted_at = excluded.wanted_at,
+            covered_at = CASE WHEN @fresh = 0 AND media_originals.deleted_at IS NULL THEN media_originals.covered_at END,
+            manifest = CASE WHEN @fresh = 0 AND media_originals.deleted_at IS NULL THEN media_originals.manifest END,
+            deleted_at = NULL, listed_at = NULL`);
+    // For a file found in quarantine without an open row: an open row is left as it is.
+    const adoptQuarantined = db.prepare(`
+        INSERT INTO media_originals (path, generationId, wanted_at) VALUES (@path, @sha, @at)
+        ON CONFLICT(path) DO UPDATE SET wanted_at = excluded.wanted_at, covered_at = NULL, manifest = NULL,
+            deleted_at = NULL, listed_at = NULL
+            WHERE media_originals.deleted_at IS NOT NULL`);
+    const hasOpenOriginal = db.prepare('SELECT 1 FROM media_originals WHERE path = ? AND deleted_at IS NULL');
+    const quarantinedDue = db.prepare(`SELECT 1 FROM media_originals
+        WHERE path = ? AND deleted_at IS NULL AND covered_at IS NOT NULL AND wanted_at <= ?`);
+    // Inlays have no mirror, so a deleted quarantine file is nobody's to follow: it counts as listed.
+    const markDeletedUnlisted = db.prepare('UPDATE media_originals SET deleted_at = @at, listed_at = @at WHERE path = @path AND deleted_at IS NULL');
 
     let running = false;
     let stopping = false;
@@ -192,6 +257,11 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
     let adoptCursor = '';
     let lastHousekeeping = -Infinity;
     let encoderWarned = false;
+    // The ids of the PNG inlays found by the current walk of the inlay directory, and how far
+    // the search has got with them. null: the next search walks the directory again.
+    let inlayIds = null;
+    let inlayIndex = 0;
+    const oddQuarantine = new Set();
 
     const info = (message) => (logger.info || logger.log || (() => {})).call(logger, `[Media transcode] ${message}`);
     const warn = (message) => logger.warn(`[Media transcode] ${message}`);
@@ -396,6 +466,280 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
         return true;
     }
 
+    const inlayDecision = (id, outcome, extra = {}) => (
+        { id: `inlay/${id}`, kind: 'inlay', key: id, outcome, result: null, detail: null, basis: null, ...extra });
+    const quarantinePath = (hash) => `media-originals/inlays/${hash}.png`;
+    const removeQuietly = (file) => fsp.unlink(file).catch(() => {});
+
+    // Reads a PNG inlay through one handle. Returns null when it is not the file `seen`
+    // describes any more or changed while it was read: a later search sees what is there then.
+    async function readInlayPng(file, seen) {
+        let handle;
+        try { handle = await fsp.open(file, 'r'); }
+        catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+        try {
+            const before = await handle.stat({ bigint: true });
+            if (!sameFile(seen, before)) return null;
+            const bytes = await handle.readFile();
+            const after = await handle.stat({ bigint: true });
+            return sameFile(before, after) && BigInt(bytes.length) === after.size ? bytes : null;
+        } finally { await handle.close(); }
+    }
+
+    // Puts the original's bytes into quarantine under the hash of its content. A file already
+    // there is kept only if it really has that content. Returns whether the file was written now.
+    async function quarantine(bytes, hash) {
+        const target = path.join(quarantineDir, `${hash}.png`);
+        const current = await fsp.readFile(target).catch((error) => { if (error.code === 'ENOENT') return null; throw error; });
+        if (current && sha256(current) === hash) return false;
+        await fsp.mkdir(quarantineDir, { recursive: true });
+        await fsp.mkdir(quarantineStagingDir, { recursive: true });
+        const temp = path.join(quarantineStagingDir, `${hash}.${crypto.randomBytes(6).toString('hex')}.tmp`);
+        try {
+            await writeSynced(temp, bytes);
+            await fsp.rename(temp, target);
+        } finally { await removeQuietly(temp); }
+        await syncDirectory(quarantineDir);
+        return true;
+    }
+
+    // The checks every change to a live inlay starts with, inside the storage queue and with no
+    // await before the change: nothing else is running, the PNG is still the file that was read
+    // and the sidecar still the text that was read. Returns the PNG's plain stat, or null.
+    function stillAsRead(id, seen, sidecarText) {
+        if (idle() || holds > 0 || inlays.inUse(id)) return null;
+        const file = path.join(inlays.dir, `${id}.png`);
+        try {
+            const current = fs.lstatSync(file, { bigint: true });
+            if (!current.isFile() || !sameFile(seen, current)) return null;
+            if (fs.readFileSync(path.join(inlays.dir, `${id}.meta.json`), 'utf-8') !== sidecarText) return null;
+            return fs.statSync(file);
+        } catch { return null; }
+    }
+
+    function forgetThumbnail(id, stat) {
+        try { inlays.forgetThumbnail?.(id, stat); } catch { /* a thumbnail left behind is only a small file */ }
+    }
+
+    // The PNG is not the payload its sidecar names, and that payload exists: a switch was cut
+    // short after the sidecar went in. Readers already get the other file, so the PNG only
+    // has to leave, through quarantine like any original.
+    async function finishSwitch(id, seen, sidecarText, payload) {
+        try { if (!(await fsp.stat(payload)).isFile()) return; } catch { return; }
+        if (inlays.inUse(id)) return;
+        const bytes = await readInlayPng(path.join(inlays.dir, `${id}.png`), seen);
+        if (!bytes || idle()) return;
+        const hash = sha256(bytes);
+        const fresh = await quarantine(bytes, hash);
+        let done = false;
+        await queue(() => {
+            const stat = stillAsRead(id, seen, sidecarText);
+            if (!stat) return;
+            try { if (!fs.statSync(payload).isFile()) return; } catch { return; }
+            wantQuarantined.run({ path: quarantinePath(hash), sha: hash, at: now(), fresh: fresh ? 1 : 0 });
+            fs.unlinkSync(path.join(inlays.dir, `${id}.png`));
+            forgetThumbnail(id, stat);
+            done = true;
+        });
+        if (done) info(`inlay ${id}: removed the PNG an interrupted conversion left behind`);
+    }
+
+    // One inlay. What a crash can leave of the switch at the end, and what this does about it:
+    //   <id>.png, sidecar "png"                  nothing happened (or only the database step): converted again
+    //   <id>.png + <id>.webp, sidecar "png"      converted again; the rename replaces the stray WebP
+    //   <id>.png + <id>.webp, sidecar "webp"     finishSwitch
+    //   <id>.webp, sidecar "webp"                done; no PNG, so it is not a candidate
+    // Returns true when an encode ran to its end.
+    async function examineInlay(id, config, live, cheap) {
+        const file = path.join(inlays.dir, `${id}.png`);
+        let seen;
+        try { seen = await fsp.lstat(file, { bigint: true }); } catch { return false; }
+        if (!seen.isFile()) return false;
+        if (seen.mtimeNs > BigInt(Math.floor(now() - config.ageDays * DAY_MS)) * 1_000_000n) return false;
+        let sidecarText, sidecar;
+        try {
+            sidecarText = await fsp.readFile(path.join(inlays.dir, `${id}.meta.json`), 'utf-8');
+            sidecar = JSON.parse(sidecarText);
+        } catch { return false; }
+        if (!sidecar || typeof sidecar !== 'object' || Array.isArray(sidecar)) return false;
+        if ((typeof sidecar.type === 'string' ? sidecar.type : 'image') !== 'image') return false;
+        const ext = sidecarExt(sidecar.ext);
+        if (ext !== 'png') {
+            // "meta.json" would make the sidecar itself pass for the other payload.
+            if (live && ext !== 'meta.json') await finishSwitch(id, seen, sidecarText, path.join(inlays.dir, `${id}.${ext}`));
+            return false;
+        }
+        if (inlays.inUse(id)) return false;
+
+        // A decision holds for this very file under these settings, and no longer.
+        const basis = `${seen.mtimeNs}-${seen.size} ${config.quality}/${config.maxDiff}/${config.maxBlockDiff}`;
+        const prior = inlayLog.get(`inlay/${id}`);
+        if (prior && prior.checks >= CHECKS && prior.basis === basis) {
+            if (prior.outcome === 'error' ? prior.next_at > now()
+                // A "converted" row never holds a PNG back: if the PNG is still the payload, the switch did not happen.
+                : SETTLED.has(prior.outcome) || (prior.outcome === 'would-convert' && !live)) return false;
+        }
+
+        let bytes;
+        try { bytes = await readInlayPng(file, seen); }
+        catch (error) {
+            cheap.push(inlayDecision(id, 'error', { detail: `read: ${error.message}`, basis }));
+            return false;
+        }
+        if (!bytes) return false;
+        const facts = isPng(bytes) ? pngFacts(bytes) : { reason: 'not a png' };
+        if (facts.reason) { cheap.push(inlayDecision(id, 'not-plain-png', { detail: facts.reason, basis })); return false; }
+        if (idle()) return false;
+
+        let encoded;
+        try { encoded = await encode(bytes, config); }
+        catch (error) {
+            if (error instanceof EncoderUnavailable) throw error;
+            if (stopping) return false;
+            cheap.push(inlayDecision(id, 'error', { detail: `encode: ${error.message}`, basis }));
+            return true;
+        }
+        if (encoded.notSmaller) { cheap.push(inlayDecision(id, 'not-smaller', { basis })); return true; }
+        if (encoded.skip) { cheap.push(inlayDecision(id, 'failed-check', { detail: encoded.skip, basis })); return true; }
+        const hash = sha256(bytes);
+        const detail = JSON.stringify({ from: bytes.length, to: encoded.webp.length,
+            diff: Number(Number(encoded.diff).toFixed(3)), blockDiff: Number(Number(encoded.blockDiff).toFixed(1)), original: hash });
+        if (!live) { cheap.push(inlayDecision(id, 'would-convert', { detail, basis })); return true; }
+        if (idle()) return false;
+
+        // Everything slow happens here, outside the queue, and nothing of it is visible to a
+        // reader of the inlay directory.
+        const token = crypto.randomBytes(8).toString('hex');
+        const stagedWebp = path.join(inlayStagingDir, `${token}.webp`);
+        const stagedSidecar = path.join(inlayStagingDir, `${token}.json`);
+        try {
+            let fresh;
+            try {
+                fresh = await quarantine(bytes, hash);
+                await fsp.mkdir(inlayStagingDir, { recursive: true });
+                await writeSynced(stagedWebp, encoded.webp);
+                // Every field the sidecar has is kept; only the extension changes.
+                await writeSynced(stagedSidecar, JSON.stringify({ ...sidecar, ext: 'webp' }));
+            } catch (error) {
+                cheap.push(inlayDecision(id, 'error', { detail: `stage: ${error.message}`, basis }));
+                return true;
+            }
+            await queue(() => {
+                const stat = stillAsRead(id, seen, sidecarText);
+                if (!stat || !fs.existsSync(stagedWebp) || !fs.existsSync(stagedSidecar)) return;
+                // The record and the wish to delete the original come first: if the process dies
+                // after them the PNG is still the payload and is simply converted again, while a
+                // switch without them would leave an original nobody asks to have pinned.
+                db.transaction(() => {
+                    writeDecisions([inlayDecision(id, 'converted', { detail, basis })]);
+                    wantQuarantined.run({ path: quarantinePath(hash), sha: hash, at: now(), fresh: fresh ? 1 : 0 });
+                }).immediate();
+                fs.renameSync(stagedWebp, path.join(inlays.dir, `${id}.webp`));
+                fs.renameSync(stagedSidecar, path.join(inlays.dir, `${id}.meta.json`));
+                fs.unlinkSync(file);
+                forgetThumbnail(id, stat);
+            });
+        } catch (error) {
+            // The switch stopped part-way. Whatever it left is one of the states above.
+            warn(`inlay ${id}: ${error?.message || error}`);
+        } finally {
+            await removeQuietly(stagedWebp);
+            await removeQuietly(stagedSidecar);
+        }
+        return true;
+    }
+
+    // The ids of the PNG files in the inlay directory. The directory is read to its end and
+    // closed before anything is examined, so no handle on it is held across an encode.
+    async function listPngInlays() {
+        const ids = [];
+        let dir;
+        try { dir = await fsp.opendir(inlays.dir, { bufferSize: 256 }); }
+        catch (error) { if (error.code !== 'ENOENT') warn(`cannot read ${inlays.dir}: ${error.message}`); return ids; }
+        try {
+            for await (const entry of dir) {
+                if (!entry.isFile() || !entry.name.endsWith('.png')) continue;
+                const id = entry.name.slice(0, -4);
+                // Plugin inlays are verified byte for byte by the plugin layer and stay as they are.
+                if (id && id !== '.' && id !== '..' && !id.startsWith('plugin-inlay-')) ids.push(id);
+            }
+        } catch (error) { warn(`cannot read ${inlays.dir}: ${error.message}`); }
+        return ids;
+    }
+
+    // Temporary files a crash left behind. A day is far longer than any step here takes.
+    async function sweepStaging() {
+        for (const dir of [quarantineStagingDir, inlayStagingDir]) {
+            let names;
+            try { names = await fsp.readdir(dir); } catch { continue; }
+            for (const name of names) {
+                const file = path.join(dir, name);
+                try { if (now() - (await fsp.stat(file)).mtimeMs > DAY_MS) await fsp.unlink(file); } catch { /* gone, or busy */ }
+            }
+        }
+    }
+
+    // One step of the inlay search: goes on from where the last step stopped and returns after
+    // at most 50 encodes. Returns true while ids of the current walk are left.
+    async function sweepInlays(config, live) {
+        if (!inlayIds) {
+            await sweepStaging();
+            inlayIds = await listPngInlays();
+            inlayIndex = 0;
+        }
+        const cheap = [];
+        try {
+            for (let encodes = 0; inlayIndex < inlayIds.length && encodes < 50;) {
+                if (idle()) break;
+                const id = inlayIds[inlayIndex];
+                let encoded = false;
+                try { encoded = await examineInlay(id, config, live, cheap); }
+                catch (error) {
+                    if (error instanceof EncoderUnavailable) throw error;
+                    warn(`inlay ${id}: ${error?.message || error}`);
+                }
+                // Interrupted: the index stays, so this inlay is looked at again.
+                if (idle()) break;
+                inlayIndex++;
+                if (encoded) encodes++;
+                if (live && now() - lastHousekeeping >= HOUSEKEEPING_MS) {
+                    if (cheap.length) await queue(() => writeDecisions(cheap.splice(0)));
+                    await housekeeping(config);
+                }
+                if (encoded && config.paceMs > 0) await rest(config.paceMs);
+                else await nextTurn();
+            }
+        } finally {
+            if (cheap.length) await queue(() => writeDecisions(cheap));
+        }
+        if (inlayIndex < inlayIds.length) return true;
+        inlayIds = null;
+        return false;
+    }
+
+    // Whatever lies in quarantine is wanted, whoever put it there and whatever happened to the
+    // process since, as long as it is what its name says. So nothing stays there unpinned.
+    async function adoptQuarantine() {
+        let names;
+        try { names = await fsp.readdir(quarantineDir); }
+        catch (error) { if (error.code !== 'ENOENT') warn(`cannot list ${quarantineDir}: ${error.message}`); return; }
+        for (const name of names) {
+            if (idle()) return;
+            const entry = quarantinePath(name.slice(0, -4));
+            const match = name.endsWith('.png') && INLAY_ORIGINAL_PATH.exec(entry);
+            if (!match || hasOpenOriginal.get(entry)) continue;
+            let bytes;
+            try { bytes = await fsp.readFile(path.join(quarantineDir, name)); } catch { continue; }
+            if (sha256(bytes) !== match[1]) {
+                // Not an original this module wrote. It is neither pinned under a name it does not deserve nor deleted.
+                if (!oddQuarantine.has(name)) { oddQuarantine.add(name); warn(`${entry} does not have the content its name says; left alone`); }
+                continue;
+            }
+            await queue(() => { if (!idle()) adoptQuarantined.run({ path: entry, sha: match[1], at: now() }); });
+            await nextTurn();
+        }
+    }
+
     async function ingestCovered() {
         let names;
         try { names = (await fsp.readdir(originalsDir)).filter(name => name.endsWith('.covered')).sort(); }
@@ -406,12 +750,17 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
             let lines;
             try { lines = (await fsp.readFile(file, 'utf-8')).split('\n').map(line => line.replace(/\r$/, '')); }
             catch (error) { if (error.code !== 'ENOENT') warn(`cannot read ${file}: ${error.message}`); continue; }
-            const paths = lines.filter(line => GENERATION_PATH.test(line));
+            // Only the two exact shapes this module writes into want.list count.
+            const paths = [];
+            for (const line of lines) {
+                if (GENERATION_PATH.test(line)) paths.push({ path: line, generationId: line.slice(10, 74) });
+                else { const original = INLAY_ORIGINAL_PATH.exec(line); if (original) paths.push({ path: line, generationId: original[1] }); }
+            }
             if (idle()) return;
             await queue(() => {
                 const at = now();
                 db.transaction(() => {
-                    for (const entry of paths) coverOriginal.run({ path: entry, generationId: entry.slice(10, 74), at, manifest: name });
+                    for (const entry of paths) coverOriginal.run({ ...entry, at, manifest: name });
                 })();
             });
             await fsp.unlink(file).catch((error) => { if (error.code !== 'ENOENT') warn(`cannot remove ${file}: ${error.message}`); });
@@ -436,8 +785,8 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
         const want = [], due = [], gone = [];
         // Whether the file is there. Anything but "no such file" counts as there: an original is
         // never written off because it could not be looked at.
-        const isPresent = async (row) => {
-            try { return (await fsp.stat(generationPath(store.root, row.generationId))).isFile(); }
+        const isPresent = async (row, file = generationPath(store.root, row.generationId)) => {
+            try { return (await fsp.stat(file)).isFile(); }
             catch (error) {
                 if (error.code === 'ENOENT') return false;
                 warn(`cannot stat ${row.path}: ${error.message}`);
@@ -448,6 +797,15 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
             const rows = openOriginals.all({ after });
             for (const row of rows) {
                 if (idle()) break;
+                if (INLAY_ORIGINAL_PATH.test(row.path)) {
+                    // A quarantined inlay original: its retention counts from when it was last wanted.
+                    // Pinned and past its retention comes first, also when the file is already
+                    // gone (a deletion whose record was lost), so that the row keeps its pin.
+                    if (row.covered_at !== null && row.wanted_at <= before) due.push(row);
+                    else if (!await isPresent(row, path.join(saveDir, row.path))) gone.push(row);
+                    else if (row.covered_at === null) want.push(row);
+                    continue;
+                }
                 if (row.retired === null) { if (!await isPresent(row)) gone.push(row); continue; }
                 if (row.retired !== 1 || !(row.transcoded === 1 || (all && row.was_live === 1))) continue;
                 if (row.covered_at === null) { if (await isPresent(row)) want.push(row); }
@@ -467,12 +825,20 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
             const chunk = due.slice(start, start + 200);
             await queue(() => {
                 for (const row of chunk) {
-                    if (stopping || holds > 0) return;
+                    if (idle() || holds > 0) return;
                     try {
                         // The deletion and its record commit together. If the record cannot be
                         // written the row comes back (its file may already be gone, which the next
                         // attempt tolerates), so a deletion is never left unannounced.
                         const done = db.transaction(() => {
+                            if (INLAY_ORIGINAL_PATH.test(row.path)) {
+                                // Looked up again here: the row may have been wanted anew since the survey.
+                                if (!quarantinedDue.get(row.path, before)) return false;
+                                try { fs.unlinkSync(path.join(saveDir, row.path)); }
+                                catch (error) { if (error.code !== 'ENOENT') throw error; }
+                                markDeletedUnlisted.run({ at: now(), path: row.path });
+                                return true;
+                            }
                             if (!store.deleteRetired(row.generationId, before)) return false;
                             markDeleted.run(now(), row.path);
                             return true;
@@ -538,6 +904,7 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
         await ingestCovered();
         if (idle()) return;
         if (config.collect === 'all') await adoptRetired();
+        if (inlays && !idle()) await adoptQuarantine();
         const found = await survey(config);
         // A survey cut short knows only part of what is wanted; a list written from it would be short.
         if (idle() || !found.complete) return;
@@ -554,8 +921,15 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
         const live = config.enabled === true;
         // Also before the first search, so pins and deletions move even while the encoder cannot start.
         if (live && now() - lastHousekeeping >= HOUSEKEEPING_MS) await housekeeping(config);
+        // Inlays follow once the asset search has nothing left: live only when both switches say
+        // so, examined without changes when either says "report".
+        const inlaysOn = inlays && config.inlays !== false;
+        if (!inlaysOn) inlayIds = null;
         let more;
-        try { more = await sweepAssets(config); }
+        try {
+            more = await sweepAssets(config);
+            if (!more && inlaysOn && !idle()) more = await sweepInlays(config, live && config.inlays === true);
+        }
         catch (error) {
             if (!(error instanceof EncoderUnavailable)) throw error;
             // Nothing is recorded against the image; the encoder is simply tried again later.
@@ -603,14 +977,16 @@ function createMediaTranscode({ db, saveDir, store, queue, logger = console, now
         if (passPromise) await passPromise.catch(() => {});
     }
 
-    // While held, nothing is deleted. A reader that listed files takes a hold until it has them.
+    // While held, nothing is deleted and no inlay is switched. A reader that listed files takes
+    // a hold until it has them; so does a writer that rewrites inlays outside the storage queue.
     function hold() {
         holds++;
         let released = false;
         return () => { if (!released) { released = true; holds--; } };
     }
 
-    return { start, stop, hold, pass, housekeeping, readConfig, paths: { originalsDir, collectedDir, wantPath, configPath } };
+    return { start, stop, hold, pass, housekeeping, readConfig,
+        paths: { originalsDir, collectedDir, wantPath, configPath, quarantineDir, quarantineStagingDir, inlayStagingDir } };
 }
 
 module.exports = { createMediaTranscode, normalizeConfig, DEFAULTS, after };
